@@ -42,7 +42,7 @@ printf 'Baseline ready after %ss; installing Herdr and agent CLIs fresh.\n' "$SE
 docker exec "$name" bash -c 'rm -f /etc/apt/apt.conf.d/docker-clean; printf "%s\n" "APT::Keep-Downloaded-Packages \"true\";" "Binary::apt::APT::Keep-Downloaded-Packages \"true\";" > /etc/apt/apt.conf.d/99ci-keep-debs; ssh-keygen -q -t ed25519 -N "" -f /root/ci-key'
 docker exec "$name" bash /workspace/install/herdr-install.sh >"$results/install.log" 2>&1
 printf 'Application installation finished after %ss; installing dashboard.\n' "$SECONDS"
-docker exec "$name" bash -c 'mkdir -p /opt/herdr-web/web /opt/herdr-web/install; cp -a /workspace/web/public /opt/herdr-web/web/; cp -a /workspace/web/gateway /opt/herdr-web/web/; cp /workspace/install/web-install.sh /opt/herdr-web/install/'
+docker exec "$name" bash -c 'mkdir -p /opt/herdr-web/web /opt/herdr-web/install; cp -a /workspace/web/public /opt/herdr-web/web/; cp -a /workspace/web/gateway /opt/herdr-web/web/; cp /workspace/install/web-install.sh /workspace/install/dashboard-update.py /opt/herdr-web/install/'
 docker exec "$name" bash /opt/herdr-web/install/web-install.sh >"$results/web-install.log" 2>&1
 docker exec "$name" install -o herdr -g herdr -m 0644 /root/ci-key.pub /home/herdr/.config/herdr-web/ci-key.pub
 docker exec "$name" bash /workspace/tests/ci/smoke.sh >"$results/smoke.log" 2>&1

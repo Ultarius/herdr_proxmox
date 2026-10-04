@@ -10,6 +10,7 @@ class DashboardState extends BlocState {
     this.workspaces = const [],
     this.agents = const [],
     this.refreshed,
+    this.serverStatus = 'unknown',
   });
   final bool connected;
   final bool busy;
@@ -17,6 +18,7 @@ class DashboardState extends BlocState {
   final List<Map<String, dynamic>> workspaces;
   final List<Map<String, dynamic>> agents;
   final DateTime? refreshed;
+  final String serverStatus;
 }
 
 class DashboardCommand extends EventBase {
@@ -130,10 +132,13 @@ class DashboardUseCase extends BlocUseCase<DashboardBloc, DashboardCommand> {
         workspaces: previous.workspaces,
         agents: previous.agents,
         refreshed: previous.refreshed,
+        serverStatus: previous.serverStatus,
       ),
     );
     try {
-      if (event.action != 'refresh') {
+      if (event.action == 'start-server') {
+        await bloc.request('herdr-server/start', {});
+      } else if (event.action != 'refresh') {
         await bloc.request('workspaces/${event.action}', event.body);
       }
       if (generation != bloc.generation) return;
@@ -145,6 +150,7 @@ class DashboardUseCase extends BlocUseCase<DashboardBloc, DashboardCommand> {
           workspaces: List<Map<String, dynamic>>.from(data['workspaces']),
           agents: List<Map<String, dynamic>>.from(data['agents']),
           refreshed: DateTime.now(),
+          serverStatus: data['herdr_server'] as String? ?? 'running',
         ),
       );
     } catch (e) {
@@ -156,6 +162,7 @@ class DashboardUseCase extends BlocUseCase<DashboardBloc, DashboardCommand> {
           workspaces: previous.workspaces,
           agents: previous.agents,
           refreshed: previous.refreshed,
+          serverStatus: previous.serverStatus,
         ),
       );
     }

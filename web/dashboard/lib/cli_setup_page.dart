@@ -3,6 +3,7 @@ import 'package:xterm/xterm.dart';
 import 'dashboard_bloc.dart';
 import 'routes.dart';
 import 'ssh_access_card.dart';
+import 'update_card.dart';
 
 class CliSetupPage extends StatefulWidget {
   const CliSetupPage({super.key, required this.coordinator});
@@ -307,6 +308,7 @@ class _CliSetupPageState extends State<CliSetupPage> {
               if (bloc.state.connected) ...[
                 const SizedBox(height: 20),
                 const SshAccessCard(),
+                const UpdateCard(),
               ],
               if (busy) const LinearProgressIndicator(),
               if (error != null)

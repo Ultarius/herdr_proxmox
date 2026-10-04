@@ -185,6 +185,10 @@ if ((web)); then
   pct push "$ctid" "$archive" /root/herdr-web.tar.gz --perms 0600
   pct exec "$ctid" -- mkdir -p /opt/herdr-web
   pct exec "$ctid" -- tar -xzf /root/herdr-web.tar.gz -C /opt/herdr-web
+  pct push "$ctid" "$repo/install/dashboard-update.py" /opt/herdr-web/install/dashboard-update.py --perms 0644
+  if [[ -f $repo/VERSION ]]; then
+    pct push "$ctid" "$repo/VERSION" /opt/herdr-web/VERSION --perms 0644
+  fi
   pct exec "$ctid" -- bash /opt/herdr-web/install/web-install.sh
   pct exec "$ctid" -- rm -f /root/herdr-web.tar.gz
   printf 'Browser access: http://<container-ip>:8787 (allow TCP 8787 from your LAN in any enabled Proxmox firewall).\n'

@@ -1,0 +1,52 @@
+root@pve01:~# bash -c "$(curl -fsSL https://raw.githubusercontent.com/Ultarius/herdr_proxmox/main/ct/herdr.sh)"
+Include the web dashboard? [Y/n] Y
+Downloading dashboard release: latest
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+100 13.7M  100 13.7M    0     0  16.1M      0 --:--:-- --:--:-- --:--:-- 16.1M
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+100    87  100    87    0     0    172      0 --:--:-- --:--:-- --:--:--   172
+herdr-proxmox.tar.gz: OK
+update successful
+downloading http://download.proxmox.com/images/system/debian-13-standard_13.6-1_arm64.tar.zst to /var/lib/vz/template/cache/debian-13-standard_13.6-1_arm64.tar.zst
+--2026-10-04 16:02:39--  http://download.proxmox.com/images/system/debian-13-standard_13.6-1_arm64.tar.zst
+Resolving download.proxmox.com (download.proxmox.com)... 185.219.221.167, 2a0f:8001:1:32::2
+Connecting to download.proxmox.com (download.proxmox.com)|185.219.221.167|:80... connected.
+HTTP request sent, awaiting response... 200 OK
+Length: 129479452 (123M) [application/octet-stream]
+Saving to: '/var/lib/vz/template/cache/debian-13-standard_13.6-1_arm64.tar.zst.tmp_dwnl.2907848'
+     0K ........ ........ ........ ........ 25% 95.1M 1s
+ 32768K ........ ........ ........ ........ 51%  112M 1s
+ 65536K ........ ........ ........ ........ 77%  112M 0s
+ 98304K ........ ........ ........ ...     100%  112M=1.2s
+2026-10-04 16:02:40 (107 MB/s) - '/var/lib/vz/template/cache/debian-13-standard_13.6-1_arm64.tar.zst.tmp_dwnl.2907848' saved [129479452/129479452]
+calculating checksum...OK, checksum verified
+download of 'http://download.proxmox.com/images/system/debian-13-standard_13.6-1_arm64.tar.zst' to '/var/lib/vz/template/cache/debian-13-standard_13.6-1_arm64.tar.zst' finished
+  Logical volume "vm-105-disk-0" created.
+  Logical volume pve/vm-105-disk-0 changed.
+Creating filesystem with 4194304 4k blocks and 1048576 inodes
+Filesystem UUID: 6794e60f-ffb6-4480-bc5b-0bd68d852664
+Superblock backups stored on blocks: 
+        32768, 98304, 163840, 229376, 294912, 819200, 884736, 1605632, 2654208, 
+extracting archive '/var/lib/vz/template/cache/debian-13-standard_13.6-1_arm64.tar.zst'
+Total bytes read: 593008640 (566MiB, 505MiB/s)
+Detected container architecture: arm64
+Creating SSH host key 'ssh_host_ecdsa_key' - this may take some time ...
+done: SHA256:kIM7xKbobW8Vzz98CYBDyXMv28B9ANgs2i+Wr4p9/No root@herdr
+Creating SSH host key 'ssh_host_rsa_key' - this may take some time ...
+done: SHA256:i8gJWBzDUxdWs6u9r8mouE7B6518j5IQtjomkIOs9+0 root@herdr
+Creating SSH host key 'ssh_host_ed25519_key' - this may take some time ...
+done: SHA256:OGNJ1Z9M0kaPcfsPCXTWQM+7xtzWkYpCFoZGOaoCEq8 root@herdr
+WARN: Systemd 257 detected. You may need to enable nesting.
+Task finished with 1 warning(s)!
+sync_wait: 34 An error occurred in another process (expected sequence number 7)
+__lxc_start: 2288 Failed to spawn container "105"
+WARN: Systemd 257 detected. You may need to enable nesting.
+startup for container '105' failed
+Installation failed. CT 105 is preserved for diagnosis; inspect it with pct enter 105.
+root@pve01:~# 

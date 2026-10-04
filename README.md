@@ -21,7 +21,8 @@ This targets **herdrdev/herdr**, not the separate **herdr-webui** project.
 Access terminals through the Proxmox console or SSH. An optional custom dashboard
 uses Flutter **3.44.8**, Jaspr **0.23.5**, Juice **1.10.0** and ZenRouter **3.0.0**.
 Herdr starts its session server when you launch it and
-keeps panes running after you detach. No custom Herdr systemd unit is installed.
+keeps panes running after you detach. Dashboard installation adds an on-demand
+`herdr-session` user service so the dashboard can start its server.
 
 ## Install
 
@@ -141,6 +142,10 @@ disabled. It installs Codex, Claude Code, OpenCode, and Google Antigravity CLI
 for the `herdr` user. Authenticate accounts afterward through the dashboard's
 **CLI configuration** page or over SSH.
 
+The installer generates `en_US.UTF-8` and sets it as the container's default
+locale before configuring the applications, preventing minimal-template locale
+warnings. Locale setup is safe to rerun.
+
 Codex uses npm with a user-owned `~/.local` prefix; Claude Code uses its native
 stable installer. OpenCode keeps its native directory and has a launcher in
 `~/.local/bin`, alongside Antigravity. Vendor installers are downloaded over
@@ -190,7 +195,8 @@ herdr update
 
 Back up the container before upgrades. Projects, credentials, configuration and
 session state live under `/home/herdr`; include that home in your backups.
-Container boot does not automatically launch Herdr. Start it after reboot;
+Container boot does not automatically launch Herdr. Use **Start Herdr** on the
+dashboard after reboot, or launch it manually as the `herdr` user;
 restoration depends on Herdr and the individual agent's resume support.
 
 ## Custom web dashboard
@@ -250,12 +256,42 @@ the Proxmox gateway. Open its LAN URL directly, or establish the optional SSH
 tunnel described below and choose **Proxmox dashboard: SSH tunnel**. Release builds are
 optimized; use these browser launches for inspection, rather than Dart hot reload.
 
-For an existing CT, copy `web/public`, the complete `web/gateway` directory and
-`install/web-install.sh` into the same layout under `/opt/herdr-web`, then run:
+For an interactive local chat/group preview without Proxmox, build
+`web/dashboard` and run `python3 scripts/preview-mock.py`. Open
+`http://127.0.0.1:8789/dashboard/` and connect with `local-preview-token`.
+The preview seeds Max and Iris, uses the real authenticated gateway, SQLite
+storage and background jobs, and simulates agent responses and artifact files.
+Enter `mock:block` to exercise a permission prompt and terminal controls.
+Container configuration and updates are disabled. All preview data is temporary
+and removed when the process exits normally; no real agent is launched.
+
+For an existing CT, copy `web/public`, the complete `web/gateway` directory,
+`install/web-install.sh`, `install/dashboard-update.py`, and the release's
+`VERSION` file into the same layout under `/opt/herdr-web`, then run:
 
 ```bash
 bash /opt/herdr-web/install/web-install.sh
 ```
+
+After installing this version once, **CLI configuration → Dashboard updates**
+checks GitHub for stable `vMAJOR.MINOR.PATCH` releases with both packaged assets.
+Checks are cached for one hour. Review the release notes and choose **Install
+update**. The root-owned `herdr-update.path` service watches a fixed request
+location; the gateway itself remains unprivileged. The updater downloads only
+from this repository, verifies the published SHA-256 checksum, validates archive
+paths and sizes, and replaces the gateway and compiled dashboard together.
+It does not execute release installer scripts or update the Herdr CLI.
+
+The gateway is stopped while its installed files and configuration/database are
+backed up under `/var/lib/herdr-updater/backup-*`. Projects and agent terminals
+remain running. Existing database initialization applies compatible schema
+changes on gateway startup; failed startup restores both files and configuration.
+Destructive or incompatible schema migrations need a separate release-specific
+migration implementation before publication. Reload the browser after completion.
+Status is retained in `/var/lib/herdr-updater/status.json`; diagnose the worker
+with `journalctl -u herdr-update`. Backups are retained for manual recovery and
+should be managed according to available disk space. Checksums detect corruption;
+release integrity relies on the repository and GitHub HTTPS.
 
 The gateway runs as `herdr`, listening on **0.0.0.0:8787 inside the CT** by default.
 Open **http://&lt;lxc-ip&gt;:8787** from your LAN. Read the login token on the
@@ -286,6 +322,16 @@ HERDR_WEB_BIND=0.0.0.0 bash /opt/herdr-web/install/web-install.sh
 You can also start Herdr through `pct enter <CTID>` and `su - herdr` before SSH
 has been configured.
 
+The connected dashboard shows **Herdr: stopped** and a **Start Herdr** button
+when no session server is running. The button launches `herdr server` through
+the `herdr` user's systemd service and refreshes the workspace list. It requires
+the dashboard token and reuses an existing server rather than launching a
+duplicate. It starts a background server; run `herdr` as that user to attach its
+terminal UI. The server continues running if you close the browser or restart
+the dashboard gateway. The user service is started on demand, not automatically
+enabled at boot. Diagnose startup with `journalctl --user -u herdr-session`
+as `herdr`.
+
 To keep the gateway loopback-only instead, reinstall the web service inside the CT
 with `HERDR_WEB_BIND=127.0.0.1 bash /opt/herdr-web/install/web-install.sh`.
 After adding an SSH key, you can forward it from your client:
@@ -298,7 +344,7 @@ herdr
 ```
 
 For the optional tunnel, open `http://127.0.0.1:8787` on your client. Start Herdr
-via the Proxmox console or SSH before using workspace controls. The dashboard lists workspaces and agents,
+using **Start Herdr**, the Proxmox console or SSH before using workspace controls. The dashboard lists workspaces and agents,
 creates workspaces within existing directories under `/home/herdr/projects`,
 and focuses or renames workspaces. It polls every five seconds and reports
 backend errors. The **CLI configuration** page detects installed runtimes and
@@ -323,6 +369,42 @@ and no automatic terminal retries. After a failure or gateway restart, inspect
 the terminal before releasing a run binding or resubmitting a task. The same
 dashboard token controls all organizations under one OS user; organization names
 do not create independent access or process isolation.
+
+In **Organization → Chat**, select a launched hire to send a prompt directly
+from the dashboard. Messages are durable jobs with deduplicated submission;
+responses are labeled terminal snapshots, not extracted conversation transcripts.
+Live terminal output refreshes every five seconds. Fixed terminal controls
+(Up, Down, Tab, Enter, Escape and Interrupt) let the operator respond to menus
+and confirmation prompts. Inspect the terminal before approving its selected
+option. Use SSH for richer terminal interaction. Timeouts and interrupted jobs
+are not replayed automatically.
+
+The same page supports named discussion groups with a description and 2–6
+members from the organization. Creating a group creates and launches a dedicated
+Herdr agent, using the first member's runtime and project. Messages on the group
+page go to that persistent agent conversation. It uses Herdr agent-to-agent
+commands to coordinate the selected members, choose rounds and follow-ups, and
+produce a Markdown action artifact plus a structured discussion transcript.
+Launch member agents before sending a group message. Existing groups acquire
+an agent on their next edit or message. Later messages reuse the same conversation;
+release and relaunch its run explicitly if that session needs recovery.
+Groups appear under **GROUPS** in the sidebar for the selected organization.
+Each opens its own `/groups/<id>` page with **Posts**, **Artifacts**, **Members**
+and **About** tabs. Each round becomes a feed post showing agent contributions;
+**View resulting artifact** opens the action brief from that specific discussion.
+Artifacts remain available across later discussions and group edits.
+Contributions and the artifact remain in the job history and can be copied.
+Files also live under `~/.config/herdr-web/discussion-artifacts/<job-id>`;
+include that directory in backups. Groups are saved separately and can be edited;
+each discussion retains its original group and run snapshots.
+
+Discussion uses the coding agents' file-writing tools. An agent without those
+tools, a blocked agent, a missing output file, or a replaced binding produces
+`needs_attention`, never a successful artifact. Group messages have a fifteen-minute wait limit; member prompts request a three-minute limit.
+Agents are reserved against overlapping dashboard messages/delegations while a
+discussion runs. External SSH activity can still interfere. Instructions ask
+agents to discuss and propose actions without changing projects; this is an
+instruction, not an operating-system sandbox. Review artifacts before acting.
 
 The token grants workspace and organization controls; rotate it by replacing the token file
 and restarting `herdr-web`. Diagnose the gateway with

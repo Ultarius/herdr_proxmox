@@ -5,16 +5,15 @@ set -Eeuo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 source /etc/os-release
 [[ $ID == debian && $VERSION_ID == 13 ]]
+locale -a | grep -qi '^en_US\.utf8$'
+[[ $(env LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 locale charmap) == UTF-8 ]]
+[[ $(env LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 perl -e 'print "locale-ok"' 2>&1) == locale-ok ]]
 systemctl is-active --quiet ssh herdr-web
 [[ $(/usr/sbin/sshd -T | awk '$1 == "passwordauthentication" {print $2}') == no ]]
 [[ $(/usr/sbin/sshd -T | awk '$1 == "permitrootlogin" {print $2}') == no ]]
-# Only the test session is supervised here; production still starts Herdr over SSH.
-trap 'systemctl stop herdr-ci-session.service >/dev/null 2>&1 || true' EXIT
-systemd-run --unit=herdr-ci-session --uid=herdr \
-  --property=WorkingDirectory=/home/herdr/projects \
-  --setenv=HOME=/home/herdr \
-  --setenv=PATH=/home/herdr/.local/bin:/usr/local/bin:/usr/bin:/bin \
-  /home/herdr/.local/bin/herdr server
+# Runtime starts Herdr through the same authenticated endpoint used by the UI.
+herdr_uid=$(id -u herdr)
+trap 'runuser -u herdr -- env XDG_RUNTIME_DIR="/run/user/$herdr_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$herdr_uid/bus" systemctl --user stop herdr-session.service >/dev/null 2>&1 || true' EXIT
 runuser -u herdr -- env HOME=/home/herdr PATH=/home/herdr/.local/bin:/usr/local/bin:/usr/bin:/bin \
   python3 "$PWD/runtime.py" before
 if [[ -f /root/ci-key ]]; then

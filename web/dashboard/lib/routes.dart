@@ -5,6 +5,22 @@ import 'organization_page.dart';
 import 'cli_setup_page.dart';
 import 'logs_page.dart';
 import 'app_shell.dart';
+import 'group_page.dart';
+
+class GroupRoute extends AppRoute {
+  GroupRoute(this.id);
+  final String id;
+  @override
+  List<Object?> get props => [id];
+  @override
+  Uri toUri() => Uri(path: '/groups/$id');
+  @override
+  Widget build(AppCoordinator coordinator, BuildContext context) => AppShell(
+    coordinator: coordinator,
+    section: 'group:$id',
+    child: GroupPage(key: ValueKey(id), id: id, coordinator: coordinator),
+  );
+}
 
 abstract class AppRoute extends RouteTarget with RouteUnique {}
 
@@ -81,12 +97,20 @@ class NotFoundRoute extends AppRoute {
 
 class AppCoordinator extends Coordinator<AppRoute> {
   @override
-  AppRoute parseRouteFromUri(Uri uri) => switch (uri.path) {
-    '/' || '' => DashboardRoute(),
-    '/agents' => AgentsRoute(),
-    '/organization' => OrganizationRoute(),
-    '/configuration' => CliSetupRoute(),
-    '/logs' => LogsRoute(),
-    _ => NotFoundRoute(uri),
-  };
+  DefaultTransitionStrategy get transitionStrategy =>
+      DefaultTransitionStrategy.none;
+
+  @override
+  AppRoute parseRouteFromUri(Uri uri) {
+    if (uri.pathSegments.length == 2 && uri.pathSegments.first == 'groups')
+      return GroupRoute(uri.pathSegments[1]);
+    return switch (uri.path) {
+      '/' || '' => DashboardRoute(),
+      '/agents' => AgentsRoute(),
+      '/organization' => OrganizationRoute(),
+      '/configuration' => CliSetupRoute(),
+      '/logs' => LogsRoute(),
+      _ => NotFoundRoute(uri),
+    };
+  }
 }

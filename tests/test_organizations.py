@@ -33,6 +33,8 @@ class OrganizationTests(unittest.TestCase):
         if args == ('api', 'schema', '--json'):
             return {'schemas': {'success_response': {'$defs': {'AgentInfo': {'properties': {key: {} for key in ('name', 'pane_id', 'agent', 'agent_status')}}}}}}
         if args[:2] == ('pane', 'process-info'):
+            self.assertEqual(len(args), 4)
+            self.assertEqual(args[2], '--pane')
             return {'process_info': {'shell_pid': 42, 'foreground_process_group_id': 42}}
         if args[:2] == ('workspace', 'create'):
             return {'root_pane': {'pane_id': f'w{len(self.calls)}:p1'}}

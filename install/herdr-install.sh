@@ -15,9 +15,16 @@ case "$(uname -m)" in
   *) echo 'Herdr requires x86_64 or aarch64.' >&2; exit 1 ;;
 esac
 export DEBIAN_FRONTEND=noninteractive
+# Minimal templates may request en_US.UTF-8 without having generated it.
+# Use Debian's built-in UTF-8 locale while installing the locale package.
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
 # apt handles the short network startup delay after pct start.
 apt-get -o Acquire::Retries=5 update
-apt-get -o Acquire::Retries=5 install -y ca-certificates curl git ripgrep openssh-server ncurses-term
+apt-get -o Acquire::Retries=5 install -y locales ca-certificates curl git ripgrep openssh-server ncurses-term
+grep -qxF 'en_US.UTF-8 UTF-8' /etc/locale.gen || printf '%s\n' 'en_US.UTF-8 UTF-8' >>/etc/locale.gen
+locale-gen --keep-existing
+update-locale --reset LANG=en_US.UTF-8
+export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 if ! id herdr >/dev/null 2>&1; then
   useradd --create-home --shell /bin/bash herdr
 fi

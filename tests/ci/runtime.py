@@ -64,6 +64,17 @@ def envelope(value):
 def before():
     if os.getuid() == 0 or Path.home() != HOME:
         raise AssertionError('Run the runtime smoke test as herdr with its own HOME')
+    rejected(401, 'herdr-server/start', {}, token=False)
+    rejected(403, 'herdr-server/start', {}, origin='https://invalid.example')
+    wait_for(lambda: api('herdr-server'))
+    api('herdr-server/start', {})
+    def running_server():
+        if api('herdr-server')['state'] != 'running':
+            raise RuntimeError('Dashboard-started Herdr is not ready yet')
+        return True
+    wait_for(running_server)
+    if api('herdr-server/start', {}).get('already_running') is not True:
+        raise AssertionError('Repeat start did not reuse the running server')
     for name in ('herdr', 'codex', 'claude', 'opencode', 'agy'):
         binary = HOME / '.local/bin' / name
         if binary.stat().st_uid != os.getuid():

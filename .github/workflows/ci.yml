@@ -86,6 +86,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/package/herdr-proxmox/web"
           cp -R ct install "$RUNNER_TEMP/package/herdr-proxmox/"
           cp README.md "$RUNNER_TEMP/package/herdr-proxmox/"
+          printf '%s\n' '${{ github.ref_name }}' > "$RUNNER_TEMP/package/herdr-proxmox/VERSION"
           cp -R web/gateway web/public "$RUNNER_TEMP/package/herdr-proxmox/web/"
           tar -czf herdr-proxmox.tar.gz -C "$RUNNER_TEMP/package" herdr-proxmox
           sha256sum herdr-proxmox.tar.gz > herdr-proxmox.tar.gz.sha256

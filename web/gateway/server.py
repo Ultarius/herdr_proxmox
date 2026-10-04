@@ -17,6 +17,8 @@ from cli_setup import CliSetup
 from run_logs import RunLogs
 from ssh_access import SshAccess
 from dashboard_access import DashboardAccess, configured_bind
+from herdr_server import HerdrServer
+from updates import Updates
 
 ROOT = Path(os.environ.get('HERDR_WEB_ROOT', '/opt/herdr-web/public')).resolve()
 PROJECTS = Path(os.environ.get('HERDR_PROJECTS', '/home/herdr/projects')).resolve()
@@ -29,6 +31,8 @@ def command(*args, timeout=10):
     result = subprocess.run([BIN, *args], capture_output=True, text=True, timeout=timeout)
     if result.returncode:
         raise ValueError(result.stderr.strip()[:500] or 'Herdr command failed; start Herdr over SSH first.')
+    if args[:2] == ('agent', 'read'):
+        return {'output': result.stdout[-40000:]}
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
@@ -117,10 +121,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/api/'):
             if not self.authenticated():
                 return
-            if self.path not in ('/api/snapshot', '/api/organizations', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access'):
+            if self.path not in ('/api/snapshot', '/api/organizations', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates'):
                 self.reply(404, {'error': 'Unknown endpoint.'})
                 return
             try:
+                if self.path == '/api/updates':
+                    self.reply(200, self.server.updates.snapshot())
+                    return
+                if self.path == '/api/herdr-server':
+                    self.reply(200, self.server.herdr_server.status())
+                    return
                 if self.path == '/api/dashboard-access':
                     self.reply(200, self.server.dashboard_access.snapshot())
                     return
@@ -137,10 +147,14 @@ class Handler(BaseHTTPRequestHandler):
                     self.reply(200, self.server.organizations.snapshot())
                     return
                 self.reply(200, {
+                    'herdr_server': 'running',
                     'workspaces': listing(command('workspace', 'list'), 'workspaces'),
                     'agents': listing(command('agent', 'list'), 'agents'),
                 })
             except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+                if self.path == '/api/snapshot' and isinstance(exc, ValueError) and 'server_not_running' in str(exc):
+                    self.reply(200, {'herdr_server': 'stopped', 'workspaces': [], 'agents': []})
+                    return
                 self.reply(502, {'error': str(exc)[:500]})
             except sqlite3.Error:
                 self.reply(503, {'error': 'Organization storage is unavailable. Check the gateway service logs and available disk space.'})
@@ -194,10 +208,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authenticated():
             return
         actions = {f'/api/workspaces/{name}': name for name in ('create', 'focus', 'rename')}
-        organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report')}
+        organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -205,7 +219,11 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < size <= 65536:
                 raise ValueError('Invalid request size.')
             body = json.loads(self.rfile.read(size))
-            if self.path == '/api/dashboard-access':
+            if self.path == '/api/updates/install':
+                self.reply(200, self.server.updates.install(body))
+            elif self.path == '/api/herdr-server/start':
+                self.reply(200, self.server.herdr_server.start(body))
+            elif self.path == '/api/dashboard-access':
                 self.reply(200, self.server.dashboard_access.update(body))
             elif self.path == '/api/ssh-access/add':
                 self.reply(200, self.server.ssh_access.add(body))
@@ -231,6 +249,7 @@ def serve_gateway(bind, port, policy, token, services):
         server = ThreadingHTTPServer((active_bind, port), Handler)
         port = server.server_port
         server.token = token
+        server.updates = Updates()
         for name, service in services.items():
             setattr(server, name, service)
         def schedule(listener=server):
@@ -259,7 +278,7 @@ def main():
     run_logs = RunLogs(DATABASE.parent / 'run-logs', BIN)
     ssh_access = SshAccess()
     try:
-        serve_gateway(bind, 8787, policy, token, {'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access})
+        serve_gateway(bind, 8787, policy, token, {'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command)})
     finally:
         organizations.close()
         cli_setup.close()

@@ -168,6 +168,19 @@ class _DashboardState extends State<Dashboard> {
                                 : 'Last read: ${refreshed.toLocal().toString().substring(11, 19)}',
                           ),
                         ),
+                        Chip(label: Text('Herdr: ${state.serverStatus}')),
+                        if (state.serverStatus == 'stopped')
+                          FilledButton.icon(
+                            onPressed: busy
+                                ? null
+                                : () => bloc.send(
+                                    DashboardCommand('start-server'),
+                                  ),
+                            icon: const Icon(Icons.play_arrow),
+                            label: Text(
+                              busy ? 'Starting Herdr…' : 'Start Herdr',
+                            ),
+                          ),
                         OutlinedButton(
                           onPressed: busy ? null : refresh,
                           child: const Text('Refresh'),
@@ -181,6 +194,10 @@ class _DashboardState extends State<Dashboard> {
                       ],
                     ),
                     const SizedBox(height: 12),
+                    if (state.serverStatus == 'stopped')
+                      const Text(
+                        'Herdr is stopped. Select Start Herdr to launch it in this container; no SSH connection is needed.',
+                      ),
                     Wrap(
                       spacing: 12,
                       children: [

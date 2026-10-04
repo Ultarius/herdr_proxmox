@@ -9,6 +9,55 @@ import 'package:juice/juice.dart';
 
 void main() {
   JuiceLoggerConfig.minLevel = Level.warning;
+  testWidgets(
+    'dashboard starts a stopped Herdr server and refreshes its state',
+    (tester) async {
+      bool running = false;
+      final connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.url.path == '/api/herdr-server/start') {
+            expect(request.method, 'POST');
+            expect(jsonDecode(request.body), {});
+            running = true;
+            return http.Response('{"state":"running"}', 200);
+          }
+          if (request.url.path == '/api/organizations')
+            return http.Response(
+              '{"organizations":[],"profiles":[],"jobs":[]}',
+              200,
+            );
+          return http.Response(
+            jsonEncode({
+              'herdr_server': running ? 'running' : 'stopped',
+              'workspaces': [],
+              'agents': [],
+            }),
+            200,
+          );
+        }),
+      );
+      BlocScope.register<DashboardBloc>(
+        () => connection,
+        lifecycle: BlocLifecycle.permanent,
+      );
+      final coordinator = AppCoordinator();
+      await tester.pumpWidget(MaterialApp.router(routerConfig: coordinator));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).first, 'token');
+      await tester.tap(find.text('Connect'));
+      await tester.pumpAndSettle();
+      expect(find.text('Herdr: stopped'), findsOneWidget);
+      await tester.tap(find.text('Start Herdr'));
+      await tester.pumpAndSettle();
+      expect(find.text('Herdr: running'), findsOneWidget);
+      expect(find.text('Start Herdr'), findsNothing);
+      expect(tester.takeException(), isNull);
+      await connection.disconnect();
+      await tester.pumpWidget(const SizedBox());
+      coordinator.dispose();
+      await BlocScope.reset();
+    },
+  );
   test(
     'connection loads real snapshot and a workspace action refreshes it',
     () async {

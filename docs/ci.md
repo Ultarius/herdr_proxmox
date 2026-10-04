@@ -15,6 +15,11 @@ permission; ordinary checks retain read-only permissions. This packaging job
 does not certify a real Proxmox installation, and tag runs do not run the
 default-branch Debian provisioning job.
 
+The runtime smoke test starts Herdr through the authenticated dashboard endpoint
+using the installed `herdr-session` user service. It verifies that a repeat start
+reuses the server and that workspace/organization controls still work after the
+dashboard gateway restarts.
+
 Pushes to the default branch and manual runs on that branch additionally provision
 a fresh Debian 13 systemd Docker container with the actual installers. The host
 runner is Ubuntu 24.04; the installation target is Debian 13, matching the LXC.

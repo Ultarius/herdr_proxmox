@@ -92,6 +92,7 @@ class GatewayTests(unittest.TestCase):
             server = gateway.ThreadingHTTPServer(('127.0.0.1', 0), gateway.Handler)
             server.token = 'a' * 48
             server.ssh_access = gateway.SshAccess(directory)
+            server.herdr_server = gateway.HerdrServer(command)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             base = f'http://127.0.0.1:{server.server_port}'
@@ -103,6 +104,12 @@ class GatewayTests(unittest.TestCase):
                 command.assert_not_called()
                 headers = {'Authorization': 'Bearer ' + server.token}
                 with self.assertRaises(HTTPError) as error:
+                    urlopen(Request(base + '/api/herdr-server/start', data=b'{}'))
+                self.assertEqual(error.exception.code, 401)
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(Request(base + '/api/herdr-server/start', data=b'{}', headers={**headers, 'Origin':'https://invalid.example'}))
+                self.assertEqual(error.exception.code, 403)
+                with self.assertRaises(HTTPError) as error:
                     urlopen(Request(base + '/api/ssh-access/add', data=b'{"public_key":"invalid"}', headers={'Content-Type': 'application/json'}))
                 self.assertEqual(error.exception.code, 401)
                 with self.assertRaises(HTTPError) as error:
@@ -111,6 +118,9 @@ class GatewayTests(unittest.TestCase):
                 self.assertEqual(json.load(urlopen(Request(base + '/api/ssh-access', headers=headers))), {'key_count': 0})
                 response = json.load(urlopen(Request(base + '/api/snapshot', headers=headers)))
                 self.assertEqual(response['workspaces'][0]['workspace_id'], 'w1')
+                command.side_effect = ValueError('server_not_running')
+                stopped = json.load(urlopen(Request(base + '/api/snapshot', headers=headers)))
+                self.assertEqual(stopped, {'herdr_server':'stopped', 'workspaces':[], 'agents':[]})
                 with self.assertRaises(HTTPError) as error:
                     urlopen(Request(base + '/api/snapshot', headers={**headers, 'Origin': 'https://evil.example'}))
                 self.assertEqual(error.exception.code, 403)

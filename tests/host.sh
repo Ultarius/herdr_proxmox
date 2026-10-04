@@ -100,6 +100,7 @@ if HERDR_TEST_DOWNLOAD_FAIL=1 bash -c "$(cat "$tmp/ct/herdr.sh")" -- --web --ssh
 mkdir -p "$tmp/web/public/dashboard" "$tmp/web/gateway"
 cp "$repo"/web/gateway/*.py "$repo/web/gateway/log_view.html" "$tmp/web/gateway/"
 cp "$repo/install/web-install.sh" "$tmp/install/"
+cp "$repo/install/dashboard-update.py" "$tmp/install/"
 touch "$tmp/web/public/index.html" "$tmp/web/public/main.dart.js" "$tmp/web/public/dashboard/index.html"
 printf 'ssh-ed25519 AAAA test\n' >"$tmp/public.key"
 export HERDR_TEST_WEB_CONTENTS="$tmp/web-contents"

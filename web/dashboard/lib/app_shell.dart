@@ -49,7 +49,10 @@ class _AppShellState extends State<AppShell> {
     super.dispose();
   }
 
-  Widget navigation(List<Map<String, dynamic>> profiles) => Container(
+  Widget navigation(
+    List<Map<String, dynamic>> profiles,
+    List<Map<String, dynamic>> groups,
+  ) => Container(
     width: 224,
     decoration: const BoxDecoration(
       color: Color(0xff0b0b0b),
@@ -107,6 +110,22 @@ class _AppShellState extends State<AppShell> {
               ),
               onTap: () => widget.coordinator.navigate(OrganizationRoute()),
             ),
+          heading('GROUPS'),
+          if (groups.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(10),
+              child: Text(
+                'No discussion groups yet',
+                style: TextStyle(color: Color(0xff777777), fontSize: 12),
+              ),
+            ),
+          for (final group in groups)
+            nav(
+              '${group['name']}',
+              Icons.forum_outlined,
+              GroupRoute(group['id'] as String),
+              'group:${group['id']}',
+            ),
           heading('CONTAINER'),
           ListTile(
             dense: true,
@@ -162,11 +181,16 @@ class _AppShellState extends State<AppShell> {
         final profiles = List<Map<String, dynamic>>.from(
           directory['profiles'],
         ).where((item) => item['organization_id'] == org?['id']).toList();
+        final groups = List<Map<String, dynamic>>.from(
+          directory['groups'] ?? [],
+        ).where((item) => item['organization_id'] == org?['id']).toList();
         return LayoutBuilder(
           builder: (context, constraints) {
             final desktop = constraints.maxWidth >= 1000;
             return Scaffold(
-              drawer: desktop ? null : Drawer(child: navigation(profiles)),
+              drawer: desktop
+                  ? null
+                  : Drawer(child: navigation(profiles, groups)),
               body: Row(
                 children: [
                   Container(
@@ -266,7 +290,7 @@ class _AppShellState extends State<AppShell> {
                       ],
                     ),
                   ),
-                  if (desktop) navigation(profiles),
+                  if (desktop) navigation(profiles, groups),
                   Expanded(
                     child: Column(
                       children: [
@@ -292,7 +316,9 @@ class _AppShellState extends State<AppShell> {
                               const SizedBox(width: 22),
                               Expanded(
                                 child: Text(
-                                  widget.section == 'organization'
+                                  widget.section.startsWith('group:')
+                                      ? 'DISCUSSION GROUP'
+                                      : widget.section == 'organization'
                                       ? 'ORG CHART'
                                       : widget.section.toUpperCase(),
                                   style: const TextStyle(

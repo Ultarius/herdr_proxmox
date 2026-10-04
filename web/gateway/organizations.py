@@ -39,6 +39,7 @@ class OrganizationStore:
                 CREATE TABLE IF NOT EXISTS organizations (id TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, data TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS groups (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS requests (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, response TEXT NOT NULL);
             ''')
             # A crash may have occurred after terminal input. Never replay automatically.
@@ -74,7 +75,7 @@ class OrganizationStore:
     def snapshot(self):
         with self.lock, closing(self.connect()) as db:
             return {table: [json.loads(row['data']) for row in db.execute(f'SELECT data FROM {table} ORDER BY rowid')]
-                    for table in ('organizations', 'profiles', 'jobs')}
+                    for table in ('organizations', 'profiles', 'jobs', 'groups')}
 
     def project(self, value):
         path = Path(value).expanduser().resolve()
@@ -106,7 +107,16 @@ class OrganizationStore:
             else:
                 org_id = text(body, 'organization_id', 40)
                 org = self.get(db, 'organizations', org_id)
-                if action == 'hire':
+                if action in ('group', 'discuss', 'chat', 'inspect', 'input'):
+                    from collaboration import action as collaboration_action
+                    item = collaboration_action(self, db, action, body, org)
+                    if action == 'group':
+                        submitted = item.get('launch_job_id')
+                    if action in ('chat', 'discuss', 'input'):
+                        submitted = item['id']
+                    if action == 'inspect':
+                        return item
+                elif action == 'hire':
                     item_id = text(body, 'id', 40, optional=True) or uuid.uuid4().hex
                     previous = self.get(db, 'profiles', item_id, org_id) if body.get('id') else None
                     runtime = text(body, 'runtime')
@@ -137,12 +147,16 @@ class OrganizationStore:
                         sender = self.get(db, 'profiles', text(body, 'sender_id', 40), org_id)
                         if sender['id'] == profile['id']:
                             raise ValueError('Select two different agents.')
+                        participants = {sender['id'], profile['id']}
+                        if any(j['state'] in ('queued', 'running') and participants.intersection(j.get('participants', [j.get('profile_id')])) for j in jobs):
+                            raise ValueError('An agent already has a queued or running task. Wait for it to finish.')
                         runs = {}
                         for p in (sender, profile):
                             runs[p['id']] = next((j for j in reversed(jobs) if j['kind'] == 'launch' and j['profile_id'] == p['id'] and j['state'] == 'persona_sent'), None)
                             if runs[p['id']] is None:
                                 raise ValueError('Launch both agents and deliver their personas first.')
                         item = dict(id=uuid.uuid4().hex, organization_id=org_id, kind='delegate', profile_id=profile['id'],
+                                    participants=list(participants),
                                     sender_id=sender['id'], task=text(body, 'task', 8000), sender_name=sender['name'],
                                     sender_run=runs[sender['id']], recipient_run=runs[profile['id']])
                     item.update(state='queued', error='', result='', created_at=now(), updated_at=now())
@@ -177,14 +191,14 @@ class OrganizationStore:
             self.put(db, 'jobs', job)
         return job
 
-    def identity(self, run):
+    def identity(self, run, ready=True):
         response = self.command('agent', 'get', run['alias'])
         agent = response.get('agent')
         if not isinstance(agent, dict) or agent.get('name') != run['alias'] or agent.get('pane_id') != run['pane_id'] or agent.get('agent') != run['profile']['runtime']:
             raise ValueError('Agent binding changed. Inspect the terminal and launch a new run.')
         if run.get('agent_session') and agent.get('agent_session') != run['agent_session']:
             raise ValueError('Agent conversation changed. Launch a new run to deliver its persona.')
-        if agent.get('agent_status', agent.get('state')) not in ('idle', 'done') or agent.get('interactive_ready') is False or agent.get('launch_pending') is True:
+        if ready and (agent.get('agent_status', agent.get('state')) not in ('idle', 'done') or agent.get('interactive_ready') is False or agent.get('launch_pending') is True):
             raise ValueError('Agent is not ready for input. Check its terminal over SSH.')
         return agent
 
@@ -197,7 +211,7 @@ class OrganizationStore:
     def wait_for_shell(self, pane):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            result = self.command('pane', 'process-info', pane)
+            result = self.command('pane', 'process-info', '--pane', pane)
             info = result.get('process_info', {})
             shell_pid = info.get('shell_pid')
             if isinstance(shell_pid, int) and shell_pid > 0 and info.get('foreground_process_group_id') == shell_pid:
@@ -208,7 +222,10 @@ class OrganizationStore:
     def execute(self, job_id):
         job = self.update_job(job_id, state='running')
         try:
-            if job['kind'] == 'launch':
+            if job['kind'] in ('chat', 'discussion', 'input'):
+                from collaboration import execute as collaboration_execute
+                collaboration_execute(self, job)
+            elif job['kind'] == 'launch':
                 self.check_contract()
                 profile = job['profile']
                 project = self.project(profile['project'])
@@ -227,7 +244,11 @@ class OrganizationStore:
                           'Read and follow the project owner instructions. Adopt this persona for this conversation. '
                           'Acknowledge readiness and wait for an assigned task. Use Herdr agent commands for explicit delegation; '
                           'do not interpret a delivered prompt or idle status as proof of completed work.')
-                self.command('agent', 'prompt', job['alias'], prompt)
+                if profile.get('group_id'):
+                    self.command('agent', 'prompt', job['alias'], prompt, '--wait', '--timeout', '180000', timeout=190)
+                    self.identity(job)
+                else:
+                    self.command('agent', 'prompt', job['alias'], prompt)
                 self.update_job(job_id, state='persona_sent')
             else:
                 # Resolve persisted runs again: the operator may have released one while this was queued.

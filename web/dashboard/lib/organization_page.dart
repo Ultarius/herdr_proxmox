@@ -3,6 +3,7 @@ import 'dashboard_bloc.dart';
 import 'organization_bloc.dart';
 import 'routes.dart';
 import 'org_chart.dart';
+import 'collaboration_panel.dart';
 
 class OrganizationPage extends StatefulWidget {
   const OrganizationPage({super.key, required this.coordinator});
@@ -328,12 +329,24 @@ class _OrganizationPageState extends State<OrganizationPage> {
                           ),
                           ButtonSegment(value: 'team', label: Text('Team')),
                           ButtonSegment(value: 'runs', label: Text('Runs')),
+                          ButtonSegment(
+                            value: 'collaborate',
+                            label: Text('Chat'),
+                          ),
                         ],
                         selected: {view},
                         onSelectionChanged: (values) =>
                             setState(() => view = values.single),
                       ),
                       const SizedBox(height: 18),
+                      if (view == 'collaborate')
+                        CollaborationPanel(
+                          key: ValueKey(org['id']),
+                          organization: org,
+                          profiles: profiles,
+                          onOpenGroup: (id) =>
+                              widget.coordinator.navigate(GroupRoute(id)),
+                        ),
                       if (view == 'chart')
                         OrgChart(
                           profiles: profiles,
@@ -421,7 +434,9 @@ class _OrganizationPageState extends State<OrganizationPage> {
                         const Text(
                           'Delivery confirms terminal input, not completed work. Launch states are historical; see Live agents for current activity.',
                         ),
-                        for (final job in jobs)
+                        for (final job in jobs.where(
+                          (j) => ['launch', 'delegate'].contains(j['kind']),
+                        ))
                           Card(
                             child: Padding(
                               padding: const EdgeInsets.all(16),
