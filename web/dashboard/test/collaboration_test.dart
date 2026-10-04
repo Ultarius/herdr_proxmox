@@ -8,7 +8,7 @@ import 'package:herdr_dashboard/collaboration_panel.dart';
 
 void main() {
   JuiceLoggerConfig.minLevel = Level.warning;
-  testWidgets('blocked output opens and action artifact fits a narrow screen', (
+  testWidgets('live output stays collapsed and action artifact fits a narrow screen', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(360, 780);
@@ -90,6 +90,8 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('Max').last);
     await tester.pumpAndSettle();
+    await tester.tap(find.text('Live terminal output'));
+    await tester.pumpAndSettle();
     expect(
       find.text('Allow this action? Selected option: Allow'),
       findsOneWidget,
@@ -100,7 +102,10 @@ void main() {
         matching: find.byType(ExpansionTile),
       ),
     );
-    expect(tile.initiallyExpanded, isTrue);
+    expect(tile.initiallyExpanded, isFalse);
+    await tester.ensureVisible(find.text('View artifact'));
+    await tester.tap(find.text('View artifact'));
+    await tester.pumpAndSettle();
     expect(
       find.text('# Action brief\nVerify backup and recovery before rollout.'),
       findsOneWidget,

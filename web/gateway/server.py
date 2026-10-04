@@ -273,8 +273,8 @@ def main():
     if bind not in ('127.0.0.1', '0.0.0.0'):
         raise SystemExit('Invalid HERDR_WEB_BIND.')
     policy = TOKEN_FILE.parent / 'dashboard-access.json'
-    organizations = OrganizationStore(DATABASE, PROJECTS, command)
     cli_setup = CliSetup()
+    organizations = OrganizationStore(DATABASE, PROJECTS, command, runtime_status=cli_setup.status)
     run_logs = RunLogs(DATABASE.parent / 'run-logs', BIN)
     ssh_access = SshAccess()
     try:

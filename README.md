@@ -427,3 +427,28 @@ and release compilation of the Flutter/Jaspr UI.
 An actual Proxmox creation, Debian provisioning, SSH login and interactive Herdr
 session still require testing on a real Proxmox host. No deployment was performed
 from the Windows development workspace.
+
+Agent profiles store optional provider, model and reasoning settings. Blank values
+preserve CLI defaults. OpenCode requires provider and model IDs together; an explicit
+reasoning variant uses OpenCode v2 `provider/model#variant` syntax. Codex receives
+session config overrides; Claude receives `--model` and `--effort`. Alternate Claude
+providers and Antigravity settings remain configured in those CLIs. Settings apply
+on the next launch, and group agents inherit the first member's launch settings.
+Model and variant IDs must be available to the selected account; the dashboard does
+not yet discover an account's model catalog automatically.
+
+Dashboard chat replies are captured as per-message Markdown files under
+`~/.config/herdr-web/chat-replies/<job-id>/reply.md`, using the same live Herdr
+agent conversation. Include this folder in backups. Missing, empty or oversized
+reply files fail visibly rather than substituting terminal screenshots. Agents
+need file-writing tools and permission to write the reply. Raw terminal output
+remains in the separate live diagnostics view; historical terminal-snapshot
+messages are collapsed by default. This is file-backed delivery, not a native
+JSON/ACP runtime adapter or token streaming.
+
+Chat polls live activity and partial reply files every second. While an agent is
+working or blocked, terminal reads use the visible screen to avoid idle-only
+history operations. Reply drafts, terminal activity and completed replies are
+collapsed by default with bounded, scrollable contents. File previews become
+available when the agent starts writing its reply; they are not token-level
+streaming and are not marked complete until the final file is validated.

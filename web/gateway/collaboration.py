@@ -22,6 +22,7 @@ def facilitator(store, db, group):
     previous = store.get(db, 'profiles', profile_id) if group.get('facilitator_id') else None
     profile = dict(id=profile_id, organization_id=group['organization_id'], name=group['name'],
                    role='Group facilitator', runtime=first['runtime'], project=first['project'], manager_id='',
+                   **{key: first.get(key, '') for key in ('provider', 'model', 'reasoning')},
                    persona='You are this group conversation. Coordinate its selected members using Herdr agent commands. '
                            'Preserve conversation context, ask follow-up questions, and return evidence-backed recommendations. '
                            'Read herdr --skill for the installed command reference. Group purpose: ' + group['description'],
@@ -79,8 +80,22 @@ def action(store, db, name, body, org):
             raise ValueError('Inspect and release the group agent run before retrying.')
     if name == 'inspect':
         agent = store.identity(runs[0], ready=False)
-        output = store.command('agent', 'read', runs[0]['alias'], '--source', 'recent-unwrapped', '--lines', '160')
-        return {'output': output['output'], 'status': agent.get('agent_status', agent.get('state', 'unknown'))}
+        status = agent.get('agent_status', agent.get('state', 'unknown'))
+        source = 'recent-unwrapped' if status in ('idle', 'done') else 'visible'
+        output = store.command('agent', 'read', runs[0]['alias'], '--source', source, '--lines', '160')
+        # A reply file may appear while the agent is still writing it. Never read
+        # beyond the reply limit or follow a symlink from agent-controlled output.
+        draft = ''
+        jobs = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs WHERE organization_id=?', (org_id,))]
+        current = next((j for j in reversed(jobs) if j['kind'] == 'chat' and
+                        j.get('profile_id') == runs[0]['profile_id'] and j['state'] == 'running'), None)
+        if current:
+            path = store.path.parent / 'chat-replies' / current['id'] / 'reply.md'
+            if path.is_file() and not path.is_symlink() and path.stat().st_size <= 40000:
+                draft = path.read_text(encoding='utf-8', errors='replace')[:40000]
+        return {'output': output['output'], 'status': status, 'reply_draft': draft,
+                'reply_job_id': current['id'] if current else None}
+
     ids = {run['profile_id'] for run in runs}
     if name == 'discuss':
         ids.add(group_run['profile_id'])
@@ -142,9 +157,24 @@ def execute(store, job):
         return
     if job['kind'] == 'chat':
         run = job['runs'][0]
-        prompt_and_wait(store, run, job['prompt'])
-        output = store.command('agent', 'read', run['alias'], '--source', 'recent-unwrapped', '--lines', '160')
-        store.update_job(job['id'], state='answered', result=output['output'])
+        directory = store.path.parent / 'chat-replies' / job['id']
+        directory.mkdir(parents=True, mode=0o700)
+        reply = directory / 'reply.md'
+        prompt = (
+            f"User message:\n{job['prompt']}\n\n"
+            "Dashboard reply delivery: answer the user message in this conversation. "
+            f"Write your final answer as UTF-8 Markdown to exactly {reply}, below 40 KB. "
+            "The file must contain only your answer, including relevant code and examples. "
+            "Exclude terminal menus, status panels, prior conversation, prompt echoes and tool logs. "
+            "Do not change the substance of the user's request. Use your file-writing tools to save "
+            "this reply file even for a read-only advisory role; do not modify other files unless "
+            "the user's request authorizes it. Finish after saving. If you cannot write the file, "
+            "report that limitation rather than claiming delivery."
+        )
+        prompt_and_wait(store, run, prompt)
+        result = read_contribution(reply)
+        store.update_job(job['id'], state='answered', result=result, result_format='markdown',
+                         reply_name='reply.md')
         return
     group_run = job['group_run']
     with store.lock, closing(store.connect()) as db:

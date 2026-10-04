@@ -59,6 +59,39 @@ class OrganizationTests(unittest.TestCase):
     def drain(self):
         self.store.worker.submit(lambda: None).result(timeout=5)
 
+    def test_launch_rejects_unconfigured_runtime_before_creating_workspace(self):
+        org = self.organization()
+        profile = self.hire(org)
+        self.store.runtime_status = lambda runtime: dict(installed=True, status='not_configured')
+        job_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == job_id)
+        self.assertEqual(job['state'], 'needs_attention')
+        self.assertIn('uses codex', job['error'])
+        self.assertFalse(any(args[:2] == ('workspace', 'create') for args, _ in self.calls))
+
+    def test_model_settings_persist_and_reach_runtime_arguments(self):
+        org = self.organization()
+        settings = [
+            ('opencode', dict(provider='openai', model='test-model', reasoning='high'), ['--model', 'openai/test-model#high']),
+            ('codex', dict(provider='openai', model='test-model', reasoning='high'), ['--model', 'test-model', '--config', 'model_provider="openai"', '--config', 'model_reasoning_effort="high"']),
+            ('claude', dict(provider='anthropic', model='sonnet', reasoning='high'), ['--model', 'sonnet', '--effort', 'high']),
+        ]
+        for runtime, config, expected in settings:
+            profile_id = self.hire(org, name=runtime, runtime=runtime, **config)
+            profile = next(p for p in self.store.snapshot()['profiles'] if p['id'] == profile_id)
+            for key, value in config.items():
+                self.assertEqual(profile[key], value)
+            job_id = self.action('launch', organization_id=org, profile_id=profile_id)
+            self.drain()
+            run = next(j for j in self.store.snapshot()['jobs'] if j['id'] == job_id)
+            self.assertEqual(run['state'], 'persona_sent', run['error'])
+            call = next(args for args, _ in self.calls if args[:3] == ('agent', 'start', run['alias']))
+            self.assertEqual(list(call[call.index('--') + 1:]), expected)
+        for config in [dict(provider='openai'), dict(model='test-model'), dict(provider='-bad', model='model')]:
+            with self.assertRaises(ValueError):
+                self.hire(org, runtime='opencode', **config)
+
     def test_persistence_idempotency_and_payload_conflict(self):
         body = {'request_id': 'unique_request_1', 'name': 'Engineering', 'purpose': 'Build', 'instructions': ''}
         first = self.store.action('save', body)

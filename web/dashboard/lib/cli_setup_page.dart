@@ -199,6 +199,82 @@ class _CliSetupPageState extends State<CliSetupPage> {
     super.dispose();
   }
 
+  Widget accountCard(Map<String, dynamic> cli) {
+    final active = session != null && selected == cli['id'];
+    final ready = [
+      'configured',
+      'credentials_detected',
+    ].contains(cli['status']);
+    final color = ready
+        ? const Color(0xff75d8a3)
+        : active
+        ? const Color(0xffff7917)
+        : const Color(0xffaaaaaa);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  ready ? Icons.check_circle_outline : Icons.terminal,
+                  color: color,
+                  size: 22,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    '${cli['name']}',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              active ? 'Setup open' : '${cli['status']}'.replaceAll('_', ' '),
+              style: TextStyle(color: color),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '${cli['detail']}',
+              style: const TextStyle(color: Color(0xffaaaaaa)),
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: busy || session != null || cli['installed'] != true
+                  ? null
+                  : () => start(cli['id'] as String),
+              icon: Icon(
+                ready ? Icons.settings_outlined : Icons.login,
+                size: 18,
+              ),
+              label: Text(
+                active
+                    ? 'Setup in progress'
+                    : cli['installed'] != true
+                    ? 'CLI not installed'
+                    : ready
+                    ? 'Manage account'
+                    : 'Connect account',
+              ),
+            ),
+            if (session != null && !active)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: Text(
+                  'Close the active setup to switch accounts.',
+                  style: TextStyle(fontSize: 12, color: Color(0xff888888)),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) => JuiceBuilder<DashboardBloc>(
     builder: (context, bloc, status) => Scaffold(
@@ -209,7 +285,7 @@ class _CliSetupPageState extends State<CliSetupPage> {
             padding: const EdgeInsets.all(28),
             children: [
               Text(
-                'CLI configuration',
+                'CLI accounts',
                 style: Theme.of(context).textTheme.headlineLarge,
               ),
               const SizedBox(height: 12),
@@ -228,7 +304,7 @@ class _CliSetupPageState extends State<CliSetupPage> {
                   ),
                   OutlinedButton(
                     onPressed: bloc.state.connected ? refresh : null,
-                    child: const Text('Check configuration'),
+                    child: const Text('Refresh status'),
                   ),
                 ],
               ),
@@ -238,35 +314,34 @@ class _CliSetupPageState extends State<CliSetupPage> {
                 )
               else ...[
                 const Text(
-                  'Configure the CLIs as the LXC herdr user. Open the authorization URL printed by the CLI in your browser, then return here to enter any code. Use arrow keys and Enter for menus.',
+                  'Connect your coding agents to their providers. Choose an account below to open its sign-in terminal.',
                 ),
                 const SizedBox(height: 12),
-                for (final cli in clis)
-                  Card(
-                    child: ListTile(
-                      title: Text(
-                        '${cli['name']} — ${cli['status'].toString().replaceAll('_', ' ')}',
-                      ),
-                      subtitle: Text('${cli['detail']}'),
-                      trailing: FilledButton(
-                        onPressed:
-                            busy || session != null || cli['installed'] != true
-                            ? null
-                            : () => start(cli['id'] as String),
-                        child: const Text('Configure'),
-                      ),
-                    ),
-                  ),
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    final columns = constraints.maxWidth >= 750 ? 2 : 1;
+                    final width =
+                        (constraints.maxWidth - (columns - 1) * 12) / columns;
+                    return Wrap(
+                      spacing: 12,
+                      runSpacing: 12,
+                      children: [
+                        for (final cli in clis)
+                          SizedBox(width: width, child: accountCard(cli)),
+                      ],
+                    );
+                  },
+                ),
                 if (session != null) ...[
                   const SizedBox(height: 16),
                   Wrap(
                     spacing: 12,
                     children: [
                       Text(
-                        'Setup terminal: $selected ${running ? "" : "(ended)"}',
+                        '${clis.where((c) => c['id'] == selected).firstOrNull?['name'] ?? selected} setup · ${running ? "Active" : "Finished"}',
                       ),
                       TextButton(
-                        onPressed: () => sendInput('\x03'),
+                        onPressed: running ? () => sendInput('\x03') : null,
                         child: const Text('Ctrl+C'),
                       ),
                       TextButton(
@@ -275,16 +350,56 @@ class _CliSetupPageState extends State<CliSetupPage> {
                       ),
                     ],
                   ),
-                  SizedBox(
-                    height: 420,
-                    child: TerminalView(terminal, autofocus: true),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Open the sign-in link shown below in your browser. Use the menu controls or click the terminal to type.',
+                  ),
+                  const SizedBox(height: 12),
+                  Container(
+                    clipBehavior: Clip.antiAlias,
+                    decoration: BoxDecoration(
+                      border: Border.all(color: const Color(0xff343434)),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    height: 340,
+                    child: TerminalView(
+                      terminal,
+                      autofocus: true,
+                      padding: const EdgeInsets.all(12),
+                      textStyle: const TerminalStyle(
+                        fontSize: 14,
+                        fontFamily: 'RobotoMono',
+                        height: 1.3,
+                      ),
+                    ),
+                  ),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final key in const {
+                        '↑ Up': '\x1b[A',
+                        '↓ Down': '\x1b[B',
+                        'Enter': '\r',
+                        'Tab': '\t',
+                        'Escape': '\x1b',
+                      }.entries)
+                        OutlinedButton(
+                          onPressed: running
+                              ? () => sendInput(key.value)
+                              : null,
+                          child: Text(key.key),
+                        ),
+                    ],
                   ),
                   const SizedBox(height: 12),
                   TextField(
                     controller: paste,
                     obscureText: true,
                     decoration: const InputDecoration(
-                      labelText: 'Paste authorization code or API key',
+                      labelText: 'Authorization code or API key',
+                      helperText:
+                          'Input is hidden here. Send it only when the terminal asks.',
                       border: OutlineInputBorder(),
                     ),
                   ),
@@ -323,3 +438,4 @@ class _CliSetupPageState extends State<CliSetupPage> {
     ),
   );
 }
+

@@ -103,15 +103,10 @@ void main() {
     await tester.pumpWidget(MaterialApp.router(routerConfig: coordinator));
     coordinator.navigate(CliSetupRoute());
     await tester.pumpAndSettle();
-    expect(find.text('Codex — not configured'), findsOneWidget);
-    final buttons = tester
-        .widgetList<FilledButton>(
-          find.widgetWithText(FilledButton, 'Configure'),
-        )
-        .toList();
-    expect(buttons[0].onPressed, isNotNull);
-    expect(buttons[1].onPressed, isNull);
-    await tester.tap(find.text('Configure').first);
+    expect(find.text('Codex'), findsOneWidget);
+    expect(tester.widget<FilledButton>(find.widgetWithText(FilledButton, 'Connect account')).onPressed, isNotNull);
+    expect(tester.widget<FilledButton>(find.widgetWithText(FilledButton, 'CLI not installed')).onPressed, isNull);
+    await tester.tap(find.text('Connect account'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 100));
     final view = tester.widget<TerminalView>(find.byType(TerminalView));
@@ -119,9 +114,12 @@ void main() {
       view.terminal.buffer.getText(),
       contains('Enter authorization code:'),
     );
+    await tester.tap(find.text('↓ Down'));
+    await tester.pump();
+    expect(inputs, contains('\x1b[B'));
     final authInput = find.widgetWithText(
       TextField,
-      'Paste authorization code or API key',
+      'Authorization code or API key',
     );
     await tester.ensureVisible(authInput);
     await tester.enterText(authInput, 'one-time-code');

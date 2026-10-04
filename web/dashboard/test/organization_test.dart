@@ -157,9 +157,14 @@ void main() {
       await tester.enterText(hireFields.at(0), 'Maya');
       await tester.enterText(hireFields.at(1), 'Lead');
       await tester.enterText(
-        hireFields.at(3),
+        find.widgetWithText(TextFormField, 'Persona instructions'),
         'Plan carefully and report evidence.',
       );
+      await tester.ensureVisible(find.text('Choose a runtime'));
+      await tester.tap(find.text('Choose a runtime'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Codex').last);
+      await tester.pumpAndSettle();
       await tester.tap(find.text('Save hire'));
       await tester.pumpAndSettle();
       expect(profiles.single['runtime'], 'codex');
@@ -174,12 +179,7 @@ void main() {
       await tester.tap(find.text('Edit persona'));
       await tester.pumpAndSettle();
       await tester.enterText(
-        find
-            .descendant(
-              of: find.byType(HireForm),
-              matching: find.byType(TextFormField),
-            )
-            .at(3),
+        find.widgetWithText(TextFormField, 'Persona instructions'),
         'Lead with a testable plan.',
       );
       await tester.tap(find.text('Save persona'));

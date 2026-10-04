@@ -27,6 +27,8 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
   String? error;
   String output = '';
   String status = '';
+  String draft = '';
+  String? draftJob;
   bool busy = false;
   bool polling = false;
   String? pendingAction;
@@ -37,7 +39,7 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
   void initState() {
     super.initState();
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 5), (_) => refresh());
+    timer = Timer.periodic(const Duration(seconds: 1), (_) => refresh());
   }
 
   @override
@@ -79,6 +81,8 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
           setState(() {
             output = result['output'] as String;
             status = result['status'] as String;
+            draft = result['reply_draft'] as String? ?? '';
+            draftJob = result['reply_job_id'] as String?;
             if (pendingBody == null) error = null;
           });
         }
@@ -182,10 +186,33 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
           if ((job['result'] as String? ?? '').isNotEmpty) ...[
             Text(
               job['kind'] == 'chat'
-                  ? 'Agent terminal snapshot'
+                  ? (job['result_format'] == 'markdown'
+                        ? 'Agent reply'
+                        : 'Earlier terminal snapshot')
                   : 'Action artifact · Markdown',
             ),
-            SelectableText(job['result'] as String),
+            if (job['kind'] == 'chat' && job['result_format'] != 'markdown')
+              ExpansionTile(
+                title: const Text('View earlier terminal output'),
+                children: [SelectableText(job['result'] as String)],
+              )
+            else
+              ExpansionTile(
+                key: ValueKey('reply-${job['id']}'),
+                initiallyExpanded: false,
+                title: Text(
+                  job['kind'] == 'chat' ? 'View reply' : 'View artifact',
+                ),
+                children: [
+                  SizedBox(
+                    height: 280,
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.all(16),
+                      child: SelectableText(job['result'] as String),
+                    ),
+                  ),
+                ],
+              ),
             TextButton(
               onPressed: () => export(job),
               child: const Text('Copy Markdown'),
@@ -225,7 +252,7 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
       const SizedBox(height: 24),
       Text('Chat with an agent', style: Theme.of(context).textTheme.titleLarge),
       const Text(
-        'Launch the agent first. Responses below show its terminal output, which may include earlier messages and CLI controls.',
+        'Launch the agent first. New replies contain only the agent’s answer. Live terminal output is available separately for troubleshooting.',
       ),
       DropdownButtonFormField<String>(
         initialValue: profile,
@@ -244,6 +271,8 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
                   profile = value;
                   output = '';
                   status = '';
+                  draft = '';
+                  draftJob = null;
                   error = null;
                 });
                 refresh();
@@ -275,12 +304,44 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
         const Text(
           'The agent needs input. Read its terminal output, then use the controls below. Approval applies to the option currently selected in the terminal.',
         ),
+      if (draftJob != null)
+        ExpansionTile(
+          key: ValueKey('draft-$draftJob'),
+          initiallyExpanded: false,
+          title: const Text('Reply in progress'),
+          subtitle: Text(
+            draft.isEmpty
+                ? 'Waiting for the agent to write its answer…'
+                : 'Live preview · updates every second',
+          ),
+          children: [
+            SizedBox(
+              height: 220,
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(16),
+                child: SelectableText(
+                  draft.isEmpty
+                      ? 'The agent is working. Expand live terminal output to see its activity.'
+                      : draft,
+                ),
+              ),
+            ),
+          ],
+        ),
       if (output.isNotEmpty)
         ExpansionTile(
-          key: ValueKey('$profile-${status == 'blocked'}'),
-          initiallyExpanded: status == 'blocked',
+          key: ValueKey('terminal-$profile'),
+          initiallyExpanded: false,
           title: const Text('Live terminal output'),
-          children: [SelectableText(output)],
+          children: [
+            SizedBox(
+              height: 240,
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(16),
+                child: SelectableText(output),
+              ),
+            ),
+          ],
         ),
       if (profile != null && output.isNotEmpty)
         Wrap(

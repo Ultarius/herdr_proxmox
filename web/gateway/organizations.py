@@ -26,11 +26,49 @@ def text(body, key, limit=120, optional=False):
     return value
 
 
+def model_settings(body, runtime):
+    values = {key: text(body, key, 160, optional=True) for key in ('provider', 'model', 'reasoning')}
+    for key, value in values.items():
+        if value and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:/-]*', value):
+            raise ValueError(f'Invalid {key} identifier.')
+    if runtime == 'agy' and any(values.values()):
+        raise ValueError('Antigravity model settings are managed in its own CLI.')
+    if runtime == 'opencode' and (bool(values['provider']) != bool(values['model'])):
+        raise ValueError('OpenCode requires both provider and model, or leave both at CLI defaults.')
+    if runtime == 'opencode' and values['reasoning'] and not values['model']:
+        raise ValueError('Select an OpenCode provider and model before choosing a reasoning variant.')
+    if runtime == 'claude' and values['provider'] not in ('', 'anthropic'):
+        raise ValueError('Claude uses its configured account/provider. Configure alternate providers in its CLI.')
+    return values
+
+
+def launch_arguments(profile):
+    runtime = profile['runtime']
+    settings = model_settings(profile, runtime)
+    provider, model, reasoning = (settings[k] for k in ('provider', 'model', 'reasoning'))
+    args = []
+    if runtime == 'opencode' and model:
+        args += ['--model', f'{provider}/{model}' + (f'#{reasoning}' if reasoning else '')]
+    elif runtime == 'codex':
+        if model:
+            args += ['--model', model]
+        for key, value in [('model_provider', provider), ('model_reasoning_effort', reasoning)]:
+            if value:
+                args += ['--config', f'{key}={json.dumps(value)}']
+    elif runtime == 'claude':
+        if model:
+            args += ['--model', model]
+        if reasoning:
+            args += ['--effort', reasoning]
+    return args
+
+
 class OrganizationStore:
-    def __init__(self, path, projects, command):
+    def __init__(self, path, projects, command, runtime_status=None):
         self.path = Path(path)
         self.projects = Path(projects).resolve()
         self.command = command
+        self.runtime_status = runtime_status
         self.lock = threading.RLock()
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix='organization')
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -132,6 +170,7 @@ class OrganizationStore:
                         current = self.get(db, 'profiles', current, org_id)['manager_id']
                     item = dict(id=item_id, organization_id=org_id, name=text(body, 'name'), role=text(body, 'role'),
                                 persona=text(body, 'persona', 8000), runtime=runtime, manager_id=manager,
+                                **model_settings(body, runtime),
                                 project=self.project(text(body, 'project', 2000)), version=(previous['version'] if previous else 0) + 1)
                     self.put(db, 'profiles', item)
                 elif action in ('launch', 'delegate'):
@@ -228,6 +267,10 @@ class OrganizationStore:
             elif job['kind'] == 'launch':
                 self.check_contract()
                 profile = job['profile']
+                if self.runtime_status is not None:
+                    status = self.runtime_status(profile['runtime'])
+                    if status.get('installed') is False or status.get('status') in ('missing', 'not_configured') and profile['runtime'] in ('codex', 'claude'):
+                        raise ValueError(f"{profile['name']} uses {profile['runtime']}. Connect this CLI on the CLI accounts page before launching; other CLI accounts do not configure it.")
                 project = self.project(profile['project'])
                 created = self.command('workspace', 'create', '--cwd', project, '--label', profile['name'], '--no-focus')
                 pane = created.get('root_pane', {}).get('pane_id')
@@ -235,7 +278,8 @@ class OrganizationStore:
                     raise ValueError('Herdr did not return a valid root pane ID.')
                 job = self.update_job(job_id, pane_id=pane)
                 self.wait_for_shell(pane)
-                self.command('agent', 'start', job['alias'], '--kind', profile['runtime'], '--pane', pane, '--timeout', '60000', timeout=70)
+                arguments = launch_arguments(profile)
+                self.command('agent', 'start', job['alias'], '--kind', profile['runtime'], '--pane', pane, '--timeout', '60000', *(['--', *arguments] if arguments else []), timeout=70)
                 agent = self.identity(job)
                 job = self.update_job(job_id, agent_session=agent.get('agent_session'))
                 org = job['organization']

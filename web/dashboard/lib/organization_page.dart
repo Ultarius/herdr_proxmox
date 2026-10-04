@@ -624,7 +624,14 @@ class _HireFormState extends State<HireForm> {
   late final project = TextEditingController(
     text: widget.profile?['project'] ?? '/home/herdr/projects',
   );
-  late String runtime = widget.profile?['runtime'] ?? 'codex';
+  late final provider = TextEditingController(
+    text: widget.profile?['provider'],
+  );
+  late final model = TextEditingController(text: widget.profile?['model']);
+  late final reasoning = TextEditingController(
+    text: widget.profile?['reasoning'],
+  );
+  late String? runtime = widget.profile?['runtime'];
   late String manager = widget.profile?['manager_id'] ?? '';
   @override
   void dispose() {
@@ -632,6 +639,9 @@ class _HireFormState extends State<HireForm> {
     role.dispose();
     persona.dispose();
     project.dispose();
+    provider.dispose();
+    model.dispose();
+    reasoning.dispose();
     super.dispose();
   }
 
@@ -651,7 +661,14 @@ class _HireFormState extends State<HireForm> {
               DropdownButtonFormField<String>(
                 isExpanded: true,
                 initialValue: runtime,
-                decoration: const InputDecoration(labelText: 'Agent runtime'),
+                decoration: const InputDecoration(
+                  labelText: 'Agent runtime',
+                  helperText:
+                      'Choose the CLI you connected on the CLI accounts page.',
+                ),
+                hint: const Text('Choose a runtime'),
+                validator: (value) =>
+                    value == null ? 'Choose an agent runtime.' : null,
                 items: [
                   for (final entry in {
                     'codex': 'Codex',
@@ -664,8 +681,67 @@ class _HireFormState extends State<HireForm> {
                       child: Text(entry.value),
                     ),
                 ],
-                onChanged: (value) => runtime = value!,
+                onChanged: (value) => setState(() {
+                  if (runtime != value) {
+                    provider.clear();
+                    model.clear();
+                    reasoning.clear();
+                  }
+                  runtime = value!;
+                }),
               ),
+              const SizedBox(height: 16),
+              if (runtime != null && runtime != 'agy') ...[
+                TextFormField(
+                  controller: provider,
+                  decoration: InputDecoration(
+                    labelText: 'Provider',
+                    hintText: runtime == 'opencode'
+                        ? 'Provider ID from OpenCode, e.g. openai'
+                        : 'Leave empty to use the configured provider',
+                    helperText: runtime == 'claude'
+                        ? 'Anthropic or the provider already configured in Claude.'
+                        : 'Use an exact provider ID available in this CLI.',
+                  ),
+                  validator: (value) =>
+                      runtime == 'opencode' &&
+                          model.text.trim().isNotEmpty &&
+                          (value ?? '').trim().isEmpty
+                      ? 'Enter the provider for this model.'
+                      : null,
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: model,
+                  decoration: const InputDecoration(
+                    labelText: 'Model',
+                    hintText: 'Exact model ID, or leave empty for CLI default',
+                  ),
+                  validator: (value) =>
+                      runtime == 'opencode' &&
+                          provider.text.trim().isNotEmpty &&
+                          (value ?? '').trim().isEmpty
+                      ? 'Enter a model ID for this provider.'
+                      : null,
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: reasoning,
+                  decoration: InputDecoration(
+                    labelText: runtime == 'opencode'
+                        ? 'Reasoning variant'
+                        : 'Reasoning effort',
+                    hintText: 'Leave empty for model default',
+                    helperText: runtime == 'opencode'
+                        ? 'Exact model variant. Explicit variants require OpenCode v2.'
+                        : 'Use a level supported by the selected model and CLI.',
+                  ),
+                ),
+              ],
+              if (runtime == 'agy')
+                const Text(
+                  'Choose provider, model and reasoning inside Antigravity.',
+                ),
               const SizedBox(height: 12),
               DropdownButtonFormField<String>(
                 isExpanded: true,
@@ -690,7 +766,7 @@ class _HireFormState extends State<HireForm> {
               field(project, 'Existing project directory', limit: 2000),
               field(persona, 'Persona instructions', limit: 8000, lines: 5),
               const Text(
-                'Use the CLI default model. Authenticate the runtime over SSH before launching.',
+                'Blank model settings use the CLI defaults. Saved settings apply on the next launch. Connect that same CLI on the CLI accounts page before launching. Changing runtime requires releasing and relaunching the existing run.',
               ),
             ],
           ),
@@ -711,6 +787,9 @@ class _HireFormState extends State<HireForm> {
               'name': name.text.trim(),
               'role': role.text.trim(),
               'runtime': runtime,
+              'provider': provider.text.trim(),
+              'model': model.text.trim(),
+              'reasoning': reasoning.text.trim(),
               'manager_id': manager,
               'project': project.text.trim(),
               'persona': persona.text.trim(),

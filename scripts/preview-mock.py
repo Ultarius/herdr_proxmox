@@ -79,6 +79,12 @@ class PreviewHandler(server.Handler):
             self.send_header('Location', '/dashboard/')
             self.end_headers()
             return
+        if self.path == '/api/cli-setup':
+            if self.authenticated():
+                self.reply(200, {'clis': [dict(id=i, name=n, installed=True,
+                    status='not_configured', detail='Connect an account using the setup terminal (local demo).')
+                    for i, n in [('codex', 'Codex'), ('claude', 'Claude Code'), ('opencode', 'OpenCode'), ('agy', 'Antigravity')]]})
+            return
         if self.path.startswith('/api/') and self.path not in ('/api/snapshot', '/api/organizations'):
             if self.authenticated():
                 self.reply(503, {'error': 'This local preview simulates agent chat and groups only. Container setup and updates are disabled.'})
@@ -88,6 +94,20 @@ class PreviewHandler(server.Handler):
         super().do_GET()
 
     def do_POST(self):
+        if self.path.startswith('/api/cli-setup/'):
+            if not self.authenticated():
+                return
+            size = int(self.headers.get('Content-Length', '0'))
+            body = json.loads(self.rfile.read(size))
+            operation = self.path.rsplit('/', 1)[-1]
+            if operation == 'start':
+                self.reply(200, {'id': 'demo-setup'})
+            elif operation == 'poll':
+                output = '' if body.get('cursor') else '\x1b[36mConnect your provider (mock)\x1b[0m\r\n\r\n  > OpenCode Zen\r\n    OpenAI\r\n    Anthropic\r\n    Google\r\n\r\nUse arrow keys and Enter to select. Demo only; do not enter real credentials.\r\n'
+                self.reply(200, {'output': output, 'cursor': 1, 'running': True})
+            else:
+                self.reply(200, {})
+            return
         if self.path.startswith('/api/') and not self.path.startswith('/api/organizations/'):
             if self.authenticated():
                 self.reply(503, {'error': 'Container configuration changes are disabled in the local mock preview.'})

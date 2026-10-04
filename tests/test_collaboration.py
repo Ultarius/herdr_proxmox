@@ -57,12 +57,36 @@ class CollaborationTests(unittest.TestCase):
         self.assertEqual(self.store.action('chat', body), response)
         self.drain()
         self.assertEqual(self.job(response['id'])['state'], 'answered')
-        self.assertIn('Agent response', self.job(response['id'])['result'])
-        prompts = [a for a, _ in self.calls if a[:2] == ('agent', 'prompt') and a[3] == body['prompt']]
+        self.assertIn('Recommended actions', self.job(response['id'])['result'])
+        self.assertEqual(self.job(response['id'])['result_format'], 'markdown')
+        prompts = [a for a, _ in self.calls if a[:2] == ('agent', 'prompt') and a[3].startswith('User message:\n' + body['prompt'] + '\n')]
         self.assertEqual(len(prompts), 1)
         self.assertIn('--wait', prompts[0])
         inspected = self.store.action('inspect', dict(request_id=uuid.uuid4().hex, organization_id=self.org, profile_id=self.max))
         self.assertEqual(inspected['status'], 'idle')
+
+    def test_missing_chat_reply_does_not_fall_back_to_terminal_snapshot(self):
+        self.writes = False
+        job_id = self.action('chat', organization_id=self.org, profile_id=self.max, prompt='Hi')
+        self.drain()
+        job = self.job(job_id)
+        self.assertEqual(job['state'], 'needs_attention')
+        self.assertEqual(job['result'], '')
+        self.assertFalse(any(args[:2] == ('agent', 'read') for args, _ in self.calls))
+
+    def test_inspection_reads_working_terminal_and_partial_reply(self):
+        run = next(j for j in self.store.snapshot()['jobs'] if j.get('profile_id') == self.max and j['kind'] == 'launch')
+        self.agents[run['alias']]['agent_status'] = 'working'
+        with closing(self.store.connect()) as db, db:
+            self.store.put(db, 'jobs', dict(id='streamtest', organization_id=self.org, kind='chat', profile_id=self.max, state='running'))
+        directory = self.store.path.parent / 'chat-replies' / 'streamtest'
+        directory.mkdir(parents=True)
+        (directory / 'reply.md').write_text('Partial answer with code: `map(fn)`', encoding='utf-8')
+        result = self.store.action('inspect', dict(request_id=uuid.uuid4().hex, organization_id=self.org, profile_id=self.max))
+        self.assertEqual(result['reply_job_id'], 'streamtest')
+        self.assertIn('Partial answer', result['reply_draft'])
+        read = [args for args, _ in self.calls if args[:2] == ('agent', 'read')][-1]
+        self.assertEqual(read[read.index('--source') + 1], 'visible')
 
     def test_group_discussion_and_artifact_persist(self):
         group = self.group()
