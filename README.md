@@ -388,6 +388,27 @@ produce a Markdown action artifact plus a structured discussion transcript.
 Launch member agents before sending a group message. Existing groups acquire
 an agent on their next edit or message. Later messages reuse the same conversation;
 release and relaunch its run explicitly if that session needs recovery.
+Group creation initializes the facilitator only. Its startup prompt withholds
+the group description and asks it to wait for a separate discussion message
+with the purpose, task, roster and output paths. Discussions may read
+or prompt only their selected members, not unrelated group conversations. If a
+proposal or document is missing, they should report the missing input instead
+of searching home or the filesystem for a substitute. Permission policies still
+apply independently; dashboard output access does not grant whole-home access.
+The facilitator is instructed to start with one round and stop when the answer is
+sufficient. At most two follow-up rounds are requested by default, each to resolve
+a material question. These defaults yield to the group's description or the user
+message: those define the workflow, depth, format and desired artifact (for
+example a decision memo, research brief or implementation plan). No assigned
+work is a valid result, and a repository is required
+only for tasks that need project files. Machine-wide searches, shell history and
+tooling/credential directories are outside ordinary discussion scope.
+Each discussion includes the participants' saved project, launch directory
+(including individual worktrees) and live Herdr-reported cwd when available.
+Members are instructed to confirm their directory before project-specific work
+and report mismatches. These are agent instructions, not filesystem confinement
+or a programmatically enforced round limit. Artifacts distinguish member reports
+from independent observations and label assumptions and proposals.
 Groups appear under **GROUPS** in the sidebar for the selected organization.
 Each opens its own `/groups/<id>` page with **Posts**, **Artifacts**, **Members**
 and **About** tabs. Each round becomes a feed post showing agent contributions;

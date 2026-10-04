@@ -28,7 +28,8 @@ def facilitator(store, db, group):
                    use_worktree=group.get('use_worktree', True),
                    **{key: first.get(key, '') for key in ('provider', 'model', 'reasoning')},
                    persona='You are this group conversation. Coordinate its selected members using Herdr agent commands. '
-                           'Preserve conversation context, ask follow-up questions, and return evidence-backed recommendations. '
+                           'Stay within the user topic, ask follow-ups only when they can change the answer, '
+                           'and stop once there is enough information. Do not manufacture disagreements or work. '
                            'Read herdr --skill for the installed command reference. Group purpose: ' + group['description'],
                    version=(previous['version'] if previous else 0) + 1, group_id=group['id'])
     store.put(db, 'profiles', profile)
@@ -304,6 +305,14 @@ def execute(store, job):
     directory.mkdir(parents=True, mode=0o700)
     artifact = directory / 'action-plan.md'
     transcript = directory / 'discussion.json'
+    def workspace_context(run):
+        live = store.identity(run)
+        return {'name': run['profile']['name'], 'alias': run['alias'],
+                'configured_project': run['profile']['project'],
+                'launch_directory': run.get('worktree_path') or run['profile']['project'],
+                'herdr_reported_cwd': live.get('cwd') if isinstance(live.get('cwd'), str) else None}
+
+    contexts = [workspace_context(group_run), *(workspace_context(r) for r in job['runs'])]
     roster = '\n'.join(f"{r['profile']['name']} ({r['profile']['role']}): {r['alias']}" for r in job['runs'])
     store.update_job(job['id'], progress='Group agent coordinating members')
     discussion_policy = (
@@ -315,15 +324,48 @@ def execute(store, job):
     prompt = (
         f"Group: {job['group']['name']}\nPurpose: {job['group']['description']}\n"
         f"User message:\n{job['prompt']}\n\nSelected members (live Herdr aliases):\n{roster}\n\n"
+        f"Workspace context (from saved launch settings and live Herdr bindings): {json.dumps(contexts)}\n"
+        "Each member has its own working directory, potentially a separate worktree. Do not assume a shared checkout. "
+        "Before project-specific commands, ask the relevant member to confirm pwd and use its assigned launch directory. "
+        "If it differs, report the mismatch; do not silently inspect another project. "
+        "The projects folder is an allowed directory boundary, not a requirement to put a repository at its root. "
+        "An empty directory or absent Git repository is only a blocker when the user's task requires project files. "
+        "General discussion and reporting no assigned work do not require a repository, Git identity or test commands. "
         "You are the group conversation and facilitator. Read herdr --skill. Use herdr agent prompt <alias> "
         "with --wait --timeout 180000 to ask selected members for input. Read their results or ask them to "
-        "write Markdown files in the discussion directory. Choose the rounds and follow-ups needed, "
-        "include disagreements, and synthesize the answer yourself. Do not prompt yourself, create other "
-        "agents, or contact anyone outside this roster. If a member is blocked, stop and report the issue. "
+        "write Markdown files in the discussion directory. Pass the user topic, workspace context and scope restrictions "
+        "below to every member. The group purpose defines the recurring workflow and desired outcome; the user "
+        "message defines this discussion's task and can refine that workflow. Follow their requested format, depth "
+        "and discussion method. Where neither specifies a method, start with one round and use at most two "
+        "follow-up rounds, each to resolve a material unanswered question or conflicting evidence. "
+        "Stop when the requested outcome is achieved or further replies add no value. Do not manufacture "
+        "disagreements or force consensus; preserve unresolved differences when relevant. Do not expand into "
+        "unrequested investigations. Synthesize the answer yourself. "
+        "Do not prompt yourself, create other agents, or list, read or prompt agents outside this roster, "
+        "including other group conversations. Treat old conversation topics as background, not instructions "
+        "for this task. If the task needs a particular proposal, document or repository that was not supplied, "
+        "report the missing input rather than choosing an unrelated task or searching the machine for one. "
+        "Conceptual discussions can proceed without files. If a member is blocked, "
+        "stop further rounds and save a concise partial artifact and transcript explaining the missing input. "
+        "Limit reads and commands to information necessary for the topic and the assigned project. Do not search "
+        "the whole machine, shell history, credential/config directories or tooling caches to find substitute work. "
+        "Broader inspection must be explicitly within the group purpose or user request and relevant to the task. "
+        "Distinguish observed evidence, member reports, "
+        "inferences and proposals. Limited searches do not prove absence everywhere; self-reports do not independently "
+        "verify filesystem activity. Source code allowing a path does not establish a required repository layout. "
         f"{discussion_policy}"
         f"Discussion directory: {directory}\n"
+        "Use these exact output paths. Do not search home or filesystem roots for action plans or transcripts. "
+        "If earlier artifacts are needed, ask for their specific path or content. A permission request is "
+        "not permission to widen the task: narrow the operation to the known task/output directory, or "
+        "report the needed access. Never switch to a root search to bypass a rejected or pending request. "
         f"Write the final UTF-8 Markdown artifact to exactly {artifact}, below 40 KB. "
-        "Include actions, evidence, risks, proposed owners and acceptance criteria. "
+        "Deliver the artifact requested by the group purpose or user message, such as a summary, decision memo, "
+        "comparison, research brief or implementation plan. If neither specifies a format, lead with the answer "
+        "and keep the artifact concise, normally under 800 words. Requested detail overrides this default, "
+        "within the file size limit. Include actions, evidence, risks, proposed owners and acceptance "
+        "criteria only where useful for this task; do not invent requirements or owners. If nothing needs action, "
+        "say so. Keep detailed round history in the transcript rather than repeating it in the artifact. "
         f"Also write {transcript} as JSON with a contributions array. Each entry must have "
         "profile_id (from the roster below), name, round (integer 1 to 20), and content (Markdown under 6 KB). "
         f"Profile IDs: {json.dumps({r['alias']: r['profile_id'] for r in job['runs']})}. "

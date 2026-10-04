@@ -166,7 +166,11 @@ class OrganizationStore:
         for agent in agents:
             item = dict(agent)
             for run in reversed(jobs):
-                if run['kind'] != 'launch' or run['state'] != 'persona_sent' or run.get('alias') != agent.get('name'):
+                if run['kind'] != 'launch' or run['state'] not in ('running', 'persona_sent', 'needs_attention') or run.get('alias') != agent.get('name'):
+                    continue
+                # Label initialization/error states only after the launched conversation
+                # has been captured; an alias alone does not prove ownership.
+                if not run.get('pane_id') or (run['state'] != 'persona_sent' and not run.get('agent_session')):
                     continue
                 profile = profiles.get(run['profile_id'])
                 if profile is None:
@@ -373,6 +377,18 @@ class OrganizationStore:
                           'Acknowledge readiness and wait for an assigned task. Use Herdr agent commands for explicit delegation; '
                           'do not interpret a delivered prompt or idle status as proof of completed work.')
                 if profile.get('group_id'):
+                    # Do not deliver an imperative group description as the startup task.
+                    # Purpose, roster and output paths arrive together in the discussion.
+                    prompt = (
+                        f"Organization: {org['name']}\nGroup conversation: {profile['name']}\n"
+                        f"Shared instructions for future tasks:\n{org['instructions']}\n\n"
+                        'INITIALIZATION ONLY: This message configures the group conversation; it does not '
+                        'start a discussion or authorize project work. '
+                        'Acknowledge readiness briefly and wait for a separate discussion message containing '
+                        'the group purpose, selected roster, user task and output paths. Until then, do not list, read or prompt '
+                        'other agents, inspect project or home directories, search for past artifacts, '
+                        'or create files. You may read herdr --skill for the command reference.'
+                    )
                     self.command('agent', 'prompt', job['alias'], prompt, '--wait', '--timeout', '180000', timeout=190)
                     self.identity(job)
                 else:

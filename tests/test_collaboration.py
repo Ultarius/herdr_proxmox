@@ -131,6 +131,30 @@ class CollaborationTests(unittest.TestCase):
         with closing(self.store.connect()) as db:
             self.assertEqual(self.store.get(db, 'jobs', run)['result'], job['result'])
 
+    def test_discussion_context_preserves_distinct_worktrees_and_live_directory_mismatch(self):
+        group = self.group()
+        member = next(j for j in self.store.snapshot()['jobs']
+                      if j['kind'] == 'launch' and j['profile_id'] == self.max)
+        checkout = str(self.projects / '.herdr-worktrees' / 'max')
+        self.store.update_job(member['id'], worktree_path=checkout)
+        self.agents[member['alias']]['cwd'] = str(self.projects / 'different-project')
+        job_id = self.action('discuss', organization_id=self.org, group_id=group,
+                             prompt='Share the latest work')
+        self.drain()
+        job = self.job(job_id)
+        self.assertEqual(job['state'], 'artifact_ready', job['error'])
+        prompt = next(a[3] for a, _ in self.calls if a[:2] == ('agent', 'prompt')
+                      and a[2] == job['group_run']['alias'] and 'Workspace context (' in a[3])
+        line = next(line for line in prompt.splitlines() if line.startswith('Workspace context ('))
+        contexts = json.loads(line.split(': ', 1)[1])
+        max_context = next(c for c in contexts if c['alias'] == member['alias'])
+        self.assertEqual(max_context['configured_project'], str(self.projects))
+        self.assertEqual(max_context['launch_directory'], checkout)
+        self.assertEqual(max_context['herdr_reported_cwd'], str(self.projects / 'different-project'))
+        iris_context = next(c for c in contexts if c['name'] == 'Iris')
+        self.assertEqual(iris_context['launch_directory'], str(self.projects))
+        self.assertIsNone(iris_context['herdr_reported_cwd'])
+
     def test_live_discussion_inspects_bound_agents_and_incremental_documents(self):
         group = self.group()
         job_id = self.action('discuss', organization_id=self.org, group_id=group)
@@ -239,18 +263,49 @@ class CollaborationTests(unittest.TestCase):
         unknown = dict(name='external-agent', pane_id='w999:p1', agent='codex')
         self.assertEqual(self.store.label_agents([unknown])[0], unknown)
 
+    def test_group_label_during_initialization_and_failed_launch_requires_session_binding(self):
+        group_id = self.group()
+        group = next(g for g in self.store.snapshot()['groups'] if g['id'] == group_id)
+        run = next(j for j in self.store.snapshot()['jobs']
+                   if j['kind'] == 'launch' and j['profile_id'] == group['facilitator_id'])
+        agent = dict(self.agents[run['alias']], agent_status='working')
+        for state in ('running', 'needs_attention'):
+            self.store.update_job(run['id'], state=state)
+            labeled = self.store.label_agents([agent])[0]
+            self.assertEqual(labeled['display_name'], 'Planning')
+            self.assertEqual(labeled['entity_type'], 'group')
+            self.assertEqual(labeled['name'], run['alias'])
+            replaced = dict(agent, agent_session={'value': 'different-session'})
+            self.assertNotIn('display_name', self.store.label_agents([replaced])[0])
+        self.store.update_job(run['id'], state='running', agent_session=None)
+        self.assertNotIn('display_name', self.store.label_agents([agent])[0])
+        self.store.update_job(run['id'], state='released', agent_session=run['agent_session'])
+        self.assertNotIn('display_name', self.store.label_agents([agent])[0])
+
     def test_group_creation_and_messages_reuse_real_agent_binding(self):
         group_id = self.group()
         group = next(g for g in self.store.snapshot()['groups'] if g['id'] == group_id)
         profile_id = group['facilitator_id']
         run = next(j for j in self.store.snapshot()['jobs'] if j.get('profile_id') == profile_id)
         self.assertEqual(run['state'], 'persona_sent')
+        startup = next(a[3] for a, _ in self.calls
+                       if a[:3] == ('agent', 'prompt', run['alias']))
+        self.assertIn('INITIALIZATION ONLY', startup)
+        self.assertNotIn(group['description'], startup)
+        self.assertIn('do not list, read or prompt other agents', startup)
+        self.assertFalse(any(j['kind'] == 'discussion' for j in self.store.snapshot()['jobs']))
         for prompt in ('Compare options', 'Refine the recommendation'):
             job_id = self.action('discuss', organization_id=self.org, group_id=group_id, prompt=prompt)
             self.drain()
             self.assertEqual(self.job(job_id)['state'], 'artifact_ready')
             self.assertEqual(self.job(job_id)['group_run']['alias'], run['alias'])
             self.assertEqual(self.job(job_id)['prompt'], prompt)
+            delivered = [a[3] for a, _ in self.calls
+                         if a[:3] == ('agent', 'prompt', run['alias'])][-1]
+            self.assertIn(f"Purpose: {group['description']}", delivered)
+            self.assertIn(f"User message:\n{prompt}", delivered)
+            self.assertIn('Selected members (live Herdr aliases):', delivered)
+            self.assertIn('Discussion directory:', delivered)
         launches = [a for a, _ in self.calls if a[:2] == ('agent', 'start') and a[2] == run['alias']]
         self.assertEqual(len(launches), 1)
 

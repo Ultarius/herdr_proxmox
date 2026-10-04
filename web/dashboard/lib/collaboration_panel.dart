@@ -374,56 +374,69 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
       const SizedBox(height: 24),
       Text('Discussion groups', style: Theme.of(context).textTheme.titleLarge),
       const Text(
-        'Choose 2–6 agents and describe the topic. Two discussion rounds produce a saved action brief. The first selected agent prepares the final artifact. Launch every member before starting.',
+        'Choose 2–6 agents and describe the desired outcome. A dedicated group facilitator coordinates members and saves the resulting artifact. Launch every member before starting.',
       ),
       TextButton(
         onPressed: busy || pendingBody != null ? null : () => editGroup(),
         child: const Text('Create group'),
       ),
       for (final group in groups)
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  group['name'] as String,
-                  style: Theme.of(context).textTheme.titleMedium,
-                ),
-                Text(group['description'] as String),
-                Text(
-                  'Members: ${(group['members'] as List).map((id) => widget.profiles.where((p) => p['id'] == id).firstOrNull?['name'] ?? id).join(', ')}',
-                ),
-                Wrap(
-                  spacing: 12,
-                  children: [
-                    if (widget.onOpenGroup != null)
+        SizedBox(
+          width: double.infinity,
+          child: Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    group['name'] as String,
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    (group['description'] as String)
+                        .replaceAll(RegExp(r'\s+'), ' ')
+                        .trim(),
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    'Members: ${(group['members'] as List).map((id) => widget.profiles.where((p) => p['id'] == id).firstOrNull?['name'] ?? id).join(', ')}',
+                  ),
+                  Wrap(
+                    spacing: 12,
+                    runSpacing: 8,
+                    children: [
+                      if (widget.onOpenGroup != null)
+                        TextButton(
+                          onPressed: () =>
+                              widget.onOpenGroup!(group['id'] as String),
+                          child: const Text('Open group'),
+                        ),
                       TextButton(
-                        onPressed: () =>
-                            widget.onOpenGroup!(group['id'] as String),
-                        child: const Text('Open group'),
+                        onPressed: busy || pendingBody != null
+                            ? null
+                            : () => editGroup(group),
+                        child: const Text('Edit group'),
                       ),
-                    TextButton(
-                      onPressed: busy || pendingBody != null
-                          ? null
-                          : () => editGroup(group),
-                      child: const Text('Edit group'),
-                    ),
-                    FilledButton(
-                      onPressed:
-                          busy ||
-                              pendingBody != null ||
-                              (group['members'] as List).any(
-                                (id) => occupied(id as String),
-                              )
-                          ? null
-                          : () => submit('discuss', {'group_id': group['id']}),
-                      child: const Text('Start discussion'),
-                    ),
-                  ],
-                ),
-              ],
+                      FilledButton(
+                        onPressed:
+                            busy ||
+                                pendingBody != null ||
+                                (group['members'] as List).any(
+                                  (id) => occupied(id as String),
+                                )
+                            ? null
+                            : () =>
+                                  submit('discuss', {'group_id': group['id']}),
+                        child: const Text('Start discussion'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
             ),
           ),
         ),
@@ -486,14 +499,16 @@ class _DiscussionGroupFormState extends State<DiscussionGroupForm> {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
+    insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+    constraints: const BoxConstraints(maxWidth: 960),
     title: Text(
       widget.group == null
           ? 'Create discussion group'
           : 'Edit discussion group',
     ),
     content: SizedBox(
-      width: 560,
-      height: MediaQuery.sizeOf(context).height * 0.6,
+      width: 900,
+      height: MediaQuery.sizeOf(context).height * 0.68,
       child: SingleChildScrollView(
         child: Form(
           key: form,
@@ -511,9 +526,13 @@ class _DiscussionGroupFormState extends State<DiscussionGroupForm> {
               TextFormField(
                 controller: description,
                 maxLength: 8000,
-                maxLines: 5,
+                minLines: 8,
+                maxLines: 14,
+                textAlignVertical: TextAlignVertical.top,
                 decoration: const InputDecoration(
                   labelText: 'Topic, desired outcome and constraints',
+                  alignLabelWithHint: true,
+                  border: OutlineInputBorder(),
                 ),
                 validator: (value) => value == null || value.trim().isEmpty
                     ? 'Describe the discussion'
