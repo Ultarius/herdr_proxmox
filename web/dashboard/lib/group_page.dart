@@ -273,7 +273,11 @@ class _GroupPageState extends State<GroupPage> {
           if (draft.isNotEmpty)
             ExpansionTile(
               key: PageStorageKey('discussion-draft-${job['id']}'),
-              title: const Text('Action brief draft · In progress'),
+              title: Text(
+                job['state'] == 'needs_attention'
+                    ? 'Saved action brief · Not finalized'
+                    : 'Action brief draft · In progress',
+              ),
               children: [
                 SizedBox(
                   height: 220,
@@ -523,6 +527,21 @@ class _GroupPageState extends State<GroupPage> {
               Text(job['progress'] as String),
             if ((job['error'] as String? ?? '').isNotEmpty)
               Text(job['error'] as String),
+            if (job['state'] == 'needs_attention') ...[
+              const Text(
+                'The dashboard stopped waiting for this discussion. If the agents have finished, recover their saved artifact and transcript without sending another prompt.',
+              ),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: OutlinedButton.icon(
+                  onPressed: busy || pending != null
+                      ? null
+                      : () => submit('recover', {'job_id': job['id']}),
+                  icon: const Icon(Icons.restore_page_outlined),
+                  label: const Text('Recover saved artifact'),
+                ),
+              ),
+            ],
             if (job == jobs.firstOrNull &&
                 ['queued', 'running', 'needs_attention'].contains(job['state']))
               liveDiscussion(job),

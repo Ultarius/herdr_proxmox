@@ -54,6 +54,31 @@ def launch_group(store, db, group, org):
 
 def action(store, db, name, body, org):
     org_id = org['id']
+    if name == 'recover':
+        job = store.get(db, 'jobs', text(body, 'job_id', 40), org_id)
+        if job['kind'] != 'discussion' or job['state'] not in ('needs_attention', 'artifact_ready'):
+            raise ValueError('Only interrupted discussions can recover saved output.')
+        if job['state'] == 'artifact_ready':
+            return job
+        participants = set(job['participants'])
+        for row in db.execute('SELECT data FROM jobs WHERE organization_id=?', (org_id,)):
+            other = json.loads(row['data'])
+            if other['id'] != job['id'] and other['state'] in ('queued', 'running') and participants.intersection(other.get('participants', [other.get('profile_id')])):
+                raise ValueError('Wait for other tasks using these agents before recovering output.')
+        for saved in [job['group_run'], *job['runs']]:
+            run = store.get(db, 'jobs', saved['id'], org_id)
+            if run['state'] != 'persona_sent':
+                raise ValueError('Run binding was released. Saved output cannot be recovered from this conversation.')
+            try:
+                store.identity(run)
+            except ValueError as error:
+                raise ValueError(f"{run['profile']['name']}: {error}") from error
+        result, contributions = discussion_documents(store, job)
+        job.update(state='artifact_ready', result=result, contributions=contributions,
+                   artifact_name='action-plan.md', progress='Saved group response recovered',
+                   previous_error=job.get('error', ''), error='', recovered_at=now(), updated_at=now())
+        store.put(db, 'jobs', job)
+        return job
     if name == 'inspect' and body.get('job_id'):
         return inspect_discussion(store, db, body, org_id)
     if name == 'group':
@@ -155,7 +180,10 @@ def current_run(store, run, ready=True):
         current = store.get(db, 'jobs', run['id'], run['organization_id'])
     if current['state'] != 'persona_sent':
         raise ValueError('Run binding was released. Launch and select an agent again.')
-    store.identity(current, ready=ready)
+    try:
+        store.identity(current, ready=ready)
+    except ValueError as error:
+        raise ValueError(f"{current['profile']['name']}: {error}") from error
     return current
 
 
@@ -187,6 +215,17 @@ def validate_contributions(contributions, runs):
             raise ValueError('Invalid member contribution in group transcript.')
         part['name'] = ids[part['profile_id']]
     return contributions
+
+
+def discussion_documents(store, job):
+    directory = store.path.parent / 'discussion-artifacts' / job['id']
+    if directory.is_symlink():
+        raise ValueError('Discussion output directory must not be a symlink.')
+    result = read_contribution(directory / 'action-plan.md')
+    data = json.loads(read_contribution(directory / 'discussion.json', 750000))
+    if not isinstance(data, dict):
+        raise ValueError('Discussion transcript must be a JSON object.')
+    return result, validate_contributions(data.get('contributions'), job['runs'])
 
 
 def inspect_discussion(store, db, body, org_id):
@@ -297,8 +336,6 @@ def execute(store, job):
     current_run(store, run)
     for member in job['runs']:
         current_run(store, member)
-    result = read_contribution(artifact)
-    data = json.loads(read_contribution(transcript, 750000))
-    contributions = validate_contributions(data.get('contributions'), job['runs'])
+    result, contributions = discussion_documents(store, job)
     store.update_job(job['id'], state='artifact_ready', result=result, contributions=contributions,
                      artifact_name='action-plan.md', progress='Group response ready')

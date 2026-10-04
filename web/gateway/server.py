@@ -150,10 +150,13 @@ class Handler(BaseHTTPRequestHandler):
                 if self.path == '/api/organizations':
                     self.reply(200, self.server.organizations.snapshot())
                     return
+                agents = listing(command('agent', 'list'), 'agents')
+                if getattr(self.server, 'organizations', None) is not None:
+                    agents = self.server.organizations.label_agents(agents)
                 self.reply(200, {
                     'herdr_server': 'running',
                     'workspaces': listing(command('workspace', 'list'), 'workspaces'),
-                    'agents': listing(command('agent', 'list'), 'agents'),
+                    'agents': agents,
                 })
             except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
                 if self.path == '/api/snapshot' and isinstance(exc, ValueError) and 'server_not_running' in str(exc):
@@ -212,7 +215,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authenticated():
             return
         actions = {f'/api/workspaces/{name}': name for name in ('create', 'focus', 'rename')}
-        organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input')}
+        organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
         if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models'):

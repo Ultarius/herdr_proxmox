@@ -420,6 +420,12 @@ class _OrganizationPageState extends State<OrganizationPage> {
                                     '${profile['runtime']} · Persona v${profile['version']} · ${profile['project']}',
                                   ),
                                   Text(
+                                    'Model: ${profile['model']?.toString().isNotEmpty == true ? '${profile['provider']?.toString().isNotEmpty == true ? '${profile['provider']}/' : ''}${profile['model']}' : 'CLI default'}',
+                                  ),
+                                  Text(
+                                    'Reasoning: ${profile['reasoning']?.toString().isNotEmpty == true ? profile['reasoning'] : 'Model default'}',
+                                  ),
+                                  Text(
                                     'Reports to: ${profiles.where((p) => p['id'] == profile['manager_id']).map((p) => p['name']).firstOrNull ?? 'Organization owner'}',
                                   ),
                                   const SizedBox(height: 8),

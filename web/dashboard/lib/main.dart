@@ -314,11 +314,17 @@ class _DashboardState extends State<Dashboard> {
                     for (final agent in agents)
                       Card(
                         child: ListTile(
-                          leading: const Icon(Icons.smart_toy_outlined),
-                          title: Text(
-                            '${agent['name'] ?? agent['agent'] ?? agent['pane_id'] ?? 'Agent'}',
+                          leading: Icon(
+                            agent['entity_type'] == 'group'
+                                ? Icons.forum_outlined
+                                : Icons.smart_toy_outlined,
                           ),
-                          subtitle: Text('${agent['pane_id'] ?? ''}'),
+                          title: Text(
+                            '${agent['display_name'] ?? agent['name'] ?? agent['agent'] ?? agent['pane_id'] ?? 'Agent'}${agent['entity_type'] == 'group' ? ' · Group' : ''}',
+                          ),
+                          subtitle: SelectableText(
+                            '${agent['name'] == null ? '' : 'Herdr ID: ${agent['name']} · '}${agent['pane_id'] ?? ''}',
+                          ),
                           trailing: Chip(
                             label: Text(
                               '${agent['agent_status'] ?? agent['state'] ?? agent['status'] ?? 'unknown'}',

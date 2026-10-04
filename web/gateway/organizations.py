@@ -157,6 +157,30 @@ class OrganizationStore:
             raise ValueError('Select an existing directory inside /home/herdr/projects.')
         return str(path)
 
+    def label_agents(self, agents):
+        """Add dashboard labels only to verified live run bindings; preserve Herdr names."""
+        with self.lock, closing(self.connect()) as db:
+            profiles = {row['id']: json.loads(row['data']) for row in db.execute('SELECT id, data FROM profiles')}
+            jobs = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs')]
+        result = []
+        for agent in agents:
+            item = dict(agent)
+            for run in reversed(jobs):
+                if run['kind'] != 'launch' or run['state'] != 'persona_sent' or run.get('alias') != agent.get('name'):
+                    continue
+                profile = profiles.get(run['profile_id'])
+                if profile is None:
+                    continue
+                try:
+                    self.identity(run, ready=False, agent=agent)
+                except ValueError:
+                    continue
+                item.update(display_name=profile['name'], entity_type='group' if profile.get('group_id') else 'agent',
+                            profile_id=profile['id'], group_id=profile.get('group_id'))
+                break
+            result.append(item)
+        return result
+
     def action(self, action, body):
         if not isinstance(body, dict):
             raise ValueError('Expected a JSON object.')
@@ -181,7 +205,7 @@ class OrganizationStore:
             else:
                 org_id = text(body, 'organization_id', 40)
                 org = self.get(db, 'organizations', org_id)
-                if action in ('group', 'discuss', 'chat', 'inspect', 'input'):
+                if action in ('group', 'discuss', 'chat', 'inspect', 'input', 'recover'):
                     from collaboration import action as collaboration_action
                     item = collaboration_action(self, db, action, body, org)
                     if action == 'group':

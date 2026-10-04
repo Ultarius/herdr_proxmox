@@ -18,8 +18,16 @@ void main() {
     var inspections = 0;
     var reply = 'First reply';
     var finished = false;
+    var interrupted = false;
+    var recoveries = 0;
     final connection = DashboardBloc(
       client: MockClient((request) async {
+        if (request.url.path.endsWith('/recover')) {
+          expect(jsonDecode(request.body)['job_id'], 'discussion');
+          recoveries++;
+          finished = true;
+          return http.Response('{"id":"discussion"}', 200);
+        }
         if (request.url.path.endsWith('/inspect')) {
           inspections++;
           expect(jsonDecode(request.body)['job_id'], 'discussion');
@@ -60,7 +68,11 @@ void main() {
                   'id': 'discussion',
                   'kind': 'discussion',
                   'group_id': 'group',
-                  'state': finished ? 'artifact_ready' : 'running',
+                  'state': finished
+                      ? 'artifact_ready'
+                      : interrupted
+                      ? 'needs_attention'
+                      : 'running',
                   'result': finished ? 'Final brief' : '',
                   'contributions': [],
                 },
@@ -104,14 +116,23 @@ void main() {
     await tester.tap(find.text('Action brief draft · In progress'));
     await tester.pumpAndSettle();
     expect(find.text('Partial action brief'), findsOneWidget);
-    finished = true;
+    interrupted = true;
     await tester.pump(const Duration(seconds: 1));
     await tester.pumpAndSettle();
+    expect(find.text('Saved action brief · Not finalized'), findsOneWidget);
+    await tester.ensureVisible(find.text('Recover saved artifact'));
+    await tester.tap(find.text('Recover saved artifact'));
+    await tester.pumpAndSettle();
+    expect(recoveries, 1);
     expect(find.text('Live discussion · 1 replies'), findsNothing);
     final afterFinish = inspections;
     await tester.pump(const Duration(seconds: 1));
     await tester.pumpAndSettle();
     expect(inspections, afterFinish);
+    await tester.ensureVisible(find.text('Artifacts'));
+    await tester.tap(find.text('Artifacts'));
+    await tester.pumpAndSettle();
+    expect(find.text('Final brief'), findsOneWidget);
     await tester.pumpWidget(const SizedBox.shrink());
     await connection.disconnect();
     await BlocScope.reset();

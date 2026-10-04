@@ -403,6 +403,15 @@ The facilitator is instructed to update the transcript after each member reply.
 This is live polling, not a token stream: clean replies appear when the agent
 saves valid documents. Completed discussions stop live inspection and display
 their final posts and artifact. Blocked runs keep their status/output visible.
+
+An interrupted discussion can finish in its Herdr terminal after the dashboard
+has stopped waiting. Its files then appear as saved drafts while the job remains
+`needs_attention`. Use **Recover saved artifact** on that discussion to validate
+and publish its existing Markdown and transcript without re-prompting agents.
+Recovery requires the original live conversation bindings, ready/idle agents,
+no overlapping queued/running tasks, and valid bounded output files. It preserves
+the earlier error in job history. Missing/invalid files and blocked or replaced
+conversations remain `needs_attention`.
 Contributions and the artifact remain in the job history and can be copied.
 Files also live under `~/.config/herdr-web/discussion-artifacts/<job-id>`;
 include that directory in backups. Groups are saved separately and can be edited;

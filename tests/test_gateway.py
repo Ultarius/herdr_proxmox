@@ -88,7 +88,10 @@ class GatewayTests(unittest.TestCase):
     def test_http_auth_origin_static_and_snapshot(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(gateway, 'ROOT', Path(directory).resolve()), patch.object(gateway, 'command') as command:
             Path(directory, 'index.html').write_text('dashboard')
-            command.side_effect = [{'workspaces': [{'workspace_id': 'w1'}]}, {'agents': []}]
+            # Match commands explicitly so snapshot request ordering is irrelevant.
+            responses = {('workspace', 'list'): {'workspaces': [{'workspace_id': 'w1'}]},
+                         ('agent', 'list'): {'agents': [{'name': 'external-agent', 'pane_id': 'w1:p1'}]}}
+            command.side_effect = lambda *args: responses[args]
             server = gateway.ThreadingHTTPServer(('127.0.0.1', 0), gateway.Handler)
             server.token = 'a' * 48
             server.ssh_access = gateway.SshAccess(directory)
@@ -118,6 +121,7 @@ class GatewayTests(unittest.TestCase):
                 self.assertEqual(json.load(urlopen(Request(base + '/api/ssh-access', headers=headers))), {'key_count': 0})
                 response = json.load(urlopen(Request(base + '/api/snapshot', headers=headers)))
                 self.assertEqual(response['workspaces'][0]['workspace_id'], 'w1')
+                self.assertEqual(response['agents'][0]['name'], 'external-agent')
                 command.side_effect = ValueError('server_not_running')
                 stopped = json.load(urlopen(Request(base + '/api/snapshot', headers=headers)))
                 self.assertEqual(stopped, {'herdr_server':'stopped', 'workspaces':[], 'agents':[]})

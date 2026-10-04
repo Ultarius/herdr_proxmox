@@ -177,6 +177,68 @@ class CollaborationTests(unittest.TestCase):
         self.assertEqual(group['accessible_paths'], ['~/reference/**'])
         self.assertEqual(facilitator['accessible_paths'], group['accessible_paths'])
 
+    def test_late_artifact_recovery_validates_files_without_reprompting(self):
+        group_id = self.group()
+        job_id = self.action('discuss', organization_id=self.org, group_id=group_id)
+        self.drain()
+        self.store.update_job(job_id, state='needs_attention', result='', contributions=[], error='Earlier wait interrupted')
+        body = dict(request_id=uuid.uuid4().hex, organization_id=self.org, job_id=job_id)
+        before = len([a for a, _ in self.calls if a[:2] == ('agent', 'prompt')])
+        response = self.store.action('recover', body)
+        recovered = self.job(job_id)
+        self.assertEqual(recovered['state'], 'artifact_ready')
+        self.assertIn('Recommended actions', recovered['result'])
+        self.assertEqual(len(recovered['contributions']), 4)
+        self.assertEqual(recovered['previous_error'], 'Earlier wait interrupted')
+        self.assertEqual(recovered['error'], '')
+        self.assertEqual(self.store.action('recover', body), response)
+        self.assertEqual(len([a for a, _ in self.calls if a[:2] == ('agent', 'prompt')]), before)
+        self.assertEqual(self.job(job_id)['state'], 'artifact_ready')
+
+    def test_recovery_rejects_blocked_replaced_and_invalid_output(self):
+        job_id = self.action('discuss', organization_id=self.org, group_id=self.group())
+        self.drain()
+        job = self.job(job_id)
+        self.store.update_job(job_id, state='needs_attention', result='')
+        def recover(org=self.org):
+            return self.store.action('recover', dict(request_id=uuid.uuid4().hex, organization_id=org, job_id=job_id))
+        agent = self.agents[job['group_run']['alias']]
+        agent['agent_status'] = 'blocked'
+        with self.assertRaisesRegex(ValueError, 'not ready'):
+            recover()
+        agent['agent_status'] = 'idle'
+        old_session = agent['agent_session']
+        agent['agent_session'] = {'value': 'replacement'}
+        with self.assertRaisesRegex(ValueError, 'conversation changed'):
+            recover()
+        agent['agent_session'] = old_session
+        directory = self.store.path.parent / 'discussion-artifacts' / job_id
+        transcript = directory / 'discussion.json'
+        original = transcript.read_text(encoding='utf-8')
+        transcript.write_text('{"contributions":', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            recover()
+        transcript.write_text(original, encoding='utf-8')
+        (directory / 'action-plan.md').unlink()
+        with self.assertRaisesRegex(ValueError, 'valid discussion document'):
+            recover()
+        other = self.organization('Other')
+        with self.assertRaises(ValueError):
+            recover(other)
+        self.assertEqual(self.job(job_id)['state'], 'needs_attention')
+
+    def test_live_names_preserve_aliases_and_distinguish_groups(self):
+        self.group()
+        agents = list(self.agents.values())
+        labeled = self.store.label_agents(agents)
+        self.assertEqual([a['name'] for a in labeled], [a['name'] for a in agents])
+        self.assertEqual([a['display_name'] for a in labeled], ['Max', 'Iris', 'Planning'])
+        self.assertEqual(labeled[-1]['entity_type'], 'group')
+        changed = dict(agents[0], agent_session={'value': 'replacement'})
+        self.assertNotIn('display_name', self.store.label_agents([changed])[0])
+        unknown = dict(name='external-agent', pane_id='w999:p1', agent='codex')
+        self.assertEqual(self.store.label_agents([unknown])[0], unknown)
+
     def test_group_creation_and_messages_reuse_real_agent_binding(self):
         group_id = self.group()
         group = next(g for g in self.store.snapshot()['groups'] if g['id'] == group_id)

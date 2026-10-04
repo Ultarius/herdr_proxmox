@@ -25,7 +25,8 @@ jobs:
       - name: Bash syntax and mock tests
         shell: bash
         run: |
-          while IFS= read -r script; do bash -n "$script"; done < <(rg --files -g '*.sh')
+          git ls-files -z -- '*.sh' > "$RUNNER_TEMP/shell-scripts"
+          while IFS= read -r -d '' script; do bash -n "$script"; done < "$RUNNER_TEMP/shell-scripts"
           bash tests/host.sh
           bash tests/build-web.sh
           bash tests/agents.sh
