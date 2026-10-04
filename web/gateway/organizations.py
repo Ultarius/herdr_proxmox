@@ -1,4 +1,5 @@
 """Durable organization records and explicit, non-retrying Herdr jobs."""
+from permissions import accessible_paths, permission_mode, prepare_permissions
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timezone
@@ -7,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -64,11 +66,12 @@ def launch_arguments(profile):
 
 
 class OrganizationStore:
-    def __init__(self, path, projects, command, runtime_status=None):
+    def __init__(self, path, projects, command, runtime_status=None, model_validator=None):
         self.path = Path(path)
         self.projects = Path(projects).resolve()
         self.command = command
         self.runtime_status = runtime_status
+        self.model_validator = model_validator
         self.lock = threading.RLock()
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix='organization')
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -112,8 +115,41 @@ class OrganizationStore:
 
     def snapshot(self):
         with self.lock, closing(self.connect()) as db:
-            return {table: [json.loads(row['data']) for row in db.execute(f'SELECT data FROM {table} ORDER BY rowid')]
+            data = {table: [json.loads(row['data']) for row in db.execute(f'SELECT data FROM {table} ORDER BY rowid')]
                     for table in ('organizations', 'profiles', 'jobs', 'groups')}
+        states = {}
+        live = None
+        if any(j['kind'] == 'launch' and j['state'] == 'persona_sent' for j in data['jobs']):
+            try:
+                response = self.command('agent', 'list')
+                entries = response if isinstance(response, list) else response.get('agents')
+                if isinstance(entries, list):
+                    live = {agent['name']: agent for agent in entries if isinstance(agent, dict) and isinstance(agent.get('name'), str)}
+            except (ValueError, OSError, subprocess.TimeoutExpired):
+                pass
+        for profile in data['profiles']:
+            run = next((j for j in reversed(data['jobs']) if j['kind'] == 'launch' and j['profile_id'] == profile['id'] and j['state'] != 'released'), None)
+            state = dict(active=False, status='off', run_id=run['id'] if run else None)
+            if run:
+                state['status'] = run['state']
+                if run['state'] == 'persona_sent':
+                    try:
+                        if live is None:
+                            state['status'] = 'unknown'
+                            states[profile['id']] = state
+                            continue
+                        if run['alias'] not in live:
+                            state['status'] = 'off'
+                            states[profile['id']] = state
+                            continue
+                        agent = self.identity(run, ready=False, agent=live[run['alias']])
+                        status = agent.get('agent_status', agent.get('state', 'unknown'))
+                        state.update(active=status in ('idle', 'done', 'working', 'blocked'), status=status)
+                    except (ValueError, OSError):
+                        state['status'] = 'unavailable'
+            states[profile['id']] = state
+        data['member_states'] = states
+        return data
 
     def project(self, value):
         path = Path(value).expanduser().resolve()
@@ -170,8 +206,12 @@ class OrganizationStore:
                         current = self.get(db, 'profiles', current, org_id)['manager_id']
                     item = dict(id=item_id, organization_id=org_id, name=text(body, 'name'), role=text(body, 'role'),
                                 persona=text(body, 'persona', 8000), runtime=runtime, manager_id=manager,
-                                **model_settings(body, runtime),
+                                **model_settings(body, runtime), permission_mode=permission_mode(body, runtime),
+                                accessible_paths=accessible_paths(body, runtime),
                                 project=self.project(text(body, 'project', 2000)), version=(previous['version'] if previous else 0) + 1)
+                    item['use_worktree'] = body.get('use_worktree', True)
+                    if not isinstance(item['use_worktree'], bool):
+                        raise ValueError('Use worktree must be true or false.')
                     self.put(db, 'profiles', item)
                 elif action in ('launch', 'delegate'):
                     profile = self.get(db, 'profiles', text(body, 'profile_id', 40), org_id)
@@ -230,9 +270,10 @@ class OrganizationStore:
             self.put(db, 'jobs', job)
         return job
 
-    def identity(self, run, ready=True):
-        response = self.command('agent', 'get', run['alias'])
-        agent = response.get('agent')
+    def identity(self, run, ready=True, agent=None):
+        if agent is None:
+            response = self.command('agent', 'get', run['alias'])
+            agent = response.get('agent')
         if not isinstance(agent, dict) or agent.get('name') != run['alias'] or agent.get('pane_id') != run['pane_id'] or agent.get('agent') != run['profile']['runtime']:
             raise ValueError('Agent binding changed. Inspect the terminal and launch a new run.')
         if run.get('agent_session') and agent.get('agent_session') != run['agent_session']:
@@ -271,14 +312,33 @@ class OrganizationStore:
                     status = self.runtime_status(profile['runtime'])
                     if status.get('installed') is False or status.get('status') in ('missing', 'not_configured') and profile['runtime'] in ('codex', 'claude'):
                         raise ValueError(f"{profile['name']} uses {profile['runtime']}. Connect this CLI on the CLI accounts page before launching; other CLI accounts do not configure it.")
+                if self.model_validator is not None:
+                    self.model_validator(profile)
                 project = self.project(profile['project'])
-                created = self.command('workspace', 'create', '--cwd', project, '--label', profile['name'], '--no-focus')
+                source = Path(project)
+                repository = any((parent / '.git').exists() for parent in (source, *source.parents))
+                if profile.get('use_worktree', True) and repository:
+                    root = (self.projects / '.herdr-worktrees').resolve()
+                    if not root.is_relative_to(self.projects):
+                        raise ValueError('Worktree directory must remain inside the projects directory.')
+                    root.mkdir(exist_ok=True, mode=0o700)
+                    checkout = root / job['id']
+                    branch = 'codex/herdr-' + job['id']
+                    job = self.update_job(job_id, worktree_path=str(checkout), worktree_branch=branch,
+                                          source_project=project, workspace_mode='worktree')
+                    # Never fall back to the shared checkout after a Git/Herdr failure.
+                    created = self.command('worktree', 'create', '--cwd', project, '--branch', branch,
+                                           '--path', str(checkout), '--label', profile['name'], '--no-focus', timeout=120)
+                else:
+                    job = self.update_job(job_id, workspace_mode='workspace', source_project=project,
+                                          workspace_note='Not a Git repository; using the selected directory.' if profile.get('use_worktree', True) else '')
+                    created = self.command('workspace', 'create', '--cwd', project, '--label', profile['name'], '--no-focus')
                 pane = created.get('root_pane', {}).get('pane_id')
                 if not isinstance(pane, str) or not re.fullmatch(r'w[0-9]+:p[0-9]+', pane):
                     raise ValueError('Herdr did not return a valid root pane ID.')
-                job = self.update_job(job_id, pane_id=pane)
+                job = self.update_job(job_id, pane_id=pane, workspace_id=created.get('workspace', {}).get('workspace_id'))
                 self.wait_for_shell(pane)
-                arguments = launch_arguments(profile)
+                arguments = launch_arguments(profile) + prepare_permissions(profile, self.path.parent)
                 self.command('agent', 'start', job['alias'], '--kind', profile['runtime'], '--pane', pane, '--timeout', '60000', *(['--', *arguments] if arguments else []), timeout=70)
                 agent = self.identity(job)
                 job = self.update_job(job_id, agent_session=agent.get('agent_session'))

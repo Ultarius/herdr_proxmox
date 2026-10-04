@@ -18,6 +18,18 @@ worker_spec.loader.exec_module(worker)
 
 
 class UpdateTests(unittest.TestCase):
+    def test_manual_check_bypasses_background_cache(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            service = updates.Updates(root, root / 'queue', root / 'status.json')
+            old = dict(tag_name='v0.0.2', html_url='https://example.test/old')
+            new = dict(tag_name='v0.0.3', html_url='https://example.test/new')
+            with patch.object(updates, 'latest_release', side_effect=[old, new]) as fetch:
+                self.assertEqual(service.snapshot()['latest'], 'v0.0.2')
+                self.assertEqual(service.snapshot()['latest'], 'v0.0.2')
+                self.assertEqual(service.snapshot(force=True)['latest'], 'v0.0.3')
+                self.assertEqual(fetch.call_count, 2)
+
     def test_bad_checksum_does_not_stop_gateway(self):
         with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
             base = Path(folder)

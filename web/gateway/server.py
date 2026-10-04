@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from organizations import OrganizationStore
 from cli_setup import CliSetup
+import model_catalog
 from run_logs import RunLogs
 from ssh_access import SshAccess
 from dashboard_access import DashboardAccess, configured_bind
@@ -121,10 +122,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/api/'):
             if not self.authenticated():
                 return
-            if self.path not in ('/api/snapshot', '/api/organizations', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates'):
+            if self.path not in ('/api/snapshot', '/api/organizations', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates', '/api/models'):
                 self.reply(404, {'error': 'Unknown endpoint.'})
                 return
             try:
+                if self.path == '/api/models':
+                    self.reply(200, model_catalog.snapshot())
+                    return
                 if self.path == '/api/updates':
                     self.reply(200, self.server.updates.snapshot())
                     return
@@ -211,7 +215,7 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -219,7 +223,11 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < size <= 65536:
                 raise ValueError('Invalid request size.')
             body = json.loads(self.rfile.read(size))
-            if self.path == '/api/updates/install':
+            if self.path == '/api/models':
+                self.reply(200, model_catalog.discover_models(self.server.cli_setup, PROJECTS, body))
+            elif self.path == '/api/updates/check':
+                self.reply(200, self.server.updates.snapshot(force=True))
+            elif self.path == '/api/updates/install':
                 self.reply(200, self.server.updates.install(body))
             elif self.path == '/api/herdr-server/start':
                 self.reply(200, self.server.herdr_server.start(body))
@@ -274,7 +282,7 @@ def main():
         raise SystemExit('Invalid HERDR_WEB_BIND.')
     policy = TOKEN_FILE.parent / 'dashboard-access.json'
     cli_setup = CliSetup()
-    organizations = OrganizationStore(DATABASE, PROJECTS, command, runtime_status=cli_setup.status)
+    organizations = OrganizationStore(DATABASE, PROJECTS, command, runtime_status=cli_setup.status, model_validator=lambda profile: model_catalog.validate_selection(cli_setup, PROJECTS, profile))
     run_logs = RunLogs(DATABASE.parent / 'run-logs', BIN)
     ssh_access = SshAccess()
     try:

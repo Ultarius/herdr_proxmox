@@ -41,6 +41,8 @@ class OrganizationTests(unittest.TestCase):
         if args[:2] == ('agent', 'start'):
             self.agents[args[2]] = {'name': args[2], 'pane_id': args[6], 'agent': args[4], 'agent_status': 'idle', 'interactive_ready': True, 'launch_pending': False, 'agent_session': {'value': uuid.uuid4().hex}}
             return {'agent': self.agents[args[2]]}
+        if args[:2] == ('agent', 'list'):
+            return {'agents': list(self.agents.values())}
         if args[:2] == ('agent', 'get'):
             return {'agent': self.agents[args[2]]}
         return {}
@@ -69,6 +71,71 @@ class OrganizationTests(unittest.TestCase):
         self.assertEqual(job['state'], 'needs_attention')
         self.assertIn('uses codex', job['error'])
         self.assertFalse(any(args[:2] == ('workspace', 'create') for args, _ in self.calls))
+
+    def test_git_launch_defaults_to_separate_committed_worktree(self):
+        def git(*args):
+            subprocess.run(['git', *args], check=True, capture_output=True, timeout=20)
+        git('init', str(self.projects))
+        (self.projects / 'tracked.txt').write_text('Committed content', encoding='utf-8')
+        git('-C', str(self.projects), 'add', 'tracked.txt')
+        git('-C', str(self.projects), '-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-m', 'Initial')
+        (self.projects / 'tracked.txt').write_text('Local uncommitted content', encoding='utf-8')
+        original = self.store.command
+        def command(*args, **kwargs):
+            if args[:2] == ('worktree', 'create'):
+                self.calls.append((args, kwargs))
+                git('-C', args[args.index('--cwd') + 1], 'worktree', 'add', '-b',
+                    args[args.index('--branch') + 1], args[args.index('--path') + 1])
+                return {'root_pane': {'pane_id': 'w999:p1'}, 'workspace': {'workspace_id': 'w999'}}
+            return original(*args, **kwargs)
+        self.store.command = command
+        org = self.organization()
+        profile = self.hire(org)
+        first = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == first)
+        self.assertEqual(job['state'], 'persona_sent', job['error'])
+        self.assertEqual(job['workspace_mode'], 'worktree')
+        checkout = Path(job['worktree_path'])
+        self.assertEqual((checkout / 'tracked.txt').read_text(encoding='utf-8'), 'Committed content')
+        (checkout / 'tracked.txt').write_text('Agent change', encoding='utf-8')
+        self.assertEqual((self.projects / 'tracked.txt').read_text(encoding='utf-8'), 'Local uncommitted content')
+        self.assertFalse(any(args[:2] == ('workspace', 'create') for args, _ in self.calls))
+        self.action('release', organization_id=org, job_id=first)
+        second = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        next_job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == second)
+        self.assertEqual(next_job['state'], 'persona_sent', next_job['error'])
+        self.assertNotEqual(next_job['worktree_path'], job['worktree_path'])
+        self.assertTrue(checkout.exists())  # Release never deletes agent work.
+
+    def test_worktree_failure_does_not_launch_in_shared_directory(self):
+        (self.projects / '.git').mkdir()
+        original = self.store.command
+        def command(*args, **kwargs):
+            if args[:2] == ('worktree', 'create'):
+                raise ValueError('Worktree unavailable')
+            return original(*args, **kwargs)
+        self.store.command = command
+        org = self.organization()
+        profile = self.hire(org)
+        job_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == job_id)
+        self.assertEqual(job['state'], 'needs_attention')
+        self.assertIn('Worktree unavailable', job['error'])
+        self.assertFalse(any(args[:2] in (('workspace', 'create'), ('agent', 'start')) for args, _ in self.calls))
+
+    def test_worktree_can_be_explicitly_disabled(self):
+        (self.projects / '.git').mkdir()
+        org = self.organization()
+        profile = self.hire(org, use_worktree=False)
+        job_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == job_id)
+        self.assertEqual(job['state'], 'persona_sent', job['error'])
+        self.assertEqual(job['workspace_mode'], 'workspace')
+        self.assertTrue(any(args[:2] == ('workspace', 'create') for args, _ in self.calls))
 
     def test_model_settings_persist_and_reach_runtime_arguments(self):
         org = self.organization()
@@ -139,7 +206,7 @@ class OrganizationTests(unittest.TestCase):
         self.drain()
         job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == delegation)
         self.assertEqual(job['state'], 'delivered')
-        self.assertIn('Work delegated by Maya', self.calls[-1][0][3])
+        self.assertIn('Work delegated by Maya', [args for args, _ in self.calls if args[:2] == ('agent', 'prompt')][-1][3])
         self.action('report', organization_id=org, job_id=delegation, result='Reviewed the reply and tests over SSH.')
         self.assertEqual(self.store.snapshot()['jobs'][-1]['state'], 'reported_complete')
         self.assertEqual(len([args for args, _ in self.calls if args[:2] == ('agent', 'start')]), 2)

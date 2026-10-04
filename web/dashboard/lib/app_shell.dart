@@ -178,9 +178,13 @@ class _AppShellState extends State<AppShell> {
         final org =
             orgs.where((item) => item['id'] == selected).firstOrNull ??
             orgs.firstOrNull;
-        final profiles = List<Map<String, dynamic>>.from(
-          directory['profiles'],
-        ).where((item) => item['organization_id'] == org?['id']).toList();
+        final profiles = List<Map<String, dynamic>>.from(directory['profiles'])
+            .where(
+              (item) =>
+                  item['organization_id'] == org?['id'] &&
+                  item['group_id'] == null,
+            )
+            .toList();
         final groups = List<Map<String, dynamic>>.from(
           directory['groups'] ?? [],
         ).where((item) => item['organization_id'] == org?['id']).toList();

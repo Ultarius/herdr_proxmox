@@ -59,8 +59,19 @@ class MockHerdr:
                 transcript = re.search(r'Also write (.+?discussion\.json)', prompt)
                 if transcript:
                     ids = json.loads(re.search(r'Profile IDs: (.+?)\. Record', prompt)[1])
-                    parts = [dict(profile_id=i, name='mock', round=r, content='Mock member response: use a staged deployment and rehearse recovery.') for r in (1, 2) for i in ids.values()]
-                    Path(transcript[1]).write_text(json.dumps({'contributions': parts}), encoding='utf-8')
+                    parts = []
+                    for round_number in (1, 2):
+                        for member_alias, profile_id in ids.items():
+                            self.agents[member_alias]['agent_status'] = 'working'
+                            self.outputs[alias] = f'Mock facilitator: asking a member for round {round_number}.'
+                            self.outputs[member_alias] = 'Mock member: comparing deployment options…'
+                            time.sleep(1.5)
+                            reply = 'Mock member response: use a staged deployment and rehearse recovery.'
+                            parts.append(dict(profile_id=profile_id, name='mock', round=round_number, content=reply))
+                            Path(transcript[1]).write_text(json.dumps({'contributions': parts}), encoding='utf-8')
+                            self.outputs[member_alias] = reply
+                            self.agents[member_alias]['agent_status'] = 'idle'
+                    self.outputs[alias] = content
             elif 'mock:block' in prompt:
                 self.agents[alias]['agent_status'] = 'blocked'
                 self.outputs[alias] = 'Mock permission request: Allow this action? Use Enter to accept or Escape to dismiss.'
@@ -85,7 +96,7 @@ class PreviewHandler(server.Handler):
                     status='not_configured', detail='Connect an account using the setup terminal (local demo).')
                     for i, n in [('codex', 'Codex'), ('claude', 'Claude Code'), ('opencode', 'OpenCode'), ('agy', 'Antigravity')]]})
             return
-        if self.path.startswith('/api/') and self.path not in ('/api/snapshot', '/api/organizations'):
+        if self.path.startswith('/api/') and self.path not in ('/api/snapshot', '/api/organizations', '/api/models'):
             if self.authenticated():
                 self.reply(503, {'error': 'This local preview simulates agent chat and groups only. Container setup and updates are disabled.'})
             return
@@ -94,6 +105,14 @@ class PreviewHandler(server.Handler):
         super().do_GET()
 
     def do_POST(self):
+        if self.path == '/api/models':
+            if self.authenticated():
+                self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                self.reply(200, {'supports_variants': True, 'models': [
+                    {'provider': 'opencode', 'id': 'big-pickle', 'name': 'Big Pickle', 'reasoning': []},
+                    {'provider': 'openai', 'id': 'gpt-5', 'name': 'GPT-5 (mock)', 'reasoning': ['low', 'medium', 'high']},
+                    {'provider': 'openai', 'id': 'fast', 'name': 'Fast (mock)', 'reasoning': []}]})
+            return
         if self.path.startswith('/api/cli-setup/'):
             if not self.authenticated():
                 return

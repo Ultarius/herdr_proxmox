@@ -8,114 +8,115 @@ import 'package:herdr_dashboard/collaboration_panel.dart';
 
 void main() {
   JuiceLoggerConfig.minLevel = Level.warning;
-  testWidgets('live output stays collapsed and action artifact fits a narrow screen', (
-    tester,
-  ) async {
-    tester.view.physicalSize = const Size(360, 780);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
-    final connection = DashboardBloc(
-      client: MockClient((request) async {
-        if (request.url.path.endsWith('/inspect'))
-          return http.Response(
-            jsonEncode({
-              'status': 'blocked',
-              'output': 'Allow this action? Selected option: Allow',
-            }),
-            200,
-          );
-        if (request.url.path.endsWith('/organizations'))
-          return http.Response(
-            jsonEncode({
-              'groups': [
-                {
-                  'id': 'group',
-                  'organization_id': 'org',
-                  'name': 'Deployment',
-                  'description': 'Discuss deployment options',
-                  'members': ['max', 'iris'],
-                },
-              ],
-              'jobs': [
-                {
-                  'id': 'discussion',
-                  'organization_id': 'org',
-                  'kind': 'discussion',
-                  'state': 'artifact_ready',
-                  'group': {'name': 'Deployment'},
-                  'result':
-                      '# Action brief\nVerify backup and recovery before rollout.',
-                  'contributions': [
-                    {
-                      'name': 'Max',
-                      'round': 1,
-                      'content': 'Test recovery first.',
-                    },
-                  ],
-                },
-              ],
-            }),
-            200,
-          );
-        return http.Response('{"workspaces":[],"agents":[]}', 200);
-      }),
-    );
-    BlocScope.register<DashboardBloc>(
-      () => connection,
-      lifecycle: BlocLifecycle.permanent,
-    );
-    final connected = connection.stream.firstWhere(
-      (_) => connection.state.connected,
-    );
-    connection.connect('token');
-    await connected;
-    await tester.pumpWidget(
-      MaterialApp(
-        home: Scaffold(
-          body: SingleChildScrollView(
-            child: CollaborationPanel(
-              organization: const {'id': 'org'},
-              profiles: const [
-                {'id': 'max', 'name': 'Max', 'role': 'Developer'},
-                {'id': 'iris', 'name': 'Iris', 'role': 'Reviewer'},
-              ],
+  testWidgets(
+    'live output stays collapsed and action artifact fits a narrow screen',
+    (tester) async {
+      tester.view.physicalSize = const Size(360, 780);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.url.path.endsWith('/inspect'))
+            return http.Response(
+              jsonEncode({
+                'status': 'blocked',
+                'output': 'Allow this action? Selected option: Allow',
+              }),
+              200,
+            );
+          if (request.url.path.endsWith('/organizations'))
+            return http.Response(
+              jsonEncode({
+                'groups': [
+                  {
+                    'id': 'group',
+                    'organization_id': 'org',
+                    'name': 'Deployment',
+                    'description': 'Discuss deployment options',
+                    'members': ['max', 'iris'],
+                  },
+                ],
+                'jobs': [
+                  {
+                    'id': 'discussion',
+                    'organization_id': 'org',
+                    'kind': 'discussion',
+                    'state': 'artifact_ready',
+                    'group': {'name': 'Deployment'},
+                    'result':
+                        '# Action brief\nVerify backup and recovery before rollout.',
+                    'contributions': [
+                      {
+                        'name': 'Max',
+                        'round': 1,
+                        'content': 'Test recovery first.',
+                      },
+                    ],
+                  },
+                ],
+              }),
+              200,
+            );
+          return http.Response('{"workspaces":[],"agents":[]}', 200);
+        }),
+      );
+      BlocScope.register<DashboardBloc>(
+        () => connection,
+        lifecycle: BlocLifecycle.permanent,
+      );
+      final connected = connection.stream.firstWhere(
+        (_) => connection.state.connected,
+      );
+      connection.connect('token');
+      await connected;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SingleChildScrollView(
+              child: CollaborationPanel(
+                organization: const {'id': 'org'},
+                profiles: const [
+                  {'id': 'max', 'name': 'Max', 'role': 'Developer'},
+                  {'id': 'iris', 'name': 'Iris', 'role': 'Reviewer'},
+                ],
+              ),
             ),
           ),
         ),
-      ),
-    );
-    await tester.pumpAndSettle();
-    await tester.tap(find.byType(DropdownButtonFormField<String>));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Max').last);
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Live terminal output'));
-    await tester.pumpAndSettle();
-    expect(
-      find.text('Allow this action? Selected option: Allow'),
-      findsOneWidget,
-    );
-    final tile = tester.widget<ExpansionTile>(
-      find.ancestor(
-        of: find.text('Live terminal output'),
-        matching: find.byType(ExpansionTile),
-      ),
-    );
-    expect(tile.initiallyExpanded, isFalse);
-    await tester.ensureVisible(find.text('View artifact'));
-    await tester.tap(find.text('View artifact'));
-    await tester.pumpAndSettle();
-    expect(
-      find.text('# Action brief\nVerify backup and recovery before rollout.'),
-      findsOneWidget,
-    );
-    expect(find.text('Copy Markdown'), findsOneWidget);
-    expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox.shrink());
-    connection.disconnect();
-    BlocScope.endAll();
-  });
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byType(DropdownButtonFormField<String>));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Max').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Live terminal output'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Allow this action? Selected option: Allow'),
+        findsOneWidget,
+      );
+      final tile = tester.widget<ExpansionTile>(
+        find.ancestor(
+          of: find.text('Live terminal output'),
+          matching: find.byType(ExpansionTile),
+        ),
+      );
+      expect(tile.initiallyExpanded, isFalse);
+      await tester.ensureVisible(find.text('View artifact'));
+      await tester.tap(find.text('View artifact'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('# Action brief\nVerify backup and recovery before rollout.'),
+        findsOneWidget,
+      );
+      expect(find.text('Copy Markdown'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      connection.disconnect();
+      BlocScope.endAll();
+    },
+  );
   testWidgets(
     'chat retry keeps its request and group saves members and brief',
     (tester) async {
@@ -192,11 +193,19 @@ void main() {
         fields.at(1),
         'Discuss deployment options and recommend next actions',
       );
+      FocusManager.instance.primaryFocus?.unfocus();
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('Max · Developer'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('Max · Developer'));
+      await tester.ensureVisible(find.text('Iris · Reviewer'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('Iris · Reviewer'));
       await tester.tap(find.text('Save group'));
       await tester.pumpAndSettle();
       expect(mutations.last['members'], ['max', 'iris']);
+      expect(mutations.last['read_only'], isTrue);
+      expect(mutations.last['permission_mode'], 'default');
       expect(mutations.last['description'], contains('deployment options'));
       await tester.pumpWidget(const SizedBox.shrink());
       connection.disconnect();

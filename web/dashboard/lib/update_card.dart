@@ -26,12 +26,15 @@ class _UpdateCardState extends State<UpdateCard> {
     super.dispose();
   }
 
-  Future<void> check() async {
+  Future<void> check({bool force = false}) async {
     if (busy || !connection.state.connected) return;
     final epoch = connection.generation;
     setState(() => busy = true);
     try {
-      final result = await connection.request('updates');
+      final result = await connection.request(
+        force ? 'updates/check' : 'updates',
+        force ? <String, dynamic>{} : null,
+      );
       if (mounted && epoch == connection.generation) {
         setState(() {
           info = result;
@@ -122,7 +125,7 @@ class _UpdateCardState extends State<UpdateCard> {
             spacing: 12,
             children: [
               TextButton(
-                onPressed: busy ? null : check,
+                onPressed: busy ? null : () => check(force: true),
                 child: const Text('Check for updates'),
               ),
               FilledButton(

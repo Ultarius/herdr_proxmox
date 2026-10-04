@@ -30,9 +30,9 @@ class Updates:
         self.cached = None
         self.checked = 0
 
-    def snapshot(self):
+    def snapshot(self, force=False):
         with self.lock:
-            if self.cached is None or time.monotonic() - self.checked > 3600:
+            if force or self.cached is None or time.monotonic() - self.checked > 3600:
                 self.cached = latest_release()
                 self.checked = time.monotonic()
             latest = self.cached['tag_name']

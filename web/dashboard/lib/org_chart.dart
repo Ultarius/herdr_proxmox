@@ -45,8 +45,12 @@ class OrgChart extends StatefulWidget {
     required this.agents,
     required this.jobs,
     required this.onSelect,
+    this.groups = const [],
+    this.onSelectGroup,
   });
   final List<Map<String, dynamic>> profiles;
+  final List<Map<String, dynamic>> groups;
+  final void Function(Map<String, dynamic>)? onSelectGroup;
   final List<Map<String, dynamic>> agents;
   final List<Map<String, dynamic>> jobs;
   final void Function(Map<String, dynamic>) onSelect;
@@ -105,7 +109,18 @@ class _OrgChartState extends State<OrgChart> {
 
   @override
   Widget build(BuildContext context) {
-    final layout = ChartLayout(widget.profiles);
+    final profiles = widget.profiles
+        .where((p) => p['group_id'] == null)
+        .toList();
+    final layout = ChartLayout(profiles);
+    final columns = math.min(3, math.max(1, widget.groups.length));
+    final canvas = Size(
+      math.max(layout.size.width, columns * 220 + 40),
+      layout.size.height +
+          (widget.groups.isEmpty
+              ? 0
+              : 40 + (widget.groups.length / columns).ceil() * 110),
+    );
     return Container(
       height: (MediaQuery.sizeOf(context).height - 240).clamp(300, 650),
       clipBehavior: Clip.antiAlias,
@@ -117,17 +132,17 @@ class _OrgChartState extends State<OrgChart> {
       child: LayoutBuilder(
         builder: (context, constraints) {
           final signature =
-              '${constraints.biggest}:${widget.profiles.map((p) => '${p['id']}:${p['manager_id']}').join(',')}';
+              '${constraints.biggest}:${profiles.map((p) => '${p['id']}:${p['manager_id']}').join(',')}:${widget.groups.map((g) => g['id']).join(',')}';
           if (signature != fitted) {
             fitted = signature;
             WidgetsBinding.instance.addPostFrameCallback((_) {
               if (mounted && fitted == signature)
-                fit(constraints.biggest, layout.size);
+                fit(constraints.biggest, canvas);
             });
           }
           return Stack(
             children: [
-              if (widget.profiles.isEmpty)
+              if (profiles.isEmpty && widget.groups.isEmpty)
                 const Center(
                   child: Text(
                     'Hire your first agent to build the org chart.',
@@ -142,19 +157,103 @@ class _OrgChartState extends State<OrgChart> {
                   maxScale: 2.5,
                   boundaryMargin: const EdgeInsets.all(600),
                   child: SizedBox(
-                    width: layout.size.width,
-                    height: layout.size.height,
+                    width: canvas.width,
+                    height: canvas.height,
                     child: Stack(
                       children: [
+                        if (widget.groups.isNotEmpty)
+                          Positioned(
+                            left: 30,
+                            top: layout.size.height,
+                            child: const Text(
+                              'GROUPS / TOPICS',
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: Color(0xffffa14d),
+                                letterSpacing: 1,
+                              ),
+                            ),
+                          ),
+                        for (var i = 0; i < widget.groups.length; i++)
+                          Positioned(
+                            left: 30 + (i % columns) * 220,
+                            top: layout.size.height + 30 + (i ~/ columns) * 110,
+                            width: 188,
+                            height: 90,
+                            child: Material(
+                              color: const Color(0xff241a13),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14),
+                                side: const BorderSide(
+                                  color: Color(0xff80532f),
+                                ),
+                              ),
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(14),
+                                onTap: widget.onSelectGroup == null
+                                    ? null
+                                    : () => widget.onSelectGroup!(
+                                        widget.groups[i],
+                                      ),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(12),
+                                  child: Row(
+                                    children: [
+                                      const Icon(
+                                        Icons.forum_outlined,
+                                        color: Color(0xffffa14d),
+                                        size: 24,
+                                      ),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          children: [
+                                            Text(
+                                              '# ${widget.groups[i]['name']}',
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: const TextStyle(
+                                                fontSize: 12,
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                            ),
+                                            Text(
+                                              'Group / topic · ${(widget.groups[i]['members'] as List? ?? []).length} members',
+                                              style: const TextStyle(
+                                                fontSize: 9,
+                                                color: Color(0xffdfb693),
+                                              ),
+                                            ),
+                                            Text(
+                                              '${widget.groups[i]['description'] ?? ''}',
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: const TextStyle(
+                                                fontSize: 9,
+                                                color: Color(0xffaa8c77),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
                         Positioned.fill(
-                          child: CustomPaint(
-                            painter: _Connections(
-                              layout.positions,
-                              widget.profiles,
+                          child: IgnorePointer(
+                            child: CustomPaint(
+                              painter: _Connections(layout.positions, profiles),
                             ),
                           ),
                         ),
-                        for (final profile in widget.profiles)
+                        for (final profile in profiles)
                           Positioned(
                             left: layout.positions[profile['id']]!.dx,
                             top: layout.positions[profile['id']]!.dy,
@@ -273,7 +372,7 @@ class _OrgChartState extends State<OrgChart> {
                     TextButton(
                       onPressed: () => fit(
                         Size(constraints.maxWidth, constraints.maxHeight),
-                        layout.size,
+                        canvas,
                       ),
                       child: const Text('Fit', style: TextStyle(fontSize: 11)),
                     ),
@@ -284,7 +383,7 @@ class _OrgChartState extends State<OrgChart> {
                 left: 18,
                 bottom: 14,
                 child: Text(
-                  'Drag to pan · Scroll to zoom · Select an agent to edit',
+                  'Drag to pan · Scroll to zoom · Select an agent or group',
                   style: TextStyle(fontSize: 10, color: Color(0xff777777)),
                 ),
               ),

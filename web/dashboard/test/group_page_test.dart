@@ -121,7 +121,7 @@ void main() {
     expect(find.text('Show all artifacts'), findsOneWidget);
     await tester.tap(find.text('Members'));
     await tester.pumpAndSettle();
-    expect(find.text('Developer'), findsOneWidget);
+    expect(find.text('Developer · unknown'), findsOneWidget);
     await tester.tap(find.text('Design review'));
     await tester.pumpAndSettle();
     expect(tester.widget<GroupPage>(find.byType(GroupPage)).id, 'group2');

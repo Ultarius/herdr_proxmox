@@ -393,6 +393,16 @@ Each opens its own `/groups/<id>` page with **Posts**, **Artifacts**, **Members*
 and **About** tabs. Each round becomes a feed post showing agent contributions;
 **View resulting artifact** opens the action brief from that specific discussion.
 Artifacts remain available across later discussions and group edits.
+
+While a discussion runs, the group page polls live output once per second.
+The collapsed **Live discussion** panel shows facilitator/member status and
+incremental member replies from the validated transcript. Expand it to inspect
+replies, the action-brief draft, or bounded terminal views. Terminal views can
+include earlier conversation and CLI controls; they are not clean reply text.
+The facilitator is instructed to update the transcript after each member reply.
+This is live polling, not a token stream: clean replies appear when the agent
+saves valid documents. Completed discussions stop live inspection and display
+their final posts and artifact. Blocked runs keep their status/output visible.
 Contributions and the artifact remain in the job history and can be copied.
 Files also live under `~/.config/herdr-web/discussion-artifacts/<job-id>`;
 include that directory in backups. Groups are saved separately and can be edited;
@@ -434,8 +444,20 @@ reasoning variant uses OpenCode v2 `provider/model#variant` syntax. Codex receiv
 session config overrides; Claude receives `--model` and `--effort`. Alternate Claude
 providers and Antigravity settings remain configured in those CLIs. Settings apply
 on the next launch, and group agents inherit the first member's launch settings.
-Model and variant IDs must be available to the selected account; the dashboard does
-not yet discover an account's model catalog automatically.
+Model and variant IDs must be available to the selected account.
+
+The hire form offers provider, model and reasoning dropdowns. OpenCode's
+**Load models from OpenCode** action runs `opencode models --verbose` in the
+selected project, as the same LXC user as the agent. Its live list is authoritative:
+models from unavailable providers are not added from a guessed catalog. Select a
+provider first, then a model; the reasoning dropdown uses that model's enabled
+variants. Changing provider or model clears the old reasoning choice.
+
+OpenCode interactive reasoning selection requires v2 (`provider/model#variant`).
+On v1, choose Model default; the gateway rejects explicit variants before launching.
+Launches recheck the selected OpenCode model and variant against the CLI catalog.
+Catalog presence does not prove paid account entitlement. Codex and Claude retain
+curated suggestions and custom model entry; their lists are not live account catalogs.
 
 Dashboard chat replies are captured as per-message Markdown files under
 `~/.config/herdr-web/chat-replies/<job-id>/reply.md`, using the same live Herdr
@@ -452,3 +474,38 @@ history operations. Reply drafts, terminal activity and completed replies are
 collapsed by default with bounded, scrollable contents. File previews become
 available when the agent starts writing its reply; they are not token-level
 streaming and are not marked complete until the final file is validated.
+
+Agent settings expose OpenCode permission modes: CLI defaults, Allow dashboard
+outputs, and Full autonomy. The gateway writes a named OpenCode primary agent
+policy under `~/.config/opencode/agents/herdr-dashboard-<profile-id>.md` and
+passes its name with `--agent` on launch. It does not overwrite the user's global
+OpenCode config. Output mode includes external directory access to gateway
+chat-reply and discussion-artifact folders; other tool restrictions still apply.
+Agent and group forms also accept up to 20 **Additional accessible path globs**,
+one per line (absolute container paths, `~/...`, or `$HOME/...`). These augment
+output mode, or provide explicit external-directory overrides alongside CLI
+defaults. Examples: `~/shared/reference/**` and `/home/herdr/worktrees/**`.
+Patterns apply on the next launch and do not override separate read/edit/command
+rules. Group paths apply to its facilitator; members retain their own policies.
+Full autonomy sets OpenCode tool permissions to allow and is not a sandbox.
+
+Herdr supports `worktree create`, `worktree open`, `worktree list`, and
+`worktree remove`. Worktrees are separate Git checkouts opened as Herdr
+workspaces and grouped with their parent repository. **Use a Git worktree** is
+enabled by default for agents and group facilitators, including saved profiles
+without this setting. Each new Git launch uses `worktree create`, a unique
+`codex/herdr-<job-id>` branch from committed HEAD, and a checkout under
+`<projects>/.herdr-worktrees/<job-id>`. Local uncommitted changes are not copied.
+Non-Git directories use ordinary workspaces; worktree creation errors stop the
+launch rather than falling back to a shared checkout. Existing sessions remain
+in their original workspace until released and relaunched. The Runs tab records
+the branch and checkout path. Release does not delete worktrees or branches;
+preserve or merge work before removing them through Herdr. The toggle can be
+disabled to use a shared project directory. Check `herdr worktree --help` for
+support in the installed version.
+
+Groups default to read-only discussion, including legacy groups without that
+field. The facilitator instructs all members not to modify projects, while
+allowing artifact delivery. This is a conversational policy, not OS enforcement.
+Group permission modes apply to the facilitator's next launch; member settings
+are independent. Use CLI defaults for non-OpenCode groups.

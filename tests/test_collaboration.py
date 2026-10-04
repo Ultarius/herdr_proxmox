@@ -4,6 +4,7 @@ import re
 import json
 import uuid
 import unittest
+from unittest.mock import patch
 from contextlib import closing
 import test_organizations as fixtures
 
@@ -51,6 +52,28 @@ class CollaborationTests(unittest.TestCase):
         self.drain()
         return group
 
+    def test_inactive_members_are_named_and_can_be_relaunched(self):
+        group = self.group()
+        for member in (self.max, self.iris):
+            run = next(j for j in self.store.snapshot()['jobs'] if j['kind'] == 'launch' and j['profile_id'] == member)
+            self.action('release', organization_id=self.org, job_id=run['id'])
+        with self.assertRaisesRegex(ValueError, 'Max, Iris'):
+            self.action('discuss', organization_id=self.org, group_id=group)
+        states = self.store.snapshot()['member_states']
+        self.assertFalse(states[self.max]['active'])
+        self.assertEqual(states[self.max]['status'], 'off')
+        self.action('launch', organization_id=self.org, profile_id=self.max)
+        self.drain()
+        self.assertTrue(self.store.snapshot()['member_states'][self.max]['active'])
+
+    def test_missing_live_agent_is_off_despite_persisted_launch(self):
+        run = next(j for j in self.store.snapshot()['jobs'] if j['kind'] == 'launch' and j['profile_id'] == self.max)
+        del self.agents[run['alias']]
+        state = self.store.snapshot()['member_states'][self.max]
+        self.assertFalse(state['active'])
+        self.assertEqual(state['status'], 'off')
+        self.assertEqual(state['run_id'], run['id'])
+
     def test_chat_wait_snapshot_and_deduplication(self):
         body = dict(request_id=uuid.uuid4().hex, organization_id=self.org, profile_id=self.max, prompt='Explain this project')
         response = self.store.action('chat', body)
@@ -90,6 +113,7 @@ class CollaborationTests(unittest.TestCase):
 
     def test_group_discussion_and_artifact_persist(self):
         group = self.group()
+        self.assertTrue(next(g for g in self.store.snapshot()['groups'] if g['id'] == group)['read_only'])
         run = self.action('discuss', organization_id=self.org, group_id=group)
         self.drain()
         job = self.job(run)
@@ -106,6 +130,52 @@ class CollaborationTests(unittest.TestCase):
         self.assertIn('herdr agent prompt', prompts[1])
         with closing(self.store.connect()) as db:
             self.assertEqual(self.store.get(db, 'jobs', run)['result'], job['result'])
+
+    def test_live_discussion_inspects_bound_agents_and_incremental_documents(self):
+        group = self.group()
+        job_id = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        job = self.job(job_id)
+        self.store.update_job(job_id, state='running')
+        self.agents[job['group_run']['alias']]['agent_status'] = 'working'
+        self.agents[job['runs'][0]['alias']]['agent_status'] = 'blocked'
+        directory = self.store.path.parent / 'discussion-artifacts' / job_id
+        (directory / 'action-plan.md').write_text('Draft synthesis', encoding='utf-8')
+        (directory / 'discussion.json').write_text(json.dumps({'contributions': [
+            dict(profile_id=self.max, name='untrusted name', round=1, content='First reply')]}), encoding='utf-8')
+        def inspect(org=self.org):
+            return self.store.action('inspect', dict(request_id=uuid.uuid4().hex, organization_id=org, job_id=job_id))
+        result = inspect()
+        self.assertEqual(result['artifact_draft'], 'Draft synthesis')
+        self.assertEqual(result['contributions'][0]['name'], 'Max')
+        self.assertEqual([s['status'] for s in result['streams']], ['working', 'blocked', 'idle'])
+        self.assertTrue(all(s['output'] for s in result['streams']))
+        self.assertEqual(self.job(job_id)['state'], 'running')
+        (directory / 'discussion.json').write_text('{"contributions":', encoding='utf-8')
+        self.assertEqual(inspect()['contributions'], [])
+        other = self.organization('Other')
+        with self.assertRaises(ValueError):
+            inspect(other)
+        self.action('release', organization_id=self.org, job_id=job['runs'][0]['id'])
+        self.assertEqual(inspect()['streams'][1]['status'], 'unavailable')
+
+    def test_group_paths_are_saved_in_facilitator_policy(self):
+        # This fixture normally uses Codex; change saved profiles before group creation.
+        with closing(self.store.connect()) as db, db:
+            for profile_id in (self.max, self.iris):
+                profile = self.store.get(db, 'profiles', profile_id)
+                profile['runtime'] = 'opencode'
+                self.store.put(db, 'profiles', profile)
+        with patch('organizations.prepare_permissions', return_value=[]):
+            group_id = self.action('group', organization_id=self.org, name='Paths',
+                                  description='Review references', members=[self.max, self.iris],
+                                  accessible_paths=['~/reference/**'], permission_mode='dashboard_outputs')
+            self.drain()
+        with closing(self.store.connect()) as db:
+            group = self.store.get(db, 'groups', group_id)
+            facilitator = self.store.get(db, 'profiles', group['facilitator_id'])
+        self.assertEqual(group['accessible_paths'], ['~/reference/**'])
+        self.assertEqual(facilitator['accessible_paths'], group['accessible_paths'])
 
     def test_group_creation_and_messages_reuse_real_agent_binding(self):
         group_id = self.group()

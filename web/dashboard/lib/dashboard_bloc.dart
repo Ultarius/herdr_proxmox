@@ -22,7 +22,8 @@ class DashboardState extends BlocState {
 }
 
 class DashboardCommand extends EventBase {
-  DashboardCommand(this.action, [this.body]);
+  DashboardCommand(this.action, [this.body, this.background = false]);
+  final bool background;
   final String action;
   final Map<String, dynamic>? body;
 }
@@ -68,7 +69,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
     _timer?.cancel();
     _timer = Timer.periodic(
       const Duration(seconds: 5),
-      (_) => send(DashboardCommand('refresh')),
+      (_) => send(DashboardCommand('refresh', null, true)),
     );
   }
 
@@ -93,7 +94,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
         await (body == null
                 ? client.get(uri, headers: headers)
                 : client.post(uri, headers: headers, body: jsonEncode(body)))
-            .timeout(const Duration(seconds: 15));
+            .timeout(Duration(seconds: path == 'models' ? 35 : 15));
     final data = jsonDecode(response.body);
     if (response.statusCode != 200)
       throw Exception(data['error'] ?? 'Request failed');
@@ -104,7 +105,15 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
         data['profiles'] is List &&
         _credential != null &&
         requestGeneration == generation) {
-      organizationDirectory.value = {...data, 'loaded': true};
+      final directory = {
+        'organizations': data['organizations'],
+        'profiles': data['profiles'],
+        'groups': data['groups'] ?? [],
+        'loaded': true,
+      };
+      if (jsonEncode(directory) != jsonEncode(organizationDirectory.value)) {
+        organizationDirectory.value = directory;
+      }
     }
     return data;
   }
@@ -125,16 +134,17 @@ class DashboardUseCase extends BlocUseCase<DashboardBloc, DashboardCommand> {
     if (bloc._credential == null) return;
     final generation = bloc.generation;
     final previous = bloc.state;
-    emitUpdate(
-      newState: DashboardState(
-        connected: true,
-        busy: true,
-        workspaces: previous.workspaces,
-        agents: previous.agents,
-        refreshed: previous.refreshed,
-        serverStatus: previous.serverStatus,
-      ),
-    );
+    if (!event.background)
+      emitUpdate(
+        newState: DashboardState(
+          connected: true,
+          busy: true,
+          workspaces: previous.workspaces,
+          agents: previous.agents,
+          refreshed: previous.refreshed,
+          serverStatus: previous.serverStatus,
+        ),
+      );
     try {
       if (event.action == 'start-server') {
         await bloc.request('herdr-server/start', {});
@@ -144,6 +154,12 @@ class DashboardUseCase extends BlocUseCase<DashboardBloc, DashboardCommand> {
       if (generation != bloc.generation) return;
       final data = await bloc.request('snapshot');
       if (generation != bloc.generation || bloc.isClosing) return;
+      if (event.background &&
+          previous.error == null &&
+          jsonEncode(data['workspaces']) == jsonEncode(previous.workspaces) &&
+          jsonEncode(data['agents']) == jsonEncode(previous.agents) &&
+          (data['herdr_server'] ?? 'running') == previous.serverStatus)
+        return;
       emitUpdate(
         newState: DashboardState(
           connected: true,

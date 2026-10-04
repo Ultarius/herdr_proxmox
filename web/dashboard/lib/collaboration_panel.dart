@@ -1,3 +1,4 @@
+import 'permission_options.dart';
 import 'dart:math';
 import 'package:flutter/services.dart';
 import 'package:juice/juice.dart';
@@ -468,11 +469,18 @@ class _DiscussionGroupFormState extends State<DiscussionGroupForm> {
     text: widget.group?['description'],
   );
   late final members = List<String>.from(widget.group?['members'] ?? []);
+  late bool readOnly = widget.group?['read_only'] ?? true;
+  late bool useWorktree = widget.group?['use_worktree'] ?? true;
+  late String permissions = widget.group?['permission_mode'] ?? 'default';
+  late final accessiblePaths = TextEditingController(
+    text: (widget.group?['accessible_paths'] as List? ?? []).join('\n'),
+  );
   String? error;
   @override
   void dispose() {
     name.dispose();
     description.dispose();
+    accessiblePaths.dispose();
     super.dispose();
   }
 
@@ -485,6 +493,7 @@ class _DiscussionGroupFormState extends State<DiscussionGroupForm> {
     ),
     content: SizedBox(
       width: 560,
+      height: MediaQuery.sizeOf(context).height * 0.6,
       child: SingleChildScrollView(
         child: Form(
           key: form,
@@ -509,6 +518,30 @@ class _DiscussionGroupFormState extends State<DiscussionGroupForm> {
                 validator: (value) => value == null || value.trim().isEmpty
                     ? 'Describe the discussion'
                     : null,
+              ),
+              SwitchListTile(
+                title: const Text('Read-only discussion'),
+                subtitle: const Text(
+                  'Default: advise and create artifacts. Members are instructed not to change projects. This is a discussion rule, not a sandbox.',
+                ),
+                value: readOnly,
+                onChanged: (v) => setState(() => readOnly = v),
+              ),
+              PermissionOptions(
+                value: permissions,
+                paths: accessiblePaths,
+                onChanged: (v) => setState(() => permissions = v),
+              ),
+              SwitchListTile(
+                title: const Text('Use a Git worktree'),
+                subtitle: const Text(
+                  'The facilitator gets a separate checkout from committed HEAD on its next launch. Non-Git folders use the selected directory. Members keep their own settings.',
+                ),
+                value: useWorktree,
+                onChanged: (v) => setState(() => useWorktree = v),
+              ),
+              const Text(
+                'Group permissions apply to the group agent on its next launch. Member agents keep their own permission settings. Non-default policies require OpenCode members.',
               ),
               for (final profile in widget.profiles.where(
                 (p) => p['group_id'] == null,
@@ -546,6 +579,12 @@ class _DiscussionGroupFormState extends State<DiscussionGroupForm> {
             if (widget.group != null) 'id': widget.group!['id'],
             'name': name.text.trim(),
             'description': description.text.trim(),
+            'read_only': readOnly,
+            'use_worktree': useWorktree,
+            'permission_mode': permissions,
+            'accessible_paths': PermissionOptions.parsePaths(
+              accessiblePaths.text,
+            ),
             'members': members,
           });
         },

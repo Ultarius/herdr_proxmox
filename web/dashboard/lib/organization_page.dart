@@ -1,9 +1,11 @@
+import 'permission_options.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'organization_bloc.dart';
 import 'routes.dart';
 import 'org_chart.dart';
 import 'collaboration_panel.dart';
+import 'model_catalog.dart';
 
 class OrganizationPage extends StatefulWidget {
   const OrganizationPage({super.key, required this.coordinator});
@@ -17,10 +19,28 @@ class _OrganizationPageState extends State<OrganizationPage> {
   late final OrganizationBloc bloc = OrganizationBloc(connection);
   Timer? timer;
   String view = 'chart';
+  ModelCatalog catalog = const ModelCatalog({});
   String? get selected => connection.selectedOrganization.value;
   set selected(String? value) => connection.selectedOrganization.value = value;
   void selectionChanged() {
     if (mounted) setState(() {});
+  }
+
+  /// The model dropdowns need a catalog before a hire form opens. A gateway
+  /// without one leaves the manual entry fields in place instead.
+  Future<void> loadCatalog() async {
+    final epoch = connection.generation;
+    try {
+      final result = await connection.request('models');
+      if (!mounted || epoch != connection.generation) return;
+      setState(
+        () => catalog = ModelCatalog.fromJson(
+          result is Map<String, dynamic> ? result : null,
+        ),
+      );
+    } catch (_) {
+      // The hire form still works; it falls back to manual entry.
+    }
   }
 
   @override
@@ -28,6 +48,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
     super.initState();
     connection.selectedOrganization.addListener(selectionChanged);
     bloc.send(OrganizationCommand('refresh'));
+    loadCatalog();
     timer = Timer.periodic(const Duration(seconds: 5), (_) {
       if (connection.state.connected && bloc.pending == null)
         bloc.send(OrganizationCommand('refresh'));
@@ -71,8 +92,11 @@ class _OrganizationPageState extends State<OrganizationPage> {
       builder: (_) => HireForm(
         organization: org,
         profile: profile,
+        catalog: catalog,
         profiles: bloc.state.profiles
-            .where((p) => p['organization_id'] == org['id'])
+            .where(
+              (p) => p['organization_id'] == org['id'] && p['group_id'] == null,
+            )
             .toList(),
       ),
     );
@@ -87,6 +111,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
         .where(
           (p) =>
               p['organization_id'] == org['id'] &&
+              p['group_id'] == null &&
               bloc.state.jobs.any(
                 (j) =>
                     j['kind'] == 'launch' &&
@@ -166,7 +191,10 @@ class _OrganizationPageState extends State<OrganizationPage> {
                   orElse: () => orgs.first,
                 );
           final profiles = state.profiles
-              .where((p) => p['organization_id'] == org?['id'])
+              .where(
+                (p) =>
+                    p['organization_id'] == org?['id'] && p['group_id'] == null,
+              )
               .toList();
           final jobs = state.jobs
               .where((j) => j['organization_id'] == org?['id'])
@@ -350,6 +378,12 @@ class _OrganizationPageState extends State<OrganizationPage> {
                       if (view == 'chart')
                         OrgChart(
                           profiles: profiles,
+                          groups: state.groups
+                              .where((g) => g['organization_id'] == org['id'])
+                              .toList(),
+                          onSelectGroup: (group) => widget.coordinator.navigate(
+                            GroupRoute(group['id'] as String),
+                          ),
                           agents: connection.state.agents,
                           jobs: jobs.toList(),
                           onSelect: (profile) => hire(org, profile),
@@ -444,7 +478,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
                                   Text(
-                                    '${job['kind'] == 'launch' ? 'Launch' : 'Delegation'} · ${profiles.where((p) => p['id'] == job['profile_id']).map((p) => p['name']).firstOrNull ?? 'Agent'}',
+                                    '${job['kind'] == 'launch' ? 'Launch' : 'Delegation'} · ${state.profiles.where((p) => p['id'] == job['profile_id']).map((p) => p['name']).firstOrNull ?? 'Agent'}',
                                   ),
                                   Text(
                                     'State: ${job['state']} · ${job['updated_at']}',
@@ -457,6 +491,13 @@ class _OrganizationPageState extends State<OrganizationPage> {
                                     Text(
                                       'From ${job['sender_name']}: ${job['task']}',
                                     ),
+                                  if (job['workspace_mode'] == 'worktree')
+                                    SelectableText(
+                                      'Worktree: ${job['worktree_path']}\nBranch: ${job['worktree_branch']}',
+                                    ),
+                                  if ((job['workspace_note'] as String? ?? '')
+                                      .isNotEmpty)
+                                    Text(job['workspace_note'] as String),
                                   if ((job['error'] ?? '') != '')
                                     Text(
                                       job['error'],
@@ -608,10 +649,12 @@ class HireForm extends StatefulWidget {
     required this.organization,
     required this.profiles,
     this.profile,
+    this.catalog = const ModelCatalog({}),
   });
   final Map<String, dynamic> organization;
   final List<Map<String, dynamic>> profiles;
   final Map<String, dynamic>? profile;
+  final ModelCatalog catalog;
   @override
   State<HireForm> createState() => _HireFormState();
 }
@@ -632,6 +675,11 @@ class _HireFormState extends State<HireForm> {
     text: widget.profile?['reasoning'],
   );
   late String? runtime = widget.profile?['runtime'];
+  late String permissions = widget.profile?['permission_mode'] ?? 'default';
+  late bool useWorktree = widget.profile?['use_worktree'] ?? true;
+  late final accessiblePaths = TextEditingController(
+    text: (widget.profile?['accessible_paths'] as List? ?? []).join('\n'),
+  );
   late String manager = widget.profile?['manager_id'] ?? '';
   @override
   void dispose() {
@@ -642,6 +690,7 @@ class _HireFormState extends State<HireForm> {
     provider.dispose();
     model.dispose();
     reasoning.dispose();
+    accessiblePaths.dispose();
     super.dispose();
   }
 
@@ -688,56 +737,22 @@ class _HireFormState extends State<HireForm> {
                     reasoning.clear();
                   }
                   runtime = value!;
+                  if (runtime != 'opencode') {
+                    permissions = 'default';
+                    accessiblePaths.clear();
+                  }
                 }),
               ),
               const SizedBox(height: 16),
-              if (runtime != null && runtime != 'agy') ...[
-                TextFormField(
-                  controller: provider,
-                  decoration: InputDecoration(
-                    labelText: 'Provider',
-                    hintText: runtime == 'opencode'
-                        ? 'Provider ID from OpenCode, e.g. openai'
-                        : 'Leave empty to use the configured provider',
-                    helperText: runtime == 'claude'
-                        ? 'Anthropic or the provider already configured in Claude.'
-                        : 'Use an exact provider ID available in this CLI.',
-                  ),
-                  validator: (value) =>
-                      runtime == 'opencode' &&
-                          model.text.trim().isNotEmpty &&
-                          (value ?? '').trim().isEmpty
-                      ? 'Enter the provider for this model.'
-                      : null,
+              if (runtime != null)
+                ModelFields(
+                  runtime: runtime,
+                  catalog: widget.catalog[runtime],
+                  provider: provider,
+                  model: model,
+                  reasoning: reasoning,
+                  project: project.text.trim(),
                 ),
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: model,
-                  decoration: const InputDecoration(
-                    labelText: 'Model',
-                    hintText: 'Exact model ID, or leave empty for CLI default',
-                  ),
-                  validator: (value) =>
-                      runtime == 'opencode' &&
-                          provider.text.trim().isNotEmpty &&
-                          (value ?? '').trim().isEmpty
-                      ? 'Enter a model ID for this provider.'
-                      : null,
-                ),
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: reasoning,
-                  decoration: InputDecoration(
-                    labelText: runtime == 'opencode'
-                        ? 'Reasoning variant'
-                        : 'Reasoning effort',
-                    hintText: 'Leave empty for model default',
-                    helperText: runtime == 'opencode'
-                        ? 'Exact model variant. Explicit variants require OpenCode v2.'
-                        : 'Use a level supported by the selected model and CLI.',
-                  ),
-                ),
-              ],
               if (runtime == 'agy')
                 const Text(
                   'Choose provider, model and reasoning inside Antigravity.',
@@ -763,7 +778,22 @@ class _HireFormState extends State<HireForm> {
                 onChanged: (value) => manager = value!,
               ),
               const SizedBox(height: 12),
+              if (runtime == 'opencode')
+                PermissionOptions(
+                  key: ValueKey('permissions-$runtime'),
+                  value: permissions,
+                  paths: accessiblePaths,
+                  onChanged: (v) => setState(() => permissions = v),
+                ),
               field(project, 'Existing project directory', limit: 2000),
+              SwitchListTile(
+                title: const Text('Use a Git worktree'),
+                subtitle: const Text(
+                  'Default: a separate branch and checkout from committed HEAD. Non-Git folders use the selected directory. Applies on next launch.',
+                ),
+                value: useWorktree,
+                onChanged: (v) => setState(() => useWorktree = v),
+              ),
               field(persona, 'Persona instructions', limit: 8000, lines: 5),
               const Text(
                 'Blank model settings use the CLI defaults. Saved settings apply on the next launch. Connect that same CLI on the CLI accounts page before launching. Changing runtime requires releasing and relaunching the existing run.',
@@ -790,6 +820,11 @@ class _HireFormState extends State<HireForm> {
               'provider': provider.text.trim(),
               'model': model.text.trim(),
               'reasoning': reasoning.text.trim(),
+              'permission_mode': permissions,
+              'use_worktree': useWorktree,
+              'accessible_paths': PermissionOptions.parsePaths(
+                accessiblePaths.text,
+              ),
               'manager_id': manager,
               'project': project.text.trim(),
               'persona': persona.text.trim(),

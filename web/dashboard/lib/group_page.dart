@@ -19,6 +19,9 @@ class _GroupPageState extends State<GroupPage> {
   Map<String, dynamic>? group;
   List<Map<String, dynamic>> profiles = [];
   List<Map<String, dynamic>> jobs = [];
+  Map<String, dynamic> memberStates = {};
+  List<Map<String, dynamic>> allJobs = [];
+  final live = <String, Map<String, dynamic>>{};
   final message = TextEditingController();
   Timer? timer;
   bool loading = false;
@@ -33,7 +36,7 @@ class _GroupPageState extends State<GroupPage> {
   void initState() {
     super.initState();
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 5), (_) => refresh());
+    timer = Timer.periodic(const Duration(seconds: 1), (_) => refresh());
   }
 
   @override
@@ -55,6 +58,8 @@ class _GroupPageState extends State<GroupPage> {
       ).where((g) => g['id'] == widget.id).firstOrNull;
       setState(() {
         group = current;
+        memberStates = Map<String, dynamic>.from(data['member_states'] ?? {});
+        allJobs = List<Map<String, dynamic>>.from(data['jobs']);
         profiles = List<Map<String, dynamic>>.from(data['profiles'])
             .where((p) => p['organization_id'] == current?['organization_id'])
             .toList();
@@ -71,6 +76,41 @@ class _GroupPageState extends State<GroupPage> {
       if (current != null)
         connection.selectedOrganization.value =
             current['organization_id'] as String;
+      final active = jobs.firstOrNull;
+      if (active != null &&
+          ['queued', 'running', 'needs_attention'].contains(active['state'])) {
+        try {
+          final result = await connection.request('organizations/inspect', {
+            'organization_id': current!['organization_id'],
+            'job_id': active['id'],
+            'request_id':
+                'group_stream_${DateTime.now().microsecondsSinceEpoch}',
+          });
+          if (mounted && epoch == connection.generation) {
+            final previous = live[active['id']];
+            // A file can briefly be incomplete while the facilitator rewrites it.
+            // Keep the last valid draft/replies until the next valid document arrives.
+            if ((result['contributions'] as List? ?? []).isEmpty &&
+                previous != null) {
+              result['contributions'] = previous['contributions'];
+            }
+            if ((result['artifact_draft'] as String? ?? '').isEmpty &&
+                previous != null) {
+              result['artifact_draft'] = previous['artifact_draft'];
+            }
+            setState(() => live[active['id'] as String] = result);
+          }
+        } catch (exception) {
+          if (mounted && epoch == connection.generation) {
+            setState(
+              () => live[active['id'] as String] = {
+                ...?live[active['id']],
+                'inspection_error': exception.toString(),
+              },
+            );
+          }
+        }
+      }
     } catch (exception) {
       if (mounted && epoch == connection.generation)
         setState(() => error = exception.toString());
@@ -197,6 +237,83 @@ class _GroupPageState extends State<GroupPage> {
     );
   }
 
+  Widget liveDiscussion(Map<String, dynamic> job) {
+    final data = live[job['id']] ?? const <String, dynamic>{};
+    final streams = data['streams'] as List? ?? [];
+    final parts = data['contributions'] as List? ?? [];
+    final draft = data['artifact_draft'] as String? ?? '';
+    return Card(
+      child: ExpansionTile(
+        key: PageStorageKey('discussion-live-${job['id']}'),
+        leading: const Icon(Icons.forum_outlined),
+        title: Text('Live discussion · ${parts.length} replies'),
+        subtitle: Text(
+          streams.isEmpty
+              ? 'Waiting for live output…'
+              : streams.map((s) => '${s['name']}: ${s['status']}').join(' · '),
+        ),
+        childrenPadding: const EdgeInsets.all(16),
+        children: [
+          if (data['inspection_error'] != null)
+            Text('Live output unavailable: ${data['inspection_error']}'),
+          if (parts.isNotEmpty)
+            SizedBox(
+              height: 240,
+              child: ListView(
+                key: PageStorageKey('discussion-replies-scroll-${job['id']}'),
+                children: [
+                  for (final part in parts)
+                    ListTile(
+                      title: Text('${part['name']} · Round ${part['round']}'),
+                      subtitle: SelectableText(part['content'] as String),
+                    ),
+                ],
+              ),
+            ),
+          if (draft.isNotEmpty)
+            ExpansionTile(
+              key: PageStorageKey('discussion-draft-${job['id']}'),
+              title: const Text('Action brief draft · In progress'),
+              children: [
+                SizedBox(
+                  height: 220,
+                  child: SingleChildScrollView(
+                    key: PageStorageKey('discussion-draft-scroll-${job['id']}'),
+                    child: SelectableText(draft),
+                  ),
+                ),
+              ],
+            ),
+          for (final stream in streams)
+            ExpansionTile(
+              key: PageStorageKey(
+                'discussion-terminal-${job['id']}-${stream['profile_id']}',
+              ),
+              title: Text('${stream['name']} · ${stream['status']}'),
+              subtitle: const Text(
+                'Live terminal output · May include earlier messages and CLI controls',
+              ),
+              children: [
+                SizedBox(
+                  height: 220,
+                  child: SingleChildScrollView(
+                    key: PageStorageKey(
+                      'discussion-terminal-scroll-${job['id']}-${stream['profile_id']}',
+                    ),
+                    child: SelectableText(
+                      (stream['error'] as String? ?? '').isNotEmpty
+                          ? stream['error'] as String
+                          : stream['output'] as String? ?? '',
+                    ),
+                  ),
+                ),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+
   Future<void> export(Map<String, dynamic> job, bool download) async {
     try {
       if (download) {
@@ -247,16 +364,16 @@ class _GroupPageState extends State<GroupPage> {
         ),
       );
     final members = group!['members'] as List;
-    final occupied =
-        List<Map<String, dynamic>>.from(
-          connection.organizationDirectory.value['jobs'] ?? [],
-        ).any(
-          (j) =>
-              ['queued', 'running'].contains(j['state']) &&
-              (j['participants'] as List? ?? [j['profile_id']]).any(
-                members.contains,
-              ),
-        );
+    final offline = members
+        .where((id) => memberStates[id]?['active'] == false)
+        .toList();
+    final occupied = allJobs.any(
+      (j) =>
+          ['queued', 'running'].contains(j['state']) &&
+          (j['participants'] as List? ?? [j['profile_id']]).any(
+            members.contains,
+          ),
+    );
     return ListView(
       padding: const EdgeInsets.all(28),
       children: [
@@ -406,6 +523,9 @@ class _GroupPageState extends State<GroupPage> {
               Text(job['progress'] as String),
             if ((job['error'] as String? ?? '').isNotEmpty)
               Text(job['error'] as String),
+            if (job == jobs.firstOrNull &&
+                ['queued', 'running', 'needs_attention'].contains(job['state']))
+              liveDiscussion(job),
             for (final round
                 in ((job['contributions'] as List? ?? [])
                     .map((p) => p['round'] as int)
@@ -465,16 +585,50 @@ class _GroupPageState extends State<GroupPage> {
               ),
             ),
         ],
+        if (offline.isNotEmpty && tab != 'members')
+          ListTile(
+            leading: const Icon(Icons.power_settings_new),
+            title: Text(
+              'Members not active: ${offline.map((id) => profiles.where((p) => p['id'] == id).firstOrNull?['name'] ?? id).join(', ')}',
+            ),
+            trailing: TextButton(
+              onPressed: () => setState(() => tab = 'members'),
+              child: const Text('Open Members'),
+            ),
+          ),
         if (tab == 'members') ...[
+          const Text(
+            'Turn on an offline member to launch it with its saved persona. Active members are shown as on. Uncertain runs need inspection from the Org chart.',
+          ),
           for (final id in members)
             Card(
               child: ListTile(
                 leading: const Icon(Icons.smart_toy_outlined),
+                trailing: Switch(
+                  value: memberStates[id]?['active'] == true,
+                  onChanged:
+                      busy ||
+                          memberStates[id]?['active'] == true ||
+                          ![
+                            'off',
+                            'stopped',
+                            'exited',
+                          ].contains(memberStates[id]?['status'])
+                      ? null
+                      : (_) async {
+                          final run = memberStates[id]?['run_id'];
+                          if (run != null) {
+                            await submit('release', {'job_id': run});
+                            if (pending != null || !mounted) return;
+                          }
+                          await submit('launch', {'profile_id': id});
+                        },
+                ),
                 title: Text(
                   '${profiles.where((p) => p['id'] == id).firstOrNull?['name'] ?? id}',
                 ),
                 subtitle: Text(
-                  '${profiles.where((p) => p['id'] == id).firstOrNull?['role'] ?? ''}',
+                  '${profiles.where((p) => p['id'] == id).firstOrNull?['role'] ?? ''} · ${memberStates[id]?['status'] ?? 'unknown'}',
                 ),
               ),
             ),

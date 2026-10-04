@@ -8,6 +8,48 @@ import 'package:herdr_dashboard/org_chart.dart';
 import 'package:herdr_dashboard/routes.dart';
 
 void main() {
+  testWidgets('group topics are distinct chart cards and open their page', (
+    tester,
+  ) async {
+    Map<String, dynamic>? opened;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: OrgChart(
+            profiles: [
+              {
+                'id': 'facilitator',
+                'group_id': 'standup',
+                'name': 'Standup',
+                'manager_id': '',
+                'role': 'Group facilitator',
+                'runtime': 'opencode',
+              },
+            ],
+            groups: [
+              {
+                'id': 'standup',
+                'name': 'Standup',
+                'description': 'Share work',
+                'members': ['max', 'olaf'],
+              },
+            ],
+            agents: [],
+            jobs: [],
+            onSelect: (_) => fail('Group opened agent editing'),
+            onSelectGroup: (g) => opened = g,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Group facilitator'), findsNothing);
+    expect(find.text('GROUPS / TOPICS'), findsOneWidget);
+    expect(find.text('Group / topic · 2 members'), findsOneWidget);
+    await tester.tap(find.text('# Standup'));
+    expect(opened?['id'], 'standup');
+  });
+
   test(
     'chart places managers above reports and handles disconnected cycles',
     () {
