@@ -1,0 +1,9 @@
+self-hosted-runner:
+  labels:
+    - proxmox-ci
+config-variables:
+  - PVE_TEMPLATE
+  - PVE_STORAGE
+  - PVE_BRIDGE
+  - PVE_IP
+  - PVE_GATEWAY

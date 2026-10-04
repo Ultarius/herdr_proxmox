@@ -1,0 +1,42 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "web: build",
+      "type": "process",
+      "command": "bash",
+      "args": ["${workspaceFolder}/scripts/build-web.sh"],
+      "windows": {
+        "command": "powershell.exe",
+        "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/scripts/build-web.ps1"]
+      },
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "web: serve build",
+      "type": "process",
+      "command": "dart",
+      "args": ["${workspaceFolder}/scripts/preview-web.dart"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "dependsOn": "web: build",
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "web-preview",
+        "pattern": {
+          "regexp": "^UNUSED_ERROR_PATTERN (.*):(\\d+): (.*)$",
+          "file": 1,
+          "line": 2,
+          "message": 3
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^Starting web preview",
+          "endsPattern": "^Web preview ready at"
+        }
+      },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "runOptions": { "instanceLimit": 1 }
+    }
+  ]
+}

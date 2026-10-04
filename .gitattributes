@@ -1,0 +1,4 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+# Linux installer scripts must retain LF on Windows checkouts.
+*.sh text eol=lf

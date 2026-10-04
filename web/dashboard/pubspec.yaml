@@ -1,0 +1,18 @@
+name: herdr_dashboard
+publish_to: none
+environment:
+  sdk: '>=3.12.0 <4.0.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  http: 1.6.0
+  juice: 1.10.0
+  zenrouter: 3.0.0
+  xterm: 4.0.0
+  cupertino_icons: 1.0.8
+  web: 1.1.1
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+flutter:
+  uses-material-design: true

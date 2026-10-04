@@ -1,0 +1,28 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Web build: Edge",
+      "type": "msedge",
+      "request": "launch",
+      "url": "http://127.0.0.1:8788",
+      "webRoot": "${workspaceFolder}/web/public",
+      "preLaunchTask": "web: serve build"
+    },
+    {
+      "name": "Web build: Chrome",
+      "type": "chrome",
+      "request": "launch",
+      "url": "http://127.0.0.1:8788",
+      "webRoot": "${workspaceFolder}/web/public",
+      "preLaunchTask": "web: serve build"
+    },
+    {
+      "name": "Proxmox dashboard: SSH tunnel",
+      "type": "msedge",
+      "request": "launch",
+      "url": "http://127.0.0.1:8787",
+      "webRoot": "${workspaceFolder}/web/public"
+    }
+  ]
+}

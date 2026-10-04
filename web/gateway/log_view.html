@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Saved terminal text</title>
+<style>body{font:16px system-ui;margin:24px;background:#10151c;color:#e8edf3}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px monospace}button{padding:8px;margin-right:12px}#info{margin:16px 0}</style>
+<h1>Saved terminal text</h1><div id="info">Loading…</div>
+<button id="previous" hidden>Previous page</button><button id="next" hidden>Next page</button>
+<pre id="text"></pre>
+<script>
+const [mode,ticket]=location.hash.slice(1).split(':');
+history.replaceState(null,'',location.pathname);
+const info=document.getElementById('info'),text=document.getElementById('text');
+const previous=document.getElementById('previous'),next=document.getElementById('next');
+const offsets=[0];let page=0,nextOffset=null;
+async function load(offset){
+  previous.disabled=next.disabled=true;
+  try{
+    const response=await fetch('/log-data',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ticket,offset}),cache:'no-store'});
+    if(!response.ok)throw new Error((await response.json()).error||'Log request failed');
+    const bytes=Number(response.headers.get('X-Log-Size-Bytes'));
+    const size=`${(bytes/1000000).toFixed(bytes<10000?6:3)} MB (${bytes.toLocaleString()} bytes; 1 MB = 1,000,000 bytes)`;
+    if(response.headers.get('X-Log-Mode')==='download'){
+      const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');
+      link.href=url;link.download='terminal-'+response.headers.get('X-Log-Id')+'.txt';link.textContent='Download saved .txt';document.body.append(link);link.click();
+      setTimeout(()=>{URL.revokeObjectURL(url);link.remove();},60000);info.textContent='File ready — '+size+'. If the download did not start, click the link below within one minute.';return;
+    }
+    text.textContent=await response.text();
+    const value=response.headers.get('X-Log-Next-Offset');nextOffset=value?Number(value):null;
+    info.textContent=`Terminal snapshot — ${size}. Page ${page+1}, starting at byte ${offset.toLocaleString()}. This is retained terminal history, not a guaranteed full transcript.`;
+    previous.hidden=page===0;next.hidden=nextOffset===null;
+  }catch(error){info.textContent=String(error);text.textContent='';}
+  finally{previous.disabled=next.disabled=false;}
+}
+previous.onclick=()=>{if(page>0)load(offsets[--page]);};
+next.onclick=()=>{if(nextOffset!==null){offsets[++page]=nextOffset;load(nextOffset);}};
+if(ticket&&(mode==='view'||mode==='download'))load(0);else info.textContent='Open this page using a log link from the authenticated dashboard.';
+</script></html>

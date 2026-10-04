@@ -1,0 +1,7 @@
+**/.dart_tool/
+**/build/
+web/public/
+**/__pycache__/
+.flutter-plugins-dependencies
+ci-results/
+.ci-cache/
