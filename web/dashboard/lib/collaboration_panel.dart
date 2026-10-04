@@ -1,4 +1,5 @@
 import 'permission_options.dart';
+import 'remove_entry_dialog.dart';
 import 'dart:math';
 import 'package:flutter/services.dart';
 import 'package:juice/juice.dart';
@@ -420,6 +421,24 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
                             ? null
                             : () => editGroup(group),
                         child: const Text('Edit group'),
+                      ),
+                      TextButton.icon(
+                        onPressed: busy || pendingBody != null
+                            ? null
+                            : () async {
+                                if (await confirmRemoval(
+                                      context,
+                                      group['name'] as String,
+                                      group: true,
+                                    ) &&
+                                    mounted) {
+                                  await submit('remove_group', {
+                                    'group_id': group['id'],
+                                  });
+                                }
+                              },
+                        icon: const Icon(Icons.delete_outline),
+                        label: const Text('Remove group'),
                       ),
                       FilledButton(
                         onPressed:

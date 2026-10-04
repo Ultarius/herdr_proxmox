@@ -6,6 +6,7 @@ import 'routes.dart';
 import 'org_chart.dart';
 import 'collaboration_panel.dart';
 import 'model_catalog.dart';
+import 'remove_entry_dialog.dart';
 
 class OrganizationPage extends StatefulWidget {
   const OrganizationPage({super.key, required this.coordinator});
@@ -438,6 +439,25 @@ class _OrganizationPageState extends State<OrganizationPage> {
                                             ? null
                                             : () => hire(org, profile),
                                         child: const Text('Edit persona'),
+                                      ),
+                                      TextButton.icon(
+                                        onPressed: state.busy
+                                            ? null
+                                            : () async {
+                                                if (await confirmRemoval(
+                                                      context,
+                                                      profile['name'] as String,
+                                                    ) &&
+                                                    mounted) {
+                                                  await submit('remove_agent', {
+                                                    'organization_id':
+                                                        org['id'],
+                                                    'profile_id': profile['id'],
+                                                  });
+                                                }
+                                              },
+                                        icon: const Icon(Icons.delete_outline),
+                                        label: const Text('Remove agent'),
                                       ),
                                       OutlinedButton(
                                         onPressed:

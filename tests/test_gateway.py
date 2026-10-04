@@ -15,6 +15,28 @@ spec.loader.exec_module(gateway)
 
 
 class GatewayTests(unittest.TestCase):
+    def test_clone_project_validates_destination_and_git_transport(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(gateway, 'PROJECTS', Path(directory)), patch.object(gateway.subprocess, 'run') as run:
+            run.return_value.returncode = 0
+            result = gateway.clone_project(dict(url='https://github.com/example/project.git', folder='project'))
+            self.assertEqual(result['cwd'], str(Path(directory) / 'project'))
+            args, kwargs = run.call_args
+            self.assertEqual(args[0][-3:], ['--', 'https://github.com/example/project.git', result['cwd']])
+            self.assertEqual(kwargs['env']['GIT_TERMINAL_PROMPT'], '0')
+            for body in [dict(url='https://github.com/example/project.git', folder='project'),
+                         dict(url='https://github.com/example/project.git', folder='../outside'),
+                         dict(url='file:///tmp/repo', folder='other'),
+                         dict(url='https://secret@github.com/repo', folder='other'),
+                         dict(url='ext::command', folder='other')]:
+                with self.assertRaises(ValueError):
+                    gateway.clone_project(body)
+            self.assertEqual(run.call_count, 1)
+            run.return_value.returncode = 1
+            with self.assertRaisesRegex(ValueError, 'retained'):
+                gateway.clone_project(dict(url='git@github.com:example/private.git', folder='private'))
+            self.assertTrue((Path(directory) / 'private').is_dir())
+
+
     def test_access_mode_rebinds_real_http_listener(self):
         listeners = []
         factory = gateway.ThreadingHTTPServer

@@ -55,6 +55,19 @@ def launch_group(store, db, group, org):
 
 def action(store, db, name, body, org):
     org_id = org['id']
+    if name == 'transcript':
+        job = store.get(db, 'jobs', text(body, 'job_id', 40), org_id)
+        if job['kind'] != 'discussion' or job['state'] != 'artifact_ready':
+            raise ValueError('Download the transcript after the discussion is finalized.')
+        directory = store.path.parent / 'discussion-artifacts' / job['id']
+        if directory.is_symlink():
+            raise ValueError('Discussion output directory must not be a symlink.')
+        content = read_contribution(directory / 'discussion.json', 750000)
+        data = json.loads(content)
+        if not isinstance(data, dict):
+            raise ValueError('Discussion transcript must be a JSON object.')
+        validate_contributions(data.get('contributions'), job['runs'])
+        return dict(content=content, filename='discussion.json')
     if name == 'recover':
         job = store.get(db, 'jobs', text(body, 'job_id', 40), org_id)
         if job['kind'] != 'discussion' or job['state'] not in ('needs_attention', 'artifact_ready'):

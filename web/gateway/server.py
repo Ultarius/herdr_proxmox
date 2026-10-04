@@ -9,12 +9,14 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from urllib.parse import urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from organizations import OrganizationStore
 from cli_setup import CliSetup
 import model_catalog
+import project_explorer
 from run_logs import RunLogs
 from ssh_access import SshAccess
 from dashboard_access import DashboardAccess, configured_bind
@@ -49,6 +51,40 @@ def listing(data, field):
     if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
         raise ValueError(f'Unexpected {field} response shape from Herdr.')
     return items
+
+
+def clone_project(body):
+    if not isinstance(body, dict):
+        raise ValueError('Expected a JSON object.')
+    url, folder = body.get('url'), body.get('folder')
+    if not isinstance(folder, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}', folder):
+        raise ValueError('Use a folder name with letters, numbers, dots, underscores or dashes.')
+    if not isinstance(url, str) or len(url) > 2000 or any(c.isspace() or ord(c) < 32 for c in url):
+        raise ValueError('Enter an HTTPS or SSH Git repository URL.')
+    parsed = urlsplit(url)
+    https = parsed.scheme == 'https' and parsed.hostname and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment
+    ssh = bool(re.fullmatch(r'git@[A-Za-z0-9.-]+:[A-Za-z0-9_./-]+', url))
+    if not (https or ssh):
+        raise ValueError('Use HTTPS without embedded credentials, or git@host:path SSH syntax.')
+    PROJECTS.mkdir(parents=True, exist_ok=True)
+    target = PROJECTS / folder
+    if target.exists() or target.is_symlink():
+        raise ValueError('That project folder already exists. Choose a new folder name.')
+    if target.resolve().parent != PROJECTS:
+        raise ValueError('Project folder must be directly inside the projects directory.')
+    target.mkdir()
+    env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0',
+           'GIT_SSH_COMMAND': 'ssh -o BatchMode=yes -o StrictHostKeyChecking=yes'}
+    try:
+        result = subprocess.run(['git', '-c', 'protocol.file.allow=never', '-c', 'protocol.ext.allow=never',
+                                 'clone', '--', url, str(target)],
+                                capture_output=True, text=True, timeout=120, env=env)
+        if result.returncode:
+            raise ValueError('Git clone failed. Check the repository URL and container Git credentials. '
+                             'The destination folder was retained for inspection.')
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError('Git clone timed out after two minutes. The destination folder was retained for inspection.') from exc
+    return dict(cwd=str(target), message='Repository cloned. Select this project when configuring agents.')
 
 
 def workspace_action(name, body):
@@ -215,10 +251,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authenticated():
             return
         actions = {f'/api/workspaces/{name}': name for name in ('create', 'focus', 'rename')}
-        organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover')}
+        organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'remove_agent', 'remove_group')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/projects/clone', '/api/projects/browse'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -226,7 +262,11 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < size <= 65536:
                 raise ValueError('Invalid request size.')
             body = json.loads(self.rfile.read(size))
-            if self.path == '/api/models':
+            if self.path == '/api/projects/browse':
+                self.reply(200, project_explorer.browse(PROJECTS, body))
+            elif self.path == '/api/projects/clone':
+                self.reply(200, clone_project(body))
+            elif self.path == '/api/models':
                 self.reply(200, model_catalog.discover_models(self.server.cli_setup, PROJECTS, body))
             elif self.path == '/api/updates/check':
                 self.reply(200, self.server.updates.snapshot(force=True))

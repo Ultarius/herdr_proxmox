@@ -31,6 +31,10 @@ class CollaborationTests(unittest.TestCase):
 
     def simulate(self, *args, **kwargs):
         response = self.original(*args, **kwargs)
+        if args[:2] == ('pane', 'close'):
+            for alias, agent in list(self.agents.items()):
+                if agent['pane_id'] == args[2]:
+                    del self.agents[alias]
         if args[:2] == ('agent', 'read'):
             return {'output': 'Agent response in terminal'}
         if args[:2] == ('agent', 'prompt') and '--wait' in args and self.writes:
@@ -51,6 +55,84 @@ class CollaborationTests(unittest.TestCase):
         group = self.action('group', organization_id=self.org, name='Planning', description='Discuss architecture', members=[self.max, self.iris])
         self.drain()
         return group
+
+    def test_removal_preserves_artifacts_and_members_but_closes_facilitator(self):
+        group_id = self.group()
+        discussion = self.action('discuss', organization_id=self.org, group_id=group_id)
+        self.drain()
+        job = self.job(discussion)
+        run = self.job(job['group_run']['id'])
+        body = dict(request_id=uuid.uuid4().hex, organization_id=self.org, group_id=group_id)
+        result = self.store.action('remove_group', body)
+        self.assertEqual(self.store.action('remove_group', body), result)
+        snapshot = self.store.snapshot()
+        self.assertFalse(snapshot['groups'])
+        self.assertEqual({p['id'] for p in snapshot['profiles']}, {self.max, self.iris})
+        self.assertNotIn(run['alias'], self.agents)
+        self.assertEqual(self.job(run['id'])['state'], 'released')
+        self.assertEqual(self.job(discussion)['result'], job['result'])
+        self.assertTrue((self.store.path.parent / 'discussion-artifacts' / discussion / 'action-plan.md').is_file())
+        closes = [a for a, _ in self.calls if a[:2] == ('pane', 'close')]
+        self.assertEqual(closes, [('pane', 'close', run['pane_id'])])
+        with self.assertRaisesRegex(ValueError, 'removed'):
+            self.action('discuss', organization_id=self.org, group_id=group_id)
+
+    def test_remove_agent_checks_membership_and_reparents_direct_reports(self):
+        group_id = self.group()
+        with self.assertRaisesRegex(ValueError, 'Planning'):
+            self.action('remove_agent', organization_id=self.org, profile_id=self.max)
+        self.action('remove_group', organization_id=self.org, group_id=group_id)
+        child = self.hire(self.org, 'Child', manager_id=self.max)
+        self.action('remove_agent', organization_id=self.org, profile_id=self.max)
+        profiles = self.store.snapshot()['profiles']
+        self.assertNotIn(self.max, [p['id'] for p in profiles])
+        self.assertEqual(next(p for p in profiles if p['id'] == child)['manager_id'], '')
+        with self.assertRaisesRegex(ValueError, 'removed'):
+            self.hire(self.org, id=self.max)
+
+    def test_removal_rejects_active_tasks_replaced_sessions_and_wrong_organization(self):
+        group_id = self.group()
+        group = next(g for g in self.store.snapshot()['groups'] if g['id'] == group_id)
+        run = next(j for j in self.store.snapshot()['jobs'] if j.get('profile_id') == group['facilitator_id'])
+        self.store.update_job(run['id'], state='running')
+        with self.assertRaisesRegex(ValueError, 'active work'):
+            self.action('remove_group', organization_id=self.org, group_id=group_id)
+        self.store.update_job(run['id'], state='persona_sent')
+        self.agents[run['alias']]['agent_status'] = 'working'
+        with self.assertRaisesRegex(ValueError, 'still working'):
+            self.action('remove_group', organization_id=self.org, group_id=group_id)
+        self.agents[run['alias']]['agent_status'] = 'idle'
+        self.agents[run['alias']]['agent_session'] = {'value': 'replacement'}
+        with self.assertRaisesRegex(ValueError, 'conversation changed'):
+            self.action('remove_group', organization_id=self.org, group_id=group_id)
+        with self.assertRaisesRegex(ValueError, 'another organization'):
+            self.action('remove_group', organization_id=self.organization('Other'), group_id=group_id)
+        self.assertFalse(any(a[:2] == ('pane', 'close') for a, _ in self.calls))
+        self.assertTrue(self.store.snapshot()['groups'])
+
+    def test_removal_close_failure_keeps_entry_and_binding(self):
+        group_id = self.group()
+        def failing_close(*args, **kwargs):
+            if args[:2] == ('pane', 'close'):
+                raise ValueError('close failed')
+            return self.simulate(*args, **kwargs)
+        with patch.object(self.store, 'command', side_effect=failing_close):
+            with self.assertRaisesRegex(ValueError, 'close failed'):
+                self.action('remove_group', organization_id=self.org, group_id=group_id)
+        self.assertTrue(self.store.snapshot()['groups'])
+        self.assertFalse(any(j['state'] == 'released' for j in self.store.snapshot()['jobs']))
+
+    def test_offline_agent_removal_preserves_worktree_files(self):
+        run = next(j for j in self.store.snapshot()['jobs'] if j.get('profile_id') == self.max)
+        checkout = self.projects / '.herdr-worktrees' / 'preserved'
+        checkout.mkdir(parents=True)
+        changed = checkout / 'work.txt'
+        changed.write_text('uncommitted work')
+        self.store.update_job(run['id'], worktree_path=str(checkout))
+        del self.agents[run['alias']]
+        self.action('remove_agent', organization_id=self.org, profile_id=self.max)
+        self.assertEqual(changed.read_text(), 'uncommitted work')
+        self.assertFalse(any(a[:2] == ('pane', 'close') for a, _ in self.calls))
 
     def test_inactive_members_are_named_and_can_be_relaunched(self):
         group = self.group()
@@ -200,6 +282,28 @@ class CollaborationTests(unittest.TestCase):
             facilitator = self.store.get(db, 'profiles', group['facilitator_id'])
         self.assertEqual(group['accessible_paths'], ['~/reference/**'])
         self.assertEqual(facilitator['accessible_paths'], group['accessible_paths'])
+
+    def test_transcript_download_returns_saved_json_and_checks_scope(self):
+        job_id = self.action('discuss', organization_id=self.org, group_id=self.group())
+        self.drain()
+        path = self.store.path.parent / 'discussion-artifacts' / job_id / 'discussion.json'
+        def download(org=self.org):
+            return self.store.action('transcript', dict(request_id=uuid.uuid4().hex,
+                                    organization_id=org, job_id=job_id))
+        result = download()
+        self.assertEqual(result['filename'], 'discussion.json')
+        self.assertEqual(result['content'], path.read_text())
+        self.assertEqual(len(json.loads(result['content'])['contributions']), 4)
+        other = self.action('save', name='Other', purpose='Other')
+        with self.assertRaises(ValueError):
+            download(other)
+        self.store.update_job(job_id, state='running')
+        with self.assertRaisesRegex(ValueError, 'finalized'):
+            download()
+        self.store.update_job(job_id, state='artifact_ready')
+        path.write_text('{"contributions": []}')
+        with self.assertRaises(ValueError):
+            download()
 
     def test_late_artifact_recovery_validates_files_without_reprompting(self):
         group_id = self.group()

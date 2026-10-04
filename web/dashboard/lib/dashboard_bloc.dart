@@ -94,7 +94,15 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
         await (body == null
                 ? client.get(uri, headers: headers)
                 : client.post(uri, headers: headers, body: jsonEncode(body)))
-            .timeout(Duration(seconds: path == 'models' ? 35 : 15));
+            .timeout(
+              Duration(
+                seconds: path == 'projects/clone'
+                    ? 135
+                    : path == 'models'
+                    ? 35
+                    : 15,
+              ),
+            );
     final data = jsonDecode(response.body);
     if (response.statusCode != 200)
       throw Exception(data['error'] ?? 'Request failed');

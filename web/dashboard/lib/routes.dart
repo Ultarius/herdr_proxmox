@@ -6,6 +6,7 @@ import 'cli_setup_page.dart';
 import 'logs_page.dart';
 import 'app_shell.dart';
 import 'group_page.dart';
+import 'project_explorer_page.dart';
 
 class GroupRoute extends AppRoute {
   GroupRoute(this.id);
@@ -23,6 +24,17 @@ class GroupRoute extends AppRoute {
 }
 
 abstract class AppRoute extends RouteTarget with RouteUnique {}
+
+class ExplorerRoute extends AppRoute {
+  @override
+  Uri toUri() => Uri.parse('/explorer');
+  @override
+  Widget build(AppCoordinator coordinator, BuildContext context) => AppShell(
+    coordinator: coordinator,
+    section: 'explorer',
+    child: const ProjectExplorerPage(),
+  );
+}
 
 class LogsRoute extends AppRoute {
   @override
@@ -110,6 +122,7 @@ class AppCoordinator extends Coordinator<AppRoute> {
       '/organization' => OrganizationRoute(),
       '/configuration' => CliSetupRoute(),
       '/logs' => LogsRoute(),
+      '/explorer' => ExplorerRoute(),
       _ => NotFoundRoute(uri),
     };
   }

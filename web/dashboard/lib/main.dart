@@ -1,6 +1,7 @@
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'routes.dart';
+import 'clone_project_card.dart';
 
 void main() {
   BlocScope.register<DashboardBloc>(
@@ -300,6 +301,8 @@ class _DashboardState extends State<Dashboard> {
                           label: const Text('Create workspace'),
                         ),
                       ),
+                      const SizedBox(height: 24),
+                      CloneProjectCard(onCloned: (path) => cwd.text = path),
                       const SizedBox(height: 32),
                     ],
                     Text(

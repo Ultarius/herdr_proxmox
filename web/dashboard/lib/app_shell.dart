@@ -88,6 +88,12 @@ class _AppShellState extends State<AppShell> {
           ),
           nav('Agent activity', Icons.bolt_outlined, AgentsRoute(), 'agents'),
           heading('WORKSPACE'),
+          nav(
+            'Project explorer',
+            Icons.folder_open_outlined,
+            ExplorerRoute(),
+            'explorer',
+          ),
           nav('Terminal logs', Icons.subject, LogsRoute(), 'logs'),
           nav('CLI accounts', Icons.terminal, CliSetupRoute(), 'configuration'),
           heading('AGENTS'),

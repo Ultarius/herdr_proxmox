@@ -111,12 +111,16 @@ class OrganizationStore:
         item = json.loads(row['data'])
         if organization_id and item.get('organization_id') != organization_id:
             raise ValueError('Record belongs to another organization.')
+        if item.get('removed_at'):
+            raise ValueError('Record has been removed.')
         return item
 
     def snapshot(self):
         with self.lock, closing(self.connect()) as db:
             data = {table: [json.loads(row['data']) for row in db.execute(f'SELECT data FROM {table} ORDER BY rowid')]
                     for table in ('organizations', 'profiles', 'jobs', 'groups')}
+        for table in ('profiles', 'groups'):
+            data[table] = [item for item in data[table] if not item.get('removed_at')]
         states = {}
         live = None
         if any(j['kind'] == 'launch' and j['state'] == 'persona_sent' for j in data['jobs']):
@@ -173,7 +177,7 @@ class OrganizationStore:
                 if not run.get('pane_id') or (run['state'] != 'persona_sent' and not run.get('agent_session')):
                     continue
                 profile = profiles.get(run['profile_id'])
-                if profile is None:
+                if profile is None or profile.get('removed_at'):
                     continue
                 try:
                     self.identity(run, ready=False, agent=agent)
@@ -184,6 +188,62 @@ class OrganizationStore:
                 break
             result.append(item)
         return result
+
+    def remove(self, db, action, body, org_id):
+        table = 'groups' if action == 'remove_group' else 'profiles'
+        key = 'group_id' if table == 'groups' else 'profile_id'
+        item = self.get(db, table, text(body, key, 40), org_id)
+        if table == 'groups':
+            profile = self.get(db, 'profiles', item['facilitator_id'], org_id) if item.get('facilitator_id') else None
+        else:
+            profile = item
+            if profile.get('group_id'):
+                raise ValueError('Remove this facilitator through its group.')
+            memberships = [json.loads(row['data']) for row in db.execute('SELECT data FROM groups WHERE organization_id=?', (org_id,))]
+            names = [group['name'] for group in memberships if not group.get('removed_at') and profile['id'] in group['members']]
+            if names:
+                raise ValueError('Remove this agent from these groups first: ' + ', '.join(names))
+        jobs = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs WHERE organization_id=?', (org_id,))]
+        profile_id = profile['id'] if profile else None
+        if any(job['state'] in ('queued', 'running') and
+               ((table == 'groups' and job.get('group_id') == item['id']) or
+                (profile_id and profile_id in job.get('participants', [job.get('profile_id')]))) for job in jobs):
+            raise ValueError('Wait for active work to finish before removing this entry.')
+        runs = [job for job in jobs if profile_id and job['kind'] == 'launch' and
+                job.get('profile_id') == profile_id and job['state'] != 'released']
+        if runs:
+            response = self.command('agent', 'list')
+            live = response if isinstance(response, list) else response.get('agents')
+            if not isinstance(live, list):
+                raise ValueError('Cannot verify live agents before removal.')
+            targets = []
+            for run in runs:
+                agent = next((a for a in live if a.get('name') == run['alias']), None)
+                if agent is None:
+                    continue
+                self.identity(run, ready=False, agent=agent)
+                if not run.get('agent_session'):
+                    raise ValueError('Agent session was not captured. Inspect and release its run before removal.')
+                if agent.get('agent_status', agent.get('state')) not in ('idle', 'done', 'blocked'):
+                    raise ValueError('Agent is still working or its status is unknown. Interrupt it before removal.')
+                targets.append(run['pane_id'])
+            for pane in targets:
+                self.command('pane', 'close', pane, timeout=10)
+            for run in runs:
+                run.update(state='released', updated_at=now())
+                self.put(db, 'jobs', run)
+        if profile:
+            profile['removed_at'] = now()
+            self.put(db, 'profiles', profile)
+            # Former direct reports remain valid organizational roots.
+            for row in db.execute('SELECT data FROM profiles WHERE organization_id=?', (org_id,)).fetchall():
+                child = json.loads(row['data'])
+                if not child.get('removed_at') and child.get('manager_id') == profile_id:
+                    child['manager_id'] = ''
+                    self.put(db, 'profiles', child)
+        item['removed_at'] = now()
+        self.put(db, table, item)
+        return item
 
     def action(self, action, body):
         if not isinstance(body, dict):
@@ -209,15 +269,17 @@ class OrganizationStore:
             else:
                 org_id = text(body, 'organization_id', 40)
                 org = self.get(db, 'organizations', org_id)
-                if action in ('group', 'discuss', 'chat', 'inspect', 'input', 'recover'):
+                if action in ('group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript'):
                     from collaboration import action as collaboration_action
                     item = collaboration_action(self, db, action, body, org)
                     if action == 'group':
                         submitted = item.get('launch_job_id')
                     if action in ('chat', 'discuss', 'input'):
                         submitted = item['id']
-                    if action == 'inspect':
+                    if action in ('inspect', 'transcript'):
                         return item
+                elif action in ('remove_agent', 'remove_group'):
+                    item = self.remove(db, action, body, org_id)
                 elif action == 'hire':
                     item_id = text(body, 'id', 40, optional=True) or uuid.uuid4().hex
                     previous = self.get(db, 'profiles', item_id, org_id) if body.get('id') else None

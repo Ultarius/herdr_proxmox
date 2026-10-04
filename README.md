@@ -415,6 +415,17 @@ and **About** tabs. Each round becomes a feed post showing agent contributions;
 **View resulting artifact** opens the action brief from that specific discussion.
 Artifacts remain available across later discussions and group edits.
 
+Use **Remove agent** on the Team roster, or **Remove group** on a group page
+or the discussion-group list. A confirmation describes the removal. Queued or
+running tasks block removal; a live agent that is working or has unknown state
+must be interrupted first. Agents assigned to groups must be removed from those
+groups before deleting their profile. Former direct reports become roots.
+Removal closes only a verified bound Herdr pane and archives the dashboard
+entry. Group removal also archives its facilitator, leaving member agents intact.
+History and saved artifact files are retained; Git worktree checkouts and branches
+are never deleted by these actions. Released or replaced terminal sessions are
+not closed. Removed profiles/groups cannot be edited, relaunched or reused.
+
 While a discussion runs, the group page polls live output once per second.
 The collapsed **Live discussion** panel shows facilitator/member status and
 incremental member replies from the validated transcript. Expand it to inspect
@@ -539,3 +550,9 @@ field. The facilitator instructs all members not to modify projects, while
 allowing artifact delivery. This is a conversational policy, not OS enforcement.
 Group permission modes apply to the facilitator's next launch; member settings
 are independent. Use CLI defaults for non-OpenCode groups.
+
+### Clone a project from the dashboard
+
+On Dashboard > Workspaces, use **Clone a project** with an HTTPS repository URL (without embedded credentials) or `git@host:path` SSH URL and a new folder name. The gateway clones into a new subdirectory of `HERDR_PROJECTS`; existing folders are never overwritten. Private repositories use the container Git credentials. SSH needs a configured key and trusted host. Authentication is non-interactive, and cloning has a two-minute timeout. Failed clone folders remain for inspection and must be handled over SSH before reusing the same name.
+
+After cloning, the workspace directory field is filled in. Create a workspace if needed, and set each relevant agent project directory to the returned repository path. Cloning does not change existing agent sessions; relaunch them to apply their project settings and create worktrees from the repository.
