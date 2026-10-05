@@ -33,6 +33,9 @@ class OrganizationCommand extends EventBase {
             };
   final String action;
   final Map<String, dynamic>? body;
+
+  Future<dynamic> execute(DashboardBloc connection) =>
+      connection.request('organizations/$action', body);
 }
 
 class OrganizationBloc extends JuiceBloc<OrganizationState> {
@@ -69,14 +72,11 @@ class OrganizationUseCase
     try {
       if (event.action != 'refresh') {
         bloc.pending = event;
-        await bloc.connection.request(
-          'organizations/${event.action}',
-          event.body,
-        );
+        await event.execute(bloc.connection);
         bloc.pending = null;
       }
       if (generation != bloc.connection.generation || bloc.isClosing) return;
-      final data = await bloc.connection.request('organizations');
+      final data = await bloc.connection.request('organizations/state');
       if (generation != bloc.connection.generation || bloc.isClosing) return;
       if (event.action == 'refresh' &&
           old.loaded &&

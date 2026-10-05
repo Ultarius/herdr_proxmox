@@ -3,6 +3,36 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import stat
+from contextlib import contextmanager
+
+ANCHORED_ACCESS = (os.open in os.supports_dir_fd and os.scandir in os.supports_fd
+                   and hasattr(os, 'O_NOFOLLOW') and hasattr(os, 'O_DIRECTORY'))
+
+
+@contextmanager
+def open_project(root, relative):
+    """Walk from a pinned root handle; never reopen a validated pathname."""
+    if not ANCHORED_ACCESS:
+        raise ValueError('Secure project browsing requires a Linux gateway.')
+    descriptors = []
+    try:
+        descriptor = os.open(root.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        descriptors.append(descriptor)
+        for part in root.parts[1:]:
+            descriptor = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            descriptors.append(descriptor)
+        for index, part in enumerate(relative.parts):
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            if index < len(relative.parts) - 1:
+                flags |= os.O_DIRECTORY
+            descriptor = os.open(part, flags, dir_fd=descriptor)
+            descriptors.append(descriptor)
+        yield descriptor
+    except OSError as error:
+        raise ValueError('Project path is unavailable or contains a symbolic link.') from error
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def browse(root, body):
@@ -12,34 +42,33 @@ def browse(root, body):
     relative = Path(value)
     if relative.is_absolute() or '..' in relative.parts or relative.drive:
         raise ValueError('Select a path inside the projects directory.')
-    root = root.resolve()
-    target = root
-    for part in relative.parts:
-        target = target / part
-        if target.is_symlink():
-            raise ValueError('Symbolic links cannot be opened in the explorer.')
-    if not target.resolve().is_relative_to(root):
-        raise ValueError('Select a path inside the projects directory.')
-    info = target.stat()
-    base = dict(path=target.relative_to(root).as_posix(), root=str(root))
+    root = Path(root).absolute()
+    with open_project(root, relative) as descriptor:
+        return browse_descriptor(root, relative, descriptor)
+
+
+def browse_descriptor(root, relative, descriptor):
+    info = os.fstat(descriptor)
+    base = dict(path=relative.as_posix(), root=str(root))
     if stat.S_ISDIR(info.st_mode):
         entries = []
-        with os.scandir(target) as children:
+        with os.scandir(descriptor) as children:
             for child in children:
                 if len(entries) >= 1000:
                     break
-                details = child.stat(follow_symlinks=False)
+                try:
+                    details = child.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue  # A concurrent deletion should not discard the listing.
                 kind = 'link' if child.is_symlink() else 'folder' if stat.S_ISDIR(details.st_mode) else 'file' if stat.S_ISREG(details.st_mode) else 'special'
-                entries.append(dict(name=child.name, path=(target / child.name).relative_to(root).as_posix(),
+                entries.append(dict(name=child.name, path=(relative / child.name).as_posix(),
                                     kind=kind, size=details.st_size if kind == 'file' else None,
                                     modified=datetime.fromtimestamp(details.st_mtime, timezone.utc).isoformat()))
         entries.sort(key=lambda entry: (entry['kind'] != 'folder', entry['name'].casefold()))
         return dict(**base, kind='folder', entries=entries, limited=len(entries) == 1000)
     if not stat.S_ISREG(info.st_mode):
         raise ValueError('Only regular files and folders can be opened.')
-    # O_NOFOLLOW also protects the final file against a symlink replacement.
-    descriptor = os.open(target, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
-    with os.fdopen(descriptor, 'rb') as stream:
+    with os.fdopen(os.dup(descriptor), 'rb') as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ValueError('Only regular files can be previewed.')
         data = stream.read(65537)

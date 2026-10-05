@@ -4,6 +4,7 @@ import re
 import json
 import uuid
 import unittest
+import threading
 from unittest.mock import patch
 from contextlib import closing
 import test_organizations as fixtures
@@ -292,7 +293,9 @@ class CollaborationTests(unittest.TestCase):
                                     organization_id=org, job_id=job_id))
         result = download()
         self.assertEqual(result['filename'], 'discussion.json')
-        self.assertEqual(result['content'], path.read_text())
+        exported = json.loads(result['content'])
+        self.assertEqual(exported['contributions'], self.job(job_id)['contributions'])
+        self.assertEqual(json.loads(path.read_text())['contributions'][0]['name'], 'simulated')
         self.assertEqual(len(json.loads(result['content'])['contributions']), 4)
         other = self.action('save', name='Other', purpose='Other')
         with self.assertRaises(ValueError):
@@ -459,3 +462,65 @@ class CollaborationTests(unittest.TestCase):
         self.drain()
         self.assertEqual(self.job(job)['state'], 'input_sent')
         self.assertIn(('agent', 'send-keys', run['alias'], 'enter'), [args for args, _ in self.calls])
+
+    def test_inspection_does_not_block_store_updates(self):
+        group = self.group()
+        job_id = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        entered, release, updated = threading.Event(), threading.Event(), threading.Event()
+        original = self.store.command
+        def slow(*args, **kwargs):
+            if args[:2] == ('agent', 'get'):
+                entered.set()
+                release.wait(5)
+            return original(*args, **kwargs)
+        self.store.command = slow
+        outcome = []
+        thread = threading.Thread(target=lambda: outcome.append(self.store.action('inspect', dict(request_id=uuid.uuid4().hex, organization_id=self.org, job_id=job_id))))
+        thread.start()
+        self.assertTrue(entered.wait(2))
+        writer = threading.Thread(target=lambda: (self.store.update_job(job_id, progress='Updated while inspecting'), updated.set()))
+        writer.start()
+        try:
+            self.assertTrue(updated.wait(1), 'Inspection held the global store lock')
+        finally:
+            release.set()
+            writer.join(5)
+            thread.join(5)
+        self.assertEqual(len(outcome[0]['streams']), 3)
+        self.assertTrue(all(s['status'] == 'idle' for s in outcome[0]['streams']))
+
+    def test_group_history_is_scoped_paginated_and_survives_archival(self):
+        group = self.group()
+        ids = []
+        for _ in range(3):
+            ids.append(self.action('discuss', organization_id=self.org, group_id=group))
+            self.drain()
+        page = self.store.history(dict(group_id=group, limit=2))
+        discussions = [j for j in page['jobs'] if j['kind'] == 'discussion']
+        self.assertEqual([j['id'] for j in discussions], ids[1:])
+        second = self.store.history(dict(group_id=group, before=page['next_before'], limit=2))
+        self.assertEqual([j['id'] for j in second['jobs'] if j['kind'] == 'discussion'], ids[:1])
+        self.assertIsNone(second['next_before'])
+        self.action('remove_group', organization_id=self.org, group_id=group)
+        archived = self.store.history(dict(group_id=group))
+        self.assertTrue(archived['group']['removed_at'])
+        self.assertEqual(len([j for j in archived['jobs'] if j['kind'] == 'discussion']), 3)
+        self.assertEqual(len(self.store.snapshot(directory=True)['archived_groups']), 1)
+        self.assertEqual(self.store.snapshot(directory=True)['jobs'], [])
+
+    def test_state_and_activity_omit_repeated_launch_snapshots(self):
+        group = self.group()
+        job_id = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        state = self.store.state_snapshot()
+        saved = next(j for j in state['jobs'] if j['id'] == job_id)
+        self.assertNotIn('contributions', saved)
+        self.assertNotIn('runs', saved)
+        self.assertNotIn('group_run', saved)
+        activity = self.store.activity(dict(organization_id=self.org))
+        saved = next(j for j in activity['jobs'] if j['id'] == job_id)
+        self.assertTrue(saved['contributions'])
+        self.assertTrue(saved['result'])
+        self.assertNotIn('runs', saved)
+        self.assertTrue(all(p['organization_id'] == self.org for p in activity['profiles']))

@@ -1,4 +1,5 @@
 """Durable organization records and explicit, non-retrying Herdr jobs."""
+from project_files import project_directory
 from permissions import accessible_paths, permission_mode, prepare_permissions
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -81,6 +82,8 @@ class OrganizationStore:
                 CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS groups (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, data TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS jobs_by_organization ON jobs(organization_id);
+                CREATE INDEX IF NOT EXISTS discussion_by_group ON jobs(organization_id, json_extract(data, '$.group_id'), json_extract(data, '$.kind'));
                 CREATE TABLE IF NOT EXISTS requests (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, response TEXT NOT NULL);
             ''')
             # A crash may have occurred after terminal input. Never replay automatically.
@@ -115,15 +118,48 @@ class OrganizationStore:
             raise ValueError('Record has been removed.')
         return item
 
-    def snapshot(self):
+    def snapshot(self, group_id=None, before=None, limit=20, directory=False):
         with self.lock, closing(self.connect()) as db:
             data = {table: [json.loads(row['data']) for row in db.execute(f'SELECT data FROM {table} ORDER BY rowid')]
-                    for table in ('organizations', 'profiles', 'jobs', 'groups')}
+                    for table in ('organizations', 'profiles', 'groups')}
+            data['archived_groups'] = [g for g in data['groups'] if g.get('removed_at')]
+            if directory:
+                data['jobs'] = []
+            elif group_id:
+                group = next((g for g in data['groups'] if g['id'] == group_id), None)
+                if group is None:
+                    raise ValueError('Group not found.')
+                org_id = group['organization_id']
+                for table in ('profiles', 'groups'):
+                    data[table] = [i for i in data[table] if i['organization_id'] == org_id]
+                rows = db.execute("SELECT rowid, data FROM jobs WHERE organization_id=? AND json_extract(data, '$.group_id')=? AND json_extract(data, '$.kind')='discussion' AND rowid<? ORDER BY rowid DESC LIMIT ?",
+                                  (org_id, group_id, before or 9223372036854775807, limit + 1)).fetchall()
+                data['next_before'] = rows[limit - 1]['rowid'] if len(rows) > limit else None
+                discussions = [json.loads(r['data']) for r in reversed(rows[:limit])]
+                # State summaries omit transcripts and repeated launch snapshots.
+                summaries = []
+                for row in db.execute("SELECT data FROM jobs WHERE organization_id=? AND (json_extract(data, '$.kind')='launch' OR json_extract(data, '$.state') IN ('queued', 'running')) ORDER BY rowid", (org_id,)):
+                    job = json.loads(row['data'])
+                    summary = {k: job[k] for k in ('id', 'kind', 'state', 'profile_id', 'participants', 'alias', 'pane_id', 'agent_session') if k in job}
+                    if 'profile' in job:
+                        summary['profile'] = {k: job['profile'][k] for k in ('id', 'name', 'runtime') if k in job['profile']}
+                    summaries.append(summary)
+                latest = {j['profile_id']: j for j in summaries if j['kind'] == 'launch'}
+                active = [j for j in summaries if j['kind'] != 'launch']
+                data['jobs'] = [*latest.values(), *active, *discussions]
+                data['group'] = group
+                data['organizations'] = [o for o in data['organizations'] if o['id'] == org_id]
+                data['archived_groups'] = [g for g in data['archived_groups'] if g['organization_id'] == org_id]
+            else:
+                data['jobs'] = [json.loads(r['data']) for r in db.execute('SELECT data FROM jobs ORDER BY rowid')]
         for table in ('profiles', 'groups'):
             data[table] = [item for item in data[table] if not item.get('removed_at')]
+        if directory:
+            data['profiles'] = [{k: p[k] for k in ('id', 'organization_id', 'name', 'runtime', 'group_id') if k in p} for p in data['profiles']]
+            return data
         states = {}
         live = None
-        if any(j['kind'] == 'launch' and j['state'] == 'persona_sent' for j in data['jobs']):
+        if not directory and any(j['kind'] == 'launch' and j['state'] == 'persona_sent' for j in data['jobs']):
             try:
                 response = self.command('agent', 'list')
                 entries = response if isinstance(response, list) else response.get('agents')
@@ -131,8 +167,9 @@ class OrganizationStore:
                     live = {agent['name']: agent for agent in entries if isinstance(agent, dict) and isinstance(agent.get('name'), str)}
             except (ValueError, OSError, subprocess.TimeoutExpired):
                 pass
+        latest_runs = {j['profile_id']: j for j in data['jobs'] if j['kind'] == 'launch' and j['state'] != 'released'}
         for profile in data['profiles']:
-            run = next((j for j in reversed(data['jobs']) if j['kind'] == 'launch' and j['profile_id'] == profile['id'] and j['state'] != 'released'), None)
+            run = latest_runs.get(profile['id'])
             state = dict(active=False, status='off', run_id=run['id'] if run else None)
             if run:
                 state['status'] = run['state']
@@ -155,21 +192,61 @@ class OrganizationStore:
         data['member_states'] = states
         return data
 
+    def state_snapshot(self):
+        data = self.snapshot()
+        data['jobs'] = [self.job_summary(j) for j in data['jobs']]
+        return data
+
+    @staticmethod
+    def job_summary(job, document=False):
+        omitted = {'runs', 'group_run', 'organization', 'profile'}
+        if not document and job['kind'] not in ('launch', 'delegate'):
+            omitted.update(('result', 'contributions', 'group', 'prompt'))
+        return {k: v for k, v in job.items() if k not in omitted}
+
+    def activity(self, body):
+        if not isinstance(body, dict):
+            raise ValueError('Expected a JSON object.')
+        org_id = text(body, 'organization_id', 40)
+        with self.lock, closing(self.connect()) as db:
+            org = self.get(db, 'organizations', org_id)
+            data = {'organizations': [org]}
+            for table in ('groups', 'profiles'):
+                data[table] = [json.loads(r['data']) for r in db.execute(f'SELECT data FROM {table} WHERE organization_id=?', (org_id,))]
+                data[table] = [i for i in data[table] if not i.get('removed_at')]
+            recent = db.execute("SELECT data FROM jobs WHERE organization_id=? AND json_extract(data, '$.kind')!='launch' ORDER BY rowid DESC LIMIT 20", (org_id,)).fetchall()
+            active = db.execute("SELECT data FROM jobs WHERE organization_id=? AND json_extract(data, '$.state') IN ('queued','running')", (org_id,)).fetchall()
+            jobs = {j['id']: j for j in (json.loads(r['data']) for r in [*reversed(recent), *active])}
+            data['jobs'] = [self.job_summary(j, document=True) for j in jobs.values()]
+        return data
+
+    def history(self, body):
+        if not isinstance(body, dict):
+            raise ValueError('Expected a JSON object.')
+        before = body.get('before')
+        if before is not None and (type(before) is not int or before <= 0):
+            raise ValueError('Invalid history cursor.')
+        limit = body.get('limit', 20)
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError('History page size must be between 1 and 50.')
+        return self.snapshot(group_id=text(body, 'group_id', 40), before=before, limit=limit)
+
     def project(self, value):
-        path = Path(value).expanduser().resolve()
-        if not path.is_relative_to(self.projects) or not path.is_dir():
-            raise ValueError('Select an existing directory inside /home/herdr/projects.')
-        return str(path)
+        return str(project_directory(self.projects, value))
 
     def label_agents(self, agents):
         """Add dashboard labels only to verified live run bindings; preserve Herdr names."""
         with self.lock, closing(self.connect()) as db:
             profiles = {row['id']: json.loads(row['data']) for row in db.execute('SELECT id, data FROM profiles')}
             jobs = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs')]
+        by_alias = {}
+        for run in reversed(jobs):
+            if run['kind'] == 'launch':
+                by_alias.setdefault(run.get('alias'), []).append(run)
         result = []
         for agent in agents:
             item = dict(agent)
-            for run in reversed(jobs):
+            for run in by_alias.get(agent.get('name'), []):
                 if run['kind'] != 'launch' or run['state'] not in ('running', 'persona_sent', 'needs_attention') or run.get('alias') != agent.get('name'):
                     continue
                 # Label initialization/error states only after the launched conversation
@@ -251,6 +328,16 @@ class OrganizationStore:
         key = text(body, 'request_id', 80)
         if not re.fullmatch(r'[A-Za-z0-9_-]{8,80}', key):
             raise ValueError('Invalid request ID.')
+        if action in ('inspect', 'transcript'):
+            # Freeze records under the lock, then perform external reads without
+            # holding the store lock or an on-disk transaction.
+            with closing(sqlite3.connect(':memory:')) as snapshot:
+                snapshot.row_factory = sqlite3.Row
+                with self.lock, closing(self.connect()) as db:
+                    db.backup(snapshot)
+                org = self.get(snapshot, 'organizations', text(body, 'organization_id', 40))
+                from collaboration import action as collaboration_action
+                return collaboration_action(self, snapshot, action, body, org)
         fingerprint = hashlib.sha256(json.dumps([action, body], sort_keys=True).encode()).hexdigest()
         submitted = None
         with self.lock, closing(self.connect()) as db, db:

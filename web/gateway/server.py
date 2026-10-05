@@ -1,5 +1,8 @@
 """Local, authenticated dashboard gateway to the official Herdr CLI."""
 import hmac
+import secrets
+import time
+from http.cookies import SimpleCookie
 import json
 import mimetypes
 import os
@@ -9,11 +12,11 @@ import sqlite3
 import subprocess
 import sys
 import threading
-from urllib.parse import urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from organizations import OrganizationStore
+from project_files import ProjectJobs, clone_repository, project_directory
 from cli_setup import CliSetup
 import model_catalog
 import project_explorer
@@ -54,37 +57,7 @@ def listing(data, field):
 
 
 def clone_project(body):
-    if not isinstance(body, dict):
-        raise ValueError('Expected a JSON object.')
-    url, folder = body.get('url'), body.get('folder')
-    if not isinstance(folder, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}', folder):
-        raise ValueError('Use a folder name with letters, numbers, dots, underscores or dashes.')
-    if not isinstance(url, str) or len(url) > 2000 or any(c.isspace() or ord(c) < 32 for c in url):
-        raise ValueError('Enter an HTTPS or SSH Git repository URL.')
-    parsed = urlsplit(url)
-    https = parsed.scheme == 'https' and parsed.hostname and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment
-    ssh = bool(re.fullmatch(r'git@[A-Za-z0-9.-]+:[A-Za-z0-9_./-]+', url))
-    if not (https or ssh):
-        raise ValueError('Use HTTPS without embedded credentials, or git@host:path SSH syntax.')
-    PROJECTS.mkdir(parents=True, exist_ok=True)
-    target = PROJECTS / folder
-    if target.exists() or target.is_symlink():
-        raise ValueError('That project folder already exists. Choose a new folder name.')
-    if target.resolve().parent != PROJECTS:
-        raise ValueError('Project folder must be directly inside the projects directory.')
-    target.mkdir()
-    env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0',
-           'GIT_SSH_COMMAND': 'ssh -o BatchMode=yes -o StrictHostKeyChecking=yes'}
-    try:
-        result = subprocess.run(['git', '-c', 'protocol.file.allow=never', '-c', 'protocol.ext.allow=never',
-                                 'clone', '--', url, str(target)],
-                                capture_output=True, text=True, timeout=120, env=env)
-        if result.returncode:
-            raise ValueError('Git clone failed. Check the repository URL and container Git credentials. '
-                             'The destination folder was retained for inspection.')
-    except subprocess.TimeoutExpired as exc:
-        raise ValueError('Git clone timed out after two minutes. The destination folder was retained for inspection.') from exc
-    return dict(cwd=str(target), message='Repository cloned. Select this project when configuring agents.')
+    return clone_repository(PROJECTS, body)
 
 
 def workspace_action(name, body):
@@ -95,9 +68,7 @@ def workspace_action(name, body):
         path_value = body.get('cwd', '')
         if not isinstance(path_value, str) or not path_value:
             raise ValueError('A project directory is required.')
-        path = Path(path_value).expanduser().resolve()
-        if not path.is_relative_to(PROJECTS) or not path.is_dir():
-            raise ValueError('Select an existing directory inside /home/herdr/projects.')
+        path = project_directory(PROJECTS, path_value)
         validate_label(label)
         return command('workspace', 'create', '--cwd', str(path), '--label', label, '--no-focus')
     workspace_id = body.get('id', '')
@@ -117,21 +88,68 @@ def validate_label(label):
         raise ValueError('Use a workspace name of 1–120 characters, without control characters or a leading dash.')
 
 
+class BrowserSessions:
+    lifetime = 7 * 24 * 60 * 60
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.entries = {}
+
+    def create(self, token):
+        key = secrets.token_urlsafe(32)
+        with self.lock:
+            now = time.time()
+            self.entries = {k: v for k, v in self.entries.items() if v[0] > now}
+            if len(self.entries) >= 256:
+                del self.entries[min(self.entries, key=lambda k: self.entries[k][0])]
+            self.entries[key] = (now + self.lifetime, token)
+        return key
+
+    def valid(self, key, token):
+        with self.lock:
+            entry = self.entries.get(key)
+            return bool(entry and entry[0] > time.time() and hmac.compare_digest(entry[1], token))
+
+    def revoke(self, key):
+        with self.lock:
+            self.entries.pop(key, None)
+
+
 class Handler(BaseHTTPRequestHandler):
-    def reply(self, status, data):
+    def reply(self, status, data, cookie=None):
         payload = json.dumps(data).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Cache-Control', 'no-store')
+        if cookie is not None:
+            self.send_header('Set-Cookie', cookie)
         self.send_header('Content-Length', str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
 
+    def session_key(self):
+        cookies = SimpleCookie()
+        try:
+            cookies.load(self.headers.get('Cookie', ''))
+            return cookies['herdr_session'].value if 'herdr_session' in cookies else ''
+        except Exception:
+            return ''
+
+    def session_cookie(self, key, age):
+        secure = '; Secure' if self.headers.get('Origin', '').startswith('https://') else ''
+        return f'herdr_session={key}; Path=/api/; Max-Age={age}; HttpOnly; SameSite=Strict{secure}'
+
     def authenticated(self):
         supplied = self.headers.get('Authorization', '')
         expected = 'Bearer ' + self.server.token
-        if not hmac.compare_digest(supplied.encode(), expected.encode()):
+        bearer = hmac.compare_digest(supplied.encode(), expected.encode())
+        if not bearer and not (
+                getattr(self.server, 'sessions', None) and
+                self.server.sessions.valid(self.session_key(), self.server.token)):
             self.reply(401, {'error': 'Invalid dashboard token. Disconnect and enter the correct token.'})
+            return False
+        if not bearer and self.command == 'POST' and not self.headers.get('Origin'):
+            self.reply(403, {'error': 'A same-origin browser request is required.'})
             return False
         return self.same_origin()
 
@@ -144,6 +162,12 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
+        if self.path == '/api/session':
+            if not self.same_origin():
+                return
+            sessions = getattr(self.server, 'sessions', None)
+            self.reply(200, {'authenticated': bool(sessions and sessions.valid(self.session_key(), self.server.token))})
+            return
         if self.path == '/logs/view':
             content = Path(__file__).with_name('log_view.html').read_bytes()
             self.send_response(200)
@@ -158,10 +182,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/api/'):
             if not self.authenticated():
                 return
-            if self.path not in ('/api/snapshot', '/api/organizations', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates', '/api/models'):
+            if self.path not in ('/api/snapshot', '/api/organizations', '/api/organizations/directory', '/api/organizations/state', '/api/projects/jobs', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates', '/api/models'):
                 self.reply(404, {'error': 'Unknown endpoint.'})
                 return
             try:
+                if self.path == '/api/projects/jobs':
+                    self.reply(200, self.server.projects.snapshot())
+                    return
                 if self.path == '/api/models':
                     self.reply(200, model_catalog.snapshot())
                     return
@@ -182,6 +209,12 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if self.path == '/api/cli-setup':
                     self.reply(200, self.server.cli_setup.snapshot())
+                    return
+                if self.path == '/api/organizations/state':
+                    self.reply(200, self.server.organizations.state_snapshot())
+                    return
+                if self.path == '/api/organizations/directory':
+                    self.reply(200, self.server.organizations.snapshot(directory=True))
                     return
                 if self.path == '/api/organizations':
                     self.reply(200, self.server.organizations.snapshot())
@@ -221,6 +254,28 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def do_POST(self):
+        if self.path in ('/api/session', '/api/session/logout'):
+            if not self.same_origin():
+                return
+            if not self.headers.get('Origin'):
+                self.reply(403, {'error': 'A same-origin browser request is required.'})
+                return
+            sessions = getattr(self.server, 'sessions', None)
+            if sessions is None:
+                self.reply(503, {'error': 'Browser sessions are unavailable.'})
+                return
+            if self.path.endswith('/logout'):
+                sessions.revoke(self.session_key())
+                self.reply(200, {'authenticated': False}, self.session_cookie('', 0))
+                return
+            expected = 'Bearer ' + self.server.token
+            if not hmac.compare_digest(self.headers.get('Authorization', '').encode(), expected.encode()):
+                self.reply(401, {'error': 'Invalid dashboard token.'})
+                return
+            sessions.revoke(self.session_key())
+            key = sessions.create(self.server.token)
+            self.reply(200, {'authenticated': True}, self.session_cookie(key, sessions.lifetime))
+            return
         if self.path == '/log-data':
             if not self.same_origin():
                 return
@@ -254,7 +309,7 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'remove_agent', 'remove_group')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/projects/clone', '/api/projects/browse'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/projects/clone', '/api/projects/browse', '/api/organizations/history', '/api/organizations/activity'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -262,10 +317,14 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < size <= 65536:
                 raise ValueError('Invalid request size.')
             body = json.loads(self.rfile.read(size))
-            if self.path == '/api/projects/browse':
+            if self.path == '/api/organizations/activity':
+                self.reply(200, self.server.organizations.activity(body))
+            elif self.path == '/api/organizations/history':
+                self.reply(200, self.server.organizations.history(body))
+            elif self.path == '/api/projects/browse':
                 self.reply(200, project_explorer.browse(PROJECTS, body))
             elif self.path == '/api/projects/clone':
-                self.reply(200, clone_project(body))
+                self.reply(200, self.server.projects.start(body))
             elif self.path == '/api/models':
                 self.reply(200, model_catalog.discover_models(self.server.cli_setup, PROJECTS, body))
             elif self.path == '/api/updates/check':
@@ -295,11 +354,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve_gateway(bind, port, policy, token, services):
+    sessions = BrowserSessions()
     while True:
         active_bind = configured_bind(policy, bind)
         server = ThreadingHTTPServer((active_bind, port), Handler)
         port = server.server_port
         server.token = token
+        server.sessions = sessions
         server.updates = Updates()
         for name, service in services.items():
             setattr(server, name, service)
@@ -328,9 +389,11 @@ def main():
     organizations = OrganizationStore(DATABASE, PROJECTS, command, runtime_status=cli_setup.status, model_validator=lambda profile: model_catalog.validate_selection(cli_setup, PROJECTS, profile))
     run_logs = RunLogs(DATABASE.parent / 'run-logs', BIN)
     ssh_access = SshAccess()
+    projects = ProjectJobs(PROJECTS, DATABASE.with_name('projects.sqlite3'))
     try:
-        serve_gateway(bind, 8787, policy, token, {'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command)})
+        serve_gateway(bind, 8787, policy, token, {'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command)})
     finally:
+        projects.close()
         organizations.close()
         cli_setup.close()
 

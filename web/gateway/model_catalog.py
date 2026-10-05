@@ -5,9 +5,9 @@ OpenCode enumerates its own catalog, so `discover_models` shells out to
 Claude expose no equivalent command, with curated suggestions for the other runtimes. OpenCode discovery is
 authoritative: only models and variants reported by the CLI are offered.
 """
+from project_files import project_directory
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 
@@ -87,20 +87,23 @@ def merge(runtime, discovered):
 def parse_models(output):
     models = []
     decoder = json.JSONDecoder()
-    lines = output.splitlines(keepends=True)
-    i = 0
-    while i < len(lines):
-        identifier = lines[i].strip()
-        i += 1
+    cursor = 0
+    while cursor < len(output):
+        end = output.find('\n', cursor)
+        if end == -1:
+            end = len(output)
+        identifier = output[cursor:end].strip()
+        cursor = end + 1
         if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.:/-]+', identifier):
             continue
         metadata = {}
-        remaining = ''.join(lines[i:]).lstrip()
-        if remaining.startswith('{'):
+        while cursor < len(output) and output[cursor].isspace():
+            cursor += 1
+        if cursor < len(output) and output[cursor] == '{':
             try:
-                metadata, end = decoder.raw_decode(remaining)
-                consumed = remaining[:end].count('\n') + 1
-                i += consumed
+                metadata, cursor = decoder.raw_decode(output, cursor)
+                if not isinstance(metadata, dict):
+                    raise ValueError()
             except ValueError:
                 raise ValueError('OpenCode returned incomplete model metadata.')
         provider, model = identifier.split('/', 1)
@@ -119,9 +122,7 @@ def parse_models(output):
 def discover_models(cli, projects, body):
     if body.get('runtime') != 'opencode':
         raise ValueError('Model discovery is currently supported for OpenCode.')
-    project = Path(body.get('project', str(projects))).resolve()
-    if not project.is_relative_to(projects.resolve()) or not project.is_dir():
-        raise ValueError('Select an existing project directory inside the projects folder.')
+    project = project_directory(projects, body.get('project', str(projects)))
     env = dict(os.environ, HOME=str(cli.home))
     result = subprocess.run([str(cli.binary('opencode')), 'models', '--verbose'],
                             cwd=project, env=env, capture_output=True, text=True, timeout=30)

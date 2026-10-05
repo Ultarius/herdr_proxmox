@@ -23,7 +23,13 @@ void main() {
           launched = true;
           return http.Response('{"id":"launch"}', 200);
         }
-        if (request.url.path.endsWith('/organizations'))
+        if ([
+          '/api/organizations',
+          '/api/organizations/history',
+          '/api/organizations/directory',
+          '/api/organizations/state',
+          '/api/organizations/activity',
+        ].contains(request.url.path))
           return http.Response(
             jsonEncode({
               'organizations': [],

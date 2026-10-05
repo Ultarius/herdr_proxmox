@@ -35,7 +35,7 @@ class _AppShellState extends State<AppShell> {
       return;
     loading = true;
     try {
-      await connection.request('organizations');
+      await connection.request('organizations/directory');
     } catch (_) {
       /* The active page reports connection errors. */
     } finally {
@@ -129,6 +129,32 @@ class _AppShellState extends State<AppShell> {
             nav(
               '${group['name']}',
               Icons.forum_outlined,
+              GroupRoute(group['id'] as String),
+              'group:${group['id']}',
+            ),
+          if ((connection.organizationDirectory.value['archived_groups']
+                      as List? ??
+                  [])
+              .isNotEmpty)
+            heading('ARCHIVED GROUPS'),
+          for (final group
+              in (connection.organizationDirectory.value['archived_groups']
+                          as List? ??
+                      [])
+                  .where(
+                    (g) =>
+                        g['organization_id'] ==
+                        (connection.selectedOrganization.value ??
+                            (connection
+                                            .organizationDirectory
+                                            .value['organizations']
+                                        as List? ??
+                                    [])
+                                .firstOrNull?['id']),
+                  ))
+            nav(
+              '${group['name']}',
+              Icons.archive_outlined,
               GroupRoute(group['id'] as String),
               'group:${group['id']}',
             ),

@@ -5,7 +5,7 @@ import 'clone_project_card.dart';
 
 void main() {
   BlocScope.register<DashboardBloc>(
-    () => DashboardBloc(),
+    () => DashboardBloc()..restoreSession(),
     lifecycle: BlocLifecycle.permanent,
   );
   runApp(
@@ -148,10 +148,14 @@ class _DashboardState extends State<Dashboard> {
                       ),
                     ),
                     const SizedBox(height: 12),
+                    const Text(
+                      'Stay signed in for 7 days. Sign out on shared devices.',
+                    ),
+                    const SizedBox(height: 12),
                     FilledButton(
                       onPressed: () {
                         if (token.text.trim().isEmpty) return;
-                        bloc.connect(token.text.trim());
+                        bloc.signIn(token.text.trim());
                         token.clear();
                       },
                       child: const Text('Connect'),

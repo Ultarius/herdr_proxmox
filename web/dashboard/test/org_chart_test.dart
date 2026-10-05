@@ -79,7 +79,16 @@ void main() {
       addTearDown(tester.view.resetDevicePixelRatio);
       final connection = DashboardBloc(
         client: MockClient((request) async {
-          if (request.url.path == '/api/organizations') {
+          if (request.url.path == '/api/session' ||
+              request.url.path == '/api/session/logout')
+            return http.Response('{"authenticated":true}', 200);
+          if ([
+            '/api/organizations',
+            '/api/organizations/history',
+            '/api/organizations/directory',
+            '/api/organizations/state',
+            '/api/organizations/activity',
+          ].contains(request.url.path)) {
             return http.Response(
               jsonEncode({
                 'organizations': [

@@ -420,11 +420,9 @@ class _OrganizationPageState extends State<OrganizationPage> {
                                   Text(
                                     '${profile['runtime']} · Persona v${profile['version']} · ${profile['project']}',
                                   ),
+                                  Text('Model: ${savedModelLabel(profile)}'),
                                   Text(
-                                    'Model: ${profile['model']?.toString().isNotEmpty == true ? '${profile['provider']?.toString().isNotEmpty == true ? '${profile['provider']}/' : ''}${profile['model']}' : 'CLI default'}',
-                                  ),
-                                  Text(
-                                    'Reasoning: ${profile['reasoning']?.toString().isNotEmpty == true ? profile['reasoning'] : 'Model default'}',
+                                    'Reasoning: ${savedReasoningLabel(profile)}',
                                   ),
                                   Text(
                                     'Reports to: ${profiles.where((p) => p['id'] == profile['manager_id']).map((p) => p['name']).firstOrNull ?? 'Organization owner'}',
@@ -708,10 +706,19 @@ class _HireFormState extends State<HireForm> {
   );
   late String manager = widget.profile?['manager_id'] ?? '';
   @override
+  void initState() {
+    super.initState();
+    project.addListener(projectChanged);
+  }
+
+  void projectChanged() => setState(() {});
+
+  @override
   void dispose() {
     name.dispose();
     role.dispose();
     persona.dispose();
+    project.removeListener(projectChanged);
     project.dispose();
     provider.dispose();
     model.dispose();

@@ -147,7 +147,7 @@ class _ModelFieldsState extends State<ModelFields> {
     super.didUpdateWidget(old);
     // Another runtime has its own provider list and model identifiers. A
     // rebuild follows, so no setState is needed here.
-    if (old.runtime != widget.runtime) {
+    if (old.runtime != widget.runtime || old.project != widget.project) {
       requestId++;
       busy = false;
       discovered = null;
@@ -413,4 +413,17 @@ class _ModelFieldsState extends State<ModelFields> {
       ],
     );
   }
+}
+
+String savedModelLabel(Map<String, dynamic> profile) {
+  final model = profile['model'] as String? ?? '';
+  final provider = profile['provider'] as String? ?? '';
+  return model.isEmpty
+      ? 'CLI default'
+      : [if (provider.isNotEmpty) provider, model].join('/');
+}
+
+String savedReasoningLabel(Map<String, dynamic> profile) {
+  final reasoning = profile['reasoning'] as String? ?? '';
+  return reasoning.isEmpty ? 'Model default' : reasoning;
 }

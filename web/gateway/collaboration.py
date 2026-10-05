@@ -1,5 +1,7 @@
 """Persisted agent chat and dedicated Herdr group conversations."""
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
+import subprocess
 import json
 from pathlib import Path
 import uuid
@@ -59,15 +61,8 @@ def action(store, db, name, body, org):
         job = store.get(db, 'jobs', text(body, 'job_id', 40), org_id)
         if job['kind'] != 'discussion' or job['state'] != 'artifact_ready':
             raise ValueError('Download the transcript after the discussion is finalized.')
-        directory = store.path.parent / 'discussion-artifacts' / job['id']
-        if directory.is_symlink():
-            raise ValueError('Discussion output directory must not be a symlink.')
-        content = read_contribution(directory / 'discussion.json', 750000)
-        data = json.loads(content)
-        if not isinstance(data, dict):
-            raise ValueError('Discussion transcript must be a JSON object.')
-        validate_contributions(data.get('contributions'), job['runs'])
-        return dict(content=content, filename='discussion.json')
+        data = discussion_transcript(store, job)
+        return dict(content=json.dumps(data, ensure_ascii=False, indent=2) + '\n', filename='discussion.json')
     if name == 'recover':
         job = store.get(db, 'jobs', text(body, 'job_id', 40), org_id)
         if job['kind'] != 'discussion' or job['state'] not in ('needs_attention', 'artifact_ready'):
@@ -145,10 +140,10 @@ def action(store, db, name, body, org):
         if group_run['state'] not in ('queued', 'running', 'persona_sent'):
             raise ValueError('Inspect and release the group agent run before retrying.')
     if name == 'inspect':
-        agent = store.identity(runs[0], ready=False)
+        agent = store.identity(runs[0], ready=False, agent=store.command('agent', 'get', runs[0]['alias'], timeout=2).get('agent'))
         status = agent.get('agent_status', agent.get('state', 'unknown'))
         source = 'recent-unwrapped' if status in ('idle', 'done') else 'visible'
-        output = store.command('agent', 'read', runs[0]['alias'], '--source', source, '--lines', '160')
+        output = store.command('agent', 'read', runs[0]['alias'], '--source', source, '--lines', '160', timeout=2)
         # A reply file may appear while the agent is still writing it. Never read
         # beyond the reply limit or follow a symlink from agent-controlled output.
         draft = ''
@@ -231,37 +226,64 @@ def validate_contributions(contributions, runs):
     return contributions
 
 
-def discussion_documents(store, job):
+def discussion_directory(store, job):
     directory = store.path.parent / 'discussion-artifacts' / job['id']
     if directory.is_symlink():
         raise ValueError('Discussion output directory must not be a symlink.')
-    result = read_contribution(directory / 'action-plan.md')
-    data = json.loads(read_contribution(directory / 'discussion.json', 750000))
+    return directory
+
+
+def discussion_transcript(store, job):
+    """Normalized export; the original agent-written document stays untouched."""
+    data = json.loads(read_contribution(discussion_directory(store, job) / 'discussion.json', 750000))
     if not isinstance(data, dict):
         raise ValueError('Discussion transcript must be a JSON object.')
-    return result, validate_contributions(data.get('contributions'), job['runs'])
+    validate_contributions(data.get('contributions'), job['runs'])
+    return data
+
+
+def discussion_documents(store, job):
+    result = read_contribution(discussion_directory(store, job) / 'action-plan.md')
+    return result, discussion_transcript(store, job)['contributions']
 
 
 def inspect_discussion(store, db, body, org_id):
     job = store.get(db, 'jobs', text(body, 'job_id', 40), org_id)
     if job['kind'] != 'discussion':
         raise ValueError('Select a discussion job.')
-    streams = []
+    runs = []
     for saved in [job['group_run'], *job['runs']]:
         try:
             run = store.get(db, 'jobs', saved['id'], org_id)
             if run['state'] != 'persona_sent':
                 raise ValueError('Agent conversation is not launched or was released.')
-            agent = store.identity(run, ready=False)
+            runs.append((saved, run, None))
+        except ValueError as error:
+            runs.append((saved, None, str(error)))
+
+    def inspect(binding):
+        saved, run, error = binding
+        stream = dict(profile_id=saved['profile_id'], name=saved['profile']['name'],
+                      status='unavailable', output='', error=error or '')
+        if run is None:
+            return stream
+        try:
+            response = store.command('agent', 'get', run['alias'], timeout=2)
+            agent = store.identity(run, ready=False, agent=response.get('agent'))
             status = agent.get('agent_status', agent.get('state', 'unknown'))
             output = store.command('agent', 'read', run['alias'], '--source',
                                    'visible' if status not in ('idle', 'done') else 'recent-unwrapped',
-                                   '--lines', '80')['output']
-            streams.append(dict(profile_id=run['profile_id'], name=run['profile']['name'],
-                                status=status, output=output[:20000], error=''))
-        except ValueError as error:
-            streams.append(dict(profile_id=saved['profile_id'], name=saved['profile']['name'],
-                                status='unavailable', output='', error=str(error)))
+                                   '--lines', '80', timeout=2)['output']
+            # Do not publish output if a binding changed during the CLI read.
+            store.identity(run, ready=False, agent=store.command('agent', 'get', run['alias'], timeout=1).get('agent'))
+            stream.update(status=status, output=output[:20000])
+        except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+            stream['error'] = str(error)
+        return stream
+
+    # Seven bindings maximum, two bounded batches; no SQLite handles in workers.
+    with ThreadPoolExecutor(max_workers=4) as reader:
+        streams = list(reader.map(inspect, runs))
     directory = store.path.parent / 'discussion-artifacts' / job['id']
     draft = ''
     contributions = []
@@ -271,8 +293,7 @@ def inspect_discussion(store, db, body, org_id):
         except (ValueError, OSError, UnicodeError):
             pass  # Missing or incomplete files are normal during an active turn.
         try:
-            data = json.loads(read_contribution(directory / 'discussion.json', 750000))
-            contributions = validate_contributions(data.get('contributions'), job['runs'])
+            contributions = discussion_transcript(store, job)['contributions']
         except (ValueError, OSError, UnicodeError, AttributeError):
             pass
     return dict(job_id=job['id'], streams=streams, artifact_draft=draft, contributions=contributions)

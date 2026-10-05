@@ -68,12 +68,20 @@ void main() {
     final sent = <Map<String, dynamic>>[];
     final connection = DashboardBloc(
       client: MockClient((request) async {
+        if (request.url.path == '/api/organizations/history')
+          return http.Response(jsonEncode(data), 200);
         if (request.method == 'POST') {
           sent.add(jsonDecode(request.body) as Map<String, dynamic>);
           return http.Response('{"id":"message-job"}', 200);
         }
         return http.Response(
-          request.url.path.endsWith('/organizations')
+          [
+                '/api/organizations',
+                '/api/organizations/history',
+                '/api/organizations/directory',
+                '/api/organizations/state',
+                '/api/organizations/activity',
+              ].contains(request.url.path)
               ? jsonEncode(data)
               : '{"workspaces":[],"agents":[]}',
           200,
@@ -110,7 +118,10 @@ void main() {
     expect(sent.single['prompt'], 'Ask Iris to review recovery');
     expect(find.text('Round 1 · Proposals'), findsOneWidget);
     expect(find.text('Round 2 · Review and refinement'), findsOneWidget);
-    expect(find.text('Original discussion topic'), findsNWidgets(2));
+    await tester.ensureVisible(find.text('Discussion context'));
+    await tester.tap(find.text('Discussion context'));
+    await tester.pumpAndSettle();
+    expect(find.text('Original discussion topic'), findsOneWidget);
     await tester.ensureVisible(find.text('View resulting artifact').first);
     await tester.tap(find.text('View resulting artifact').first);
     await tester.pumpAndSettle();

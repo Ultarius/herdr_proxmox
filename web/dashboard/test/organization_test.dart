@@ -15,13 +15,23 @@ void main() {
     final requests = <Map<String, dynamic>>[];
     final connection = DashboardBloc(
       client: MockClient((request) async {
-        if (request.method == 'POST') {
+        if (request.url.path == '/api/session' ||
+            request.url.path == '/api/session/logout')
+          return http.Response('{"authenticated":true}', 200);
+        if (request.method == 'POST' &&
+            !request.url.path.endsWith('/activity')) {
           requests.add(jsonDecode(request.body) as Map<String, dynamic>);
           if (requests.length == 1)
             return http.Response('{"error":"Connection interrupted"}', 502);
           return http.Response('{"id":"org1"}', 200);
         }
-        if (request.url.path == '/api/organizations')
+        if ([
+          '/api/organizations',
+          '/api/organizations/history',
+          '/api/organizations/directory',
+          '/api/organizations/state',
+          '/api/organizations/activity',
+        ].contains(request.url.path))
           return http.Response(
             '{"organizations":[],"profiles":[],"jobs":[]}',
             200,
@@ -57,7 +67,16 @@ void main() {
     final started = Completer<void>();
     final connection = DashboardBloc(
       client: MockClient((request) async {
-        if (request.url.path == '/api/organizations') {
+        if (request.url.path == '/api/session' ||
+            request.url.path == '/api/session/logout')
+          return http.Response('{"authenticated":true}', 200);
+        if ([
+          '/api/organizations',
+          '/api/organizations/history',
+          '/api/organizations/directory',
+          '/api/organizations/state',
+          '/api/organizations/activity',
+        ].contains(request.url.path)) {
           started.complete();
           return response.future;
         }
@@ -93,7 +112,11 @@ void main() {
       final mutations = <String>[];
       final connection = DashboardBloc(
         client: MockClient((request) async {
-          if (request.method == 'POST') {
+          if (request.url.path == '/api/session' ||
+              request.url.path == '/api/session/logout')
+            return http.Response('{"authenticated":true}', 200);
+          if (request.method == 'POST' &&
+              !request.url.path.endsWith('/activity')) {
             mutations.add(request.url.path);
             final data = jsonDecode(request.body) as Map<String, dynamic>;
             if (request.url.path.endsWith('/save')) {
@@ -108,7 +131,13 @@ void main() {
             }
             return http.Response('{"id":"saved"}', 200);
           }
-          if (request.url.path == '/api/organizations')
+          if ([
+            '/api/organizations',
+            '/api/organizations/history',
+            '/api/organizations/directory',
+            '/api/organizations/state',
+            '/api/organizations/activity',
+          ].contains(request.url.path))
             return http.Response(
               jsonEncode({
                 'organizations': organizations,

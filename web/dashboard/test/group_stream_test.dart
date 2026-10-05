@@ -49,7 +49,13 @@ void main() {
             200,
           );
         }
-        if (request.url.path.endsWith('/organizations')) {
+        if ([
+          '/api/organizations',
+          '/api/organizations/history',
+          '/api/organizations/directory',
+          '/api/organizations/state',
+          '/api/organizations/activity',
+        ].contains(request.url.path)) {
           return http.Response(
             jsonEncode({
               'organizations': [],
@@ -113,13 +119,16 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Updated reply'), findsOneWidget);
     expect(find.text('Standup: working'), findsOneWidget);
-    await tester.tap(find.text('Action brief draft · In progress'));
+    await tester.tap(find.text('Discussion artifact draft · In progress'));
     await tester.pumpAndSettle();
     expect(find.text('Partial action brief'), findsOneWidget);
     interrupted = true;
     await tester.pump(const Duration(seconds: 1));
     await tester.pumpAndSettle();
-    expect(find.text('Saved action brief · Not finalized'), findsOneWidget);
+    expect(
+      find.text('Saved discussion artifact · Not finalized'),
+      findsOneWidget,
+    );
     await tester.ensureVisible(find.text('Recover saved artifact'));
     await tester.tap(find.text('Recover saved artifact'));
     await tester.pumpAndSettle();

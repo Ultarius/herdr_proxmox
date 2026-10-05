@@ -58,7 +58,8 @@ void main() {
       final connection = DashboardBloc(
         client: MockClient(
           (r) async => http.Response(
-            r.url.path.endsWith('organizations')
+            (r.url.path.endsWith('organizations') ||
+                    r.url.path.endsWith('state'))
                 ? '{"organizations":[],"profiles":[],"jobs":[]}'
                 : '{"workspaces":[],"agents":[]}',
             200,

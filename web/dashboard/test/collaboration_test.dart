@@ -25,7 +25,9 @@ void main() {
               }),
               200,
             );
-          if (request.url.path.endsWith('/organizations'))
+          if ((request.url.path.endsWith('/organizations') ||
+              request.url.path.endsWith('/state') ||
+              request.url.path.endsWith('/activity')))
             return http.Response(
               jsonEncode({
                 'groups': [
@@ -129,13 +131,16 @@ void main() {
         client: MockClient((request) async {
           if (request.url.path.endsWith('/inspect'))
             return http.Response('{"status":"idle","output":"Ready"}', 200);
-          if (request.method == 'POST') {
+          if (request.method == 'POST' &&
+              !request.url.path.endsWith('/activity')) {
             mutations.add(jsonDecode(request.body) as Map<String, dynamic>);
             if (mutations.length == 1)
               return http.Response('{"error":"Connection interrupted"}', 502);
             return http.Response('{"id":"saved"}', 200);
           }
-          if (request.url.path.endsWith('/organizations'))
+          if ((request.url.path.endsWith('/organizations') ||
+              request.url.path.endsWith('/state') ||
+              request.url.path.endsWith('/activity')))
             return http.Response('{"groups":[],"jobs":[]}', 200);
           return http.Response('{"workspaces":[],"agents":[]}', 200);
         }),

@@ -28,13 +28,16 @@ class DashboardCommand extends EventBase {
   final Map<String, dynamic>? body;
 }
 
-class DisconnectDashboard extends EventBase {}
+class DisconnectDashboard extends EventBase {
+  DisconnectDashboard([this.error]);
+  final String? error;
+}
 
 class DisconnectUseCase
     extends BlocUseCase<DashboardBloc, DisconnectDashboard> {
   @override
   Future<void> execute(DisconnectDashboard event) async {
-    emitUpdate(newState: const DashboardState());
+    emitUpdate(newState: DashboardState(error: event.error));
   }
 }
 
@@ -62,6 +65,45 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
     'profiles': [],
   });
 
+  Future<void> signIn(String token) async {
+    final attempt = ++generation;
+    try {
+      final response = await client
+          .post(
+            Uri.base.resolve('/api/session'),
+            headers: {'Authorization': 'Bearer $token'},
+          )
+          .timeout(const Duration(seconds: 15));
+      if (attempt != generation || isClosing) return;
+      if (response.statusCode != 200 ||
+          jsonDecode(response.body)['authenticated'] != true) {
+        throw Exception(
+          jsonDecode(response.body)['error'] ?? 'Sign in failed.',
+        );
+      }
+      connect('');
+    } catch (error) {
+      if (attempt == generation && !isClosing)
+        await send(DisconnectDashboard(error.toString()));
+    }
+  }
+
+  Future<void> restoreSession() async {
+    final attempt = generation;
+    try {
+      final response = await client
+          .get(Uri.base.resolve('/api/session'))
+          .timeout(const Duration(seconds: 15));
+      if (attempt == generation &&
+          !isClosing &&
+          response.statusCode == 200 &&
+          jsonDecode(response.body)['authenticated'] == true)
+        connect('');
+    } catch (_) {
+      // Leave the token form available when the gateway is unreachable.
+    }
+  }
+
   void connect(String token) {
     _credential = token;
     generation++;
@@ -73,21 +115,40 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
     );
   }
 
-  Future<void> disconnect() {
+  Future<void> disconnect() async {
+    final browserSession = _credential == '';
     _timer?.cancel();
     _credential = null;
     selectedOrganization.value = null;
     organizationDirectory.value = {'organizations': [], 'profiles': []};
     generation++;
     // Reset immediately, including when an old request is still in flight.
-    return send(DisconnectDashboard());
+    await send(DisconnectDashboard());
+    if (browserSession) {
+      final attempt = generation;
+      try {
+        final response = await client
+            .post(Uri.base.resolve('/api/session/logout'))
+            .timeout(const Duration(seconds: 15));
+        if (response.statusCode != 200) throw StateError('Sign out failed');
+      } catch (_) {
+        if (attempt == generation && !isClosing) {
+          await send(
+            DisconnectDashboard(
+              'Could not revoke the browser session. Reconnect and sign out when the gateway is available.',
+            ),
+          );
+        }
+      }
+    }
   }
 
   Future<dynamic> request(String path, [Map<String, dynamic>? body]) async {
     final requestGeneration = generation;
     final uri = Uri.base.resolve('/api/$path');
     final headers = {
-      'Authorization': 'Bearer $_credential',
+      if (_credential != null && _credential!.isNotEmpty)
+        'Authorization': 'Bearer $_credential',
       'Content-Type': 'application/json',
     };
     final response =
@@ -103,10 +164,29 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
                     : 15,
               ),
             );
+    if (requestGeneration != generation || _credential == null)
+      throw StateError('Dashboard connection changed.');
     final data = jsonDecode(response.body);
+    if (response.statusCode == 401 && _credential == '') {
+      _timer?.cancel();
+      _credential = null;
+      generation++;
+      selectedOrganization.value = null;
+      organizationDirectory.value = {'organizations': [], 'profiles': []};
+      await send(
+        DisconnectDashboard(
+          'Your session expired. Enter the dashboard token to reconnect.',
+        ),
+      );
+      throw StateError('Dashboard session expired.');
+    }
     if (response.statusCode != 200)
       throw Exception(data['error'] ?? 'Request failed');
-    if (path == 'organizations' &&
+    if ([
+          'organizations',
+          'organizations/directory',
+          'organizations/state',
+        ].contains(path) &&
         body == null &&
         data is Map<String, dynamic> &&
         data['organizations'] is List &&
@@ -117,6 +197,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
         'organizations': data['organizations'],
         'profiles': data['profiles'],
         'groups': data['groups'] ?? [],
+        'archived_groups': data['archived_groups'] ?? [],
         'loaded': true,
       };
       if (jsonEncode(directory) != jsonEncode(organizationDirectory.value)) {

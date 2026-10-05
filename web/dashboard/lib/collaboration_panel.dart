@@ -1,10 +1,10 @@
 import 'permission_options.dart';
 import 'remove_entry_dialog.dart';
-import 'dart:math';
-import 'package:flutter/services.dart';
+import 'dart:convert';
+import 'organization_bloc.dart';
+import 'artifact_export.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
-import 'artifact_download.dart';
 
 class CollaborationPanel extends StatefulWidget {
   const CollaborationPanel({
@@ -33,15 +33,18 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
   String? draftJob;
   bool busy = false;
   bool polling = false;
-  String? pendingAction;
-  Map<String, dynamic>? pendingBody;
+  OrganizationCommand? pending;
+  String? snapshotSignature;
+  int pollTick = 0;
   Timer? timer;
 
   @override
   void initState() {
     super.initState();
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 1), (_) => refresh());
+    timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (profile != null || ++pollTick % 10 == 0) refresh();
+    });
   }
 
   @override
@@ -51,12 +54,10 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
     super.dispose();
   }
 
-  Map<String, dynamic> body(Map<String, dynamic> values) => {
-    ...values,
-    'organization_id': widget.organization['id'],
-    'request_id':
-        '${DateTime.now().microsecondsSinceEpoch}_${Random.secure().nextInt(0x7fffffff)}',
-  };
+  Map<String, dynamic> body(Map<String, dynamic> values) => OrganizationCommand(
+    'inspect',
+    {...values, 'organization_id': widget.organization['id']},
+  ).body!;
 
   Future<void> refresh() async {
     if (polling || !connection.state.connected) return;
@@ -64,28 +65,40 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
     final epoch = connection.generation;
     final selected = profile;
     try {
-      final data = await connection.request('organizations');
-      if (!mounted || epoch != connection.generation) return;
-      setState(() {
-        groups = List<Map<String, dynamic>>.from(data['groups'] ?? [])
-            .where((g) => g['organization_id'] == widget.organization['id'])
-            .toList();
-        jobs = List<Map<String, dynamic>>.from(data['jobs'])
-            .where((j) => j['organization_id'] == widget.organization['id'])
-            .toList();
+      final data = await connection.request('organizations/activity', {
+        'organization_id': widget.organization['id'],
       });
+      if (!mounted || epoch != connection.generation) return;
+      final signature = jsonEncode(data);
+      if (snapshotSignature != signature)
+        setState(() {
+          snapshotSignature = signature;
+          groups = List<Map<String, dynamic>>.from(data['groups'] ?? [])
+              .where((g) => g['organization_id'] == widget.organization['id'])
+              .toList();
+          jobs = List<Map<String, dynamic>>.from(data['jobs'])
+              .where((j) => j['organization_id'] == widget.organization['id'])
+              .toList();
+        });
       if (selected != null) {
         final result = await connection.request(
           'organizations/inspect',
           body({'profile_id': selected}),
         );
-        if (mounted && epoch == connection.generation && selected == profile) {
+        if (mounted &&
+            epoch == connection.generation &&
+            selected == profile &&
+            (output != result['output'] ||
+                status != result['status'] ||
+                draft != (result['reply_draft'] ?? '') ||
+                draftJob != result['reply_job_id'] ||
+                (error != null && pending == null))) {
           setState(() {
             output = result['output'] as String;
             status = result['status'] as String;
             draft = result['reply_draft'] as String? ?? '';
             draftJob = result['reply_job_id'] as String?;
-            if (pendingBody == null) error = null;
+            if (pending == null) error = null;
           });
         }
       }
@@ -105,18 +118,19 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
     if (busy || !connection.state.connected) return;
     final epoch = connection.generation;
     if (!retry) {
-      pendingAction = action;
-      pendingBody = body(values);
+      pending = OrganizationCommand(action, {
+        ...values,
+        'organization_id': widget.organization['id'],
+      });
     }
     setState(() {
       busy = true;
       error = null;
     });
     try {
-      await connection.request('organizations/$pendingAction', pendingBody);
+      await pending!.execute(connection);
       if (!mounted || epoch != connection.generation) return;
-      pendingAction = null;
-      pendingBody = null;
+      pending = null;
       if (action == 'chat') prompt.clear();
       await refresh();
     } catch (exception) {
@@ -142,35 +156,8 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
         ((j['participants'] as List? ?? [j['profile_id']]).contains(id)),
   );
 
-  Future<void> export(Map<String, dynamic> job, {bool download = false}) async {
-    try {
-      if (download) {
-        await downloadArtifact(
-          job['result'] as String,
-          'action-plan-${job['id']}.md',
-        );
-      } else {
-        await Clipboard.setData(ClipboardData(text: job['result'] as String));
-      }
-      if (mounted)
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              download ? 'Markdown download started.' : 'Markdown copied.',
-            ),
-          ),
-        );
-    } catch (exception) {
-      if (mounted)
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Export failed. Select the artifact text to copy it manually.',
-            ),
-          ),
-        );
-    }
-  }
+  Future<void> export(Map<String, dynamic> job, {bool download = false}) =>
+      exportDiscussionArtifact(context, job, download: download);
 
   Widget record(Map<String, dynamic> job) => Card(
     child: Padding(
@@ -191,7 +178,7 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
                   ? (job['result_format'] == 'markdown'
                         ? 'Agent reply'
                         : 'Earlier terminal snapshot')
-                  : 'Action artifact · Markdown',
+                  : 'Discussion artifact · Markdown',
             ),
             if (job['kind'] == 'chat' && job['result_format'] != 'markdown')
               ExpansionTile(
@@ -290,7 +277,7 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
       ),
       FilledButton(
         onPressed:
-            busy || pendingBody != null || profile == null || occupied(profile!)
+            busy || pending != null || profile == null || occupied(profile!)
             ? null
             : () {
                 if (prompt.text.trim().isNotEmpty)
@@ -358,7 +345,7 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
               'ctrl+c': 'Interrupt',
             }.entries)
               OutlinedButton(
-                onPressed: busy || pendingBody != null || occupied(profile!)
+                onPressed: busy || pending != null || occupied(profile!)
                     ? null
                     : () => submit('input', {
                         'profile_id': profile,
@@ -378,7 +365,7 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
         'Choose 2–6 agents and describe the desired outcome. A dedicated group facilitator coordinates members and saves the resulting artifact. Launch every member before starting.',
       ),
       TextButton(
-        onPressed: busy || pendingBody != null ? null : () => editGroup(),
+        onPressed: busy || pending != null ? null : () => editGroup(),
         child: const Text('Create group'),
       ),
       for (final group in groups)
@@ -417,13 +404,13 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
                           child: const Text('Open group'),
                         ),
                       TextButton(
-                        onPressed: busy || pendingBody != null
+                        onPressed: busy || pending != null
                             ? null
                             : () => editGroup(group),
                         child: const Text('Edit group'),
                       ),
                       TextButton.icon(
-                        onPressed: busy || pendingBody != null
+                        onPressed: busy || pending != null
                             ? null
                             : () async {
                                 if (await confirmRemoval(
@@ -443,7 +430,7 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
                       FilledButton(
                         onPressed:
                             busy ||
-                                pendingBody != null ||
+                                pending != null ||
                                 (group['members'] as List).any(
                                   (id) => occupied(id as String),
                                 )
@@ -460,18 +447,17 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
           ),
         ),
       if (error != null) Text(error!),
-      if (pendingBody != null && !busy)
+      if (pending != null && !busy)
         Wrap(
           spacing: 12,
           children: [
             TextButton(
-              onPressed: () => submit(pendingAction!, const {}, retry: true),
+              onPressed: () => submit(pending!.action, const {}, retry: true),
               child: const Text('Retry same request'),
             ),
             TextButton(
               onPressed: () => setState(() {
-                pendingAction = null;
-                pendingBody = null;
+                pending = null;
                 error = null;
               }),
               child: const Text('Dismiss request'),

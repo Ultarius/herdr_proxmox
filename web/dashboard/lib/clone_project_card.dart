@@ -1,4 +1,5 @@
 import 'package:juice/juice.dart';
+import 'dart:convert';
 import 'dashboard_bloc.dart';
 
 class CloneProjectCard extends StatefulWidget {
@@ -12,33 +13,76 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
   final url = TextEditingController();
   final folder = TextEditingController();
   bool busy = false;
+  Timer? timer;
+  List<Map<String, dynamic>> jobs = [];
+  String? completed;
+  bool polling = false;
+
+  @override
+  void initState() {
+    super.initState();
+    refreshJobs();
+    timer = Timer.periodic(const Duration(seconds: 3), (_) => refreshJobs());
+  }
+
+  Future<void> refreshJobs() async {
+    final connection = BlocScope.get<DashboardBloc>();
+    if (polling || !connection.state.connected) return;
+    polling = true;
+    final epoch = connection.generation;
+    try {
+      final data = await connection.request('projects/jobs');
+      if (!mounted || epoch != connection.generation) return;
+      final next = List<Map<String, dynamic>>.from(data['jobs'] ?? []);
+      if (jsonEncode(next) != jsonEncode(jobs)) setState(() => jobs = next);
+      final latest = jobs.firstOrNull;
+      if (latest?['state'] == 'completed' && latest?['id'] != completed) {
+        completed = latest!['id'] as String;
+        widget.onCloned(latest['cwd'] as String);
+      }
+    } catch (exception) {
+      if (mounted && epoch == connection.generation)
+        setState(
+          () => result =
+              'Clone status unavailable; the server job may still be running. $exception',
+        );
+    } finally {
+      polling = false;
+    }
+  }
+
   String? result;
 
   @override
   void dispose() {
+    timer?.cancel();
     url.dispose();
     folder.dispose();
     super.dispose();
   }
 
   Future<void> clone() async {
+    final connection = BlocScope.get<DashboardBloc>();
+    final epoch = connection.generation;
     setState(() {
       busy = true;
       result = null;
     });
     try {
-      final data = await BlocScope.get<DashboardBloc>().request(
-        'projects/clone',
-        {'url': url.text.trim(), 'folder': folder.text.trim()},
-      );
-      if (!mounted) return;
-      widget.onCloned(data['cwd'] as String);
-      setState(
-        () => result =
-            'Cloned into ${data['cwd']}. The workspace directory above is filled in. Select this path in agent profiles too.',
-      );
+      final data = await connection.request('projects/clone', {
+        'url': url.text.trim(),
+        'folder': folder.text.trim(),
+      });
+      if (!mounted || epoch != connection.generation) return;
+      setState(() {
+        jobs.insert(0, Map<String, dynamic>.from(data));
+        result =
+            'Clone queued. You can navigate away and return to see its status.';
+      });
+      await refreshJobs();
     } catch (error) {
-      if (mounted) setState(() => result = error.toString());
+      if (mounted && epoch == connection.generation)
+        setState(() => result = error.toString());
     } finally {
       if (mounted) setState(() => busy = false);
     }
@@ -95,6 +139,28 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
                 : const Icon(Icons.download_outlined),
             label: Text(busy ? 'Cloning…' : 'Clone repository'),
           ),
+          for (final job in jobs)
+            ListTile(
+              leading: Icon(
+                job['state'] == 'completed'
+                    ? Icons.check_circle_outline
+                    : job['state'] == 'failed'
+                    ? Icons.error_outline
+                    : Icons.download_outlined,
+              ),
+              title: Text('${job['folder']} · ${job['state']}'),
+              subtitle: Text(
+                (job['error'] as String? ?? '').isNotEmpty
+                    ? job['error'] as String
+                    : job['cwd'] as String,
+              ),
+              trailing: job['state'] == 'completed'
+                  ? TextButton(
+                      onPressed: () => widget.onCloned(job['cwd'] as String),
+                      child: const Text('Use project'),
+                    )
+                  : null,
+            ),
           if (result != null)
             Padding(
               padding: const EdgeInsets.only(top: 12),

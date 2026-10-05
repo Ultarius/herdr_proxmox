@@ -15,13 +15,24 @@ void main() {
       bool running = false;
       final connection = DashboardBloc(
         client: MockClient((request) async {
+          if (request.url.path == '/api/session' ||
+              request.url.path == '/api/session/logout')
+            return http.Response('{"authenticated":true}', 200);
+          if (request.url.path == '/api/session')
+            return http.Response('{"authenticated":true}', 200);
           if (request.url.path == '/api/herdr-server/start') {
             expect(request.method, 'POST');
             expect(jsonDecode(request.body), {});
             running = true;
             return http.Response('{"state":"running"}', 200);
           }
-          if (request.url.path == '/api/organizations')
+          if ([
+            '/api/organizations',
+            '/api/organizations/history',
+            '/api/organizations/directory',
+            '/api/organizations/state',
+            '/api/organizations/activity',
+          ].contains(request.url.path))
             return http.Response(
               '{"organizations":[],"profiles":[],"jobs":[]}',
               200,
@@ -64,9 +75,13 @@ void main() {
       final paths = <String>[];
       final bloc = DashboardBloc(
         client: MockClient((request) async {
+          if (request.url.path == '/api/session' ||
+              request.url.path == '/api/session/logout')
+            return http.Response('{"authenticated":true}', 200);
           paths.add(request.url.path);
           expect(request.headers['Authorization'], 'Bearer test-token');
-          if (request.method == 'POST') {
+          if (request.method == 'POST' &&
+              !request.url.path.endsWith('/activity')) {
             expect(jsonDecode(request.body)['id'], 'w1');
             return http.Response('{}', 200);
           }
@@ -153,7 +168,10 @@ void main() {
     (tester) async {
       final bloc = DashboardBloc(
         client: MockClient(
-          (_) async => http.Response('{"workspaces":[],"agents":[]}', 200),
+          (_) async => http.Response(
+            '{"authenticated":true,"workspaces":[],"agents":[]}',
+            200,
+          ),
         ),
       );
       BlocScope.register<DashboardBloc>(

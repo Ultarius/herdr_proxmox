@@ -25,6 +25,8 @@ class _ProjectExplorerPageState extends State<ProjectExplorerPage> {
   }
 
   Future<void> open(String selected) async {
+    final connection = BlocScope.get<DashboardBloc>();
+    final epoch = connection.generation;
     final current = ++generation;
     setState(() {
       busy = true;
@@ -32,11 +34,10 @@ class _ProjectExplorerPageState extends State<ProjectExplorerPage> {
     });
     try {
       final data = Map<String, dynamic>.from(
-        await BlocScope.get<DashboardBloc>().request('projects/browse', {
-          'path': selected,
-        }),
+        await connection.request('projects/browse', {'path': selected}),
       );
-      if (!mounted || current != generation) return;
+      if (!mounted || current != generation || epoch != connection.generation)
+        return;
       setState(() {
         if (data['kind'] == 'folder') {
           directory = data;
@@ -48,10 +49,11 @@ class _ProjectExplorerPageState extends State<ProjectExplorerPage> {
         }
       });
     } catch (exception) {
-      if (mounted && current == generation)
+      if (mounted && current == generation && epoch == connection.generation)
         setState(() => error = exception.toString());
     } finally {
-      if (mounted && current == generation) setState(() => busy = false);
+      if (mounted && current == generation && epoch == connection.generation)
+        setState(() => busy = false);
     }
   }
 
@@ -112,7 +114,7 @@ class _ProjectExplorerPageState extends State<ProjectExplorerPage> {
                 child: SelectableText(
                   preview!['content'] as String,
                   style: const TextStyle(
-                    fontFamily: 'monospace',
+                    fontFamily: 'RobotoMono',
                     fontSize: 13,
                     height: 1.6,
                   ),
@@ -268,7 +270,16 @@ class _ProjectExplorerPageState extends State<ProjectExplorerPage> {
                       const Divider(height: 1),
                       Expanded(
                         child: entries.isEmpty
-                            ? const Center(child: Text('No files to show.'))
+                            ? Center(
+                                child: Text(
+                                  filter.isNotEmpty
+                                      ? 'No entries match your filter.'
+                                      : (directory?['entries'] as List? ?? [])
+                                            .isNotEmpty
+                                      ? 'Only hidden entries are present. Enable Show hidden.'
+                                      : 'This folder is empty.',
+                                ),
+                              )
                             : ListView.builder(
                                 itemCount: entries.length,
                                 itemBuilder: (context, index) {

@@ -1,4 +1,5 @@
-import 'package:flutter/services.dart';
+import 'artifact_export.dart';
+import 'dart:convert';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'organization_bloc.dart';
@@ -28,6 +29,10 @@ class _GroupPageState extends State<GroupPage> {
   bool loading = false;
   bool busy = false;
   bool loaded = false;
+  String? snapshotSignature;
+  int pollTick = 0;
+  int? nextBefore;
+  int historyLimit = 20;
   String tab = 'posts';
   String? artifact;
   String? error;
@@ -37,7 +42,13 @@ class _GroupPageState extends State<GroupPage> {
   void initState() {
     super.initState();
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 1), (_) => refresh());
+    timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final active = jobs.any(
+        (j) => ['queued', 'running'].contains(j['state']),
+      );
+      final interval = active && tab == 'posts' ? 1 : 10;
+      if (++pollTick % interval == 0) refresh();
+    });
   }
 
   @override
@@ -52,33 +63,50 @@ class _GroupPageState extends State<GroupPage> {
     loading = true;
     final epoch = connection.generation;
     try {
-      final data = await connection.request('organizations');
-      if (!mounted || epoch != connection.generation) return;
-      final current = List<Map<String, dynamic>>.from(
-        data['groups'] ?? [],
-      ).where((g) => g['id'] == widget.id).firstOrNull;
-      setState(() {
-        group = current;
-        memberStates = Map<String, dynamic>.from(data['member_states'] ?? {});
-        allJobs = List<Map<String, dynamic>>.from(data['jobs']);
-        profiles = List<Map<String, dynamic>>.from(data['profiles'])
-            .where((p) => p['organization_id'] == current?['organization_id'])
-            .toList();
-        jobs = List<Map<String, dynamic>>.from(data['jobs'])
-            .where(
-              (j) => j['kind'] == 'discussion' && j['group_id'] == widget.id,
-            )
-            .toList()
-            .reversed
-            .toList();
-        loaded = true;
-        if (pending == null) error = null;
+      final data = await connection.request('organizations/history', {
+        'group_id': widget.id,
+        'limit': historyLimit,
       });
+      if (!mounted || epoch != connection.generation) return;
+      final current =
+          List<Map<String, dynamic>>.from(
+            data['groups'] ?? [],
+          ).where((g) => g['id'] == widget.id).firstOrNull ??
+          data['group'] as Map<String, dynamic>?;
+      final signature = jsonEncode(data);
+      if (signature != snapshotSignature)
+        setState(() {
+          snapshotSignature = signature;
+          group = current;
+          if (jobs.length <= historyLimit)
+            nextBefore = data['next_before'] as int?;
+          memberStates = Map<String, dynamic>.from(data['member_states'] ?? {});
+          allJobs = List<Map<String, dynamic>>.from(data['jobs']);
+          profiles = List<Map<String, dynamic>>.from(data['profiles'])
+              .where((p) => p['organization_id'] == current?['organization_id'])
+              .toList();
+          final older = jobs
+              .where(
+                (j) => !(data['jobs'] as List).any((n) => n['id'] == j['id']),
+              )
+              .toList();
+          jobs = List<Map<String, dynamic>>.from(data['jobs'])
+              .where(
+                (j) => j['kind'] == 'discussion' && j['group_id'] == widget.id,
+              )
+              .toList()
+              .reversed
+              .toList();
+          jobs.addAll(older);
+          loaded = true;
+          if (pending == null) error = null;
+        });
       if (current != null)
         connection.selectedOrganization.value =
             current['organization_id'] as String;
       final active = jobs.firstOrNull;
-      if (active != null &&
+      if (tab == 'posts' &&
+          active != null &&
           ['queued', 'running', 'needs_attention'].contains(active['state'])) {
         try {
           final result = await connection.request('organizations/inspect', {
@@ -99,7 +127,8 @@ class _GroupPageState extends State<GroupPage> {
                 previous != null) {
               result['artifact_draft'] = previous['artifact_draft'];
             }
-            setState(() => live[active['id'] as String] = result);
+            if (jsonEncode(previous) != jsonEncode(result))
+              setState(() => live[active['id'] as String] = result);
           }
         } catch (exception) {
           if (mounted && epoch == connection.generation) {
@@ -115,6 +144,33 @@ class _GroupPageState extends State<GroupPage> {
     } catch (exception) {
       if (mounted && epoch == connection.generation)
         setState(() => error = exception.toString());
+    } finally {
+      loading = false;
+    }
+  }
+
+  Future<void> loadOlder() async {
+    if (loading || nextBefore == null) return;
+    final epoch = connection.generation;
+    loading = true;
+    try {
+      final data = await connection.request('organizations/history', {
+        'group_id': widget.id,
+        'before': nextBefore,
+      });
+      if (!mounted || epoch != connection.generation) return;
+      setState(() {
+        final ids = jobs.map((j) => j['id']).toSet();
+        jobs.addAll(
+          List<Map<String, dynamic>>.from(data['jobs'])
+              .where((j) => j['kind'] == 'discussion' && !ids.contains(j['id']))
+              .toList()
+              .reversed,
+        );
+        nextBefore = data['next_before'] as int?;
+      });
+    } catch (exception) {
+      if (mounted) setState(() => error = exception.toString());
     } finally {
       loading = false;
     }
@@ -138,13 +194,12 @@ class _GroupPageState extends State<GroupPage> {
       error = null;
     });
     try {
-      await connection.request(
-        'organizations/${pending!.action}',
-        pending!.body,
-      );
+      await pending!.execute(connection);
       if (!mounted || epoch != connection.generation) return;
       final removed = pending!.action == 'remove_group';
       pending = null;
+      if (action == 'group' || removed)
+        await connection.request('organizations/directory');
       await refresh();
       if (removed && mounted) widget.coordinator.navigate(DashboardRoute());
       if (action == 'discuss') message.clear();
@@ -277,8 +332,8 @@ class _GroupPageState extends State<GroupPage> {
               key: PageStorageKey('discussion-draft-${job['id']}'),
               title: Text(
                 job['state'] == 'needs_attention'
-                    ? 'Saved action brief · Not finalized'
-                    : 'Action brief draft · In progress',
+                    ? 'Saved discussion artifact · Not finalized'
+                    : 'Discussion artifact draft · In progress',
               ),
               children: [
                 SizedBox(
@@ -337,35 +392,8 @@ class _GroupPageState extends State<GroupPage> {
     }
   }
 
-  Future<void> export(Map<String, dynamic> job, bool download) async {
-    try {
-      if (download) {
-        await downloadArtifact(
-          job['result'] as String,
-          'action-plan-${job['id']}.md',
-        );
-      } else {
-        await Clipboard.setData(ClipboardData(text: job['result'] as String));
-      }
-      if (mounted)
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              download ? 'Markdown download started.' : 'Markdown copied.',
-            ),
-          ),
-        );
-    } catch (_) {
-      if (mounted)
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Export failed. Select the artifact text to copy it manually.',
-            ),
-          ),
-        );
-    }
-  }
+  Future<void> export(Map<String, dynamic> job, bool download) =>
+      exportDiscussionArtifact(context, job, download: download);
 
   @override
   Widget build(BuildContext context) {
@@ -386,6 +414,7 @@ class _GroupPageState extends State<GroupPage> {
           ],
         ),
       );
+    final archived = group!['removed_at'] != null;
     final members = group!['members'] as List;
     final offline = members
         .where((id) => memberStates[id]?['active'] == false)
@@ -404,90 +433,111 @@ class _GroupPageState extends State<GroupPage> {
         child: ListView(
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
           children: [
-            Container(
-              padding: const EdgeInsets.all(24),
-              decoration: BoxDecoration(
-                color: const Color(0xff191512),
+            Card(
+              color: const Color(0xff191512),
+              shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: const Color(0xff332820)),
+                side: const BorderSide(color: Color(0xff332820)),
               ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      const Icon(
-                        Icons.forum_outlined,
-                        color: Color(0xffff7917),
-                        size: 30,
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Text(
-                          '# ${group!['name']}',
-                          style: Theme.of(context).textTheme.headlineSmall,
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.forum_outlined,
+                          color: Color(0xffff7917),
+                          size: 30,
                         ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    (group!['description'] as String).split('\n').first,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.bodyLarge,
-                  ),
-                  ExpansionTile(
-                    key: PageStorageKey('group-instructions-${widget.id}'),
-                    tilePadding: EdgeInsets.zero,
-                    title: const Text('Purpose and instructions'),
-                    childrenPadding: const EdgeInsets.only(bottom: 16),
-                    expandedCrossAxisAlignment: CrossAxisAlignment.start,
-                    children: [SelectableText(group!['description'] as String)],
-                  ),
-                  const SizedBox(height: 16),
-                  Wrap(
-                    spacing: 12,
-                    runSpacing: 8,
-                    children: [
-                      Chip(
-                        avatar: const Icon(Icons.people_outline, size: 18),
-                        label: Text('${members.length} members'),
-                      ),
-                      OutlinedButton(
-                        onPressed: busy || pending != null ? null : edit,
-                        child: const Text('Edit group'),
-                      ),
-                      OutlinedButton.icon(
-                        onPressed: busy || pending != null || occupied
-                            ? null
-                            : () async {
-                                if (await confirmRemoval(
-                                      context,
-                                      group!['name'] as String,
-                                      group: true,
-                                    ) &&
-                                    mounted) {
-                                  await submit('remove_group', {
-                                    'group_id': widget.id,
-                                  });
-                                }
-                              },
-                        icon: const Icon(Icons.delete_outline),
-                        label: const Text('Remove group'),
-                      ),
-                      FilledButton.icon(
-                        onPressed: busy || pending != null || occupied
-                            ? null
-                            : () => submit('discuss', {'group_id': widget.id}),
-                        icon: const Icon(Icons.play_arrow),
-                        label: const Text('Start discussion'),
-                      ),
-                    ],
-                  ),
-                ],
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            '# ${group!['name']}',
+                            style: Theme.of(context).textTheme.headlineSmall,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      (group!['description'] as String).split('\n').first,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodyLarge,
+                    ),
+                    ExpansionTile(
+                      key: PageStorageKey('group-instructions-${widget.id}'),
+                      tilePadding: EdgeInsets.zero,
+                      title: const Text('Purpose and instructions'),
+                      childrenPadding: const EdgeInsets.only(bottom: 16),
+                      expandedCrossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        SelectableText(
+                          group!['description'] as String,
+                          key: PageStorageKey(
+                            'group-purpose-text-${widget.id}',
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    Wrap(
+                      spacing: 12,
+                      runSpacing: 8,
+                      children: [
+                        Chip(
+                          avatar: const Icon(Icons.people_outline, size: 18),
+                          label: Text('${members.length} members'),
+                        ),
+                        OutlinedButton(
+                          onPressed: busy || pending != null || archived
+                              ? null
+                              : edit,
+                          child: const Text('Edit group'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed:
+                              busy || pending != null || occupied || archived
+                              ? null
+                              : () async {
+                                  if (await confirmRemoval(
+                                        context,
+                                        group!['name'] as String,
+                                        group: true,
+                                      ) &&
+                                      mounted) {
+                                    await submit('remove_group', {
+                                      'group_id': widget.id,
+                                    });
+                                  }
+                                },
+                          icon: const Icon(Icons.delete_outline),
+                          label: const Text('Remove group'),
+                        ),
+                        FilledButton.icon(
+                          onPressed:
+                              busy || pending != null || occupied || archived
+                              ? null
+                              : () =>
+                                    submit('discuss', {'group_id': widget.id}),
+                          icon: const Icon(Icons.play_arrow),
+                          label: const Text('Start discussion'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
               ),
             ),
+            if (archived)
+              const Padding(
+                padding: EdgeInsets.all(12),
+                child: Text(
+                  'Archived group · Saved discussions and downloads remain available.',
+                ),
+              ),
             const SizedBox(height: 16),
             Wrap(
               spacing: 8,
@@ -513,7 +563,7 @@ class _GroupPageState extends State<GroupPage> {
               ],
             ),
             const Divider(height: 24),
-            if (tab == 'posts') ...[
+            if (tab == 'posts' && !archived) ...[
               TextField(
                 controller: message,
                 minLines: 2,
@@ -528,7 +578,7 @@ class _GroupPageState extends State<GroupPage> {
               Align(
                 alignment: Alignment.centerRight,
                 child: FilledButton.icon(
-                  onPressed: busy || pending != null || occupied
+                  onPressed: busy || pending != null || occupied || archived
                       ? null
                       : () {
                           if (message.text.trim().isNotEmpty) {
@@ -577,6 +627,25 @@ class _GroupPageState extends State<GroupPage> {
                     'Discussion · ${timestamp(job['created_at'])} · ${job['state']}',
                   ),
                 ),
+                Card(
+                  child: ExpansionTile(
+                    key: PageStorageKey('discussion-context-${job['id']}'),
+                    title: const Text('Discussion context'),
+                    childrenPadding: const EdgeInsets.all(16),
+                    expandedCrossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SelectableText(
+                        job['group']?['description'] as String? ?? '',
+                        key: PageStorageKey(
+                          'discussion-context-text-${job['id']}',
+                        ),
+                      ),
+                      Text(
+                        'Members: ${(job['runs'] as List? ?? []).map((r) => r['profile']?['name'] ?? r['profile_id']).join(', ')}',
+                      ),
+                    ],
+                  ),
+                ),
                 if ((job['prompt'] as String? ?? '').isNotEmpty)
                   SelectableText('You: ${job['prompt']}'),
                 if ((job['progress'] as String? ?? '').isNotEmpty &&
@@ -618,6 +687,11 @@ class _GroupPageState extends State<GroupPage> {
                     post(job, round),
               ],
             ],
+            if (tab == 'posts' && nextBefore != null)
+              TextButton(
+                onPressed: loading ? null : loadOlder,
+                child: const Text('Load older discussions'),
+              ),
             if (tab == 'artifacts') ...[
               if (artifact != null)
                 TextButton(
@@ -640,7 +714,7 @@ class _GroupPageState extends State<GroupPage> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          'Action brief · ${timestamp(job['created_at'])}',
+                          'Discussion artifact · ${timestamp(job['created_at'])}',
                           style: Theme.of(context).textTheme.titleLarge,
                         ),
                         const SizedBox(height: 16),
@@ -695,6 +769,8 @@ class _GroupPageState extends State<GroupPage> {
                       value: memberStates[id]?['active'] == true,
                       onChanged:
                           busy ||
+                              archived ||
+                              pending != null ||
                               memberStates[id]?['active'] == true ||
                               ![
                                 'off',
@@ -726,10 +802,13 @@ class _GroupPageState extends State<GroupPage> {
                 style: Theme.of(context).textTheme.titleLarge,
               ),
               const SizedBox(height: 12),
-              SelectableText(group!['description'] as String),
+              SelectableText(
+                group!['description'] as String,
+                key: PageStorageKey('group-purpose-text-${widget.id}'),
+              ),
               const SizedBox(height: 24),
               const Text(
-                'This group has its own Herdr agent conversation. Your messages go to that agent, which coordinates the selected members and synthesizes an action brief. It chooses the discussion rounds and follow-ups. Posts and artifacts preserve the group description and members used for that discussion. Review recommendations before taking action.',
+                'This group has its own Herdr agent conversation. Your messages go to that agent, which coordinates the selected members and synthesizes an discussion artifact. It chooses the discussion rounds and follow-ups. Posts and artifacts preserve the group description and members used for that discussion. Review recommendations before taking action.',
               ),
             ],
           ],

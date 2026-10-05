@@ -21,6 +21,13 @@ not-a-model-line
 
 
 class ModelCatalogTests(unittest.TestCase):
+    def test_forward_parser_preserves_multiline_metadata_and_plain_ids(self):
+        source = 'provider/plain\nprovider/named\n' + json.dumps({'name': 'Named', 'variants': {'high': {}, 'hidden': {'disabled': True}}}, indent=2) + '\nprovider/final\n'
+        parsed = model_catalog.parse_models(source)
+        self.assertEqual([m['id'] for m in parsed], ['plain', 'named', 'final'])
+        self.assertEqual(parsed[1]['reasoning'], ['high'])
+        self.assertEqual(parsed[1]['name'], 'Named')
+
     def test_selection_rejects_missing_model_invalid_variant_and_v1(self):
         cli = Mock()
         profile = {'runtime': 'opencode', 'project': '.', 'provider': 'openai', 'model': 'test', 'reasoning': 'high'}
