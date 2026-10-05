@@ -29,13 +29,40 @@ class Updates:
         self.lock = threading.Lock()
         self.cached = None
         self.checked = 0
+        self.refreshing = False
+        self.retry_after = 0
+        self.check_error = None
 
     def snapshot(self, force=False):
         with self.lock:
-            if force or self.cached is None or time.monotonic() - self.checked > 3600:
-                self.cached = latest_release()
-                self.checked = time.monotonic()
-            latest = self.cached['tag_name']
+            now = time.monotonic()
+            refresh = (force or self.cached is None or now - self.checked > 3600)
+            refresh = refresh and not self.refreshing and now >= self.retry_after
+            if refresh:
+                self.refreshing = True
+            cached = self.cached
+            error = self.check_error
+        if refresh:
+            try:
+                release = latest_release()
+            except Exception as exception:
+                with self.lock:
+                    self.check_error = str(exception)
+                    self.retry_after = time.monotonic() + 60
+                    cached, error = self.cached, self.check_error
+            else:
+                with self.lock:
+                    self.cached = cached = release
+                    self.checked = time.monotonic()
+                    self.retry_after = 0
+                    self.check_error = error = None
+            finally:
+                with self.lock:
+                    self.refreshing = False
+        if cached is None:
+            raise ValueError(error or 'Release check is in progress. Try again shortly.')
+        with self.lock:
+            latest = cached['tag_name']
             version = self.root / 'VERSION'
             installed = version.read_text().strip() if version.exists() else 'unknown'
             status = json.loads(self.state.read_text()) if self.state.exists() else {'state': 'idle'}
@@ -44,8 +71,8 @@ class Updates:
             newer = installed == 'unknown' or (bool(re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', installed))
                 and tuple(map(int, latest[1:].split('.'))) > tuple(map(int, installed[1:].split('.'))))
             return dict(installed=installed, latest=latest, available=newer,
-                        supported=self.queue.is_dir(), release_url=self.cached['html_url'],
-                        notes=self.cached.get('body', '')[:12000], **status)
+                        supported=self.queue.is_dir(), release_url=cached['html_url'],
+                        notes=cached.get('body', '')[:12000], **status)
 
     def install(self, body):
         info = self.snapshot()

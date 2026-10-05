@@ -561,4 +561,8 @@ The project explorer uses Linux directory descriptors to prevent symlink swaps f
 
 Group history is paginated, with faster polling while a discussion is active on Posts and slower polling when idle or viewing another tab. Each discussion preserves a collapsed snapshot of its original purpose and roster. Archived groups remain available in the sidebar for reading saved discussions and downloading artifacts. Transcript downloads normalize member names from the recorded roster; the original agent-written JSON stays unchanged on disk.
 
-Browser sign-in uses an opaque HttpOnly, SameSite=Strict cookie valid for seven days. Refreshing or reopening the dashboard restores the session without storing the dashboard access token in browser storage. Sign out revokes that browser session. Gateway restart or token rotation invalidates existing sessions; HTTPS sign-in marks the cookie Secure. Bearer-token API access remains supported.
+Browser sign-in uses an opaque HttpOnly, SameSite=Strict cookie valid for seven days. Refreshing or reopening the dashboard restores the session without storing the dashboard access token in browser storage. Sign out revokes that browser session. Gateway restart or token rotation invalidates existing sessions; Secure cookies are enabled explicitly for HTTPS deployments as described below. Bearer-token API access remains supported.
+
+### HTTPS browser sessions
+
+For a trusted HTTPS reverse proxy, set `Environment=HERDR_WEB_COOKIE_SECURE=1` in a systemd drop-in for `herdr-web.service` (using `systemctl edit herdr-web`), then restart the service and preserve the original Host header. The gateway then marks session cookies Secure regardless of request headers. The default `0` supports direct HTTP LAN access and loopback SSH tunnels; direct HTTP LAN traffic is unencrypted. Use HTTPS or an SSH tunnel on untrusted networks. Invalid setting values stop startup.

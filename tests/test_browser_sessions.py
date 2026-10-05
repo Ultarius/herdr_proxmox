@@ -53,6 +53,9 @@ class BrowserSessionTests(unittest.TestCase):
 
     def test_expiry_rotation_and_secure_cookie(self):
         response = self.request('/api/session', 'POST', Authorization='Bearer secret', Origin=self.base.replace('http:', 'https:'))
+        self.assertNotIn('; Secure', response.headers['Set-Cookie'])
+        self.server.cookie_secure = True
+        response = self.request('/api/session', 'POST', Authorization='Bearer secret', Origin=self.base)
         self.assertIn('; Secure', response.headers['Set-Cookie'])
         key = response.headers['Set-Cookie'].split(';')[0].split('=', 1)[1]
         self.assertFalse(self.server.sessions.valid(key, 'rotated'))

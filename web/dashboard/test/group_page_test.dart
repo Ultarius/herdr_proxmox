@@ -1,3 +1,4 @@
+import 'dart:ui' show Tristate;
 import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -108,6 +109,53 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byType(GroupPage), findsOneWidget);
     expect(find.text('# Deployment review'), findsOneWidget);
+    await tester.binding.setSurfaceSize(const Size(600, 800));
+    await tester.pumpAndSettle();
+    final shell = Scaffold.of(
+      tester.element(find.byTooltip('Open navigation')),
+    );
+    await tester.tap(find.byTooltip('Open navigation'));
+    await tester.pumpAndSettle();
+    expect(shell.isDrawerOpen, isTrue);
+    await tester.tap(find.text('Deployment review'));
+    await tester.pumpAndSettle();
+    expect(shell.isDrawerOpen, isFalse);
+    await tester.binding.setSurfaceSize(null);
+    await tester.pumpAndSettle();
+    final semantics = tester.ensureSemantics();
+    await tester.pumpAndSettle();
+    expect(
+      tester
+              .getSemantics(find.byKey(const ValueKey('group-tab-posts')))
+              .getSemanticsData()
+              .flagsCollection
+              .isSelected ==
+          Tristate.isTrue,
+      isTrue,
+    );
+    await tester.tap(find.text('About'));
+    await tester.pumpAndSettle();
+    expect(
+      tester
+              .getSemantics(find.byKey(const ValueKey('group-tab-about')))
+              .getSemanticsData()
+              .flagsCollection
+              .isSelected ==
+          Tristate.isTrue,
+      isTrue,
+    );
+    expect(
+      tester
+              .getSemantics(find.byKey(const ValueKey('group-tab-posts')))
+              .getSemanticsData()
+              .flagsCollection
+              .isSelected ==
+          Tristate.isTrue,
+      isFalse,
+    );
+    await tester.tap(find.text('Posts'));
+    await tester.pumpAndSettle();
+    semantics.dispose();
     await tester.enterText(
       find.byType(TextField),
       'Ask Iris to review recovery',

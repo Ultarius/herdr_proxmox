@@ -1,6 +1,7 @@
 import 'package:flutter/services.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
+import 'project_git_panel.dart';
 
 class ProjectExplorerPage extends StatefulWidget {
   const ProjectExplorerPage({super.key});
@@ -16,6 +17,7 @@ class _ProjectExplorerPageState extends State<ProjectExplorerPage> {
   String? error;
   bool busy = false;
   bool showHidden = false;
+  bool gitView = false;
   int generation = 0;
 
   @override
@@ -170,6 +172,24 @@ class _ProjectExplorerPageState extends State<ProjectExplorerPage> {
             ],
           ),
           const SizedBox(height: 16),
+          SegmentedButton<bool>(
+            segments: const [
+              ButtonSegment(
+                value: false,
+                label: Text('Files'),
+                icon: Icon(Icons.folder_outlined),
+              ),
+              ButtonSegment(
+                value: true,
+                label: Text('Git changes'),
+                icon: Icon(Icons.account_tree_outlined),
+              ),
+            ],
+            selected: {gitView},
+            onSelectionChanged: (value) =>
+                setState(() => gitView = value.single),
+          ),
+          const SizedBox(height: 12),
           Wrap(
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
@@ -236,133 +256,152 @@ class _ProjectExplorerPageState extends State<ProjectExplorerPage> {
               'Listing limited to 1,000 items. Open a subfolder to explore further.',
             ),
           Expanded(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final wide = constraints.maxWidth >= 950;
-                final listing = Card(
-                  child: Column(
-                    children: [
-                      Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 20,
-                          vertical: 12,
-                        ),
-                        child: Row(
+            child: gitView
+                ? ProjectGitPanel(
+                    key: ValueKey(path),
+                    path: path,
+                    onOpen: (selected) {
+                      setState(() => gitView = false);
+                      open(selected);
+                    },
+                  )
+                : LayoutBuilder(
+                    builder: (context, constraints) {
+                      final wide = constraints.maxWidth >= 950;
+                      final listing = Card(
+                        child: Column(
                           children: [
-                            const Expanded(
-                              child: Text(
-                                'Name',
-                                style: TextStyle(fontWeight: FontWeight.bold),
+                            Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 20,
+                                vertical: 12,
+                              ),
+                              child: Row(
+                                children: [
+                                  const Expanded(
+                                    child: Text(
+                                      'Name',
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ),
+                                  if (wide)
+                                    const SizedBox(
+                                      width: 140,
+                                      child: Text('Modified'),
+                                    ),
+                                  const SizedBox(
+                                    width: 80,
+                                    child: Text(
+                                      'Size',
+                                      textAlign: TextAlign.right,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
-                            if (wide)
-                              const SizedBox(
-                                width: 140,
-                                child: Text('Modified'),
-                              ),
-                            const SizedBox(
-                              width: 80,
-                              child: Text('Size', textAlign: TextAlign.right),
+                            const Divider(height: 1),
+                            Expanded(
+                              child: entries.isEmpty
+                                  ? Center(
+                                      child: Text(
+                                        filter.isNotEmpty
+                                            ? 'No entries match your filter.'
+                                            : (directory?['entries'] as List? ??
+                                                      [])
+                                                  .isNotEmpty
+                                            ? 'Only hidden entries are present. Enable Show hidden.'
+                                            : 'This folder is empty.',
+                                      ),
+                                    )
+                                  : ListView.builder(
+                                      itemCount: entries.length,
+                                      itemBuilder: (context, index) {
+                                        final entry = entries[index];
+                                        final folder =
+                                            entry['kind'] == 'folder';
+                                        final enabled =
+                                            folder || entry['kind'] == 'file';
+                                        final modified = DateTime.tryParse(
+                                          '${entry['modified']}',
+                                        )?.toLocal();
+                                        return ListTile(
+                                          selected:
+                                              preview?['path'] == entry['path'],
+                                          leading: Icon(
+                                            folder
+                                                ? Icons.folder_outlined
+                                                : entry['kind'] == 'link'
+                                                ? Icons.link
+                                                : Icons.description_outlined,
+                                            color: folder
+                                                ? Theme.of(
+                                                    context,
+                                                  ).colorScheme.primary
+                                                : null,
+                                          ),
+                                          title: Text(
+                                            '${entry['name']}',
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                          subtitle: enabled
+                                              ? null
+                                              : Text(
+                                                  '${entry['kind']} · Cannot be opened',
+                                                ),
+                                          trailing: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              if (wide)
+                                                SizedBox(
+                                                  width: 140,
+                                                  child: Text(
+                                                    modified == null
+                                                        ? ''
+                                                        : '${modified.year}-${modified.month.toString().padLeft(2, '0')}-${modified.day.toString().padLeft(2, '0')}',
+                                                    style: Theme.of(
+                                                      context,
+                                                    ).textTheme.bodySmall,
+                                                  ),
+                                                ),
+                                              SizedBox(
+                                                width: 80,
+                                                child: Text(
+                                                  size(entry['size']),
+                                                  textAlign: TextAlign.right,
+                                                  style: Theme.of(
+                                                    context,
+                                                  ).textTheme.bodySmall,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                          onTap: busy || !enabled
+                                              ? null
+                                              : () => open(
+                                                  entry['path'] as String,
+                                                ),
+                                        );
+                                      },
+                                    ),
                             ),
                           ],
                         ),
-                      ),
-                      const Divider(height: 1),
-                      Expanded(
-                        child: entries.isEmpty
-                            ? Center(
-                                child: Text(
-                                  filter.isNotEmpty
-                                      ? 'No entries match your filter.'
-                                      : (directory?['entries'] as List? ?? [])
-                                            .isNotEmpty
-                                      ? 'Only hidden entries are present. Enable Show hidden.'
-                                      : 'This folder is empty.',
-                                ),
-                              )
-                            : ListView.builder(
-                                itemCount: entries.length,
-                                itemBuilder: (context, index) {
-                                  final entry = entries[index];
-                                  final folder = entry['kind'] == 'folder';
-                                  final enabled =
-                                      folder || entry['kind'] == 'file';
-                                  final modified = DateTime.tryParse(
-                                    '${entry['modified']}',
-                                  )?.toLocal();
-                                  return ListTile(
-                                    selected: preview?['path'] == entry['path'],
-                                    leading: Icon(
-                                      folder
-                                          ? Icons.folder_outlined
-                                          : entry['kind'] == 'link'
-                                          ? Icons.link
-                                          : Icons.description_outlined,
-                                      color: folder
-                                          ? Theme.of(
-                                              context,
-                                            ).colorScheme.primary
-                                          : null,
-                                    ),
-                                    title: Text(
-                                      '${entry['name']}',
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                    subtitle: enabled
-                                        ? null
-                                        : Text(
-                                            '${entry['kind']} · Cannot be opened',
-                                          ),
-                                    trailing: Row(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        if (wide)
-                                          SizedBox(
-                                            width: 140,
-                                            child: Text(
-                                              modified == null
-                                                  ? ''
-                                                  : '${modified.year}-${modified.month.toString().padLeft(2, '0')}-${modified.day.toString().padLeft(2, '0')}',
-                                              style: Theme.of(
-                                                context,
-                                              ).textTheme.bodySmall,
-                                            ),
-                                          ),
-                                        SizedBox(
-                                          width: 80,
-                                          child: Text(
-                                            size(entry['size']),
-                                            textAlign: TextAlign.right,
-                                            style: Theme.of(
-                                              context,
-                                            ).textTheme.bodySmall,
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                    onTap: busy || !enabled
-                                        ? null
-                                        : () => open(entry['path'] as String),
-                                  );
-                                },
-                              ),
-                      ),
-                    ],
+                      );
+                      if (preview == null) return listing;
+                      return wide
+                          ? Row(
+                              children: [
+                                Expanded(child: listing),
+                                const SizedBox(width: 16),
+                                Expanded(child: filePreview()),
+                              ],
+                            )
+                          : filePreview();
+                    },
                   ),
-                );
-                if (preview == null) return listing;
-                return wide
-                    ? Row(
-                        children: [
-                          Expanded(child: listing),
-                          const SizedBox(width: 16),
-                          Expanded(child: filePreview()),
-                        ],
-                      )
-                    : filePreview();
-              },
-            ),
           ),
         ],
       ),

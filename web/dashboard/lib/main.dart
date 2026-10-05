@@ -25,6 +25,7 @@ void main() {
             ),
         filledButtonTheme: FilledButtonThemeData(
           style: FilledButton.styleFrom(
+            foregroundColor: Colors.black,
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(7),
             ),
@@ -278,35 +279,51 @@ class _DashboardState extends State<Dashboard> {
                           ),
                         ),
                       const SizedBox(height: 16),
-                      TextField(
-                        controller: label,
-                        decoration: const InputDecoration(
-                          labelText: 'New workspace name',
+                      Card(
+                        child: ExpansionTile(
+                          key: const PageStorageKey('dashboard-project-setup'),
+                          leading: const Icon(Icons.create_new_folder_outlined),
+                          title: const Text('Add a project or workspace'),
+                          subtitle: const Text(
+                            'Clone a repository or use an existing directory',
+                          ),
+                          childrenPadding: const EdgeInsets.all(16),
+                          expandedCrossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            TextField(
+                              controller: label,
+                              decoration: const InputDecoration(
+                                labelText: 'New workspace name',
+                              ),
+                            ),
+                            TextField(
+                              controller: cwd,
+                              decoration: const InputDecoration(
+                                labelText:
+                                    'Existing project directory inside ~/projects',
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            Align(
+                              alignment: Alignment.centerLeft,
+                              child: FilledButton.icon(
+                                onPressed: busy
+                                    ? null
+                                    : () => action('create', {
+                                        'label': label.text.trim(),
+                                        'cwd': cwd.text.trim(),
+                                      }),
+                                icon: const Icon(Icons.add),
+                                label: const Text('Create workspace'),
+                              ),
+                            ),
+                            const SizedBox(height: 24),
+                            CloneProjectCard(
+                              onCloned: (path) => cwd.text = path,
+                            ),
+                          ],
                         ),
                       ),
-                      TextField(
-                        controller: cwd,
-                        decoration: const InputDecoration(
-                          labelText:
-                              'Existing project directory inside ~/projects',
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      Align(
-                        alignment: Alignment.centerLeft,
-                        child: FilledButton.icon(
-                          onPressed: busy
-                              ? null
-                              : () => action('create', {
-                                  'label': label.text.trim(),
-                                  'cwd': cwd.text.trim(),
-                                }),
-                          icon: const Icon(Icons.add),
-                          label: const Text('Create workspace'),
-                        ),
-                      ),
-                      const SizedBox(height: 24),
-                      CloneProjectCard(onCloned: (path) => cwd.text = path),
                       const SizedBox(height: 32),
                     ],
                     Text(
@@ -340,8 +357,18 @@ class _DashboardState extends State<Dashboard> {
                         ),
                       ),
                     const SizedBox(height: 24),
-                    const SelectableText(
-                      'Terminal access: ssh herdr@<container-ip>\nThen: cd ~/projects && herdr',
+                    const Card(
+                      child: ExpansionTile(
+                        title: Text('Terminal access'),
+                        leading: Icon(Icons.terminal),
+                        childrenPadding: EdgeInsets.all(16),
+                        children: [
+                          SelectableText(
+                            'ssh herdr@<container-ip>\nThen: cd ~/projects && herdr',
+                            key: PageStorageKey('dashboard-terminal-help'),
+                          ),
+                        ],
+                      ),
                     ),
                   ],
                   if (busy) const LinearProgressIndicator(),

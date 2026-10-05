@@ -278,7 +278,12 @@ class _GroupPageState extends State<GroupPage> {
                       style: const TextStyle(fontWeight: FontWeight.bold),
                     ),
                     const SizedBox(height: 6),
-                    SelectableText(part['content'] as String),
+                    FeedText(
+                      key: ValueKey(
+                        'reply-${job['id']}-$round-${part['profile_id'] ?? part['name']}',
+                      ),
+                      text: part['content'] as String,
+                    ),
                   ],
                 ),
               ),
@@ -548,17 +553,21 @@ class _GroupPageState extends State<GroupPage> {
                   'members': 'Members',
                   'about': 'About',
                 }.entries)
-                  TextButton(
-                    onPressed: () => setState(() {
-                      tab = item.key;
-                      artifact = null;
-                    }),
-                    style: TextButton.styleFrom(
-                      backgroundColor: tab == item.key
-                          ? const Color(0xff242424)
-                          : Colors.transparent,
+                  Semantics(
+                    key: ValueKey('group-tab-${item.key}'),
+                    selected: tab == item.key,
+                    child: TextButton(
+                      onPressed: () => setState(() {
+                        tab = item.key;
+                        artifact = null;
+                      }),
+                      style: TextButton.styleFrom(
+                        backgroundColor: tab == item.key
+                            ? const Color(0xff242424)
+                            : Colors.transparent,
+                      ),
+                      child: Text(item.value),
                     ),
-                    child: Text(item.value),
                   ),
               ],
             ),
@@ -620,72 +629,122 @@ class _GroupPageState extends State<GroupPage> {
                     'No discussion posts yet. Start a discussion to hear from the group.',
                   ),
                 ),
-              for (final job in jobs) ...[
-                Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                  child: Text(
-                    'Discussion · ${timestamp(job['created_at'])} · ${job['state']}',
-                  ),
-                ),
+              for (final job in jobs)
                 Card(
-                  child: ExpansionTile(
-                    key: PageStorageKey('discussion-context-${job['id']}'),
-                    title: const Text('Discussion context'),
-                    childrenPadding: const EdgeInsets.all(16),
-                    expandedCrossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      SelectableText(
-                        job['group']?['description'] as String? ?? '',
-                        key: PageStorageKey(
-                          'discussion-context-text-${job['id']}',
+                  margin: const EdgeInsets.only(bottom: 20),
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            const CircleAvatar(
+                              child: Icon(Icons.person_outline),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'You',
+                                    style: Theme.of(
+                                      context,
+                                    ).textTheme.titleMedium,
+                                  ),
+                                  Text(
+                                    timestamp(job['created_at']),
+                                    style: Theme.of(
+                                      context,
+                                    ).textTheme.bodySmall,
+                                  ),
+                                ],
+                              ),
+                            ),
+                            Chip(
+                              label: Text(switch (job['state']) {
+                                'artifact_ready' => 'Completed',
+                                'needs_attention' => 'Needs attention',
+                                'running' => 'In progress',
+                                'queued' => 'Queued',
+                                _ => '${job['state']}',
+                              }),
+                            ),
+                          ],
                         ),
-                      ),
-                      Text(
-                        'Members: ${(job['runs'] as List? ?? []).map((r) => r['profile']?['name'] ?? r['profile_id']).join(', ')}',
-                      ),
-                    ],
-                  ),
-                ),
-                if ((job['prompt'] as String? ?? '').isNotEmpty)
-                  SelectableText('You: ${job['prompt']}'),
-                if ((job['progress'] as String? ?? '').isNotEmpty &&
-                    job['state'] != 'artifact_ready')
-                  Text(job['progress'] as String),
-                if ((job['error'] as String? ?? '').isNotEmpty)
-                  Text(job['error'] as String),
-                if (job['state'] == 'needs_attention') ...[
-                  const Text(
-                    'The dashboard stopped waiting for this discussion. If the agents have finished, recover their saved artifact and transcript without sending another prompt.',
-                  ),
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: OutlinedButton.icon(
-                      onPressed: busy || pending != null
-                          ? null
-                          : () => submit('recover', {'job_id': job['id']}),
-                      icon: const Icon(Icons.restore_page_outlined),
-                      label: const Text('Recover saved artifact'),
+                        const SizedBox(height: 16),
+                        FeedText(
+                          key: ValueKey('prompt-${job['id']}'),
+                          text: (job['prompt'] as String? ?? '').isNotEmpty
+                              ? job['prompt'] as String
+                              : 'Started a discussion with the group.',
+                        ),
+                        const Divider(height: 28),
+                        ExpansionTile(
+                          key: PageStorageKey(
+                            'discussion-context-${job['id']}',
+                          ),
+                          tilePadding: EdgeInsets.zero,
+                          title: const Text('Discussion context'),
+                          expandedCrossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            SelectableText(
+                              job['group']?['description'] as String? ?? '',
+                              key: PageStorageKey(
+                                'discussion-context-text-${job['id']}',
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              'Members: ${(job['runs'] as List? ?? []).map((r) => r['profile']?['name'] ?? r['profile_id']).join(', ')}',
+                            ),
+                            const SizedBox(height: 16),
+                          ],
+                        ),
+                        if ((job['progress'] as String? ?? '').isNotEmpty &&
+                            job['state'] != 'artifact_ready')
+                          Text(job['progress'] as String),
+                        if ((job['error'] as String? ?? '').isNotEmpty)
+                          Text(job['error'] as String),
+                        if (job['state'] == 'needs_attention') ...[
+                          const Text(
+                            'The dashboard stopped waiting for this discussion. If the agents have finished, recover their saved artifact and transcript without sending another prompt.',
+                          ),
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: OutlinedButton.icon(
+                              onPressed: busy || pending != null
+                                  ? null
+                                  : () => submit('recover', {
+                                      'job_id': job['id'],
+                                    }),
+                              icon: const Icon(Icons.restore_page_outlined),
+                              label: const Text('Recover saved artifact'),
+                            ),
+                          ),
+                        ],
+                        if (job == jobs.firstOrNull &&
+                            [
+                              'queued',
+                              'running',
+                              'needs_attention',
+                            ].contains(job['state']))
+                          liveDiscussion(job),
+                        for (final round
+                            in ((job['contributions'] as List? ?? [])
+                                .map((p) => p['round'] as int)
+                                .toSet()
+                                .toList()
+                              ..sort((a, b) => b.compareTo(a))))
+                          if ((job['contributions'] as List? ?? []).any(
+                            (part) => part['round'] == round,
+                          ))
+                            post(job, round),
+                      ],
                     ),
                   ),
-                ],
-                if (job == jobs.firstOrNull &&
-                    [
-                      'queued',
-                      'running',
-                      'needs_attention',
-                    ].contains(job['state']))
-                  liveDiscussion(job),
-                for (final round
-                    in ((job['contributions'] as List? ?? [])
-                        .map((p) => p['round'] as int)
-                        .toSet()
-                        .toList()
-                      ..sort((a, b) => b.compareTo(a))))
-                  if ((job['contributions'] as List? ?? []).any(
-                    (part) => part['round'] == round,
-                  ))
-                    post(job, round),
-              ],
+                ),
             ],
             if (tab == 'posts' && nextBefore != null)
               TextButton(
@@ -816,4 +875,51 @@ class _GroupPageState extends State<GroupPage> {
       ),
     );
   }
+}
+
+/// Keeps long posts readable without hiding the rest of the discussion feed.
+class FeedText extends StatefulWidget {
+  const FeedText({super.key, required this.text});
+  final String text;
+  @override
+  State<FeedText> createState() => _FeedTextState();
+}
+
+class _FeedTextState extends State<FeedText> {
+  bool expanded = false;
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final style = Theme.of(
+        context,
+      ).textTheme.bodyMedium!.copyWith(height: 1.5);
+      final preview = TextPainter(
+        text: TextSpan(text: widget.text, style: style),
+        textDirection: Directionality.of(context),
+        textScaler: MediaQuery.textScalerOf(context),
+        maxLines: 5,
+      )..layout(maxWidth: constraints.maxWidth);
+      final overflows = preview.didExceedMaxLines;
+      preview.dispose();
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (expanded || !overflows)
+            SelectableText(widget.text, style: style)
+          else
+            Text(
+              widget.text,
+              style: style,
+              maxLines: 5,
+              overflow: TextOverflow.ellipsis,
+            ),
+          if (overflows)
+            TextButton(
+              onPressed: () => setState(() => expanded = !expanded),
+              child: Text(expanded ? 'Show less' : 'Show more'),
+            ),
+        ],
+      );
+    },
+  );
 }

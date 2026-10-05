@@ -176,7 +176,13 @@ void main() {
       await tester.enterText(orgFields.at(1), 'Build reliable software');
       await tester.tap(find.text('Save organization'));
       await tester.pumpAndSettle();
-      expect(find.text('Engineering'), findsOneWidget);
+      expect(find.byKey(const ValueKey('organization-name')), findsOneWidget);
+      expect(
+        tester
+            .widget<Text>(find.byKey(const ValueKey('organization-name')))
+            .data,
+        'Engineering',
+      );
       await tester.tap(find.text('Hire agent'));
       await tester.pumpAndSettle();
       final hireFields = find.descendant(

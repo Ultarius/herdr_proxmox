@@ -303,23 +303,60 @@ class _OrganizationPageState extends State<OrganizationPage> {
                         ),
                       ),
                     if (org != null) ...[
-                      if (MediaQuery.sizeOf(context).width < 1000 ||
-                          view != 'chart') ...[
-                        const SizedBox(height: 24),
-                        Text(
-                          org['purpose'],
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
-                      ],
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const CircleAvatar(
+                            radius: 26,
+                            child: Icon(Icons.business_outlined),
+                          ),
+                          const SizedBox(width: 16),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  org['name'],
+                                  key: const ValueKey('organization-name'),
+                                  style: Theme.of(
+                                    context,
+                                  ).textTheme.headlineMedium,
+                                ),
+                                const SizedBox(height: 6),
+                                Text(
+                                  org['purpose'],
+                                  style: Theme.of(context).textTheme.bodyMedium,
+                                ),
+                                const SizedBox(height: 10),
+                                Text(
+                                  '${profiles.length} agents · ${state.groups.where((g) => g['organization_id'] == org['id']).length} groups',
+                                  style: Theme.of(context).textTheme.bodySmall,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
                       if (view != 'chart' &&
                           (org['instructions'] as String).isNotEmpty)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 8),
-                          child: Text(org['instructions']),
+                        Card(
+                          child: ExpansionTile(
+                            key: PageStorageKey(
+                              'organization-instructions-${org['id']}',
+                            ),
+                            title: const Text('Shared instructions'),
+                            leading: const Icon(Icons.description_outlined),
+                            childrenPadding: const EdgeInsets.all(16),
+                            expandedCrossAxisAlignment:
+                                CrossAxisAlignment.start,
+                            children: [Text(org['instructions'])],
+                          ),
                         ),
                       const SizedBox(height: 12),
                       Wrap(
                         spacing: 12,
+                        runSpacing: 8,
                         children: [
                           OutlinedButton(
                             onPressed: state.busy
@@ -417,18 +454,48 @@ class _OrganizationPageState extends State<OrganizationPage> {
                                       context,
                                     ).textTheme.titleMedium,
                                   ),
+                                  const SizedBox(height: 8),
                                   Text(
-                                    '${profile['runtime']} · Persona v${profile['version']} · ${profile['project']}',
-                                  ),
-                                  Text('Model: ${savedModelLabel(profile)}'),
-                                  Text(
-                                    'Reasoning: ${savedReasoningLabel(profile)}',
-                                  ),
-                                  Text(
-                                    'Reports to: ${profiles.where((p) => p['id'] == profile['manager_id']).map((p) => p['name']).firstOrNull ?? 'Organization owner'}',
+                                    'Model: ${savedModelLabel(profile)}',
+                                    style: Theme.of(
+                                      context,
+                                    ).textTheme.bodyMedium,
                                   ),
                                   const SizedBox(height: 8),
-                                  Text(profile['persona']),
+                                  ExpansionTile(
+                                    key: PageStorageKey(
+                                      'agent-persona-${profile['id']}',
+                                    ),
+                                    tilePadding: EdgeInsets.zero,
+                                    title: const Text(
+                                      'Persona and responsibilities',
+                                    ),
+                                    childrenPadding: const EdgeInsets.only(
+                                      bottom: 12,
+                                    ),
+                                    expandedCrossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        '${profile['runtime']} · Persona v${profile['version']}',
+                                      ),
+                                      const SizedBox(height: 8),
+                                      SelectableText(
+                                        'Project: ${profile['project']}',
+                                        key: PageStorageKey(
+                                          'agent-project-${profile['id']}',
+                                        ),
+                                      ),
+                                      Text(
+                                        'Reasoning: ${savedReasoningLabel(profile)}',
+                                      ),
+                                      Text(
+                                        'Reports to: ${profiles.where((p) => p['id'] == profile['manager_id']).map((p) => p['name']).firstOrNull ?? 'Organization owner'}',
+                                      ),
+                                      const Divider(height: 24),
+                                      Text(profile['persona']),
+                                    ],
+                                  ),
                                   Wrap(
                                     spacing: 12,
                                     children: [
@@ -605,7 +672,7 @@ class _OrganizationFormState extends State<OrganizationForm> {
       widget.organization == null ? 'Create organization' : 'Edit organization',
     ),
     content: SizedBox(
-      width: 580,
+      width: 800,
       child: SingleChildScrollView(
         child: Form(
           key: form,
@@ -613,12 +680,14 @@ class _OrganizationFormState extends State<OrganizationForm> {
             mainAxisSize: MainAxisSize.min,
             children: [
               field(name, 'Organization name'),
+              const SizedBox(height: 16),
               field(purpose, 'Purpose', limit: 2000, lines: 3),
+              const SizedBox(height: 16),
               field(
                 instructions,
                 'Shared instructions',
                 limit: 8000,
-                lines: 4,
+                lines: 8,
                 required: false,
               ),
             ],

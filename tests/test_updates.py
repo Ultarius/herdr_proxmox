@@ -5,6 +5,7 @@ import shutil
 import tarfile
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 from contextlib import ExitStack
@@ -29,6 +30,32 @@ class UpdateTests(unittest.TestCase):
                 self.assertEqual(service.snapshot()['latest'], 'v0.0.2')
                 self.assertEqual(service.snapshot(force=True)['latest'], 'v0.0.3')
                 self.assertEqual(fetch.call_count, 2)
+
+    def test_refresh_does_not_block_cached_snapshot_and_failure_keeps_release(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            service = updates.Updates(root, root / 'queue', root / 'status.json')
+            release = dict(tag_name='v0.0.2', html_url='https://example.test/old')
+            with patch.object(updates, 'latest_release', return_value=release):
+                service.snapshot()
+            entered, finish = threading.Event(), threading.Event()
+            def slow_fetch():
+                entered.set()
+                if not finish.wait(3):
+                    raise RuntimeError('Test refresh timed out')
+                raise OSError('Network unavailable')
+            with patch.object(updates, 'latest_release', side_effect=slow_fetch) as fetch:
+                worker_thread = threading.Thread(target=lambda: service.snapshot(force=True))
+                worker_thread.start()
+                self.assertTrue(entered.wait(2))
+                try:
+                    self.assertEqual(service.snapshot()['latest'], 'v0.0.2')
+                finally:
+                    finish.set()
+                    worker_thread.join(3)
+                self.assertFalse(worker_thread.is_alive())
+                self.assertEqual(service.snapshot(force=True)['latest'], 'v0.0.2')
+                self.assertEqual(fetch.call_count, 1)
 
     def test_bad_checksum_does_not_stop_gateway(self):
         with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:

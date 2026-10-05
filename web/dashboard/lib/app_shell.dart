@@ -49,6 +49,13 @@ class _AppShellState extends State<AppShell> {
     super.dispose();
   }
 
+  final shellKey = GlobalKey<ScaffoldState>();
+
+  void navigate(AppRoute route) {
+    shellKey.currentState?.closeDrawer();
+    widget.coordinator.navigate(route);
+  }
+
   Widget navigation(
     List<Map<String, dynamic>> profiles,
     List<Map<String, dynamic>> groups,
@@ -114,7 +121,7 @@ class _AppShellState extends State<AppShell> {
                 '${profile['name']}',
                 style: const TextStyle(fontSize: 12),
               ),
-              onTap: () => widget.coordinator.navigate(OrganizationRoute()),
+              onTap: () => navigate(OrganizationRoute()),
             ),
           heading('GROUPS'),
           if (groups.isEmpty)
@@ -192,7 +199,7 @@ class _AppShellState extends State<AppShell> {
           contentPadding: const EdgeInsets.symmetric(horizontal: 10),
           leading: Icon(icon, size: 17),
           title: Text(label, style: const TextStyle(fontSize: 12)),
-          onTap: () => widget.coordinator.navigate(route),
+          onTap: () => navigate(route),
         ),
       );
 
@@ -224,6 +231,7 @@ class _AppShellState extends State<AppShell> {
           builder: (context, constraints) {
             final desktop = constraints.maxWidth >= 1000;
             return Scaffold(
+              key: shellKey,
               drawer: desktop
                   ? null
                   : Drawer(child: navigation(profiles, groups)),
@@ -269,9 +277,7 @@ class _AppShellState extends State<AppShell> {
                                                   .selectedOrganization
                                                   .value =
                                               item['id'];
-                                          widget.coordinator.navigate(
-                                            OrganizationRoute(),
-                                          );
+                                          navigate(OrganizationRoute());
                                         },
                                         child: AnimatedContainer(
                                           duration: const Duration(
@@ -317,9 +323,7 @@ class _AppShellState extends State<AppShell> {
                           padding: const EdgeInsets.only(bottom: 18),
                           child: IconButton(
                             tooltip: 'Manage organizations',
-                            onPressed: () => widget.coordinator.navigate(
-                              OrganizationRoute(),
-                            ),
+                            onPressed: () => navigate(OrganizationRoute()),
                             icon: const Icon(Icons.add),
                           ),
                         ),

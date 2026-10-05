@@ -20,6 +20,7 @@ from project_files import ProjectJobs, clone_repository, project_directory
 from cli_setup import CliSetup
 import model_catalog
 import project_explorer
+import project_git
 from run_logs import RunLogs
 from ssh_access import SshAccess
 from dashboard_access import DashboardAccess, configured_bind
@@ -136,7 +137,7 @@ class Handler(BaseHTTPRequestHandler):
             return ''
 
     def session_cookie(self, key, age):
-        secure = '; Secure' if self.headers.get('Origin', '').startswith('https://') else ''
+        secure = '; Secure' if getattr(self.server, 'cookie_secure', False) else ''
         return f'herdr_session={key}; Path=/api/; Max-Age={age}; HttpOnly; SameSite=Strict{secure}'
 
     def authenticated(self):
@@ -309,7 +310,7 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'remove_agent', 'remove_group')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/projects/clone', '/api/projects/browse', '/api/organizations/history', '/api/organizations/activity'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/organizations/history', '/api/organizations/activity'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -321,6 +322,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, self.server.organizations.activity(body))
             elif self.path == '/api/organizations/history':
                 self.reply(200, self.server.organizations.history(body))
+            elif self.path == '/api/projects/git':
+                self.reply(200, project_git.inspect(PROJECTS, body))
             elif self.path == '/api/projects/browse':
                 self.reply(200, project_explorer.browse(PROJECTS, body))
             elif self.path == '/api/projects/clone':
@@ -353,7 +356,7 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(503, {'error': 'Organization storage is unavailable. Check the gateway service logs and available disk space.'})
 
 
-def serve_gateway(bind, port, policy, token, services):
+def serve_gateway(bind, port, policy, token, services, cookie_secure=False):
     sessions = BrowserSessions()
     while True:
         active_bind = configured_bind(policy, bind)
@@ -361,6 +364,7 @@ def serve_gateway(bind, port, policy, token, services):
         port = server.server_port
         server.token = token
         server.sessions = sessions
+        server.cookie_secure = cookie_secure
         server.updates = Updates()
         for name, service in services.items():
             setattr(server, name, service)
@@ -381,6 +385,9 @@ def main():
     token = TOKEN_FILE.read_text().strip()
     if len(token) < 32:
         raise SystemExit('Dashboard token must contain at least 32 characters.')
+    secure_setting = os.environ.get('HERDR_WEB_COOKIE_SECURE', '0')
+    if secure_setting not in ('0', '1'):
+        raise SystemExit('HERDR_WEB_COOKIE_SECURE must be 0 or 1.')
     bind = os.environ.get('HERDR_WEB_BIND', '127.0.0.1')
     if bind not in ('127.0.0.1', '0.0.0.0'):
         raise SystemExit('Invalid HERDR_WEB_BIND.')
@@ -391,7 +398,7 @@ def main():
     ssh_access = SshAccess()
     projects = ProjectJobs(PROJECTS, DATABASE.with_name('projects.sqlite3'))
     try:
-        serve_gateway(bind, 8787, policy, token, {'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command)})
+        serve_gateway(bind, 8787, policy, token, {'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command)}, cookie_secure=secure_setting == '1')
     finally:
         projects.close()
         organizations.close()
