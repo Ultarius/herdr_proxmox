@@ -5,6 +5,7 @@ import json
 import uuid
 import unittest
 import threading
+import time
 from unittest.mock import patch
 from contextlib import closing
 import test_organizations as fixtures
@@ -168,8 +169,20 @@ class CollaborationTests(unittest.TestCase):
         prompts = [a for a, _ in self.calls if a[:2] == ('agent', 'prompt') and a[3].startswith('User message:\n' + body['prompt'] + '\n')]
         self.assertEqual(len(prompts), 1)
         self.assertIn('--wait', prompts[0])
+        self.assertIn('180000', prompts[0])
         inspected = self.store.action('inspect', dict(request_id=uuid.uuid4().hex, organization_id=self.org, profile_id=self.max))
         self.assertEqual(inspected['status'], 'idle')
+
+    def test_chat_wait_seconds_is_bounded_and_forwarded(self):
+        for value in (5, 3601, '180', True):
+            with self.assertRaises(ValueError):
+                self.store.action('chat', dict(request_id=uuid.uuid4().hex, organization_id=self.org,
+                                                profile_id=self.max, prompt='Hi', wait_seconds=value))
+        job_id = self.action('chat', organization_id=self.org, profile_id=self.max, prompt='Hi', wait_seconds=1800)
+        self.drain()
+        self.assertEqual(self.job(job_id)['wait_seconds'], 1800)
+        prompt = next(a for a, _ in self.calls if a[:2] == ('agent', 'prompt') and a[3].startswith('User message:'))
+        self.assertIn('1800000', prompt)
 
     def test_missing_chat_reply_does_not_fall_back_to_terminal_snapshot(self):
         self.writes = False
@@ -524,3 +537,28 @@ class CollaborationTests(unittest.TestCase):
         self.assertTrue(saved['result'])
         self.assertNotIn('runs', saved)
         self.assertTrue(all(p['organization_id'] == self.org for p in activity['profiles']))
+
+    def test_slow_agent_does_not_block_other_agent_and_same_agent_is_exclusive(self):
+        entered, release = threading.Event(), threading.Event()
+        simulate = self.store.command
+        def delayed(*args, **kwargs):
+            if args[:2] == ('agent', 'prompt') and args[3].startswith('User message:\nSlow task'):
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError('Test did not release agent')
+            return simulate(*args, **kwargs)
+        self.store.command = delayed
+        try:
+            slow = self.action('chat', organization_id=self.org, profile_id=self.max, prompt='Slow task')
+            self.assertTrue(entered.wait(2))
+            with self.assertRaisesRegex(ValueError, 'queued or running'):
+                self.action('chat', organization_id=self.org, profile_id=self.max, prompt='Overlapping task')
+            fast = self.action('chat', organization_id=self.org, profile_id=self.iris, prompt='Independent task')
+            deadline = time.monotonic() + 2
+            while self.job(fast)['state'] in ('queued', 'running') and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(self.job(fast)['state'], 'answered')
+            self.assertEqual(self.job(slow)['state'], 'running')
+        finally:
+            release.set()
+            self.drain()

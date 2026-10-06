@@ -1,7 +1,7 @@
 """Durable organization records and explicit, non-retrying Herdr jobs."""
 from project_files import project_directory
 from permissions import accessible_paths, permission_mode, prepare_permissions
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
@@ -67,14 +67,17 @@ def launch_arguments(profile):
 
 
 class OrganizationStore:
-    def __init__(self, path, projects, command, runtime_status=None, model_validator=None):
+    def __init__(self, path, projects, command, runtime_status=None, model_validator=None, integration=None):
         self.path = Path(path)
         self.projects = Path(projects).resolve()
         self.command = command
         self.runtime_status = runtime_status
         self.model_validator = model_validator
+        self.integration = integration
         self.lock = threading.RLock()
-        self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix='organization')
+        self.worker = ThreadPoolExecutor(max_workers=4, thread_name_prefix='organization')
+        self.agent_locks = {}
+        self.futures = set()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with closing(self.connect()) as db, db:
             db.executescript('''
@@ -190,7 +193,32 @@ class OrganizationStore:
                         state['status'] = 'unavailable'
             states[profile['id']] = state
         data['member_states'] = states
+        # Integration drift is measured in the background, so a long-lived agent
+        # keeps working and the operator learns about it when they return.
+        data['integration'] = self.integration.snapshot() if self.integration is not None else {
+            'alerts': [], 'checked': None, 'interval': None}
         return data
+
+    def active_checkouts(self):
+        """Where each launched agent works, for the background Git watcher.
+
+        Read-only: used to decide which checkouts to inspect. Worktree launches
+        report the isolated checkout, so an agent keeps its own directory.
+        """
+        with self.lock, closing(self.connect()) as db:
+            rows = [json.loads(r['data']) for r in db.execute(
+                "SELECT data FROM jobs WHERE json_extract(data, '$.kind')='launch' "
+                "AND json_extract(data, '$.state')='persona_sent' ORDER BY rowid DESC")]
+        found = {}
+        for job in rows:
+            profile = job.get('profile') or {}
+            path = job.get('worktree_path') or job.get('source_project') or profile.get('project')
+            if not path:
+                continue
+            # Preserve every agent; the watcher reuses measurements for shared checkouts.
+            found.setdefault(job.get('profile_id') or profile.get('id'), (profile.get('id') or job.get('profile_id'), job['id'],
+                                         profile.get('name', ''), str(path)))
+        return list(found.values())
 
     def state_snapshot(self):
         data = self.snapshot()
@@ -437,8 +465,22 @@ class OrganizationStore:
             response = {'id': item['id']}
             db.execute('INSERT INTO requests VALUES (?, ?, ?)', (key, fingerprint, json.dumps(response)))
         if submitted:
-            self.worker.submit(self.execute, submitted)
+            with self.lock:
+                future = self.worker.submit(self.execute, submitted)
+                self.futures.add(future)
+                future.add_done_callback(self._finished)
         return response
+
+    def _finished(self, future):
+        with self.lock:
+            self.futures.discard(future)
+
+    def wait_idle(self, timeout=10):
+        with self.lock:
+            futures = list(self.futures)
+        _, pending = wait(futures, timeout=timeout)
+        if pending:
+            raise TimeoutError('Organization jobs did not finish.')
 
     def update_job(self, job_id, **changes):
         with self.lock, closing(self.connect()) as db, db:
@@ -477,6 +519,21 @@ class OrganizationStore:
         raise ValueError('New pane shell did not become available. Inspect its terminal over SSH.')
 
     def execute(self, job_id):
+        with self.lock, closing(self.connect()) as db:
+            job = self.get(db, 'jobs', job_id)
+            ids = sorted(set(job.get('participants') or [job.get('profile_id')]) - {None})
+            locks = [self.agent_locks.setdefault(profile_id, threading.RLock()) for profile_id in ids]
+        # Ordered acquisition also protects discussions/delegations involving
+        # several agents, without holding the global store lock during work.
+        for lock in locks:
+            lock.acquire()
+        try:
+            self._execute(job_id)
+        finally:
+            for lock in reversed(locks):
+                lock.release()
+
+    def _execute(self, job_id):
         job = self.update_job(job_id, state='running')
         try:
             if job['kind'] in ('chat', 'discussion', 'input'):

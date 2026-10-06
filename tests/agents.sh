@@ -4,10 +4,10 @@ set -Eeuo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 source "$repo/install/agents-install.sh"
 log=$(mktemp)
-trap 'rm -f -- "$log"' EXIT
+trap 'rm -f -- "$log" "$log.config"' EXIT
 curl() {
   local output
-  [[ " $* " == *' --compressed '* ]] || return 1
+  [[ " $* " == *' --compressed '* && " $* " == *' --http1.1 '* && " $* " == *' --retry-all-errors '* ]] || return 1
   while (($#)); do
     if [[ $1 == -o ]]; then output=$2; break; fi
     shift
@@ -17,9 +17,23 @@ curl() {
 runuser() {
   [[ $1 == -u && $2 == herdr && $3 == -- ]]
   printf '%s\n' "$*" >>"$log"
+  if [[ " $* " == *' bash -s '* ]]; then
+    local argument config=''
+    for argument in "$@"; do
+      [[ $argument != CURL_HOME=* ]] || config=${argument#CURL_HOME=}
+    done
+    [[ -n $config && -r $config/.curlrc ]]
+    grep -qx 'http1.1' "$config/.curlrc"
+    grep -qx 'retry-all-errors' "$config/.curlrc"
+    grep -qx 'retry = 3' "$config/.curlrc"
+    printf '%s\n' "$config" >>"$log.config"
+  fi
   [[ ${FAIL_AGENTS:-0} == 0 || "$*" != *'npm install'* ]]
 }
 install_agents
+while IFS= read -r config; do
+  [[ ! -e $config ]] || { echo 'Temporary curl configuration leaked.' >&2; exit 1; }
+done <"$log.config"
 for command in codex claude opencode agy; do
   grep -q "/home/herdr/.local/bin/$command --version" "$log"
 done
@@ -35,4 +49,7 @@ if FAIL_AGENTS=1 bash -c 'source "$1"; install_agents' _ "$repo/install/agents-i
   echo 'Installation failure was swallowed.' >&2
   exit 1
 fi
+while IFS= read -r config; do
+  [[ ! -e $config ]] || { echo 'Temporary curl configuration leaked after failure.' >&2; exit 1; }
+done <"$log.config"
 printf 'Agent installer mock tests passed.\n'

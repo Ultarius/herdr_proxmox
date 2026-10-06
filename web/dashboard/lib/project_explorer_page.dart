@@ -4,7 +4,8 @@ import 'dashboard_bloc.dart';
 import 'project_git_panel.dart';
 
 class ProjectExplorerPage extends StatefulWidget {
-  const ProjectExplorerPage({super.key});
+  const ProjectExplorerPage({super.key, this.initialPath = ''});
+  final String initialPath;
   @override
   State<ProjectExplorerPage> createState() => _ProjectExplorerPageState();
 }
@@ -23,7 +24,9 @@ class _ProjectExplorerPageState extends State<ProjectExplorerPage> {
   @override
   void initState() {
     super.initState();
-    open('');
+    // A notice can link straight to one checkout's Git changes.
+    if (widget.initialPath.isNotEmpty) gitView = true;
+    open(widget.initialPath);
   }
 
   Future<void> open(String selected) async {

@@ -175,7 +175,8 @@ def action(store, db, name, body, org):
             raise ValueError('Unsupported terminal key.')
         item.update(profile_id=runs[0]['profile_id'], key=key)
     elif name == 'chat':
-        item.update(profile_id=runs[0]['profile_id'], prompt=text(body, 'prompt', 8000))
+        item.update(profile_id=runs[0]['profile_id'], prompt=text(body, 'prompt', 8000),
+                    wait_seconds=wait_seconds(body), integration_event=body.get('integration_event'))
     else:
         item.update(group_id=group['id'], group=group, group_run=group_run,
                     prompt=text(body, 'prompt', 8000, optional=True) or group['description'],
@@ -196,11 +197,19 @@ def current_run(store, run, ready=True):
     return current
 
 
-def prompt_and_wait(store, run, prompt):
+def prompt_and_wait(store, run, prompt, wait=180):
     run = current_run(store, run)
-    store.command('agent', 'prompt', run['alias'], prompt, '--wait', '--timeout', '180000', timeout=190)
+    store.command('agent', 'prompt', run['alias'], prompt, '--wait', '--timeout', str(wait * 1000), timeout=wait + 10)
     # Blocked, replaced, or released bindings never count as completed turns.
     current_run(store, run)
+
+
+def wait_seconds(body):
+    """Bound how long a chat request waits for the agent's reply file."""
+    value = body.get('wait_seconds', 180)
+    if type(value) is not int or not 30 <= value <= 3600:
+        raise ValueError('Wait seconds must be an integer between 30 and 3600.')
+    return value
 
 
 def read_contribution(path, limit=40000):
@@ -322,7 +331,7 @@ def execute(store, job):
             "the user's request authorizes it. Finish after saving. If you cannot write the file, "
             "report that limitation rather than claiming delivery."
         )
-        prompt_and_wait(store, run, prompt)
+        prompt_and_wait(store, run, prompt, job.get('wait_seconds', 180))
         result = read_contribution(reply)
         store.update_job(job['id'], state='answered', result=result, result_format='markdown',
                          reply_name='reply.md')

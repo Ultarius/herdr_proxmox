@@ -16,6 +16,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from organizations import OrganizationStore
+from integration import IntegrationWatcher
+from integration_coordinator import IntegrationCoordinator
 from project_files import ProjectJobs, clone_repository, project_directory
 from cli_setup import CliSetup
 import model_catalog
@@ -183,7 +185,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/api/'):
             if not self.authenticated():
                 return
-            if self.path not in ('/api/snapshot', '/api/organizations', '/api/organizations/directory', '/api/organizations/state', '/api/projects/jobs', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates', '/api/models'):
+            if self.path not in ('/api/snapshot', '/api/organizations', '/api/organizations/directory', '/api/organizations/state', '/api/projects/jobs', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates', '/api/models', '/api/integration'):
                 self.reply(404, {'error': 'Unknown endpoint.'})
                 return
             try:
@@ -192,6 +194,10 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if self.path == '/api/models':
                     self.reply(200, model_catalog.snapshot())
+                    return
+                if self.path == '/api/integration':
+                    # Served from memory; the watcher owns the Git work.
+                    self.reply(200, self.server.integration.snapshot())
                     return
                 if self.path == '/api/updates':
                     self.reply(200, self.server.updates.snapshot())
@@ -310,7 +316,7 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'remove_agent', 'remove_group')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/organizations/history', '/api/organizations/activity'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/organizations/history', '/api/organizations/activity'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -322,6 +328,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, self.server.organizations.activity(body))
             elif self.path == '/api/organizations/history':
                 self.reply(200, self.server.organizations.history(body))
+            elif self.path == '/api/integration/configure':
+                self.reply(200, self.server.coordinator.configure(body))
+            elif self.path == '/api/integration/retry':
+                self.reply(200, self.server.coordinator.retry(body.get('id')))
             elif self.path == '/api/projects/git':
                 self.reply(200, project_git.inspect(PROJECTS, body))
             elif self.path == '/api/projects/browse':
@@ -397,9 +407,14 @@ def main():
     run_logs = RunLogs(DATABASE.parent / 'run-logs', BIN)
     ssh_access = SshAccess()
     projects = ProjectJobs(PROJECTS, DATABASE.with_name('projects.sqlite3'))
+    coordinator = IntegrationCoordinator(DATABASE.with_name('integration.sqlite3'), organizations)
+    integration = IntegrationWatcher(PROJECTS, organizations.active_checkouts, coordinator=coordinator)
+    organizations.integration = integration
     try:
-        serve_gateway(bind, 8787, policy, token, {'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command)}, cookie_secure=secure_setting == '1')
+        serve_gateway(bind, 8787, policy, token, {'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator}, cookie_secure=secure_setting == '1')
     finally:
+        coordinator.close()
+        integration.close()
         projects.close()
         organizations.close()
         cli_setup.close()

@@ -563,6 +563,24 @@ Group history is paginated, with faster polling while a discussion is active on 
 
 Browser sign-in uses an opaque HttpOnly, SameSite=Strict cookie valid for seven days. Refreshing or reopening the dashboard restores the session without storing the dashboard access token in browser storage. Sign out revokes that browser session. Gateway restart or token rotation invalidates existing sessions; Secure cookies are enabled explicitly for HTTPS deployments as described below. Bearer-token API access remains supported.
 
+### Integration notices
+
+A background watcher measures every checkout where a launched agent is working, once a minute, whether or not a dashboard is open. It is read-only: it runs `git status` and commit counts, and never prompts an agent, merges, resets or stashes anything. A notice is recorded when a checkout is behind its base branch, has unresolved conflicts, or is in the middle of a merge or rebase.
+
+Notices appear as a count in the dashboard header, with a short message the first time one shows up. The list offers **Ask to integrate** for an idle agent, **Copy instructions**, and **Open Git changes** for that checkout. A busy agent's action stays disabled and the server refuses the request, so long-running work is never interrupted; ask once the agent has finished. Comparison uses the remote-tracking refs, so fetch first when the base branch looks stale. Both fetching and merging stay operator-initiated, and a notice clears itself once the checkout is current again.
+
 ### HTTPS browser sessions
 
 For a trusted HTTPS reverse proxy, set `Environment=HERDR_WEB_COOKIE_SECURE=1` in a systemd drop-in for `herdr-web.service` (using `systemctl edit herdr-web`), then restart the service and preserve the original Host header. The gateway then marks session cookies Secure regardless of request headers. The default `0` supports direct HTTP LAN access and loopback SSH tunnels; direct HTTP LAN traffic is unencrypted. Use HTTPS or an SSH tunnel on untrusted networks. Invalid setting values stop startup.
+
+### Fetching and worktree integration
+
+In Project explorer → Git changes, **Fetch remote updates** updates origin's remote-tracking branches without switching branches or changing working files. Fetch supports HTTPS origins without embedded credentials and `git@host:path` SSH origins, using existing container credentials. Local refresh does not fetch; the last-fetch timestamp distinguishes cached tracking information from a recent remote check. A failed fetch is reported beside the local status rather than replacing it, and a checkout that cannot be inspected is listed with its error instead of disappearing.
+
+Each checkout is also compared with `origin/main` (or `origin/master`), including agent branches without an upstream. Behind-main warnings and conflict counts remain visible while agents work. Use **Copy merge instructions** or, for an idle mapped agent, **Ask … to integrate main**. That explicit action sends a tracked organization chat request with a longer wait than an ordinary message, because merging and testing can outlast the default. Busy agents are not interrupted. The agent must preserve its work, merge in its own worktree, resolve conflicts and run tests within its assigned permissions. Fetching itself never merges, resets, stashes or discards files. A failed fetch, a conflict, or a merge request to an agent authorizes nothing on its own; the operator still reviews and releases the resulting run.
+
+### Integration coordinator and recovery
+
+After deploying, enable coordination under Project explorer → Git changes → Integration coordinator. A dedicated OpenCode coordinator collects decisions. The durable inbox waits for idle workers, supports integrate/defer/blocked decisions, merges exact commits, and verifies incorporation and conflicts with reported test evidence. Pausing prevents new delivery.
+
+Before a merge request, the gateway pins a stash-shaped snapshot under `refs/herdr/recovery/<id>`, preserving tracked and non-ignored untracked files and the original staging tree without changing the checkout. Snapshot failure blocks delivery. The coordinator dashboard shows recovery references, separate-worktree recovery commands, and durable configuration/state audit history. Ignored files and submodule working directories require separate backups. Recovery references remain until an operator explicitly removes them. Audit history is not a tamper-proof security ledger.

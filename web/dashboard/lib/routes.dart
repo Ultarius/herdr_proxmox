@@ -26,13 +26,20 @@ class GroupRoute extends AppRoute {
 abstract class AppRoute extends RouteTarget with RouteUnique {}
 
 class ExplorerRoute extends AppRoute {
+  ExplorerRoute([this.path = '']);
+  final String path;
   @override
-  Uri toUri() => Uri.parse('/explorer');
+  List<Object?> get props => [path];
+  @override
+  Uri toUri() => Uri(
+    path: '/explorer',
+    queryParameters: path.isEmpty ? null : {'path': path},
+  );
   @override
   Widget build(AppCoordinator coordinator, BuildContext context) => AppShell(
     coordinator: coordinator,
     section: 'explorer',
-    child: const ProjectExplorerPage(),
+    child: ProjectExplorerPage(key: ValueKey(path), initialPath: path),
   );
 }
 
@@ -122,7 +129,7 @@ class AppCoordinator extends Coordinator<AppRoute> {
       '/organization' => OrganizationRoute(),
       '/configuration' => CliSetupRoute(),
       '/logs' => LogsRoute(),
-      '/explorer' => ExplorerRoute(),
+      '/explorer' => ExplorerRoute(uri.queryParameters['path'] ?? ''),
       _ => NotFoundRoute(uri),
     };
   }

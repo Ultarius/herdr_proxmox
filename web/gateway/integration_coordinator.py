@@ -1,0 +1,298 @@
+"""Durable, idle-only integration inbox and coordinator reports."""
+from contextlib import closing
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import re
+import sqlite3
+import threading
+
+import project_git
+
+
+def stamp():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def identity(*values):
+    return hashlib.sha256(json.dumps(values).encode()).hexdigest()
+
+
+class IntegrationCoordinator:
+    def __init__(self, path, store):
+        self.path, self.store = Path(path), store
+        self.lock = threading.RLock()
+        self.stopped = threading.Event()
+        self._dispatch_jobs = None
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(self.connect()) as db, db:
+            db.executescript('CREATE TABLE IF NOT EXISTS settings (repository TEXT PRIMARY KEY, data TEXT NOT NULL);'
+                             'CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, data TEXT NOT NULL);'
+                             'CREATE TABLE IF NOT EXISTS audit (sequence INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL);')
+
+    def close(self):
+        self.stopped.set()
+
+    def connect(self):
+        return sqlite3.connect(self.path, timeout=10)
+
+    def save(self, db, event):
+        previous = db.execute('SELECT data FROM events WHERE id=?', (event['id'],)).fetchone()
+        previous = json.loads(previous[0]) if previous else {}
+        if any(previous.get(k) != event.get(k) for k in ('state', 'job_id', 'reason', 'recovery')):
+            self.audit(db, dict(event_id=event['id'], repository=event['repository'],
+                                profile_id=event['profile_id'], path=event['path'],
+                                action='transition', before=previous.get('state'), state=event['state'],
+                                reason=event.get('reason'), job_id=event.get('job_id'), recovery=event.get('recovery')))
+        event['updated_at'] = stamp()
+        db.execute('INSERT OR REPLACE INTO events VALUES (?, ?)', (event['id'], json.dumps(event)))
+
+    def audit(self, db, entry):
+        db.execute('INSERT INTO audit(data) VALUES (?)', (json.dumps(dict(entry, at=stamp())),))
+
+    def configure(self, body):
+        if not isinstance(body, dict):
+            raise ValueError('Expected a JSON object.')
+        repository = body.get('repository')
+        if not isinstance(repository, str):
+            raise ValueError('Select a repository.')
+        info = project_git.inspect(self.store.projects, {'path': repository})
+        if not info.get('repository'):
+            raise ValueError('Select a Git repository.')
+        repository = info['repository_path']
+        enabled = body.get('enabled', True)
+        if type(enabled) is not bool:
+            raise ValueError('Enabled must be a boolean.')
+        org_id = body.get('organization_id')
+        profile_id = body.get('profile_id')
+        with self.lock, closing(self.connect()) as db, db:
+            old = db.execute('SELECT data FROM settings WHERE repository=?', (repository,)).fetchone()
+            old = json.loads(old[0]) if old else {}
+            if not enabled:
+                config = dict(old, repository=repository, enabled=False)
+            else:
+                if profile_id == 'new':
+                    # Deterministic request ids make creation safe to retry after a crash.
+                    key = identity('coordinator', repository, org_id)
+                    profile_id = self.store.action('hire', dict(
+                        request_id=key, organization_id=org_id, name='Integration coordinator',
+                        role='Integration coordinator', runtime='opencode',
+                        project=str(self.store.projects / repository), use_worktree=True,
+                        permission_mode='dashboard_outputs',
+                        persona='Coordinate integration decisions and summarize queued reports. '
+                                'Initialization only: acknowledge readiness and wait for assigned reports. '
+                                'Do not change project files or prompt other agents directly. '
+                                'The durable gateway inbox delivers requests when workers are idle. '
+                                'Preserve deferrals and blockers; never claim a merge or test without evidence.'))['id']
+                    self.store.action('launch', dict(request_id=identity(key, 'launch'),
+                                      organization_id=org_id, profile_id=profile_id))
+                profiles = self.store.snapshot(directory=True)['profiles']
+                profile = next((p for p in profiles if p['id'] == profile_id), None)
+                if profile is None:
+                    raise ValueError('Coordinator profile is unavailable.')
+                config = dict(repository=repository, enabled=True,
+                              profile_id=profile_id, organization_id=profile['organization_id'])
+            db.execute('INSERT OR REPLACE INTO settings VALUES (?, ?)', (repository, json.dumps(config)))
+            self.audit(db, dict(action='configuration', repository=repository, enabled=enabled, profile_id=config.get('profile_id')))
+        return config
+
+    def observe(self, notices):
+        with self.lock, closing(self.connect()) as db, db:
+            settings = {r[0]: json.loads(r[1]) for r in db.execute('SELECT * FROM settings')}
+            for notice in notices:
+                config = settings.get(notice.get('repository'), {})
+                if (not config.get('enabled') or not notice.get('target') or
+                        not notice.get('behind') or notice['profile_id'] == config['profile_id']):
+                    continue
+                for row in db.execute('SELECT data FROM events').fetchall():
+                    previous = json.loads(row[0])
+                    if (previous['repository'] == notice['repository'] and previous['profile_id'] == notice['profile_id']
+                            and previous['target'] != notice['target'] and previous['state'] in ('waiting', 'deferred', 'ready')):
+                        previous.update(state='superseded', reason='A newer main commit is queued.')
+                        self.save(db, previous)
+                key = identity(notice['repository'], notice['target'], notice['profile_id'], notice['run_id'])
+                if db.execute('SELECT 1 FROM events WHERE id=?', (key,)).fetchone():
+                    continue
+                event = dict(notice, id=key, state='waiting', created_at=stamp(), reason='',
+                             coordinator_id=config['profile_id'], organization_id=config['organization_id'])
+                self.save(db, event)
+
+    def retry(self, event_id):
+        if not isinstance(event_id, str) or not re.fullmatch(r'[a-f0-9]{64}', event_id):
+            raise ValueError('Invalid integration event ID.')
+        with self.lock, closing(self.connect()) as db, db:
+            row = db.execute('SELECT data FROM events WHERE id=?', (event_id,)).fetchone()
+            if not row:
+                raise ValueError('Integration event not found.')
+            event = json.loads(row[0])
+            if event['state'] not in ('deferred', 'blocked'):
+                raise ValueError('Only deferred or blocked decisions may be retried. Inspect uncertain jobs first.')
+            event.update(state='waiting', attempt=event.get('attempt', 0) + 1, reason='')
+            event.pop('job_id', None)
+            event.pop('recovery', None)  # A new attempt needs a fresh checkpoint; older refs remain pinned.
+            self.save(db, event)
+        return event
+
+    def ready(self, profile_id, run_id=None):
+        jobs = self._dispatch_jobs if self._dispatch_jobs is not None else self.store.snapshot()['jobs']
+        runs = [j for j in jobs if j['kind'] == 'launch' and
+                j.get('profile_id') == profile_id and j['state'] == 'persona_sent']
+        run = next((j for j in reversed(runs) if not run_id or j['id'] == run_id), None)
+        if run is None:
+            return None
+        if any(j['state'] in ('queued', 'running') and
+               profile_id in j.get('participants', [j.get('profile_id')]) for j in jobs):
+            return None
+        try:
+            self.store.identity(run)
+        except ValueError:
+            return None
+        return run
+
+    def submit(self, event, phase, prompt, profile_id=None):
+        if self.stopped.is_set():
+            return None
+        profile_id = profile_id or event['profile_id']
+        run = self.ready(profile_id, event['run_id'] if profile_id == event['profile_id'] else None)
+        if not run:
+            return None
+        # OrganizationStore also checks readiness and occupied participants under
+        # its own lock; the pre-check alone never authorizes terminal delivery.
+        job_id = self.store.action('chat', dict(
+            request_id=identity(event['id'], phase, event.get('attempt', 0), profile_id),
+            organization_id=run['organization_id'], profile_id=profile_id,
+            prompt=prompt, wait_seconds=1800, integration_event=event['id']))['id']
+        if self._dispatch_jobs is not None:
+            self._dispatch_jobs.append(dict(id=job_id, kind='chat', profile_id=profile_id, state='queued'))
+        return job_id
+
+    def tick(self):
+        with self.lock, closing(self.connect()) as db, db:
+            settings = {r[0]: json.loads(r[1]) for r in db.execute('SELECT * FROM settings')}
+            events = [json.loads(r[0]) for r in db.execute("SELECT data FROM events ORDER BY CASE WHEN json_extract(data, '$.state') IN ('waiting','ready','deciding','integrating','deferred') THEN 0 ELSE 1 END, rowid DESC LIMIT 100")]
+            self._dispatch_jobs = list(self.store.snapshot()['jobs'])
+            jobs = {j['id']: j for j in self._dispatch_jobs}
+            for event in events:
+                if not settings.get(event['repository'], {}).get('enabled'):
+                    continue
+                try:
+                    state = event['state']
+                    job = jobs.get(event.get('job_id'))
+                    if state in ('deciding', 'integrating'):
+                        if not job or job['state'] in ('uncertain', 'needs_attention', 'released'):
+                            event.update(state='needs_attention', reason='Inspect the existing agent job; delivery may have occurred.')
+                        elif job['state'] == 'answered':
+                            if state == 'integrating':
+                                # Completion is verified from Git, not accepted on a model claim.
+                                cwd = self.store.projects / event['path']
+                                behind = int(project_git.git(cwd, 'rev-list', '--count', 'HEAD..' + event['target']).strip())
+                                tree = project_git.summary(self.store.projects, cwd)
+                                raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', job.get('result', '').strip())
+                                try:
+                                    result = json.loads(raw)
+                                except (ValueError, TypeError):
+                                    result = {}
+                                if not isinstance(result, dict):
+                                    result = {}
+                                tests = result.get('tests', {})
+                                passed = isinstance(tests, dict) and tests.get('status') == 'passed'
+                                done = not behind and not tree['conflicts'] and not tree['merging'] and result.get('outcome') == 'integrated' and passed
+                                event.update(state='completed' if done else 'blocked',
+                                             reason=str(result.get('reason') or ('Commit incorporated; reported tests passed.' if done else 'Integration or reported test results require review.'))[:1000],
+                                             tests=dict(status=tests.get('status'), summary=str(tests.get('summary', ''))[:1000]) if isinstance(tests, dict) else {})
+                            else:
+                                raw = job.get('result', '').strip()
+                                raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw)
+                                try:
+                                    decision = json.loads(raw)
+                                except (ValueError, TypeError):
+                                    decision = {}
+                                if not isinstance(decision, dict):
+                                    decision = {}
+                                choice = decision.get('decision')
+                                event.update(state={'integrate_now': 'ready', 'defer': 'deferred', 'blocked': 'blocked'}.get(choice, 'needs_attention'),
+                                             reason=str(decision.get('reason', 'Reply must contain a valid integration decision.'))[:2000],
+                                             checkpoint=str(decision.get('checkpoint', ''))[:1000],
+                                             deferred_after=[j['id'] for j in jobs.values() if not j.get('integration_event') and event['profile_id'] in j.get('participants', [j.get('profile_id')])])
+                    elif state == 'deferred':
+                        completed = [j for j in jobs.values() if not j.get('integration_event') and
+                                     j['id'] not in event.get('deferred_after', []) and
+                                     event['profile_id'] in j.get('participants', [j.get('profile_id')]) and
+                                     j['state'] in ('answered', 'delivered', 'artifact_ready')]
+                        if completed:
+                            event.update(state='waiting', attempt=event.get('attempt', 0) + 1)
+                            event.pop('job_id', None)
+                    elif state == 'waiting':
+                        prompt = (f"Integration inbox: main advanced to exact commit {event['target']}. "
+                                  f"Your assigned checkout is {self.store.projects / event['path']}. "
+                                  "Assess relevance to your current task. Do not merge or change files yet. "
+                                  'Respond ONLY with JSON: {"decision":"integrate_now|defer|blocked","reason":"...","checkpoint":"..."}. '
+                                  "Choose blocked if your role or permissions do not authorize a merge. Defer may name a task checkpoint.")
+                        job_id = self.submit(event, 'decision', prompt)
+                        if job_id:
+                            event.update(state='deciding', job_id=job_id, reason='')
+                        else:
+                            event['reason'] = 'Waiting for the original bound agent session to be idle.'
+                    elif state == 'ready':
+                        if not self.ready(event['profile_id'], event['run_id']):
+                            continue
+                        if not event.get('recovery'):
+                            event['recovery'] = project_git.recovery_snapshot(
+                                self.store.projects, event['path'], identity(event['id'], event.get('attempt', 0)))
+                            self.save(db, event)
+                            db.commit()  # Durable recovery and audit must precede terminal delivery.
+                        prompt = (f"You chose integrate_now. In your assigned checkout {self.store.projects / event['path']}, "
+                                  f"Recovery snapshot is pinned at {event['recovery']['ref']}. Preserve your current work and merge exact commit {event['target']} into your existing branch. "
+                                  "Inspect any existing merge/rebase first; finish it rather than starting another. "
+                                  "Resolve conflicts and run relevant tests. Return ONLY JSON with "
+                                  '{"outcome":"integrated|blocked","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands and results"},"reason":"..."}. '
+                                  "Never claim tests passed if they were not run. "
+                                  "Never discard unrelated changes, reset, force-push or deploy. Respect your assigned permissions; report blockers.")
+                        job_id = self.submit(event, 'merge', prompt)
+                        if job_id:
+                            event.update(state='integrating', job_id=job_id)
+                    self.save(db, event)
+                except (ValueError, OSError) as error:
+                    event.update(reason=str(error)[:2000])
+                    if event['state'] in ('deciding', 'integrating'):
+                        event['state'] = 'needs_attention'
+                    self.save(db, event)
+            # Coordinator receives the actual collected decisions, never guessed responses.
+            for repository, config in settings.items():
+                reports = [e for e in events if e['repository'] == repository]
+                if not any(e['state'] in ('deferred', 'blocked', 'completed', 'needs_attention') for e in reports):
+                    continue
+                if not config.get('enabled') or not reports:
+                    continue
+                digest = identity([(e['id'], e['state'], e.get('reason')) for e in reports])
+                if config.get('report_digest') == digest:
+                    continue
+                report = dict(id=digest, profile_id=config['profile_id'], run_id='', attempt=0)
+                bounded = []
+                for event in reports:
+                    entry = {k: event.get(k) for k in ('name', 'path', 'target', 'state')}
+                    entry.update(reason=str(event.get('reason', ''))[:500], checkpoint=str(event.get('checkpoint', ''))[:200])
+                    if len(json.dumps([*bounded, entry])) > 6000:
+                        break
+                    bounded.append(entry)
+                payload = json.dumps(bounded)
+                prompt = ('Integration coordinator report. Summarize these actual worker responses and recommend next steps. '
+                          'Do not prompt workers directly or modify their files; the durable inbox handles delivery. '
+                          f'Respect deferrals; identify checkpoints and blockers. Do not claim tests passed without evidence. Showing {len(bounded)} of {len(reports)} worker events; pending entries have no decision yet.\n' + payload)
+                try:
+                    job_id = self.submit(report, 'report', prompt, config['profile_id'])
+                except ValueError:
+                    job_id = None
+                if job_id:
+                    config.update(report_digest=digest, report_job_id=job_id)
+                    db.execute('UPDATE settings SET data=? WHERE repository=?', (json.dumps(config), repository))
+
+    def snapshot(self):
+        # A reader must not wait for dispatch/network work holding the writer lock.
+        with closing(self.connect()) as db:
+            db.execute('BEGIN')
+            return dict(configurations=[json.loads(r[0]) for r in db.execute('SELECT data FROM settings')],
+                        recoveries=[json.loads(r[0]) for r in db.execute("SELECT data FROM audit WHERE json_extract(data, '$.recovery') IS NOT NULL AND json_extract(data, '$.state')='ready' ORDER BY sequence DESC")],
+                        audit=[dict(json.loads(r[1]), sequence=r[0]) for r in db.execute('SELECT sequence,data FROM audit ORDER BY sequence DESC LIMIT 200')],
+                        events=[json.loads(r[0]) for r in db.execute('SELECT data FROM events ORDER BY rowid DESC LIMIT 100')])

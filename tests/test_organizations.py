@@ -59,7 +59,7 @@ class OrganizationTests(unittest.TestCase):
         return self.action('hire', **body)
 
     def drain(self):
-        self.store.worker.submit(lambda: None).result(timeout=5)
+        self.store.wait_idle(timeout=5)
 
     def test_launch_rejects_unconfigured_runtime_before_creating_workspace(self):
         org = self.organization()

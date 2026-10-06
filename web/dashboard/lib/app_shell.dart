@@ -1,5 +1,7 @@
+import 'package:flutter/services.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
+import 'integration.dart';
 import 'routes.dart';
 
 class AppShell extends StatefulWidget {
@@ -20,12 +22,28 @@ class _AppShellState extends State<AppShell> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
   StreamSubscription? subscription;
   bool loading = false;
+  bool polling = false;
+  int noticeGeneration = -1;
+  List<IntegrationNotice> notices = const [];
+  final Set<String> seen = {};
+  final Set<String> asking = {};
+  String? noticesChecked;
+  Timer? noticeTimer;
 
   @override
   void initState() {
     super.initState();
-    subscription = connection.stream.listen((_) => load());
+    subscription = connection.stream.listen((_) {
+      load();
+      if (noticeGeneration != connection.generation)
+        pollNotices(announce: false);
+    });
     load();
+    pollNotices(announce: false);
+    noticeTimer = Timer.periodic(
+      const Duration(seconds: 15),
+      (_) => pollNotices(),
+    );
   }
 
   Future<void> load() async {
@@ -45,6 +63,7 @@ class _AppShellState extends State<AppShell> {
 
   @override
   void dispose() {
+    noticeTimer?.cancel();
     subscription?.cancel();
     super.dispose();
   }
@@ -54,6 +73,237 @@ class _AppShellState extends State<AppShell> {
   void navigate(AppRoute route) {
     shellKey.currentState?.closeDrawer();
     widget.coordinator.navigate(route);
+  }
+
+  /// Integration notices are polled here rather than on one page so drift is
+  /// visible wherever the operator is. Nothing is merged automatically and a
+  /// busy agent is left alone; a notice only asks for attention.
+  Future<void> pollNotices({bool announce = true}) async {
+    if (!connection.state.connected) {
+      if (notices.isNotEmpty || seen.isNotEmpty)
+        setState(() {
+          notices = const [];
+          seen.clear();
+          noticesChecked = null;
+        });
+      return;
+    }
+    if (noticeGeneration != connection.generation) {
+      noticeGeneration = connection.generation;
+      setState(() {
+        notices = const [];
+        seen.clear();
+        noticesChecked = null;
+      });
+    }
+    if (polling) return;
+    final epoch = connection.generation;
+    polling = true;
+    try {
+      final result = await connection.request('integration');
+      if (!mounted ||
+          epoch != connection.generation ||
+          !connection.state.connected)
+        return;
+      final notices = [
+        for (final notice in (result['alerts'] as List? ?? const []))
+          if (notice is Map<String, dynamic>)
+            IntegrationNotice.fromJson(notice),
+      ];
+      seen.removeWhere((key) => !notices.any((n) => n.key == key));
+      final fresh = notices.where((n) => seen.add(n.key)).toList();
+      if (mounted)
+        setState(() {
+          this.notices = notices;
+          noticesChecked = result['checked'] as String?;
+        });
+      if (announce && fresh.isNotEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              fresh.length == 1
+                  ? 'Integration notice: ${fresh.first.summary}'
+                  : '${fresh.length} integration notices need review',
+            ),
+            action: SnackBarAction(label: 'Review', onPressed: showNotices),
+            duration: const Duration(seconds: 8),
+          ),
+        );
+      }
+    } catch (_) {
+      // Notices are advisory; a failure must not disturb the current page.
+    } finally {
+      polling = false;
+    }
+  }
+
+  Future<void> showNotices() async {
+    final checked = noticesChecked;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Integration notices'),
+        content: SizedBox(
+          width: 560,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Agents keep working. Nothing is merged automatically; ask an '
+                'idle agent to integrate, or copy the instructions yourself.',
+              ),
+              if (checked != null) ...[
+                const SizedBox(height: 4),
+                Text(
+                  'Checked ${DateTime.tryParse(checked)?.toLocal() ?? checked}',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+              const SizedBox(height: 12),
+              Flexible(
+                child: notices.isEmpty
+                    ? const Text(
+                        'No integration notices were found in the last check.',
+                      )
+                    : ListView(
+                        shrinkWrap: true,
+                        children: [
+                          for (final notice in notices) noticeCard(notice),
+                        ],
+                      ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget noticeCard(IntegrationNotice notice) {
+    final canAsk = agentCanIntegrate(connection, notice.profileId);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              notice.name.isEmpty ? notice.path : notice.name,
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            Text(
+              '${notice.path}${notice.branch.isEmpty ? '' : ' · ${notice.branch}'}',
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 6),
+            Text(notice.summary),
+            Text(
+              notice.lastFetch == null
+                  ? 'Remote comparison has no recorded fetch time.'
+                  : 'Remote last fetched: ${DateTime.tryParse(notice.lastFetch!)?.toLocal() ?? notice.lastFetch}',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: canAsk && !asking.contains(notice.profileId)
+                      ? () => askIntegration(notice)
+                      : null,
+                  icon: const Icon(Icons.notifications_outlined, size: 18),
+                  label: Text(
+                    canAsk
+                        ? 'Ask to integrate'
+                        : 'Busy; ask later to integrate',
+                  ),
+                ),
+                TextButton.icon(
+                  onPressed: () => Clipboard.setData(
+                    ClipboardData(text: notice.instructions),
+                  ),
+                  icon: const Icon(Icons.copy_outlined, size: 18),
+                  label: const Text('Copy instructions'),
+                ),
+                TextButton.icon(
+                  onPressed: () {
+                    Navigator.pop(context);
+                    navigate(ExplorerRoute(notice.path));
+                  },
+                  icon: const Icon(Icons.difference_outlined, size: 18),
+                  label: const Text('Open Git changes'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> askIntegration(IntegrationNotice notice) async {
+    if (asking.contains(notice.profileId)) return;
+    setState(() => asking.add(notice.profileId));
+    try {
+      await requestIntegration(connection, notice);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Asked ${notice.name.isEmpty ? 'the agent' : notice.name} to integrate.',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Integration request failed: $e')));
+    } finally {
+      if (mounted) setState(() => asking.remove(notice.profileId));
+    }
+  }
+
+  Widget noticeBadge() {
+    if (notices.isEmpty) return const SizedBox.shrink();
+    return Tooltip(
+      message: notices.length == 1
+          ? '1 integration notice'
+          : '${notices.length} integration notices',
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: showNotices,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.warning_amber_rounded,
+                size: 20,
+                color: Color(0xfff1c75b),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                '${notices.length}',
+                style: const TextStyle(
+                  fontWeight: FontWeight.w700,
+                  color: Color(0xfff1c75b),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   Widget navigation(
@@ -376,6 +626,7 @@ class _AppShellState extends State<AppShell> {
                                     color: Color(0xff999999),
                                   ),
                                 ),
+                              noticeBadge(),
                               const SizedBox(width: 22),
                             ],
                           ),

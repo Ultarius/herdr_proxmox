@@ -1,0 +1,122 @@
+"""Background integration notices for checkouts where agents are working.
+
+This watcher is read-only. It records where a checkout drifted from its base
+branch or has unresolved conflicts so the operator can decide what to do. It
+never prompts an agent, never merges, resets or stashes anything, and it lets a
+busy agent finish its current work: notices are advisory and a merge is only
+ever requested by an operator, through an explicit dashboard action.
+
+The gateway keeps running when no dashboard is connected, so drift is detected
+even while nobody is watching. Fetches stay operator-initiated; each notice
+carries when the remote-tracking refs were last updated so a stale comparison
+is visible.
+"""
+from datetime import datetime, timezone
+from pathlib import Path
+import threading
+import time
+
+import project_git
+
+INTERVAL = 60
+LIMIT = 20
+BASE_TTL = 300
+
+
+class IntegrationWatcher:
+    def __init__(self, root, checkouts, interval=INTERVAL, coordinator=None):
+        self.root = Path(root).resolve()
+        self.checkouts = checkouts
+        self.coordinator = coordinator
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.alerts = []
+        self.checked = None
+        self.bases = {}
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.stopped.set()
+
+    def base_for(self, repository):
+        """Cached base ref for a repository, re-resolved occasionally so a later
+        fetch that creates origin/main is noticed."""
+        now = time.monotonic()
+        with self.lock:
+            cached = self.bases.get(repository)
+            if cached and now - cached[1] < BASE_TTL:
+                return cached[0]
+        base = None
+        for candidate in ('refs/remotes/origin/main', 'refs/remotes/origin/master'):
+            try:
+                project_git.git(repository, 'rev-parse', '--verify', candidate)
+                base = candidate
+                break
+            except ValueError:
+                continue
+        with self.lock:
+            self.bases[repository] = (base, now)
+        return base
+
+    def _loop(self):
+        while not self.stopped.wait(self.interval):
+            try:
+                self.refresh()
+            except Exception:
+                # A broken repository must never stop the watcher thread.
+                continue
+
+    def refresh(self):
+        found = []
+        measured = {}
+        for profile_id, run_id, name, path in self.checkouts()[:LIMIT]:
+            try:
+                key = str(Path(path).resolve())
+                if key not in measured:
+                    measured[key] = self.notice(profile_id, run_id, name, path)
+                found.append(dict(measured[key], profile_id=profile_id, run_id=run_id, name=name))
+            except (ValueError, OSError) as error:
+                found.append(dict(profile_id=profile_id, run_id=run_id, name=name,
+                                  path=str(path), error=str(error)))
+        # Only actionable drift is kept; clean checkouts produce no notice.
+        notices = [n for n in found
+                   if n.get('behind') or n.get('conflicts') or n.get('merging') or n.get('error')]
+        with self.lock:
+            now = time.monotonic()
+            self.bases = {key: value for key, value in self.bases.items() if now - value[1] < BASE_TTL}
+            self.alerts = notices
+            self.checked = datetime.now(timezone.utc).isoformat()
+        if self.coordinator is not None and not self.stopped.is_set():
+            self.coordinator.observe(notices)
+            self.coordinator.tick()
+        return notices
+
+    def notice(self, profile_id, run_id, name, path):
+        directory = Path(path).resolve()
+        if not directory.is_relative_to(self.root) or not directory.is_dir():
+            raise ValueError('Agent checkout is outside the projects directory.')
+        repository = Path(project_git.git(directory, 'rev-parse', '--show-toplevel').strip()).resolve()
+        if not repository.is_relative_to(self.root):
+            raise ValueError('Repository is outside the projects directory.')
+        common = Path(project_git.git(repository, 'rev-parse', '--git-common-dir').strip())
+        if not common.is_absolute():
+            common = repository / common
+        common = common.resolve()
+        if not common.is_relative_to(self.root):
+            raise ValueError('Git metadata is outside the projects directory.')
+        fetched = common / 'FETCH_HEAD'
+        last_fetch = datetime.fromtimestamp(fetched.stat().st_mtime, timezone.utc).isoformat() if fetched.is_file() else None
+        tree = project_git.summary(self.root, directory, self.base_for(repository))
+        base = self.base_for(repository)
+        target = project_git.git(repository, 'rev-parse', base).strip() if base else None
+        return dict(repository=(common.parent if common.name == '.git' else repository).relative_to(self.root).as_posix(), target=target, profile_id=profile_id, run_id=run_id, name=name, path=tree['path'], last_fetch=last_fetch,
+                    branch=tree['branch'], base=tree['base'], behind=tree['base_behind'],
+                    ahead=tree['base_ahead'], conflicts=tree['conflicts'],
+                    dirty=tree['dirty'], merging=tree['merging'])
+
+    def snapshot(self):
+        with self.lock:
+            return {'alerts': list(self.alerts), 'checked': self.checked, 'interval': self.interval,
+                    'coordination': self.coordinator.snapshot() if self.coordinator else {'configurations': [], 'events': []}}

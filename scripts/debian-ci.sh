@@ -12,6 +12,15 @@ name="herdr-ci-$owner"
 finish() {
   local rc=$?
   trap - EXIT
+  if ((rc != 0)); then
+    local diagnostic
+    for diagnostic in install web-install smoke image-build; do
+      if [[ -f $results/$diagnostic.log ]]; then
+        printf '\n--- %s failure diagnostics (last 80 lines) ---\n' "$diagnostic" >&2
+        tail -n 80 "$results/$diagnostic.log" >&2 || true
+      fi
+    done
+  fi
   if [[ $(docker inspect --format '{{ index .Config.Labels "herdr.ci.owner" }}' "$name" 2>/dev/null || true) == "$owner" ]]; then
     docker logs "$name" >"$results/container.log" 2>&1 || true
     docker exec "$name" journalctl --no-pager -u herdr-web -u herdr-ci-session -n 100 >"$results/journal.log" 2>&1 || true
