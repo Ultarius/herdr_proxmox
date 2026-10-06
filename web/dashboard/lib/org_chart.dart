@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'ui_colors.dart';
 
 class ChartLayout {
   ChartLayout(List<Map<String, dynamic>> profiles) {
@@ -146,7 +147,7 @@ class _OrgChartState extends State<OrgChart> {
                 const Center(
                   child: Text(
                     'Hire your first agent to build the org chart.',
-                    style: TextStyle(color: Color(0xff777777)),
+                    style: TextStyle(color: secondaryTextColor),
                   ),
                 )
               else
@@ -330,7 +331,7 @@ class _OrgChartState extends State<OrgChart> {
                                                   '${profile['runtime']}',
                                                   style: const TextStyle(
                                                     fontSize: 9,
-                                                    color: Color(0xff777777),
+                                                    color: secondaryTextColor,
                                                   ),
                                                 ),
                                               ],
@@ -384,7 +385,7 @@ class _OrgChartState extends State<OrgChart> {
                 bottom: 14,
                 child: Text(
                   'Drag to pan · Scroll to zoom · Select an agent or group',
-                  style: TextStyle(fontSize: 10, color: Color(0xff777777)),
+                  style: TextStyle(fontSize: 10, color: secondaryTextColor),
                 ),
               ),
             ],

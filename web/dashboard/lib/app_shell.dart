@@ -3,6 +3,7 @@ import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'integration.dart';
 import 'routes.dart';
+import 'ui_colors.dart';
 
 class AppShell extends StatefulWidget {
   const AppShell({
@@ -359,7 +360,7 @@ class _AppShellState extends State<AppShell> {
               padding: EdgeInsets.all(10),
               child: Text(
                 'Hire your first agent',
-                style: TextStyle(color: Color(0xff777777), fontSize: 12),
+                style: TextStyle(color: secondaryTextColor, fontSize: 12),
               ),
             ),
           for (final profile in profiles)
@@ -379,7 +380,7 @@ class _AppShellState extends State<AppShell> {
               padding: EdgeInsets.all(10),
               child: Text(
                 'No discussion groups yet',
-                style: TextStyle(color: Color(0xff777777), fontSize: 12),
+                style: TextStyle(color: secondaryTextColor, fontSize: 12),
               ),
             ),
           for (final group in groups)
@@ -434,7 +435,7 @@ class _AppShellState extends State<AppShell> {
       style: const TextStyle(
         fontSize: 10,
         letterSpacing: 1.5,
-        color: Color(0xff777777),
+        color: secondaryTextColor,
       ),
     ),
   );

@@ -67,13 +67,12 @@ def launch_arguments(profile):
 
 
 class OrganizationStore:
-    def __init__(self, path, projects, command, runtime_status=None, model_validator=None, integration=None):
+    def __init__(self, path, projects, command, runtime_status=None, model_validator=None):
         self.path = Path(path)
         self.projects = Path(projects).resolve()
         self.command = command
         self.runtime_status = runtime_status
         self.model_validator = model_validator
-        self.integration = integration
         self.lock = threading.RLock()
         self.worker = ThreadPoolExecutor(max_workers=4, thread_name_prefix='organization')
         self.agent_locks = {}
@@ -121,7 +120,7 @@ class OrganizationStore:
             raise ValueError('Record has been removed.')
         return item
 
-    def snapshot(self, group_id=None, before=None, limit=20, directory=False):
+    def snapshot(self, group_id=None, before=None, limit=20, directory=False, live_status=True):
         with self.lock, closing(self.connect()) as db:
             data = {table: [json.loads(row['data']) for row in db.execute(f'SELECT data FROM {table} ORDER BY rowid')]
                     for table in ('organizations', 'profiles', 'groups')}
@@ -162,7 +161,7 @@ class OrganizationStore:
             return data
         states = {}
         live = None
-        if not directory and any(j['kind'] == 'launch' and j['state'] == 'persona_sent' for j in data['jobs']):
+        if live_status and not directory and any(j['kind'] == 'launch' and j['state'] == 'persona_sent' for j in data['jobs']):
             try:
                 response = self.command('agent', 'list')
                 entries = response if isinstance(response, list) else response.get('agents')
@@ -193,11 +192,15 @@ class OrganizationStore:
                         state['status'] = 'unavailable'
             states[profile['id']] = state
         data['member_states'] = states
-        # Integration drift is measured in the background, so a long-lived agent
-        # keeps working and the operator learns about it when they return.
-        data['integration'] = self.integration.snapshot() if self.integration is not None else {
-            'alerts': [], 'checked': None, 'interval': None}
         return data
+
+    def job_records(self, launches_only=False):
+        """Narrow durable job read with no runtime queries or integration callbacks."""
+        with self.lock, closing(self.connect()) as db:
+            query = "SELECT data FROM jobs"
+            if launches_only:
+                query += " WHERE json_extract(data, '$.kind')='launch'"
+            return [json.loads(row['data']) for row in db.execute(query + ' ORDER BY rowid')]
 
     def active_checkouts(self):
         """Where each launched agent works, for the background Git watcher.
@@ -507,6 +510,35 @@ class OrganizationStore:
         if not {'name', 'pane_id', 'agent', 'agent_status'}.issubset(properties):
             raise ValueError('Unsupported Herdr agent schema. Update Herdr and inspect herdr api schema --json before launching.')
 
+    def created_pane(self, created, project):
+        """Resolve only a unique new checkout workspace; never use focused panes."""
+        if not isinstance(created, dict):
+            raise ValueError('Unexpected Herdr workspace creation response.')
+        root_pane = created.get('root_pane')
+        pane = root_pane.get('pane_id') if isinstance(root_pane, dict) else None
+        if isinstance(pane, str) and re.fullmatch(r'w[0-9]+:p[0-9]+', pane):
+            return pane, created.get('workspace', {}).get('workspace_id')
+        # Some installed Herdr versions omit a usable root pane in creation
+        # responses. Re-read authoritative records for the exact created cwd.
+        response = self.command('workspace', 'list')
+        workspaces = response if isinstance(response, list) else response.get('workspaces', [])
+        matches = [w for w in workspaces if isinstance(w, dict) and
+                   (w.get('worktree') or {}).get('checkout_path', w.get('cwd')) and
+                   str(Path((w.get('worktree') or {}).get('checkout_path', w.get('cwd'))).resolve()) == str(Path(project).resolve())]
+        if len(matches) != 1:
+            raise ValueError('Cannot uniquely resolve the created checkout workspace. Inspect its terminal before retrying.')
+        workspace = matches[0].get('workspace_id')
+        if not isinstance(workspace, str) or not re.fullmatch(r'w[0-9]+', workspace):
+            raise ValueError('Created workspace has an unsupported ID.')
+        response = self.command('pane', 'list', '--workspace', workspace)
+        panes = response if isinstance(response, list) else response.get('panes', [])
+        if len(panes) != 1:
+            raise ValueError('Created workspace must have exactly one pane before agent launch.')
+        pane = panes[0].get('pane_id')
+        if not isinstance(pane, str) or not re.fullmatch(re.escape(workspace) + r':p[0-9]+', pane):
+            raise ValueError('Herdr did not return a valid root pane ID for the created workspace.')
+        return pane, workspace
+
     def wait_for_shell(self, pane):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -567,10 +599,8 @@ class OrganizationStore:
                     job = self.update_job(job_id, workspace_mode='workspace', source_project=project,
                                           workspace_note='Not a Git repository; using the selected directory.' if profile.get('use_worktree', True) else '')
                     created = self.command('workspace', 'create', '--cwd', project, '--label', profile['name'], '--no-focus')
-                pane = created.get('root_pane', {}).get('pane_id')
-                if not isinstance(pane, str) or not re.fullmatch(r'w[0-9]+:p[0-9]+', pane):
-                    raise ValueError('Herdr did not return a valid root pane ID.')
-                job = self.update_job(job_id, pane_id=pane, workspace_id=created.get('workspace', {}).get('workspace_id'))
+                pane, workspace = self.created_pane(created, job.get('worktree_path', project))
+                job = self.update_job(job_id, pane_id=pane, workspace_id=workspace)
                 self.wait_for_shell(pane)
                 arguments = launch_arguments(profile) + prepare_permissions(profile, self.path.parent)
                 self.command('agent', 'start', job['alias'], '--kind', profile['runtime'], '--pane', pane, '--timeout', '60000', *(['--', *arguments] if arguments else []), timeout=70)

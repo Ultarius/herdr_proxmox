@@ -38,6 +38,8 @@ void main() {
                             'repository': 'repo',
                             'enabled': true,
                             'profile_id': 'coord',
+                            'coordinator_state': 'needs_attention',
+                            'coordinator_error': 'Invalid root pane',
                           },
                         ]
                       : [],
@@ -99,9 +101,13 @@ void main() {
       expect(actions, isEmpty);
       await tester.tap(find.text('Integration coordinator'));
       await tester.pumpAndSettle();
+      expect(find.text('Not configured'), findsOneWidget);
       await tester.tap(find.text('Enable coordinator'));
       await tester.pumpAndSettle();
       expect(actions, ['configure']);
+      expect(find.text('Coordinator: needs_attention'), findsOneWidget);
+      expect(find.text('Invalid root pane'), findsOneWidget);
+      expect(find.byTooltip('Refresh coordination'), findsOneWidget);
       await tester.ensureVisible(find.text('Recovery · Max'));
       await tester.tap(find.text('Recovery · Max'));
       await tester.pumpAndSettle();

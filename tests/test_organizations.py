@@ -47,6 +47,67 @@ class OrganizationTests(unittest.TestCase):
             return {'agent': self.agents[args[2]]}
         return {}
 
+    def test_created_pane_recovers_from_authoritative_checkout_records(self):
+        def command(*args, **kwargs):
+            if args == ('workspace', 'list'):
+                return {'workspaces': [dict(workspace_id='w42', worktree=dict(checkout_path=str(self.projects)))]}
+            if args == ('pane', 'list', '--workspace', 'w42'):
+                return {'panes': [dict(pane_id='w42:p1')]}
+            self.fail(f'Unexpected command: {args}')
+        self.store.command = command
+        self.assertEqual(self.store.created_pane({}, str(self.projects)), ('w42:p1', 'w42'))
+
+    def test_created_pane_rejects_ambiguous_checkout_or_wrong_workspace_pane(self):
+        self.store.command = lambda *args, **kwargs: {'workspaces': [
+            dict(workspace_id='w42', worktree=dict(checkout_path=str(self.projects))),
+            dict(workspace_id='w43', cwd=str(self.projects))]}
+        with self.assertRaisesRegex(ValueError, 'uniquely'):
+            self.store.created_pane({}, str(self.projects))
+        self.store.command = lambda *args, **kwargs: ({'workspaces': [dict(workspace_id='w42', worktree=dict(checkout_path=str(self.projects)))]}
+            if args == ('workspace', 'list') else {'panes': [dict(pane_id='w99:p1')]})
+        with self.assertRaisesRegex(ValueError, 'valid root pane'):
+            self.store.created_pane({}, str(self.projects))
+
+    def test_launch_starts_agent_after_missing_root_pane_is_resolved(self):
+        original = self.store.command
+        def command(*args, **kwargs):
+            if args[:2] == ('workspace', 'create'):
+                return {'type': 'workspace_created'}
+            if args == ('workspace', 'list'):
+                return {'workspaces': [dict(workspace_id='w42', worktree=dict(checkout_path=str(self.projects)))]}
+            if args == ('pane', 'list', '--workspace', 'w42'):
+                return {'panes': [dict(pane_id='w42:p1')]}
+            return original(*args, **kwargs)
+        self.store.command = command
+        org = self.organization()
+        profile = self.hire(org)
+        run = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == run)
+        self.assertEqual(job['state'], 'persona_sent', job.get('error'))
+        self.assertEqual(job['pane_id'], 'w42:p1')
+        starts = [args for args, _ in self.calls if args[:2] == ('agent', 'start')]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][6], 'w42:p1')
+
+    def test_ambiguous_launch_never_sends_agent_input(self):
+        original = self.store.command
+        def command(*args, **kwargs):
+            if args[:2] == ('workspace', 'create'):
+                return {'root_pane': None}
+            if args == ('workspace', 'list'):
+                return {'workspaces': [dict(workspace_id='w42', worktree=dict(checkout_path=str(self.projects))),
+                                       dict(workspace_id='w43', worktree=dict(checkout_path=str(self.projects)))]}
+            return original(*args, **kwargs)
+        self.store.command = command
+        org = self.organization()
+        profile = self.hire(org)
+        run = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == run)
+        self.assertEqual(job['state'], 'needs_attention')
+        self.assertFalse(any(args[:2] in (('agent', 'start'), ('agent', 'prompt')) for args, _ in self.calls))
+
     def action(self, action, **body):
         return self.store.action(action, {'request_id': uuid.uuid4().hex, **body})['id']
 

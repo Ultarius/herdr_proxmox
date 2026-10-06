@@ -42,7 +42,7 @@ class IntegrationCoordinator:
         previous = json.loads(previous[0]) if previous else {}
         if any(previous.get(k) != event.get(k) for k in ('state', 'job_id', 'reason', 'recovery')):
             self.audit(db, dict(event_id=event['id'], repository=event['repository'],
-                                profile_id=event['profile_id'], path=event['path'],
+                                profile_id=event['profile_id'], name=event.get('name'), path=event['path'],
                                 action='transition', before=previous.get('state'), state=event['state'],
                                 reason=event.get('reason'), job_id=event.get('job_id'), recovery=event.get('recovery')))
         event['updated_at'] = stamp()
@@ -135,7 +135,7 @@ class IntegrationCoordinator:
         return event
 
     def ready(self, profile_id, run_id=None):
-        jobs = self._dispatch_jobs if self._dispatch_jobs is not None else self.store.snapshot()['jobs']
+        jobs = self._dispatch_jobs if self._dispatch_jobs is not None else self.store.job_records()
         runs = [j for j in jobs if j['kind'] == 'launch' and
                 j.get('profile_id') == profile_id and j['state'] == 'persona_sent']
         run = next((j for j in reversed(runs) if not run_id or j['id'] == run_id), None)
@@ -171,12 +171,19 @@ class IntegrationCoordinator:
         with self.lock, closing(self.connect()) as db, db:
             settings = {r[0]: json.loads(r[1]) for r in db.execute('SELECT * FROM settings')}
             events = [json.loads(r[0]) for r in db.execute("SELECT data FROM events ORDER BY CASE WHEN json_extract(data, '$.state') IN ('waiting','ready','deciding','integrating','deferred') THEN 0 ELSE 1 END, rowid DESC LIMIT 100")]
-            self._dispatch_jobs = list(self.store.snapshot()['jobs'])
+            self._dispatch_jobs = list(self.store.job_records())
             jobs = {j['id']: j for j in self._dispatch_jobs}
             for event in events:
+                if event['state'] not in ('waiting', 'ready', 'deciding', 'integrating', 'deferred'):
+                    continue
                 if not settings.get(event['repository'], {}).get('enabled'):
                     continue
                 try:
+                    coordinator = max((j for j in self._dispatch_jobs if j['kind'] == 'launch' and j.get('profile_id') == event['coordinator_id']), key=lambda j: j.get('created_at', ''), default=None)
+                    if event['state'] in ('waiting', 'ready') and (not coordinator or coordinator['state'] != 'persona_sent'):
+                        event['reason'] = 'Coordinator launch is not ready. Inspect its run before worker delivery.'
+                        self.save(db, event)
+                        continue
                     state = event['state']
                     job = jobs.get(event.get('job_id'))
                     if state in ('deciding', 'integrating'):
@@ -226,9 +233,9 @@ class IntegrationCoordinator:
                     elif state == 'waiting':
                         prompt = (f"Integration inbox: main advanced to exact commit {event['target']}. "
                                   f"Your assigned checkout is {self.store.projects / event['path']}. "
-                                  "Assess relevance to your current task. Do not merge or change files yet. "
+                                  "This is a new integration request authorized by the repository owner enabling coordination, separate from any completed read-only review. Assess relevance to your current task. This message requests a decision only; do not execute a merge or change files in this step. A developer assigned implementation work may choose integrate_now; a separate authorized merge request follows. A temporary read-only review task does not itself revoke the developer role. Preserve any explicit owner restriction against integration. "
                                   'Respond ONLY with JSON: {"decision":"integrate_now|defer|blocked","reason":"...","checkpoint":"..."}. '
-                                  "Choose blocked if your role or permissions do not authorize a merge. Defer may name a task checkpoint.")
+                                  "Choose blocked for an explicit owner prohibition, read-only assigned role, or unavailable permissions/toolchain. Choose defer for a task checkpoint. Do not treat the decision-only instruction itself as a prohibition on choosing integrate_now.")
                         job_id = self.submit(event, 'decision', prompt)
                         if job_id:
                             event.update(state='deciding', job_id=job_id, reason='')
@@ -290,9 +297,17 @@ class IntegrationCoordinator:
 
     def snapshot(self):
         # A reader must not wait for dispatch/network work holding the writer lock.
-        with closing(self.connect()) as db:
+        jobs = self.store.job_records(launches_only=True)
+        with closing(self.connect()) as db, db:
             db.execute('BEGIN')
-            return dict(configurations=[json.loads(r[0]) for r in db.execute('SELECT data FROM settings')],
+            configurations = [json.loads(r[0]) for r in db.execute('SELECT data FROM settings')]
+            for config in configurations:
+                runs = [j for j in jobs if j['kind'] == 'launch' and j.get('profile_id') == config.get('profile_id')]
+                run = max(runs, key=lambda j: j.get('created_at', ''), default={})
+                config.update(coordinator_state=run.get('state', 'not_launched'),
+                              coordinator_error=run.get('error', ''), coordinator_run_id=run.get('id'),
+                              coordinator_path=run.get('worktree_path'))
+            return dict(configurations=configurations,
                         recoveries=[json.loads(r[0]) for r in db.execute("SELECT data FROM audit WHERE json_extract(data, '$.recovery') IS NOT NULL AND json_extract(data, '$.state')='ready' ORDER BY sequence DESC")],
                         audit=[dict(json.loads(r[1]), sequence=r[0]) for r in db.execute('SELECT sequence,data FROM audit ORDER BY sequence DESC LIMIT 200')],
                         events=[json.loads(r[0]) for r in db.execute('SELECT data FROM events ORDER BY rowid DESC LIMIT 100')])

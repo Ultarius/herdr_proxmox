@@ -839,6 +839,9 @@ class _HireFormState extends State<HireForm> {
                     reasoning.clear();
                   }
                   runtime = value!;
+                  if (widget.profile == null && runtime == 'opencode') {
+                    permissions = 'dashboard_outputs';
+                  }
                   if (runtime != 'opencode') {
                     permissions = 'default';
                     accessiblePaths.clear();

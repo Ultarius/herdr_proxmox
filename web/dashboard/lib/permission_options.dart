@@ -43,7 +43,7 @@ class PermissionOptions extends StatelessWidget {
       Text(
         value == 'full_autonomy'
             ? 'Automatically allows all OpenCode tools. This does not create a sandbox. Applies on next launch.'
-            : 'Applies on next launch. Output mode allows dashboard reply and artifact folders; other CLI rules still apply.',
+            : 'Applies on next launch. Existing sessions must be relaunched. Allow dashboard outputs grants only reply and artifact folder access; it does not grant unrestricted home access or merge permissions.',
       ),
       const SizedBox(height: 12),
       TextFormField(

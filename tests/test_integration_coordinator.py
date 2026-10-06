@@ -1,5 +1,6 @@
 """Durable inbox state-machine tests; no live model or network needed."""
 import json
+from contextlib import closing
 from pathlib import Path
 import sys
 import tempfile
@@ -21,6 +22,9 @@ class Store:
 
     def snapshot(self, **kwargs):
         return dict(jobs=list(self.jobs.values()), profiles=self.profiles)
+
+    def job_records(self, launches_only=False):
+        return [j for j in self.jobs.values() if not launches_only or j['kind'] == 'launch']
 
     def identity(self, run):
         if run['profile_id'] in self.busy:
@@ -74,7 +78,8 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(self.event()['state'], 'deciding')
         self.assertEqual(len(self.store.calls), 1)
         self.assertIn('a' * 40, self.store.calls[0]['prompt'])
-        self.assertIn('Do not merge', self.store.calls[0]['prompt'])
+        self.assertIn('do not execute a merge', self.store.calls[0]['prompt'])
+        self.assertIn('does not itself revoke the developer role', self.store.calls[0]['prompt'])
 
     def test_restart_preserves_waiting_and_never_replays_uncertain_delivery(self):
         self.service.observe([self.notice])
@@ -195,3 +200,54 @@ class CoordinatorTests(unittest.TestCase):
         recovered = IntegrationCoordinator(self.path, self.store).snapshot()
         self.assertEqual(recovered['events'][0]['recovery']['commit'], 'b' * 40)
         self.assertTrue(any(a.get('recovery') for a in recovered['audit']))
+
+
+    def test_failed_coordinator_launch_blocks_worker_delivery_and_is_visible(self):
+        self.store.jobs['coordinator'].update(state='needs_attention', error='Invalid root pane')
+        self.service.observe([self.notice])
+        self.service.tick()
+        self.assertEqual(self.store.calls, [])
+        self.assertEqual(self.event()['state'], 'waiting')
+        config = self.service.snapshot()['configurations'][0]
+        self.assertEqual(config['coordinator_state'], 'needs_attention')
+        self.assertEqual(config['coordinator_error'], 'Invalid root pane')
+
+
+    def test_outage_preserves_terminal_outcomes_without_new_audit_entries(self):
+        self.service.observe([self.notice])
+        for state in ('completed', 'blocked', 'needs_attention', 'superseded'):
+            with closing(self.service.connect()) as db, db:
+                event = self.event()
+                event.update(state=state, reason='Original evidence', tests={'status': 'passed', 'summary': 'test command'})
+                self.service.save(db, event)
+            before = len(self.service.snapshot()['audit'])
+            self.store.jobs['coordinator']['state'] = 'needs_attention'
+            self.service.tick()
+            self.assertEqual(self.event()['reason'], 'Original evidence')
+            self.assertEqual(self.event()['tests']['summary'], 'test command')
+            self.assertEqual(len(self.service.snapshot()['audit']), before)
+
+    def test_decision_finishes_during_coordinator_outage_but_merge_waits(self):
+        self.service.observe([self.notice])
+        self.service.tick()
+        self.store.jobs['coordinator']['state'] = 'needs_attention'
+        self.answer({'decision': 'integrate_now', 'reason': 'Ready'})
+        self.assertEqual(self.event()['state'], 'ready')
+        self.service.tick()
+        self.assertEqual(self.event()['state'], 'ready')
+        self.assertEqual(len(self.store.calls), 1)
+
+    def test_merge_result_finishes_during_coordinator_outage(self):
+        self.service.observe([self.notice])
+        self.service.tick()
+        self.answer({'decision': 'integrate_now', 'reason': 'Ready'})
+        self.service.tick()
+        self.store.jobs['coordinator']['state'] = 'needs_attention'
+        event = self.event()
+        self.store.jobs[event['job_id']].update(state='answered', result=json.dumps({
+            'outcome': 'integrated', 'tests': {'status': 'passed', 'summary': 'tests passed'}}))
+        with patch('integration_coordinator.project_git.git', return_value='0'), patch(
+                'integration_coordinator.project_git.summary', return_value={'conflicts': 0, 'merging': False}):
+            self.service.tick()
+        self.assertEqual(self.event()['state'], 'completed')
+        self.assertEqual(self.event()['tests']['summary'], 'tests passed')

@@ -409,7 +409,6 @@ def main():
     projects = ProjectJobs(PROJECTS, DATABASE.with_name('projects.sqlite3'))
     coordinator = IntegrationCoordinator(DATABASE.with_name('integration.sqlite3'), organizations)
     integration = IntegrationWatcher(PROJECTS, organizations.active_checkouts, coordinator=coordinator)
-    organizations.integration = integration
     try:
         serve_gateway(bind, 8787, policy, token, {'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator}, cookie_secure=secure_setting == '1')
     finally:

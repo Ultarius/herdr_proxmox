@@ -31,3 +31,19 @@ class CoordinatorCreationTests(unittest.TestCase):
         launches = [j for j in self.store.snapshot()['jobs'] if j['kind'] == 'launch']
         self.assertEqual(len(launches), 1)
         self.assertEqual(launches[0]['state'], 'persona_sent', launches[0].get('error'))
+
+
+    def test_real_store_watcher_coordinator_wiring_has_no_recursive_snapshot(self):
+        from integration import IntegrationWatcher
+        service = IntegrationCoordinator(self.root / 'integration.sqlite3', self.store)
+        watcher = IntegrationWatcher(self.projects, self.store.active_checkouts, interval=3600, coordinator=service)
+        self.addCleanup(watcher.close)
+        self.addCleanup(service.close)
+        # Production wiring is one-way: watcher reads the store; the store
+        # must not call back into the watcher or coordinator.
+        self.assertNotIn('integration', self.store.snapshot())
+        self.assertNotIn('integration', self.store.state_snapshot())
+        self.assertIn('coordination', watcher.snapshot())
+        with patch.object(self.store, 'snapshot', side_effect=AssertionError('full snapshot on coordinator read')):
+            self.assertEqual(service.snapshot()['events'], [])
+            watcher.refresh()
