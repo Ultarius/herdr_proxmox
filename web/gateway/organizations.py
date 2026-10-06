@@ -204,6 +204,11 @@ class OrganizationStore:
                 query += " WHERE json_extract(data, '$.kind')='launch'"
             return [json.loads(row['data']) for row in db.execute(query + ' ORDER BY rowid')]
 
+    def profile_records(self):
+        """Narrow durable profile read with no runtime queries or integration callbacks."""
+        with self.lock, closing(self.connect()) as db:
+            return [json.loads(row['data']) for row in db.execute('SELECT data FROM profiles ORDER BY rowid')]
+
     def active_checkouts(self):
         """Where each launched agent works, for the background Git watcher.
 

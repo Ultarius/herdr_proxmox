@@ -1,5 +1,5 @@
-import 'package:flutter/services.dart';
 import 'package:juice/juice.dart';
+import 'clipboard_copy.dart';
 import 'dashboard_bloc.dart';
 import 'integration.dart';
 import 'routes.dart';
@@ -228,9 +228,19 @@ class _AppShellState extends State<AppShell> {
                   ),
                 ),
                 TextButton.icon(
-                  onPressed: () => Clipboard.setData(
-                    ClipboardData(text: notice.instructions),
-                  ),
+                  onPressed: () async {
+                    final message = await copyTextOrDownload(
+                      notice.instructions,
+                      'integration-instructions.md',
+                      copied: 'Instructions copied.',
+                      downloaded:
+                          'Clipboard unavailable over HTTP; instructions downloaded instead.',
+                    );
+                    if (context.mounted)
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text(message)),
+                      );
+                  },
                   icon: const Icon(Icons.copy_outlined, size: 18),
                   label: const Text('Copy instructions'),
                 ),

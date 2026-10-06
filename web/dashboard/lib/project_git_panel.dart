@@ -1,5 +1,5 @@
-import 'package:flutter/services.dart';
 import 'package:juice/juice.dart';
+import 'clipboard_copy.dart';
 import 'dashboard_bloc.dart';
 import 'integration.dart';
 import 'integration_board.dart';
@@ -318,9 +318,19 @@ class _ProjectGitPanelState extends State<ProjectGitPanel> {
               style: const TextStyle(color: Color(0xfff1c75b)),
             ),
             TextButton.icon(
-              onPressed: () => Clipboard.setData(
-                ClipboardData(text: noticeFor(tree).instructions),
-              ),
+              onPressed: () async {
+                final message = await copyTextOrDownload(
+                  noticeFor(tree).instructions,
+                  'merge-instructions.md',
+                  copied: 'Merge instructions copied.',
+                  downloaded:
+                      'Clipboard unavailable over HTTP; merge instructions downloaded instead.',
+                );
+                if (context.mounted)
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text(message)),
+                  );
+              },
               icon: const Icon(Icons.copy_outlined),
               label: const Text('Copy merge instructions'),
             ),

@@ -94,6 +94,17 @@ class TransferTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '2 MB'):
             import_configuration(self.target, exported)
 
+    def test_import_rejects_unlaunchable_model_settings(self):
+        for changes in ({'provider': '', 'model': 'big-pickle'},
+                        {'provider': 'opencode', 'model': ''},
+                        {'provider': 'bad id!', 'model': 'big-pickle'},
+                        {'provider': 'opencode', 'model': 'big-pickle', 'reasoning': 'not a level!'}):
+            bad = copy.deepcopy(self.bundle)
+            bad['profiles'][0].update(changes)
+            with self.assertRaises(ValueError):
+                import_configuration(self.source, bad)
+            self.assertEqual(export_configuration(self.source)['profiles'], [])
+
     def test_malformed_references_are_rejected_as_value_errors(self):
         cases = []
         bad = copy.deepcopy(self.bundle); bad['groups'][0]['members'] = [['max'], 'olaf']; cases.append(bad)

@@ -40,6 +40,8 @@ void main() {
                             'profile_id': 'coord',
                             'coordinator_state': 'needs_attention',
                             'coordinator_error': 'Invalid root pane',
+                            'report_state': 'uncertain',
+                            'report_error': 'Delivery interrupted',
                           },
                         ]
                       : [],
@@ -115,6 +117,10 @@ void main() {
       expect(actions, ['configure']);
       expect(find.text('Coordinator: needs_attention'), findsOneWidget);
       expect(find.text('Invalid root pane'), findsOneWidget);
+      expect(
+        find.textContaining('Coordinator report needs attention.'),
+        findsOneWidget,
+      );
       expect(find.byTooltip('Refresh coordination'), findsOneWidget);
       await tester.ensureVisible(find.text('Maya · deciding'));
       await tester.tap(find.text('Maya · deciding'));

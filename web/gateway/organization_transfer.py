@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 import json
 import re
 
+from organizations import model_settings
+
 TABLES = ('organizations', 'profiles', 'groups')
 MAX_TRANSFER_BYTES = 2_000_000
 
@@ -56,6 +58,9 @@ def import_configuration(store, bundle):
             if item['id'] in mapped or not isinstance(item.get('name'), str):
                 raise ValueError(f'Duplicate ID or missing name in {table}.')
             validate_text_fields(item)
+            if table == 'profiles':
+                # Reuse the creation rules so an imported profile can launch.
+                model_settings(item, item.get('runtime'))
             mapped[item['id']] = item
         records[table] = mapped
     def profile(reference, org):

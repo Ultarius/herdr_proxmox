@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'web/gateway'))
-from integration_coordinator import IntegrationCoordinator
+from integration_coordinator import IntegrationCoordinator, report_digest
 
 
 class Store:
@@ -25,6 +25,9 @@ class Store:
 
     def job_records(self, launches_only=False):
         return [j for j in self.jobs.values() if not launches_only or j['kind'] == 'launch']
+
+    def profile_records(self):
+        return list(self.profiles)
 
     def identity(self, run):
         if run['profile_id'] in self.busy:
@@ -151,6 +154,10 @@ class CoordinatorTests(unittest.TestCase):
         self.service.tick()
         self.answer({'decision': 'integrate_now'})
         self.service.tick()
+        merge = self.store.calls[-1]
+        self.assertEqual(merge['profile_id'], 'worker')
+        self.assertIn('git merge --no-edit <target>', merge['prompt'])
+        self.assertIn('Missing required suites/toolchains', merge['prompt'])
         self.store.jobs[self.event()['job_id']].update(state='answered', result=json.dumps({
             'outcome': 'integrated', 'tests': {'status': 'passed', 'summary': 'unit tests passed'}}))
         with patch('integration_coordinator.project_git.git', return_value='0'), patch(
@@ -158,6 +165,12 @@ class CoordinatorTests(unittest.TestCase):
             self.service.tick()
         self.assertEqual(self.event()['state'], 'completed')
         self.assertEqual(self.event()['tests']['status'], 'passed')
+        report = [c for c in self.store.calls if c['profile_id'] == 'coordinator'][-1]['prompt']
+        self.assertIn('Do not inspect repositories or other worktrees', report)
+        payload = json.loads(report.split('\n', 1)[1])
+        self.assertEqual(payload[0]['tests']['summary'], 'unit tests passed')
+        self.assertTrue(payload[0]['verification']['target_incorporated'])
+        self.assertEqual(payload[0]['recovery']['ref'], 'refs/herdr/recovery/test')
 
     def test_non_object_decision_requires_review_without_retry(self):
         self.service.observe([self.notice])
@@ -251,3 +264,60 @@ class CoordinatorTests(unittest.TestCase):
             self.service.tick()
         self.assertEqual(self.event()['state'], 'completed')
         self.assertEqual(self.event()['tests']['summary'], 'tests passed')
+
+    def test_terminal_report_job_does_not_block_later_reports(self):
+        self.service.observe([self.notice])
+        self.service.tick()
+        self.answer({'decision': 'blocked', 'reason': 'First blocker'})
+        self.service.tick()
+        reports = [c for c in self.store.calls if c['profile_id'] == 'coordinator']
+        self.assertEqual(len(reports), 1)
+        # A resolved report must allow a later outcome to be summarized.
+        config = self.service.snapshot()['configurations'][0]
+        self.store.jobs[config['report_job_id']]['state'] = 'answered'
+        with closing(self.service.connect()) as db, db:
+            event = self.event()
+            event.update(state='completed', reason='Second outcome')
+            self.service.save(db, event)
+        self.service.tick()
+        reports = [c for c in self.store.calls if c['profile_id'] == 'coordinator']
+        self.assertEqual(len(reports), 2)
+        self.assertIn('Second outcome', reports[1]['prompt'])
+
+    def test_uncertain_report_waits_for_operator_resolution(self):
+        self.service.observe([self.notice])
+        self.service.tick()
+        self.answer({'decision': 'blocked', 'reason': 'First blocker'})
+        config = self.service.snapshot()['configurations'][0]
+        with closing(self.service.connect()) as db, db:
+            event = self.event()
+            event.update(reason='New evidence')
+            self.service.save(db, event)
+        for state in ('uncertain', 'needs_attention'):
+            self.store.jobs[config['report_job_id']]['state'] = state
+            self.service.tick()
+            self.assertEqual(len([c for c in self.store.calls if c['profile_id'] == 'coordinator']), 1)
+        snapshot = self.service.snapshot()['configurations'][0]
+        self.assertEqual(snapshot['report_state'], 'needs_attention')
+        # Replacing a session after explicitly releasing its binding makes a
+        # fresh report safe without replaying the old report's content.
+        self.store.jobs[config['report_job_id']]['runs'] = [{'id': 'old-coordinator'}]
+        self.store.jobs['old-coordinator'] = dict(id='old-coordinator', kind='launch',
+                                                 profile_id='coordinator', state='released')
+        self.service.tick()
+        self.assertEqual(len([c for c in self.store.calls if c['profile_id'] == 'coordinator']), 2)
+
+    def test_report_digest_notices_changes_beyond_the_prompt_bound(self):
+        first = [dict(id='a', state='blocked', reason='x'), dict(id='b', state='completed', reason='y')]
+        shortened = first[:1]  # the 6000-byte cap dropped the second event
+        changed = [first[0], dict(id='b', state='completed', reason='changed')]
+        self.assertEqual(report_digest(first, shortened), report_digest(list(first), shortened))
+        self.assertNotEqual(report_digest(first, shortened), report_digest(changed, shortened))
+
+    def test_report_digest_detects_test_and_verification_changes(self):
+        original = [dict(id='a', state='completed', reason='x' * 500)]
+        for changes in ({'reason': 'x' * 499 + 'y'}, {'tests': {'status': 'not_run'}},
+                        {'verification': {'target_incorporated': True}},
+                        {'recovery': {'ref': 'refs/herdr/recovery/new'}}):
+            changed = [dict(original[0], **changes)]
+            self.assertNotEqual(report_digest(original, original), report_digest(changed, original))

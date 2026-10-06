@@ -1,6 +1,6 @@
-import 'package:flutter/services.dart';
 import 'package:juice/juice.dart';
 import 'artifact_download.dart';
+import 'clipboard_copy.dart';
 
 Future<void> exportDiscussionArtifact(
   BuildContext context,
@@ -10,12 +10,18 @@ Future<void> exportDiscussionArtifact(
   String message;
   try {
     final content = job['result'] as String;
+    final filename = 'discussion-artifact-${job['id']}.md';
     if (download) {
-      await downloadArtifact(content, 'discussion-artifact-${job['id']}.md');
+      await downloadArtifact(content, filename);
+      message = 'Markdown download started.';
     } else {
-      await Clipboard.setData(ClipboardData(text: content));
+      message = await copyTextOrDownload(
+        content,
+        filename,
+        copied: 'Markdown copied.',
+        downloaded: 'Clipboard unavailable over HTTP; Markdown downloaded instead.',
+      );
     }
-    message = download ? 'Markdown download started.' : 'Markdown copied.';
   } catch (_) {
     message = 'Export failed. Select the artifact text to copy it manually.';
   }

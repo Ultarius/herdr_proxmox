@@ -104,15 +104,15 @@ before=$(wc -l <"$HERDR_TEST_LOG")
 if HERDR_TEST_DOWNLOAD_FAIL=1 bash -c "$(cat "$tmp/ct/herdr.sh")" -- --web --ssh-key "$tmp/public.key" >"$tmp/output" 2>&1; then exit 1; fi
 [[ $(wc -l <"$HERDR_TEST_LOG") == "$before" ]]
 # Confirm the web bundle includes every gateway module and the standalone text viewer.
-mkdir -p "$tmp/web/public/dashboard" "$tmp/web/gateway"
-cp "$repo"/web/gateway/*.py "$repo/web/gateway/log_view.html" "$tmp/web/gateway/"
+mkdir -p "$tmp/web/public/dashboard"
+cp -R "$repo/web/gateway" "$tmp/web/gateway"
 cp "$repo/install/web-install.sh" "$tmp/install/"
 cp "$repo/install/dashboard-update.py" "$tmp/install/"
 touch "$tmp/web/public/index.html" "$tmp/web/public/main.dart.js" "$tmp/web/public/dashboard/index.html"
 printf 'ssh-ed25519 AAAA test\n' >"$tmp/public.key"
 export HERDR_TEST_WEB_CONTENTS="$tmp/web-contents"
 bash "$tmp/ct/herdr.sh" --web --ssh-key "$tmp/public.key" --template local:vztmpl/debian-13-standard_test_amd64.tar.zst >"$tmp/output"
-for file in cli_setup.py pty_exec.py run_logs.py log_view.html; do grep -q "web/gateway/$file" "$HERDR_TEST_WEB_CONTENTS"; done
+for file in cli_setup.py pty_exec.py run_logs.py log_view.html skills/herdr-worktree-integration/SKILL.md; do grep -q "web/gateway/$file" "$HERDR_TEST_WEB_CONTENTS"; done
 mkdir "$tmp/package/herdr-proxmox"
 cp -R "$tmp/ct" "$tmp/install" "$tmp/web" "$tmp/package/herdr-proxmox/"
 export HERDR_TEST_SOURCE_ARCHIVE="$tmp/herdr-proxmox.tar.gz"

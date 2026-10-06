@@ -1,6 +1,6 @@
 import 'package:juice/juice.dart';
+import 'clipboard_copy.dart';
 import 'dashboard_bloc.dart';
-import 'package:flutter/services.dart';
 
 /// Durable coordinator configuration and collected worker decisions.
 class IntegrationBoard extends StatefulWidget {
@@ -146,8 +146,13 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
                   : Text('${config['coordinator_error']}'),
             ),
           const Text(
-            'The gateway queues exact-commit updates. Enabling coordination lets workers merge after choosing integrate_now; deferred work waits for a checkpoint. Workers can also report a blocker. A dedicated coordinator collects their responses. Existing worktrees and sessions stay in place.',
+            'The gateway queues exact-commit updates. Enabling coordination lets workers merge after choosing integrate_now; deferred work waits for a checkpoint. Workers can also report a blocker. The coordinator summarizes supplied Git verification, worker-reported tests and recovery references; it does not need access to other worktrees. Inspect a pending permission request in Org chart → Chat. Existing worktrees and sessions stay in place.',
           ),
+          if (config?['report_state'] == 'uncertain' ||
+              config?['report_state'] == 'needs_attention')
+            Text(
+              'Coordinator report needs attention. ${config?['report_error'] ?? ''} Inspect the conversation in Org chart → Chat. If it cannot be recovered, stop the old session and release its run in Org chart → Runs before launching a replacement.',
+            ),
           const SizedBox(height: 12),
           if (config?['enabled'] != true)
             FilledButton.icon(
@@ -201,12 +206,19 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
               subtitle: Text('${event['path']} · before integration'),
               children: [
                 TextButton.icon(
-                  onPressed: () => Clipboard.setData(
-                    ClipboardData(
-                      text:
-                          'git worktree add --detach <new-recovery-folder> ${event['recovery']['ref']}',
-                    ),
-                  ),
+                  onPressed: () async {
+                    final message = await copyTextOrDownload(
+                      'git worktree add --detach <new-recovery-folder> ${event['recovery']['ref']}',
+                      'recovery-command.txt',
+                      copied: 'Recovery command copied.',
+                      downloaded:
+                          'Clipboard unavailable over HTTP; recovery command downloaded instead.',
+                    );
+                    if (context.mounted)
+                      ScaffoldMessenger.of(
+                        context,
+                      ).showSnackBar(SnackBar(content: Text(message)));
+                  },
                   icon: const Icon(Icons.copy),
                   label: const Text('Copy recovery command'),
                 ),

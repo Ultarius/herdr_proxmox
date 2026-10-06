@@ -42,6 +42,41 @@ class ModelCatalogTests(unittest.TestCase):
                 model_catalog.validate_selection(cli, Path('.'), profile)
             model_catalog.validate_selection(cli, Path('.'), dict(profile, reasoning=''))
 
+    def test_selection_requires_a_provider_and_project_before_discovery(self):
+        cli = Mock()
+        with patch.object(model_catalog, 'discover_models') as discover:
+            for profile, message in (
+                    ({'runtime': 'opencode', 'provider': '', 'model': 'gpt-6-astra'}, 'provider and a model'),
+                    ({'runtime': 'opencode', 'provider': 'openai', 'model': 'gpt-6-astra'}, 'project directory'),
+                    ({'runtime': 'opencode', 'provider': 'openai', 'model': 'gpt-6-astra', 'project': 7}, 'project directory')):
+                with self.assertRaisesRegex(ValueError, message):
+                    model_catalog.validate_selection(cli, Path('.'), profile)
+            discover.assert_not_called()
+
+    def test_discovery_normalizes_missing_binary_and_reports_unknown_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            projects = root / 'projects'
+            projects.mkdir()
+            cli = Mock()
+            cli.home = root
+            cli.binary.return_value = str(root / '.local/bin/opencode')
+            body = {'runtime': 'opencode', 'project': str(projects)}
+            with patch.object(model_catalog.subprocess, 'run', side_effect=FileNotFoundError('missing')):
+                with self.assertRaisesRegex(ValueError, 'could not run'):
+                    model_catalog.discover_models(cli, projects, body)
+            with patch.object(model_catalog.subprocess, 'run',
+                              side_effect=model_catalog.subprocess.TimeoutExpired('opencode', 30)):
+                with self.assertRaisesRegex(ValueError, 'could not run'):
+                    model_catalog.discover_models(cli, projects, body)
+            # A failed version probe stays unknown instead of claiming v1.
+            with patch.object(model_catalog.subprocess, 'run',
+                              side_effect=[Mock(returncode=0, stdout=VERBOSE, stderr=''),
+                                           Mock(returncode=1, stdout='', stderr='denied')]):
+                result = model_catalog.discover_models(cli, projects, body)
+            self.assertFalse(result['supports_variants'])
+            self.assertEqual(result['version'], '')
+
     def test_every_runtime_reports_dropdown_options(self):
         snapshot = model_catalog.snapshot()['runtimes']
         self.assertEqual(sorted(snapshot), ['agy', 'claude', 'codex', 'opencode'])
@@ -95,7 +130,7 @@ class ModelCatalogTests(unittest.TestCase):
             cli.home = root
             cli.binary.return_value = str(root / '.local/bin/opencode')
             completed = Mock(returncode=0, stdout=VERBOSE, stderr='')
-            with patch.object(model_catalog.subprocess, 'run', side_effect=[completed, Mock(stdout='2.0.0')]) as run:
+            with patch.object(model_catalog.subprocess, 'run', side_effect=[completed, Mock(returncode=0, stdout='2.0.0')]) as run:
                 result = model_catalog.discover_models(cli, projects, {'runtime': 'opencode',
                                                                        'project': str(projects)})
             self.assertEqual(run.call_args_list[0].args[0][1:], ['models', '--verbose'])

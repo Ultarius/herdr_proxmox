@@ -11,12 +11,26 @@ import threading
 import project_git
 
 
+def merge_skill():
+    # Deliver the bundled procedure even when the worker's older checkout lacks
+    # project-local skills. It grants no extra OpenCode permissions.
+    return (Path(__file__).parent / 'skills/herdr-worktree-integration/SKILL.md').read_text(encoding='utf-8')
+
+
 def stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
 def identity(*values):
     return hashlib.sha256(json.dumps(values).encode()).hexdigest()
+
+
+def report_digest(reports, bounded):
+    """Detect changes anywhere while the delivered prompt stays bounded."""
+    signature = [{key: event.get(key) for key in
+                  ('id', 'state', 'name', 'path', 'target', 'reason', 'checkpoint', 'tests', 'verification', 'recovery')}
+                 for event in reports]
+    return identity('summary-only-v4', signature, bounded)
 
 
 class IntegrationCoordinator:
@@ -51,6 +65,34 @@ class IntegrationCoordinator:
     def audit(self, db, entry):
         db.execute('INSERT INTO audit(data) VALUES (?)', (json.dumps(dict(entry, at=stamp())),))
 
+    def coordinator_profile(self, org_id, repository):
+        """Reuse the repository's existing coordinator profile, or hire one.
+
+        A configuration import carries the coordinator profile but not the
+        coordination settings, so enabling coordination afterwards must reuse
+        that profile instead of creating a duplicate agent.
+        """
+        project = str((self.store.projects / repository).resolve())
+        existing = next((profile for profile in self.store.profile_records()
+                         if profile.get('organization_id') == org_id and not profile.get('removed_at')
+                         and profile.get('role') == 'Integration coordinator'
+                         and isinstance(profile.get('project'), str) and profile['project']
+                         and str(Path(profile['project']).resolve()) == project), None)
+        if existing is not None:
+            return existing['id']
+        # Deterministic request ids make creation safe to retry after a crash.
+        key = identity('coordinator', repository, org_id)
+        return self.store.action('hire', dict(
+            request_id=key, organization_id=org_id, name='Integration coordinator',
+            role='Integration coordinator', runtime='opencode',
+            project=project, use_worktree=True,
+            permission_mode='dashboard_outputs',
+            persona='Coordinate integration decisions and summarize queued reports. '
+                    'Initialization only: acknowledge readiness and wait for assigned reports. '
+                    'Do not change project files or prompt other agents directly. '
+                    'The durable gateway inbox delivers requests when workers are idle. '
+                    'Preserve deferrals and blockers; never claim a merge or test without evidence.'))['id']
+
     def configure(self, body):
         if not isinstance(body, dict):
             raise ValueError('Expected a JSON object.')
@@ -73,25 +115,19 @@ class IntegrationCoordinator:
                 config = dict(old, repository=repository, enabled=False)
             else:
                 if profile_id == 'new':
-                    # Deterministic request ids make creation safe to retry after a crash.
-                    key = identity('coordinator', repository, org_id)
-                    profile_id = self.store.action('hire', dict(
-                        request_id=key, organization_id=org_id, name='Integration coordinator',
-                        role='Integration coordinator', runtime='opencode',
-                        project=str(self.store.projects / repository), use_worktree=True,
-                        permission_mode='dashboard_outputs',
-                        persona='Coordinate integration decisions and summarize queued reports. '
-                                'Initialization only: acknowledge readiness and wait for assigned reports. '
-                                'Do not change project files or prompt other agents directly. '
-                                'The durable gateway inbox delivers requests when workers are idle. '
-                                'Preserve deferrals and blockers; never claim a merge or test without evidence.'))['id']
-                    self.store.action('launch', dict(request_id=identity(key, 'launch'),
-                                      organization_id=org_id, profile_id=profile_id))
+                    profile_id = self.coordinator_profile(org_id, repository)
+                    # Keyed on the resolved profile so a reused imported profile
+                    # launches once even if coordination is enabled repeatedly.
+                    runs = [job for job in self.store.job_records(launches_only=True)
+                            if job.get('profile_id') == profile_id]
+                    if not any(job.get('state') != 'released' for job in runs):
+                        self.store.action('launch', dict(request_id=identity(profile_id, 'launch', len(runs)),
+                                                         organization_id=org_id, profile_id=profile_id))
                 profiles = self.store.snapshot(directory=True)['profiles']
                 profile = next((p for p in profiles if p['id'] == profile_id), None)
                 if profile is None:
                     raise ValueError('Coordinator profile is unavailable.')
-                config = dict(repository=repository, enabled=True,
+                config = dict(old if old.get('profile_id') == profile_id else {}, repository=repository, enabled=True,
                               profile_id=profile_id, organization_id=profile['organization_id'])
             db.execute('INSERT OR REPLACE INTO settings VALUES (?, ?)', (repository, json.dumps(config)))
             self.audit(db, dict(action='configuration', repository=repository, enabled=enabled, profile_id=config.get('profile_id')))
@@ -206,6 +242,7 @@ class IntegrationCoordinator:
                                 passed = isinstance(tests, dict) and tests.get('status') == 'passed'
                                 done = not behind and not tree['conflicts'] and not tree['merging'] and result.get('outcome') == 'integrated' and passed
                                 event.update(state='completed' if done else 'blocked',
+                                             verification=dict(target_incorporated=not behind, conflicts=tree['conflicts'], merging=tree['merging']),
                                              reason=str(result.get('reason') or ('Commit incorporated; reported tests passed.' if done else 'Integration or reported test results require review.'))[:1000],
                                              tests=dict(status=tests.get('status'), summary=str(tests.get('summary', ''))[:1000]) if isinstance(tests, dict) else {})
                             else:
@@ -251,11 +288,12 @@ class IntegrationCoordinator:
                             db.commit()  # Durable recovery and audit must precede terminal delivery.
                         prompt = (f"You chose integrate_now. In your assigned checkout {self.store.projects / event['path']}, "
                                   f"Recovery snapshot is pinned at {event['recovery']['ref']}. Preserve your current work and merge exact commit {event['target']} into your existing branch. "
-                                  "Inspect any existing merge/rebase first; finish it rather than starting another. "
+                                  "Inspect any existing merge/rebase first; do not start another or automatically finish an unrelated operation. "
                                   "Resolve conflicts and run relevant tests. Return ONLY JSON with "
                                   '{"outcome":"integrated|blocked","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands and results"},"reason":"..."}. '
                                   "Never claim tests passed if they were not run. "
-                                  "Never discard unrelated changes, reset, force-push or deploy. Respect your assigned permissions; report blockers.")
+                                  "Never discard unrelated changes, reset, force-push or deploy. Respect your assigned permissions; report blockers.\n\n"
+                                  "Follow this gateway-bundled worker skill for the authorized merge:\n" + merge_skill())
                         job_id = self.submit(event, 'merge', prompt)
                         if job_id:
                             event.update(state='integrating', job_id=job_id)
@@ -272,19 +310,35 @@ class IntegrationCoordinator:
                     continue
                 if not config.get('enabled') or not reports:
                     continue
-                digest = identity([(e['id'], e['state'], e.get('reason')) for e in reports])
-                if config.get('report_digest') == digest:
-                    continue
-                report = dict(id=digest, profile_id=config['profile_id'], run_id='', attempt=0)
+                # Uncertain delivery needs operator resolution; the old prompt
+                # may still be running or waiting for a permission response.
+                previous = jobs.get(config.get('report_job_id'))
+                if previous and previous.get('state') in ('queued', 'running', 'uncertain', 'needs_attention'):
+                    bindings = previous.get('runs', [])
+                    released = bool(bindings) and all(jobs.get(run.get('id'), {}).get('state') == 'released'
+                                                      for run in bindings)
+                    if previous.get('state') in ('queued', 'running') or not released:
+                        continue
                 bounded = []
                 for event in reports:
                     entry = {k: event.get(k) for k in ('name', 'path', 'target', 'state')}
                     entry.update(reason=str(event.get('reason', ''))[:500], checkpoint=str(event.get('checkpoint', ''))[:200])
+                    # Supply evidence here so the summarizer need not access another
+                    # agent's checkout. Tests remain worker-reported, not gateway-run.
+                    entry.update(tests=event.get('tests', {}), verification=event.get('verification', {}))
+                    recovery = event.get('recovery') or {}
+                    entry['recovery'] = {k: recovery.get(k) for k in ('ref', 'commit')}
                     if len(json.dumps([*bounded, entry])) > 6000:
                         break
                     bounded.append(entry)
                 payload = json.dumps(bounded)
+                digest = report_digest(reports, bounded)
+                if config.get('report_digest') == digest:
+                    continue
+                report = dict(id=digest, profile_id=config['profile_id'], run_id='', attempt=0)
                 prompt = ('Integration coordinator report. Summarize these actual worker responses and recommend next steps. '
+                          'This is a summary-only task: use only the supplied payload. Do not inspect repositories or other worktrees, run shell commands, or use tools to revalidate evidence. '
+                          'Distinguish gateway Git verification from worker-reported tests. Missing evidence is unknown; report it without investigating or requesting directory access. '
                           'Do not prompt workers directly or modify their files; the durable inbox handles delivery. '
                           f'Respect deferrals; identify checkpoints and blockers. Do not claim tests passed without evidence. Showing {len(bounded)} of {len(reports)} worker events; pending entries have no decision yet.\n' + payload)
                 try:
@@ -297,7 +351,7 @@ class IntegrationCoordinator:
 
     def snapshot(self):
         # A reader must not wait for dispatch/network work holding the writer lock.
-        jobs = self.store.job_records(launches_only=True)
+        jobs = self.store.job_records()
         with closing(self.connect()) as db, db:
             db.execute('BEGIN')
             configurations = [json.loads(r[0]) for r in db.execute('SELECT data FROM settings')]
@@ -307,6 +361,8 @@ class IntegrationCoordinator:
                 config.update(coordinator_state=run.get('state', 'not_launched'),
                               coordinator_error=run.get('error', ''), coordinator_run_id=run.get('id'),
                               coordinator_path=run.get('worktree_path'))
+                report = next((job for job in jobs if job['id'] == config.get('report_job_id')), {})
+                config.update(report_state=report.get('state'), report_error=report.get('error', ''))
             return dict(configurations=configurations,
                         recoveries=[json.loads(r[0]) for r in db.execute("SELECT data FROM audit WHERE json_extract(data, '$.recovery') IS NOT NULL AND json_extract(data, '$.state')='ready' ORDER BY sequence DESC")],
                         audit=[dict(json.loads(r[1]), sequence=r[0]) for r in db.execute('SELECT sequence,data FROM audit ORDER BY sequence DESC LIMIT 200')],

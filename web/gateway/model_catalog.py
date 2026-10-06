@@ -124,8 +124,11 @@ def discover_models(cli, projects, body):
         raise ValueError('Model discovery is currently supported for OpenCode.')
     project = project_directory(projects, body.get('project', str(projects)))
     env = dict(os.environ, HOME=str(cli.home))
-    result = subprocess.run([str(cli.binary('opencode')), 'models', '--verbose'],
-                            cwd=project, env=env, capture_output=True, text=True, timeout=30)
+    try:
+        result = subprocess.run([str(cli.binary('opencode')), 'models', '--verbose'],
+                                cwd=project, env=env, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError('OpenCode model discovery could not run or timed out. Check the CLI installation and try again.') from error
     if result.returncode:
         raise ValueError('OpenCode model discovery failed. Check the CLI accounts configuration and gateway logs.')
     if len(result.stdout) > 8_000_000:
@@ -133,7 +136,12 @@ def discover_models(cli, projects, body):
     models = parse_models(result.stdout)
     if not models:
         raise ValueError('OpenCode returned no models. Check the installed CLI version and provider configuration.')
-    version = subprocess.run([str(cli.binary('opencode')), '--version'], capture_output=True, text=True, timeout=5).stdout.strip()
+    # A failed version probe must not be reported as an explicit v1 rejection.
+    try:
+        probe = subprocess.run([str(cli.binary('opencode')), '--version'], capture_output=True, text=True, timeout=5)
+        version = probe.stdout.strip() if probe.returncode == 0 else ''
+    except (OSError, subprocess.TimeoutExpired):
+        version = ''
     major = re.match(r'v?(\d+)\.', version)
     return {'runtime': 'opencode', 'models': models, 'efforts': [dict(DEFAULT_EFFORT)],
             'supports_variants': bool(major and int(major[1]) >= 2), 'version': version,
@@ -141,9 +149,16 @@ def discover_models(cli, projects, body):
 
 
 def validate_selection(cli, projects, profile):
-    if profile['runtime'] != 'opencode' or not profile.get('model'):
+    if profile.get('runtime') != 'opencode' or not profile.get('model'):
         return
-    catalog = discover_models(cli, projects, {'runtime': 'opencode', 'project': profile['project']})
+    if not profile.get('provider'):
+        # Report the real configuration error instead of a catalog miss.
+        raise ValueError('OpenCode requires both a provider and a model, or leave both at CLI defaults.')
+    project = profile.get('project')
+    if not isinstance(project, str) or not project:
+        raise ValueError('This agent has no project directory, so its saved model cannot be checked. '
+                         'Set a project or clear the model to use the CLI default.')
+    catalog = discover_models(cli, projects, {'runtime': 'opencode', 'project': project})
     selected = next((m for m in catalog['models'] if m['provider'] == profile['provider'] and m['id'] == profile['model']), None)
     if selected is None:
         raise ValueError('Selected OpenCode model is unavailable. Refresh models before launching.')

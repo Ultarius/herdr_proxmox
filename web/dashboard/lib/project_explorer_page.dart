@@ -1,5 +1,5 @@
-import 'package:flutter/services.dart';
 import 'package:juice/juice.dart';
+import 'clipboard_copy.dart';
 import 'dashboard_bloc.dart';
 import 'project_git_panel.dart';
 
@@ -90,11 +90,19 @@ class _ProjectExplorerPageState extends State<ProjectExplorerPage> {
               ),
               IconButton(
                 tooltip: 'Copy file path',
-                onPressed: () => Clipboard.setData(
-                  ClipboardData(
-                    text: '${directory?['root']}/${preview!['path']}',
-                  ),
-                ),
+                onPressed: () async {
+                  final message = await copyTextOrDownload(
+                    '${directory?['root']}/${preview!['path']}',
+                    'path.txt',
+                    copied: 'Path copied.',
+                    downloaded:
+                        'Clipboard unavailable over HTTP; path downloaded instead.',
+                  );
+                  if (context.mounted)
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text(message)),
+                    );
+                },
                 icon: const Icon(Icons.copy_outlined),
               ),
               IconButton(
