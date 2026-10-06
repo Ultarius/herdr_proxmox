@@ -27,6 +27,8 @@ from ssh_access import SshAccess
 from dashboard_access import DashboardAccess, configured_bind
 from herdr_server import HerdrServer
 from herdr_ids import is_workspace_id
+from resource_usage import resources
+from organization_transfer import export_configuration, import_configuration
 from updates import Updates
 
 ROOT = Path(os.environ.get('HERDR_WEB_ROOT', '/opt/herdr-web/public')).resolve()
@@ -185,6 +187,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/api/'):
             if not self.authenticated():
                 return
+            if self.path == '/api/resources':
+                self.reply(200, resources.snapshot())
+                return
+            if self.path == '/api/organizations/export':
+                self.reply(200, export_configuration(self.server.organizations))
+                return
             if self.path not in ('/api/snapshot', '/api/organizations', '/api/organizations/directory', '/api/organizations/state', '/api/projects/jobs', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates', '/api/models', '/api/integration'):
                 self.reply(404, {'error': 'Unknown endpoint.'})
                 return
@@ -316,15 +324,17 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'remove_agent', 'remove_group')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/organizations/history', '/api/organizations/activity'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/organizations/history', '/api/organizations/activity'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
             size = int(self.headers.get('Content-Length', '0'))
-            if not 0 < size <= 65536:
+            if not 0 < size <= (2_000_000 if self.path == '/api/organizations/import' else 65536):
                 raise ValueError('Invalid request size.')
             body = json.loads(self.rfile.read(size))
-            if self.path == '/api/organizations/activity':
+            if self.path == '/api/organizations/import':
+                self.reply(200, import_configuration(self.server.organizations, body))
+            elif self.path == '/api/organizations/activity':
                 self.reply(200, self.server.organizations.activity(body))
             elif self.path == '/api/organizations/history':
                 self.reply(200, self.server.organizations.history(body))

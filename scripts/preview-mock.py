@@ -85,6 +85,13 @@ class MockHerdr:
 
 class PreviewHandler(server.Handler):
     def do_GET(self):
+        if self.path == '/api/resources':
+            if self.authenticated():
+                # Deterministic demo values, never claim host readings are LXC usage.
+                self.reply(200, {'available': True, 'sampled_at': 0, 'cpu_percent': 12,
+                    'cpu_cores': 2, 'memory_used': 1024**3, 'memory_total': 4 * 1024**3,
+                    'swap_used': 0, 'swap_total': 512 * 1024**2, 'processes': []})
+            return
         if self.path == '/':
             self.send_response(302)
             self.send_header('Location', '/dashboard/')
@@ -96,7 +103,7 @@ class PreviewHandler(server.Handler):
                     status='not_configured', detail='Connect an account using the setup terminal (local demo).')
                     for i, n in [('codex', 'Codex'), ('claude', 'Claude Code'), ('opencode', 'OpenCode'), ('agy', 'Antigravity')]]})
             return
-        if self.path.startswith('/api/') and self.path not in ('/api/snapshot', '/api/organizations', '/api/models'):
+        if self.path.startswith('/api/') and self.path not in ('/api/snapshot', '/api/organizations', '/api/organizations/export', '/api/organizations/state', '/api/organizations/directory', '/api/models'):
             if self.authenticated():
                 self.reply(503, {'error': 'This local preview simulates agent chat and groups only. Container setup and updates are disabled.'})
             return

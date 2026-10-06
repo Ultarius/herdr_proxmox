@@ -183,6 +183,8 @@ void main() {
             .data,
         'Engineering',
       );
+      await tester.ensureVisible(find.text('Hire agent'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('Hire agent'));
       await tester.pumpAndSettle();
       final hireFields = find.descendant(
@@ -259,6 +261,8 @@ void main() {
         scrollable: find.byType(Scrollable).last,
       );
       expect(find.text('Maya · Lead'), findsOneWidget);
+      pageScroll.position.jumpTo(0);
+      await tester.pumpAndSettle();
       await tester.tap(find.text('Disconnect'));
       await tester.pumpAndSettle();
       expect(find.text('Connect on the dashboard'), findsOneWidget);

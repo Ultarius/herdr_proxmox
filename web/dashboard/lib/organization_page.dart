@@ -7,6 +7,7 @@ import 'org_chart.dart';
 import 'collaboration_panel.dart';
 import 'model_catalog.dart';
 import 'remove_entry_dialog.dart';
+import 'configuration_transfer.dart';
 
 class OrganizationPage extends StatefulWidget {
   const OrganizationPage({super.key, required this.coordinator});
@@ -273,6 +274,11 @@ class _OrganizationPageState extends State<OrganizationPage> {
                         ),
                     ],
                     const SizedBox(height: 16),
+                    ConfigurationTransfer(
+                      onImported: () async {
+                        await bloc.send(OrganizationCommand('refresh'));
+                      },
+                    ),
                     if (org == null || MediaQuery.sizeOf(context).width < 1000)
                       Wrap(
                         spacing: 12,

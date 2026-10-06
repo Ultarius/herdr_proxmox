@@ -2,6 +2,7 @@ import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'routes.dart';
 import 'clone_project_card.dart';
+import 'resource_panel.dart';
 
 void main() {
   BlocScope.register<DashboardBloc>(
@@ -162,6 +163,7 @@ class _DashboardState extends State<Dashboard> {
                       child: const Text('Connect'),
                     ),
                   ] else ...[
+                    const ResourcePanel(),
                     Wrap(
                       spacing: 12,
                       runSpacing: 12,
