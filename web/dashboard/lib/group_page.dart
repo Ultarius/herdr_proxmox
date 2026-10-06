@@ -439,10 +439,10 @@ class _GroupPageState extends State<GroupPage> {
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
           children: [
             Card(
-              color: const Color(0xff191512),
+              color: Theme.of(context).colorScheme.surface,
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(16),
-                side: const BorderSide(color: Color(0xff332820)),
+                side: BorderSide(color: Theme.of(context).dividerColor),
               ),
               child: Padding(
                 padding: const EdgeInsets.all(24),
@@ -563,7 +563,7 @@ class _GroupPageState extends State<GroupPage> {
                       }),
                       style: TextButton.styleFrom(
                         backgroundColor: tab == item.key
-                            ? const Color(0xff242424)
+                            ? Theme.of(context).colorScheme.secondaryContainer
                             : Colors.transparent,
                       ),
                       child: Text(item.value),

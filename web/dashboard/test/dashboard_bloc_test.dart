@@ -57,10 +57,10 @@ void main() {
       await tester.enterText(find.byType(TextField).first, 'token');
       await tester.tap(find.text('Connect'));
       await tester.pumpAndSettle();
-      expect(find.text('Herdr: stopped'), findsOneWidget);
+      expect(find.text('Unavailable'), findsOneWidget);
       await tester.tap(find.text('Start Herdr'));
       await tester.pumpAndSettle();
-      expect(find.text('Herdr: running'), findsOneWidget);
+      expect(find.text('Connected'), findsOneWidget);
       expect(find.text('Start Herdr'), findsNothing);
       expect(tester.takeException(), isNull);
       await connection.disconnect();
@@ -190,7 +190,19 @@ void main() {
       await tester.pumpAndSettle();
       expect(bloc.state.connected, true);
       expect(find.text('Create workspace'), findsNothing);
-      await tester.tap(find.text('Disconnect'));
+      await tester.tap(find.byTooltip('Open navigation'));
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(
+        find.text('Sign out'),
+        150,
+        scrollable: find
+            .descendant(
+              of: find.byType(Drawer),
+              matching: find.byType(Scrollable),
+            )
+            .first,
+      );
+      await tester.tap(find.text('Sign out'));
       await tester.pumpAndSettle();
       expect(find.text('Connect'), findsOneWidget);
       await tester.pumpWidget(const SizedBox());

@@ -1,5 +1,7 @@
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
+import 'overview_panels.dart';
+import 'recent_activity.dart';
 
 class ResourcePanel extends StatefulWidget {
   const ResourcePanel({super.key});
@@ -54,6 +56,30 @@ class _ResourcePanelState extends State<ResourcePanel> {
       '${((value as num? ?? 0) / 1048576).toStringAsFixed(0)} MiB';
   String percent(dynamic value) =>
       value == null ? 'Sampling…' : '${(value as num).toStringAsFixed(1)}%';
+  double ratio(dynamic used, dynamic total) => (total as num? ?? 0) > 0
+      ? ((used as num? ?? 0) / (total as num)).toDouble()
+      : 0;
+  Widget meter(IconData icon, String text, num value) => Container(
+    padding: const EdgeInsets.all(16),
+    decoration: BoxDecoration(
+      color: Theme.of(context).colorScheme.surfaceContainerLow,
+      borderRadius: BorderRadius.circular(12),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, color: Theme.of(context).colorScheme.primary),
+        const SizedBox(height: 12),
+        Text(text, style: const TextStyle(fontWeight: FontWeight.w600)),
+        const SizedBox(height: 14),
+        LinearProgressIndicator(
+          value: value.toDouble().clamp(0, 1),
+          borderRadius: BorderRadius.circular(10),
+          minHeight: 7,
+        ),
+      ],
+    ),
+  );
   @override
   Widget build(BuildContext context) {
     final d = data;
@@ -63,14 +89,14 @@ class _ResourcePanelState extends State<ResourcePanel> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              'Container resources',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            TextButton.icon(
-              onPressed: loading ? null : refresh,
-              icon: const Icon(Icons.refresh),
-              label: const Text('Refresh resources'),
+            PanelHeading(
+              'System health',
+              Icons.monitor_heart_outlined,
+              action: IconButton(
+                onPressed: loading ? null : refresh,
+                tooltip: 'Refresh resources',
+                icon: const Icon(Icons.refresh),
+              ),
             ),
             const SizedBox(height: 8),
             if (error != null) Text(error!),
@@ -82,28 +108,60 @@ class _ResourcePanelState extends State<ResourcePanel> {
               Text(
                 'Sampled: ${DateTime.fromMillisecondsSinceEpoch(((d['sampled_at'] as num) * 1000).round()).toLocal()}',
               ),
-              Wrap(
-                spacing: 20,
-                runSpacing: 8,
-                children: [
-                  Text(
-                    'CPU ${percent(d['cpu_percent'])} · ${d['cpu_cores']} cores',
-                  ),
-                  Text(
-                    'Memory ${bytes(d['memory_used'])} / ${bytes(d['memory_total'])}',
-                  ),
-                  Text(
-                    'Swap ${bytes(d['swap_used'])} / ${bytes(d['swap_total'])}',
-                  ),
-                ],
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final width = constraints.maxWidth < 700
+                      ? constraints.maxWidth
+                      : (constraints.maxWidth - 16) / 2;
+                  return Wrap(
+                    spacing: 16,
+                    runSpacing: 16,
+                    children: [
+                      SizedBox(
+                        width: width,
+                        child: Column(
+                          children: [
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: meter(
+                                    Icons.memory,
+                                    'CPU ${percent(d['cpu_percent'])} · ${d['cpu_cores']} cores',
+                                    (d['cpu_percent'] as num? ?? 0) / 100,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: meter(
+                                    Icons.storage_outlined,
+                                    'Memory ${bytes(d['memory_used'])} / ${bytes(d['memory_total'])}',
+                                    ratio(d['memory_used'], d['memory_total']),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 12),
+                            Text(
+                              'Swap ${bytes(d['swap_used'])} / ${bytes(d['swap_total'])}',
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                          ],
+                        ),
+                      ),
+                      SizedBox(width: width, child: const RecentActivity()),
+                    ],
+                  );
+                },
               ),
               if ((d['memory_total'] as num) > 0 &&
                   (d['memory_used'] as num) / (d['memory_total'] as num) >= .9)
-                const Padding(
-                  padding: EdgeInsets.only(top: 8),
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
                   child: Text(
                     'High memory usage — avoid launching more agents.',
-                    style: TextStyle(color: Colors.orange),
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
                   ),
                 ),
               ExpansionTile(

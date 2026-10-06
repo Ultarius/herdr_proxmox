@@ -107,6 +107,10 @@ void main() {
   testWidgets(
     'create organization, hire, edit persona and navigate with a shared connection',
     (tester) async {
+      tester.view.physicalSize = const Size(1440, 1100);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
       final organizations = <Map<String, dynamic>>[];
       final profiles = <Map<String, dynamic>>[];
       final mutations = <String>[];
@@ -159,7 +163,7 @@ void main() {
       await tester.enterText(find.byType(TextField).first, 'token');
       await tester.tap(find.text('Connect'));
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Organization'));
+      await tester.tap(find.text('Org chart').first);
       await tester.pumpAndSettle();
       expect(find.byType(OrganizationPage), findsOneWidget);
       await tester.tap(find.text('Create organization'));
@@ -183,7 +187,16 @@ void main() {
             .data,
         'Engineering',
       );
-      await tester.ensureVisible(find.text('Hire agent'));
+      await tester.scrollUntilVisible(
+        find.text('Hire agent'),
+        100,
+        scrollable: find
+            .descendant(
+              of: find.byType(OrganizationPage),
+              matching: find.byType(Scrollable),
+            )
+            .first,
+      );
       await tester.pumpAndSettle();
       await tester.tap(find.text('Hire agent'));
       await tester.pumpAndSettle();
@@ -238,10 +251,10 @@ void main() {
         const Offset(0, 1000),
       );
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Workspaces'));
+      await tester.tap(find.text('Dashboard'));
       await tester.pumpAndSettle();
       expect(connection.state.connected, true);
-      await tester.tap(find.text('Organization'));
+      await tester.tap(find.text('Org chart').first);
       await tester.pumpAndSettle();
       final pageScroll = tester.state<ScrollableState>(
         find
@@ -253,7 +266,7 @@ void main() {
       );
       pageScroll.position.jumpTo(250);
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Team'));
+      await tester.tap(find.text('Team').last);
       await tester.pumpAndSettle();
       await tester.scrollUntilVisible(
         find.text('Maya · Lead'),
@@ -263,7 +276,7 @@ void main() {
       expect(find.text('Maya · Lead'), findsOneWidget);
       pageScroll.position.jumpTo(0);
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Disconnect'));
+      await tester.tap(find.text('Sign out'));
       await tester.pumpAndSettle();
       expect(find.text('Connect on the dashboard'), findsOneWidget);
       expect(find.text('Maya · Lead'), findsNothing);

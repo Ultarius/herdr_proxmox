@@ -126,8 +126,8 @@ class _OrgChartState extends State<OrgChart> {
       height: (MediaQuery.sizeOf(context).height - 240).clamp(300, 650),
       clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
-        color: const Color(0xff101010),
-        border: Border.all(color: const Color(0xff292929)),
+        color: Theme.of(context).colorScheme.surfaceContainerLow,
+        border: Border.all(color: Theme.of(context).dividerColor),
         borderRadius: BorderRadius.circular(8),
       ),
       child: LayoutBuilder(
@@ -182,11 +182,13 @@ class _OrgChartState extends State<OrgChart> {
                             width: 188,
                             height: 90,
                             child: Material(
-                              color: const Color(0xff241a13),
+                              color: Theme.of(
+                                context,
+                              ).colorScheme.primaryContainer,
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(14),
-                                side: const BorderSide(
-                                  color: Color(0xff80532f),
+                                side: BorderSide(
+                                  color: Theme.of(context).dividerColor,
                                 ),
                               ),
                               child: InkWell(
@@ -224,18 +226,22 @@ class _OrgChartState extends State<OrgChart> {
                                             ),
                                             Text(
                                               'Group / topic · ${(widget.groups[i]['members'] as List? ?? []).length} members',
-                                              style: const TextStyle(
+                                              style: TextStyle(
                                                 fontSize: 9,
-                                                color: Color(0xffdfb693),
+                                                color: Theme.of(
+                                                  context,
+                                                ).colorScheme.onSurfaceVariant,
                                               ),
                                             ),
                                             Text(
                                               '${widget.groups[i]['description'] ?? ''}',
                                               maxLines: 1,
                                               overflow: TextOverflow.ellipsis,
-                                              style: const TextStyle(
+                                              style: TextStyle(
                                                 fontSize: 9,
-                                                color: Color(0xffaa8c77),
+                                                color: Theme.of(
+                                                  context,
+                                                ).colorScheme.onSurfaceVariant,
                                               ),
                                             ),
                                           ],
@@ -261,11 +267,11 @@ class _OrgChartState extends State<OrgChart> {
                             width: 188,
                             height: 88,
                             child: Material(
-                              color: const Color(0xff191919),
+                              color: Theme.of(context).colorScheme.surface,
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(9),
-                                side: const BorderSide(
-                                  color: Color(0xff2a2a2a),
+                                side: BorderSide(
+                                  color: Theme.of(context).dividerColor,
                                 ),
                               ),
                               child: InkWell(
@@ -311,9 +317,11 @@ class _OrgChartState extends State<OrgChart> {
                                               '${profile['role']}',
                                               maxLines: 1,
                                               overflow: TextOverflow.ellipsis,
-                                              style: const TextStyle(
+                                              style: TextStyle(
                                                 fontSize: 10,
-                                                color: Color(0xffaaaaaa),
+                                                color: Theme.of(
+                                                  context,
+                                                ).colorScheme.onSurfaceVariant,
                                               ),
                                             ),
                                             Row(

@@ -3,52 +3,40 @@ import 'dashboard_bloc.dart';
 import 'routes.dart';
 import 'clone_project_card.dart';
 import 'resource_panel.dart';
+import 'overview_panels.dart';
+import 'app_theme.dart';
 
 void main() {
   BlocScope.register<DashboardBloc>(
     () => DashboardBloc()..restoreSession(),
     lifecycle: BlocLifecycle.permanent,
   );
-  runApp(
-    MaterialApp.router(
+  runApp(const HerdrApp());
+}
+
+class HerdrApp extends StatefulWidget {
+  const HerdrApp({super.key});
+  @override
+  State<HerdrApp> createState() => _HerdrAppState();
+}
+
+class _HerdrAppState extends State<HerdrApp> {
+  final coordinator = AppCoordinator();
+  @override
+  void dispose() {
+    coordinator.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => ValueListenableBuilder<ThemeMode>(
+    valueListenable: themeMode,
+    builder: (context, mode, _) => MaterialApp.router(
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        brightness: Brightness.dark,
-        colorScheme:
-            ColorScheme.fromSeed(
-              seedColor: const Color(0xffff7917),
-              brightness: Brightness.dark,
-            ).copyWith(
-              primary: const Color(0xffff7917),
-              onPrimary: Colors.white,
-              secondaryContainer: const Color(0xff252525),
-              onSecondaryContainer: Colors.white,
-            ),
-        filledButtonTheme: FilledButtonThemeData(
-          style: FilledButton.styleFrom(
-            foregroundColor: Colors.black,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(7),
-            ),
-          ),
-        ),
-        outlinedButtonTheme: OutlinedButtonThemeData(
-          style: OutlinedButton.styleFrom(
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(7),
-            ),
-          ),
-        ),
-        scaffoldBackgroundColor: const Color(0xff0b0b0b),
-        cardTheme: const CardThemeData(
-          color: Color(0xff161616),
-          elevation: 0,
-          margin: EdgeInsets.symmetric(vertical: 6),
-        ),
-        dividerColor: const Color(0xff282828),
-        useMaterial3: true,
-      ),
-      routerConfig: AppCoordinator(),
+      theme: dashboardTheme(Brightness.light),
+      darkTheme: dashboardTheme(Brightness.dark),
+      themeMode: mode,
+      routerConfig: coordinator,
     ),
   );
 }
@@ -66,6 +54,8 @@ class Dashboard extends StatefulWidget {
 }
 
 class _DashboardState extends State<Dashboard> {
+  final setupKey = GlobalKey();
+  final setupController = ExpansibleController();
   final token = TextEditingController();
   final label = TextEditingController();
   final cwd = TextEditingController(text: '/home/herdr/projects');
@@ -106,6 +96,7 @@ class _DashboardState extends State<Dashboard> {
 
   @override
   void dispose() {
+    setupController.dispose();
     token.dispose();
     label.dispose();
     cwd.dispose();
@@ -127,15 +118,38 @@ class _DashboardState extends State<Dashboard> {
             child: ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 1200),
               child: ListView(
-                padding: const EdgeInsets.all(28),
+                padding: EdgeInsets.all(
+                  MediaQuery.sizeOf(context).width < 650 ? 16 : 28,
+                ),
                 children: [
-                  Text(
-                    'Your agents, at a glance.',
-                    style: Theme.of(context).textTheme.headlineLarge,
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    'Manage workspaces here. Open a terminal over SSH to work with your herd.',
+                  Wrap(
+                    alignment: WrapAlignment.spaceBetween,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    spacing: 20,
+                    runSpacing: 16,
+                    children: [
+                      Text(
+                        widget.agentsOnly ? 'Agents' : 'Overview',
+                        style: Theme.of(context).textTheme.headlineLarge
+                            ?.copyWith(fontWeight: FontWeight.w700),
+                      ),
+                      if (state.connected && !widget.agentsOnly)
+                        FilledButton.icon(
+                          onPressed: () {
+                            setupController.expand();
+                            WidgetsBinding.instance.addPostFrameCallback((_) {
+                              final target = setupKey.currentContext;
+                              if (target != null)
+                                Scrollable.ensureVisible(
+                                  target,
+                                  duration: const Duration(milliseconds: 250),
+                                );
+                            });
+                          },
+                          icon: const Icon(Icons.add),
+                          label: const Text('Create workspace'),
+                        ),
+                    ],
                   ),
                   const SizedBox(height: 24),
                   if (!state.connected) ...[
@@ -163,126 +177,49 @@ class _DashboardState extends State<Dashboard> {
                       child: const Text('Connect'),
                     ),
                   ] else ...[
-                    const ResourcePanel(),
-                    Wrap(
-                      spacing: 12,
-                      runSpacing: 12,
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      children: [
-                        Chip(
-                          label: Text(
-                            refreshed == null
-                                ? 'Connecting'
-                                : 'Last read: ${refreshed.toLocal().toString().substring(11, 19)}',
-                          ),
-                        ),
-                        Chip(label: Text('Herdr: ${state.serverStatus}')),
-                        if (state.serverStatus == 'stopped')
-                          FilledButton.icon(
-                            onPressed: busy
-                                ? null
-                                : () => bloc.send(
-                                    DashboardCommand('start-server'),
-                                  ),
-                            icon: const Icon(Icons.play_arrow),
-                            label: Text(
-                              busy ? 'Starting Herdr…' : 'Start Herdr',
-                            ),
-                          ),
-                        OutlinedButton(
-                          onPressed: busy ? null : refresh,
-                          child: const Text('Refresh'),
-                        ),
-                        TextButton(
-                          onPressed: () {
-                            bloc.disconnect();
-                          },
-                          child: const Text('Disconnect'),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    if (state.serverStatus == 'stopped')
-                      const Text(
-                        'Herdr is stopped. Select Start Herdr to launch it in this container; no SSH connection is needed.',
-                      ),
-                    Wrap(
-                      spacing: 12,
-                      children: [
-                        TextButton(
-                          onPressed: () =>
-                              widget.coordinator.navigate(DashboardRoute()),
-                          child: const Text('Workspaces'),
-                        ),
-                        TextButton(
-                          onPressed: () =>
-                              widget.coordinator.navigate(AgentsRoute()),
-                          child: const Text('Agents'),
-                        ),
-                        TextButton(
-                          onPressed: () =>
-                              widget.coordinator.navigate(OrganizationRoute()),
-                          child: const Text('Organization'),
-                        ),
-                        TextButton(
-                          onPressed: () =>
-                              widget.coordinator.navigate(CliSetupRoute()),
-                          child: const Text('CLI configuration'),
-                        ),
-                        TextButton(
-                          onPressed: () =>
-                              widget.coordinator.navigate(LogsRoute()),
-                          child: const Text('Saved logs'),
-                        ),
-                      ],
-                    ),
                     if (!widget.agentsOnly) ...[
-                      const SizedBox(height: 24),
-                      Text(
-                        'Workspaces',
-                        style: Theme.of(context).textTheme.titleLarge,
+                      OverviewSummary(
+                        agents: agents.length,
+                        workspaces: workspaces.length,
+                        connected: state.serverStatus == 'running',
+                        onAgents: () =>
+                            widget.coordinator.navigate(AgentsRoute()),
+                        onWorkspaces: () =>
+                            widget.coordinator.navigate(ExplorerRoute()),
+                        onConnection: refresh,
                       ),
-                      const SizedBox(height: 12),
-                      if (workspaces.isEmpty &&
-                          error == null &&
-                          refreshed != null)
-                        const Text(
-                          'No workspaces yet. Create your first below.',
-                        ),
-                      for (final workspace in workspaces)
-                        Card(
-                          child: ListTile(
-                            title: Text(
-                              '${workspace['label'] ?? workspace['workspace_id']}',
-                            ),
-                            subtitle: Text(
-                              '${workspace['cwd'] ?? workspace['workspace_id']}',
-                            ),
-                            trailing: Wrap(
-                              children: [
-                                IconButton(
-                                  tooltip: 'Focus in Herdr',
-                                  onPressed: busy
-                                      ? null
-                                      : () => action('focus', {
-                                          'id': workspace['workspace_id'],
-                                        }),
-                                  icon: const Icon(Icons.center_focus_strong),
-                                ),
-                                IconButton(
-                                  tooltip: 'Rename',
-                                  onPressed: busy
-                                      ? null
-                                      : () => rename(workspace),
-                                  icon: const Icon(Icons.edit_outlined),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
+                      const SizedBox(height: 24),
+                    ],
+                    if (state.serverStatus == 'stopped')
+                      FilledButton.icon(
+                        onPressed: busy
+                            ? null
+                            : () => bloc.send(DashboardCommand('start-server')),
+                        icon: const Icon(Icons.play_arrow),
+                        label: const Text('Start Herdr'),
+                      ),
+                    AgentPanel(
+                      agents: agents,
+                      onManage: () =>
+                          widget.coordinator.navigate(OrganizationRoute()),
+                    ),
+                    const SizedBox(height: 24),
+                    if (!widget.agentsOnly) ...[
+                      WorkspacePanel(
+                        workspaces: workspaces,
+                        agents: agents,
+                        busy: busy,
+                        onFocus: (workspace) =>
+                            action('focus', {'id': workspace['workspace_id']}),
+                        onRename: rename,
+                      ),
                       const SizedBox(height: 16),
+                      const ResourcePanel(),
+                      const SizedBox(height: 24),
                       Card(
+                        key: setupKey,
                         child: ExpansionTile(
+                          controller: setupController,
                           key: const PageStorageKey('dashboard-project-setup'),
                           leading: const Icon(Icons.create_new_folder_outlined),
                           title: const Text('Add a project or workspace'),
@@ -332,36 +269,25 @@ class _DashboardState extends State<Dashboard> {
                       ),
                       const SizedBox(height: 32),
                     ],
-                    Text(
-                      'Agents',
-                      style: Theme.of(context).textTheme.titleLarge,
-                    ),
-                    const SizedBox(height: 12),
-                    if (agents.isEmpty && error == null && refreshed != null)
-                      const Text(
-                        'No agents detected. Launch one in a Herdr pane over SSH.',
-                      ),
-                    for (final agent in agents)
-                      Card(
-                        child: ListTile(
-                          leading: Icon(
-                            agent['entity_type'] == 'group'
-                                ? Icons.forum_outlined
-                                : Icons.smart_toy_outlined,
-                          ),
-                          title: Text(
-                            '${agent['display_name'] ?? agent['name'] ?? agent['agent'] ?? agent['pane_id'] ?? 'Agent'}${agent['entity_type'] == 'group' ? ' · Group' : ''}',
-                          ),
-                          subtitle: SelectableText(
-                            '${agent['name'] == null ? '' : 'Herdr ID: ${agent['name']} · '}${agent['pane_id'] ?? ''}',
-                          ),
-                          trailing: Chip(
-                            label: Text(
-                              '${agent['agent_status'] ?? agent['state'] ?? agent['status'] ?? 'unknown'}',
-                            ),
+                    const SizedBox(height: 16),
+                    if (widget.agentsOnly) const ResourcePanel(),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            refreshed == null
+                                ? 'Herdr: ${state.serverStatus} · Waiting for first update'
+                                : 'Herdr: ${state.serverStatus} · Updated ${refreshed.toLocal().toString().substring(11, 19)}',
+                            style: Theme.of(context).textTheme.bodySmall,
                           ),
                         ),
-                      ),
+                        TextButton.icon(
+                          onPressed: busy ? null : refresh,
+                          icon: const Icon(Icons.refresh, size: 18),
+                          label: const Text('Refresh'),
+                        ),
+                      ],
+                    ),
                     const SizedBox(height: 24),
                     const Card(
                       child: ExpansionTile(

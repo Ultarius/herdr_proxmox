@@ -3,7 +3,7 @@ import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'integration.dart';
 import 'routes.dart';
-import 'ui_colors.dart';
+import 'app_theme.dart';
 
 class AppShell extends StatefulWidget {
   const AppShell({
@@ -312,12 +312,12 @@ class _AppShellState extends State<AppShell> {
     List<Map<String, dynamic>> groups,
   ) => Container(
     width: 224,
-    decoration: const BoxDecoration(
-      color: Color(0xff0b0b0b),
-      border: Border(right: BorderSide(color: Color(0xff252525))),
+    decoration: BoxDecoration(
+      color: Theme.of(context).colorScheme.surface,
+      border: Border(right: BorderSide(color: Theme.of(context).dividerColor)),
     ),
     child: Material(
-      color: const Color(0xff0b0b0b),
+      color: Theme.of(context).colorScheme.surface,
       child: ListView(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 20),
         children: [
@@ -356,11 +356,14 @@ class _AppShellState extends State<AppShell> {
           nav('CLI accounts', Icons.terminal, CliSetupRoute(), 'configuration'),
           heading('AGENTS'),
           if (profiles.isEmpty)
-            const Padding(
-              padding: EdgeInsets.all(10),
+            Padding(
+              padding: const EdgeInsets.all(10),
               child: Text(
                 'Hire your first agent',
-                style: TextStyle(color: secondaryTextColor, fontSize: 12),
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  fontSize: 12,
+                ),
               ),
             ),
           for (final profile in profiles)
@@ -376,11 +379,14 @@ class _AppShellState extends State<AppShell> {
             ),
           heading('GROUPS'),
           if (groups.isEmpty)
-            const Padding(
-              padding: EdgeInsets.all(10),
+            Padding(
+              padding: const EdgeInsets.all(10),
               child: Text(
                 'No discussion groups yet',
-                style: TextStyle(color: secondaryTextColor, fontSize: 12),
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  fontSize: 12,
+                ),
               ),
             ),
           for (final group in groups)
@@ -432,10 +438,10 @@ class _AppShellState extends State<AppShell> {
     padding: const EdgeInsets.fromLTRB(10, 28, 10, 10),
     child: Text(
       text,
-      style: const TextStyle(
+      style: TextStyle(
         fontSize: 10,
         letterSpacing: 1.5,
-        color: secondaryTextColor,
+        color: Theme.of(context).colorScheme.onSurfaceVariant,
       ),
     ),
   );
@@ -445,7 +451,7 @@ class _AppShellState extends State<AppShell> {
         child: ListTile(
           dense: true,
           selected: widget.section == section,
-          selectedTileColor: const Color(0xff1b1b1b),
+          selectedTileColor: Theme.of(context).colorScheme.primaryContainer,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
           contentPadding: const EdgeInsets.symmetric(horizontal: 10),
           leading: Icon(icon, size: 17),
@@ -486,111 +492,176 @@ class _AppShellState extends State<AppShell> {
               drawer: desktop
                   ? null
                   : Drawer(child: navigation(profiles, groups)),
+              bottomNavigationBar: desktop
+                  ? null
+                  : NavigationBar(
+                      selectedIndex: switch (widget.section) {
+                        'explorer' => 1,
+                        'agents' => 2,
+                        'organization' => 3,
+                        'configuration' => 4,
+                        _ => 0,
+                      },
+                      onDestinationSelected: (index) => navigate(
+                        [
+                          DashboardRoute(),
+                          ExplorerRoute(),
+                          AgentsRoute(),
+                          OrganizationRoute(),
+                          CliSetupRoute(),
+                        ][index],
+                      ),
+                      destinations: const [
+                        NavigationDestination(
+                          icon: Icon(Icons.home_outlined),
+                          selectedIcon: Icon(Icons.home),
+                          label: 'Overview',
+                        ),
+                        NavigationDestination(
+                          icon: Icon(Icons.folder_outlined),
+                          label: 'Projects',
+                        ),
+                        NavigationDestination(
+                          icon: Icon(Icons.smart_toy_outlined),
+                          label: 'Agents',
+                        ),
+                        NavigationDestination(
+                          icon: Icon(Icons.account_tree_outlined),
+                          label: 'Team',
+                        ),
+                        NavigationDestination(
+                          icon: Icon(Icons.settings_outlined),
+                          label: 'Settings',
+                        ),
+                      ],
+                    ),
               body: Row(
                 children: [
-                  Container(
-                    width: desktop ? 68 : 56,
-                    decoration: const BoxDecoration(
-                      color: Color(0xff090909),
-                      border: Border(
-                        right: BorderSide(color: Color(0xff252525)),
-                      ),
-                    ),
-                    child: Column(
-                      children: [
-                        const SizedBox(height: 18),
-                        const Tooltip(
-                          message: 'Herdr organizations',
-                          child: Icon(Icons.hub_outlined, size: 25),
+                  if (desktop)
+                    Container(
+                      width: 68,
+                      decoration: BoxDecoration(
+                        color: Theme.of(
+                          context,
+                        ).colorScheme.surfaceContainerLow,
+                        border: Border(
+                          right: BorderSide(
+                            color: Theme.of(context).dividerColor,
+                          ),
                         ),
-                        const SizedBox(height: 24),
-                        Expanded(
-                          child: ListView(
-                            children: [
-                              for (final item in orgs)
-                                Padding(
-                                  padding: const EdgeInsets.fromLTRB(
-                                    9,
-                                    0,
-                                    9,
-                                    12,
-                                  ),
-                                  child: Tooltip(
-                                    message: '${item['name']}',
-                                    child: Semantics(
-                                      button: true,
-                                      label: 'Switch to ${item['name']}',
-                                      selected: org?['id'] == item['id'],
-                                      child: InkWell(
-                                        borderRadius: BorderRadius.circular(13),
-                                        onTap: () {
-                                          connection
-                                                  .selectedOrganization
-                                                  .value =
-                                              item['id'];
-                                          navigate(OrganizationRoute());
-                                        },
-                                        child: AnimatedContainer(
-                                          duration: const Duration(
-                                            milliseconds: 150,
+                      ),
+                      child: Column(
+                        children: [
+                          const SizedBox(height: 18),
+                          const Tooltip(
+                            message: 'Herdr organizations',
+                            child: Icon(Icons.hub_outlined, size: 25),
+                          ),
+                          const SizedBox(height: 24),
+                          Expanded(
+                            child: ListView(
+                              children: [
+                                for (final item in orgs)
+                                  Padding(
+                                    padding: const EdgeInsets.fromLTRB(
+                                      9,
+                                      0,
+                                      9,
+                                      12,
+                                    ),
+                                    child: Tooltip(
+                                      message: '${item['name']}',
+                                      child: Semantics(
+                                        button: true,
+                                        label: 'Switch to ${item['name']}',
+                                        selected: org?['id'] == item['id'],
+                                        child: InkWell(
+                                          borderRadius: BorderRadius.circular(
+                                            13,
                                           ),
-                                          height: desktop ? 46 : 38,
-                                          decoration: BoxDecoration(
-                                            color: org?['id'] == item['id']
-                                                ? const Color(0xffff7917)
-                                                : const Color(0xff202020),
-                                            borderRadius: BorderRadius.circular(
-                                              13,
+                                          onTap: () {
+                                            connection
+                                                    .selectedOrganization
+                                                    .value =
+                                                item['id'];
+                                            navigate(OrganizationRoute());
+                                          },
+                                          child: AnimatedContainer(
+                                            duration: const Duration(
+                                              milliseconds: 150,
                                             ),
-                                            border: Border.all(
+                                            height: desktop ? 46 : 38,
+                                            decoration: BoxDecoration(
                                               color: org?['id'] == item['id']
-                                                  ? const Color(0xffffa14d)
-                                                  : const Color(0xff343434),
+                                                  ? Theme.of(
+                                                      context,
+                                                    ).colorScheme.primary
+                                                  : Theme.of(context)
+                                                        .colorScheme
+                                                        .surfaceContainerHighest,
+                                              borderRadius:
+                                                  BorderRadius.circular(13),
+                                              border: Border.all(
+                                                color: org?['id'] == item['id']
+                                                    ? Theme.of(
+                                                        context,
+                                                      ).colorScheme.primary
+                                                    : Theme.of(
+                                                        context,
+                                                      ).dividerColor,
+                                              ),
                                             ),
-                                          ),
-                                          alignment: Alignment.center,
-                                          child: Text(
-                                            '${item['name']}'.trim().isEmpty
-                                                ? '?'
-                                                : '${item['name']}'
-                                                      .trim()
-                                                      .substring(0, 1)
-                                                      .toUpperCase(),
-                                            style: const TextStyle(
-                                              fontSize: 19,
-                                              fontWeight: FontWeight.w700,
-                                              color: Colors.white,
+                                            alignment: Alignment.center,
+                                            child: Text(
+                                              '${item['name']}'.trim().isEmpty
+                                                  ? '?'
+                                                  : '${item['name']}'
+                                                        .trim()
+                                                        .substring(0, 1)
+                                                        .toUpperCase(),
+                                              style: TextStyle(
+                                                fontSize: 19,
+                                                fontWeight: FontWeight.w700,
+                                                color: org?['id'] == item['id']
+                                                    ? Theme.of(
+                                                        context,
+                                                      ).colorScheme.onPrimary
+                                                    : Theme.of(
+                                                        context,
+                                                      ).colorScheme.onSurface,
+                                              ),
                                             ),
                                           ),
                                         ),
                                       ),
                                     ),
                                   ),
-                                ),
-                            ],
+                              ],
+                            ),
                           ),
-                        ),
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 18),
-                          child: IconButton(
-                            tooltip: 'Manage organizations',
-                            onPressed: () => navigate(OrganizationRoute()),
-                            icon: const Icon(Icons.add),
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 18),
+                            child: IconButton(
+                              tooltip: 'Manage organizations',
+                              onPressed: () => navigate(OrganizationRoute()),
+                              icon: const Icon(Icons.add),
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
-                  ),
                   if (desktop) navigation(profiles, groups),
                   Expanded(
                     child: Column(
                       children: [
                         Container(
                           height: 56,
-                          decoration: const BoxDecoration(
-                            color: Color(0xff0b0b0b),
+                          decoration: BoxDecoration(
+                            color: Theme.of(context).colorScheme.surface,
                             border: Border(
-                              bottom: BorderSide(color: Color(0xff252525)),
+                              bottom: BorderSide(
+                                color: Theme.of(context).dividerColor,
+                              ),
                             ),
                           ),
                           child: Row(
@@ -608,10 +679,12 @@ class _AppShellState extends State<AppShell> {
                               Expanded(
                                 child: Text(
                                   widget.section.startsWith('group:')
-                                      ? 'DISCUSSION GROUP'
+                                      ? 'Discussion group'
                                       : widget.section == 'organization'
-                                      ? 'ORG CHART'
-                                      : widget.section.toUpperCase(),
+                                      ? 'Organization'
+                                      : widget.section == 'dashboard'
+                                      ? 'HERDR'
+                                      : widget.section,
                                   style: const TextStyle(
                                     fontSize: 12,
                                     fontWeight: FontWeight.w700,
@@ -622,11 +695,14 @@ class _AppShellState extends State<AppShell> {
                               if (desktop && org != null)
                                 Text(
                                   '${org['name']}',
-                                  style: const TextStyle(
+                                  style: TextStyle(
                                     fontSize: 12,
-                                    color: Color(0xff999999),
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
                                   ),
                                 ),
+                              const ThemeMenu(),
                               noticeBadge(),
                               const SizedBox(width: 22),
                             ],

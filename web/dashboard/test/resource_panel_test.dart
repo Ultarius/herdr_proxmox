@@ -10,6 +10,10 @@ void main() {
   testWidgets(
     'shows container pressure and process usage; stops polling on errors',
     (tester) async {
+      tester.view.physicalSize = const Size(320, 1600);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
       var requests = 0;
       var fail = false;
       final bloc = DashboardBloc(
