@@ -63,7 +63,7 @@ permissions or authorize interaction with other agents.
 Return only the JSON schema requested by the gateway:
 
 ```json
-{"outcome":"integrated|blocked","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands, results and any skipped required checks"},"reason":"integration result or precise blocker"}
+{"outcome":"integrated|blocked","blocker":"missing_toolchain|missing_permissions|owner_restriction|read_only_role|task_conflict|state_conflict|unspecified","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands, results and any skipped required checks"},"reason":"integration result or precise blocker"}
 ```
 
 Use `integrated` only when the target is incorporated and conflicts/operations are
@@ -72,3 +72,5 @@ gateway independently checks Git state; the test evidence remains worker-reporte
 Write the reply through the dashboard's provided delivery instructions. Include
 recovery references in a blocker where useful; restore into a separate recovery
 checkout only on an explicit recovery request, never by resetting the working branch.
+
+Report `missing_toolchain` when a required validation suite cannot run because its SDK is absent, even if the merge succeeded. This allows an administrator-approved SDK provisioning policy to act on an explicit blocker without guessing from prose.

@@ -268,8 +268,10 @@ Container configuration and updates are disabled. All preview data is temporary
 and removed when the process exits normally; no real agent is launched.
 
 For an existing CT, copy `web/public`, the complete `web/gateway` directory,
-`install/web-install.sh`, `install/dashboard-update.py`, and the release's
-`VERSION` file into the same layout under `/opt/herdr-web`, then run:
+`install/web-install.sh`, `install/dashboard-update.py`, `install/sdk-install.py`,
+`install/operator-admin.py`, `install/dev-tools-install.sh`,
+`install/flutter-release.py`, and the release's `VERSION` file into the same
+layout under `/opt/herdr-web`, then run:
 
 ```bash
 bash /opt/herdr-web/install/web-install.sh
@@ -371,6 +373,14 @@ and no automatic terminal retries. After a failure or gateway restart, inspect
 the terminal before releasing a run binding or resubmitting a task. The same
 dashboard token controls all organizations under one OS user; organization names
 do not create independent access or process isolation.
+
+Named operator tokens are optional. As root, `herdr-operator add <name> --role
+admin|operator` prints a token once and stores only its SHA-256; `list`, `rotate`
+and `remove` manage the file at `/etc/herdr/operators.json`. The shared
+dashboard token keeps working as the bootstrap administrator and is shown as
+`dashboard`. Coordinator approvals, retries, repairs, SDK installation requests
+and validation runs record the authenticated operator name; validation waivers
+require the admin role.
 
 In **Organization → Chat**, select a launched hire to send a prompt directly
 from the dashboard. Messages are durable jobs with deduplicated submission;
@@ -589,4 +599,4 @@ Before a merge request, the gateway pins a stash-shaped snapshot under `refs/her
 
 ### Development agent toolchain
 
-For an LXC used for Flutter development, explicitly run `bash install/dev-tools-install.sh` as root from this repository. It installs Flutter 3.44.8 for the `herdr` user, selects the exact stable architecture from the official manifest, verifies SHA-256 before extraction, and adds `flutter` and `dart` under `~/.local/bin`. Existing unrelated launchers are preserved. The SDK, package cache and build outputs add several GiB, so size `var_disk` with headroom for them. Run `scripts/build-web.sh` as `herdr` from the assigned repository/worktree to validate the dashboard and shell. Dashboard-only installations do not need this SDK. Existing OpenCode processes must be relaunched to pick up saved dashboard-output permission policies; changing a profile does not change a running process.
+For an LXC used for Flutter development, explicitly run `bash install/dev-tools-install.sh` as root from this repository. It installs Flutter 3.44.8 for the `herdr` user, selects the exact stable architecture from the official manifest, verifies SHA-256 before extraction, and adds `flutter` and `dart` under `~/.local/bin`. Existing unrelated launchers are preserved. The SDK, package cache and build outputs add several GiB, so size `var_disk` with headroom for them. Run `scripts/build-web.sh` as `herdr` from the assigned repository/worktree to validate the dashboard and shell. Dashboard-only installations do not need this SDK. The web installer also provides a root-owned `herdr-sdk.path` service: when the Integration card reports a missing toolchain, an administrator can queue the same pinned installation from the dashboard, which only writes a fixed request file. Existing OpenCode processes must be relaunched to pick up saved dashboard-output permission policies; changing a profile does not change a running process.

@@ -60,10 +60,23 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   int generation = 0;
   Timer? _timer;
   final selectedOrganization = ValueNotifier<String?>(null);
+  final operator = ValueNotifier<Map<String, dynamic>>({
+    'name': 'dashboard',
+    'role': 'admin',
+  });
   final organizationDirectory = ValueNotifier<Map<String, dynamic>>({
     'organizations': [],
     'profiles': [],
   });
+
+  void _rememberOperator(dynamic session) {
+    if (session is Map<String, dynamic>) {
+      operator.value = {
+        'name': session['operator'] ?? 'dashboard',
+        'role': session['role'] ?? 'admin',
+      };
+    }
+  }
 
   Future<void> signIn(String token) async {
     final attempt = ++generation;
@@ -75,12 +88,11 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
           )
           .timeout(const Duration(seconds: 15));
       if (attempt != generation || isClosing) return;
-      if (response.statusCode != 200 ||
-          jsonDecode(response.body)['authenticated'] != true) {
-        throw Exception(
-          jsonDecode(response.body)['error'] ?? 'Sign in failed.',
-        );
+      final session = jsonDecode(response.body);
+      if (response.statusCode != 200 || session['authenticated'] != true) {
+        throw Exception(session['error'] ?? 'Sign in failed.');
       }
+      _rememberOperator(session);
       connect('');
     } catch (error) {
       if (attempt == generation && !isClosing)
@@ -94,11 +106,14 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
       final response = await client
           .get(Uri.base.resolve('/api/session'))
           .timeout(const Duration(seconds: 15));
+      final session = jsonDecode(response.body);
       if (attempt == generation &&
           !isClosing &&
           response.statusCode == 200 &&
-          jsonDecode(response.body)['authenticated'] == true)
+          session['authenticated'] == true) {
+        _rememberOperator(session);
         connect('');
+      }
     } catch (_) {
       // Leave the token form available when the gateway is unreachable.
     }
@@ -120,6 +135,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
     _timer?.cancel();
     _credential = null;
     selectedOrganization.value = null;
+    operator.value = {'name': 'dashboard', 'role': 'admin'};
     organizationDirectory.value = {'organizations': [], 'profiles': []};
     generation++;
     // Reset immediately, including when an old request is still in flight.
@@ -205,6 +221,29 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
       }
     }
     return data;
+  }
+
+  Future<String> text(String path) async {
+    final requestGeneration = generation;
+    final response = await client
+        .get(
+          Uri.base.resolve('/api/$path'),
+          headers: {
+            if (_credential != null && _credential!.isNotEmpty)
+              'Authorization': 'Bearer $_credential',
+          },
+        )
+        .timeout(const Duration(seconds: 30));
+    if (requestGeneration != generation || _credential == null)
+      throw StateError('Dashboard connection changed.');
+    if (response.statusCode != 200) {
+      var message = 'Request failed';
+      try {
+        message = jsonDecode(response.body)['error'] ?? message;
+      } catch (_) {}
+      throw Exception(message);
+    }
+    return response.body;
   }
 
   @override

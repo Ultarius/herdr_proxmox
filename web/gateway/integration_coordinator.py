@@ -1,6 +1,6 @@
 """Durable, idle-only integration inbox and coordinator reports."""
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -9,6 +9,11 @@ import sqlite3
 import threading
 
 import project_git
+from blockers import TOOLCHAIN, label as blocker_label, normalize as normalize_blocker
+
+# An approval is a point-in-time decision. It expires, and its exact checkout
+# revision is re-verified immediately before any approved work is delivered.
+APPROVAL_TTL_SECONDS = 24 * 60 * 60
 
 
 def merge_skill():
@@ -33,14 +38,16 @@ def identity(*values):
 def report_digest(reports, bounded):
     """Detect changes anywhere while the delivered prompt stays bounded."""
     signature = [{key: event.get(key) for key in
-                  ('id', 'state', 'name', 'path', 'target', 'reason', 'checkpoint', 'tests', 'verification', 'recovery')}
+                  ('id', 'state', 'name', 'path', 'target', 'reason', 'checkpoint', 'tests', 'verification', 'recovery', 'blocker', 'validation_run')}
                  for event in reports]
-    return identity('summary-only-v4', signature, bounded)
+    return identity('summary-only-v5', signature, bounded)
 
 
 class IntegrationCoordinator:
-    def __init__(self, path, store):
+    def __init__(self, path, store, sdk_request=None):
         self.path, self.store = Path(path), store
+        # Fixed-purpose, best-effort hook for an opt-in SDK install request.
+        self.sdk_request = sdk_request
         self.lock = threading.RLock()
         self.stopped = threading.Event()
         self._dispatch_jobs = None
@@ -99,9 +106,11 @@ class IntegrationCoordinator:
                     'The durable gateway inbox delivers requests when workers are idle. '
                     'Preserve deferrals and blockers; never claim a merge or test without evidence.'))['id']
 
-    def configure(self, body):
+    def configure(self, body, actor=None, role='admin'):
         if not isinstance(body, dict):
             raise ValueError('Expected a JSON object.')
+        if 'auto_sdk' in body and role != 'admin':
+            raise ValueError('Only an administrator can change automatic SDK installation.')
         repository = body.get('repository')
         if not isinstance(repository, str):
             raise ValueError('Select a repository.')
@@ -112,6 +121,9 @@ class IntegrationCoordinator:
         enabled = body.get('enabled', True)
         if type(enabled) is not bool:
             raise ValueError('Enabled must be a boolean.')
+        auto_sdk = body.get('auto_sdk')
+        if auto_sdk is not None and type(auto_sdk) is not bool:
+            raise ValueError('Automatic SDK installation must be a boolean.')
         org_id = body.get('organization_id')
         profile_id = body.get('profile_id')
         with self.lock, closing(self.connect()) as db, db:
@@ -135,8 +147,11 @@ class IntegrationCoordinator:
                     raise ValueError('Coordinator profile is unavailable.')
                 config = dict(old if old.get('profile_id') == profile_id else {}, repository=repository, enabled=True,
                               profile_id=profile_id, organization_id=profile['organization_id'])
+            if auto_sdk is not None:
+                config['auto_sdk'] = auto_sdk
             db.execute('INSERT OR REPLACE INTO settings VALUES (?, ?)', (repository, json.dumps(config)))
-            self.audit(db, dict(action='configuration', repository=repository, enabled=enabled, profile_id=config.get('profile_id')))
+            self.audit(db, dict(action='configuration', repository=repository, enabled=enabled,
+                                profile_id=config.get('profile_id'), actor=actor or 'dashboard_operator'))
         return config
 
     def observe(self, notices):
@@ -160,7 +175,7 @@ class IntegrationCoordinator:
                              coordinator_id=config['profile_id'], organization_id=config['organization_id'])
                 self.save(db, event)
 
-    def repair_report(self, body):
+    def repair_report(self, body, actor=None):
         if (not isinstance(body, dict) or not isinstance(body.get('repository'), str)
                 or body.get('mode') not in ('recover', 'fresh')):
             raise ValueError('Choose saved reply recovery or a fresh summary.')
@@ -190,10 +205,11 @@ class IntegrationCoordinator:
                 config['report_pending'] = True
             db.execute('UPDATE settings SET data=? WHERE repository=?', (json.dumps(config), config['repository']))
             self.audit(db, dict(action='report_repair', repository=config['repository'],
-                                profile_id=config['profile_id'], job_id=report_id, reason=resolution))
+                                profile_id=config['profile_id'], job_id=report_id, reason=resolution,
+                                actor=actor or 'dashboard_operator'))
         return {'resolution': resolution}
 
-    def retry(self, event_id):
+    def retry(self, event_id, actor=None):
         if not isinstance(event_id, str) or not re.fullmatch(r'[a-f0-9]{64}', event_id):
             raise ValueError('Invalid integration event ID.')
         with self.lock, closing(self.connect()) as db, db:
@@ -215,7 +231,167 @@ class IntegrationCoordinator:
             if not validate:
                 event.pop('recovery', None)  # A new merge needs a fresh checkpoint.
             self.save(db, event)
+            self.audit(db, dict(action='retry', repository=event['repository'], profile_id=event['profile_id'],
+                                 state=event['state'], actor=actor or 'dashboard_operator'))
         return event
+
+    def event(self, event_id):
+        if not isinstance(event_id, str) or not re.fullmatch(r'[a-f0-9]{64}', event_id):
+            return None
+        with self.lock, closing(self.connect()) as db:
+            row = db.execute('SELECT data FROM events WHERE id=?', (event_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def record_validation_run(self, event_id, summary):
+        """Attach an exact-commit runner result to its event for the dashboard."""
+        with self.lock, closing(self.connect()) as db, db:
+            row = db.execute('SELECT data FROM events WHERE id=?', (event_id,)).fetchone()
+            if not row:
+                return
+            event = json.loads(row[0])
+            event['validation_run'] = summary
+            self.save(db, event)
+            self.audit(db, dict(action='validation_run', repository=event['repository'],
+                                profile_id=event['profile_id'], **summary))
+
+    def approval_check(self, event):
+        """Re-verify an operator approval immediately before delivery.
+
+        Returns (ok, blocker_code, detail, verification). A stale or expired
+        approval is never delivered; the event returns to the blocker queue.
+        """
+        approval = event.get('operator_approval') or {}
+        if not approval:
+            return True, None, '', None
+        expires = approval.get('expires_at')
+        if expires:
+            try:
+                expired = datetime.fromisoformat(expires) <= datetime.now(timezone.utc)
+            except (ValueError, TypeError):
+                expired = True
+            if expired:
+                return False, 'approval_expired', 'The operator approval expired before delivery.', None
+        else:
+            return False, 'approval_expired', 'The operator approval has no expiry and cannot be trusted.', None
+        checkout = self.store.projects / event['path']
+        approved_head = approval.get('approved_head')
+        if approved_head:
+            try:
+                head = project_git.git(checkout, 'rev-parse', 'HEAD').strip()
+            except (ValueError, OSError):
+                return False, 'approval_stale', 'The approved checkout can no longer be inspected.', None
+            if head != approved_head:
+                return False, 'approval_stale', 'The checkout changed after the operator approval.', None
+        if approval.get('action') not in ('retry_validation', 'waive_validation'):
+            return True, None, '', None
+        # Fresh Git verification: incorporation must still hold right now.
+        try:
+            behind = int(project_git.git(checkout, 'rev-list', '--count', 'HEAD..' + event['target']).strip())
+            tree = project_git.summary(self.store.projects, checkout)
+            verification = dict(target_incorporated=not behind, conflicts=tree['conflicts'], merging=tree['merging'])
+        except (ValueError, OSError):
+            return False, 'verification_failed', 'Git verification could not run for this checkout.', None
+        if behind or tree['conflicts'] or tree['merging']:
+            return False, 'verification_failed', 'Git verification no longer confirms the exact commit.', verification
+        return True, None, '', verification
+
+    def missing_toolchain(self, config, event):
+        """Queue the scoped SDK install once, when the operator opted in."""
+        if not config.get('auto_sdk') or not event.get('blocker') == TOOLCHAIN or self.sdk_request is None:
+            return
+        if event.get('sdk_requested'):
+            return
+        try:
+            self.sdk_request()
+        except (ValueError, OSError):
+            return
+        event['sdk_requested'] = True
+        event['reason'] = (str(event.get('reason', '')) + ' The dashboard queued the pinned SDK installation.').strip()[:2000]
+
+    def review_blockers(self, body, actor='dashboard_operator', role='admin'):
+        """Approve exact event revisions atomically; never change CLI permissions.
+
+        Missing tools cannot be made present by an override. A waiver records
+        an operator exception while preserving the original test evidence.
+        """
+        if not isinstance(body, dict):
+            raise ValueError('Invalid blocker review.')
+        request_id, reason, selections = body.get('request_id'), body.get('reason'), body.get('selections')
+        if not isinstance(request_id, str) or not re.fullmatch(r'[a-f0-9]{32}', request_id):
+            raise ValueError('Invalid approval request ID.')
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
+            raise ValueError('An approval reason is required (maximum 1000 characters).')
+        if not isinstance(selections, list) or not 1 <= len(selections) <= 20:
+            raise ValueError('Select 1–20 blocker actions.')
+        with self.lock, closing(self.connect()) as db, db:
+            # Lost-response retries reuse the durable request and do not dispatch again.
+            previous = db.execute("SELECT data FROM audit WHERE json_extract(data, '$.approval_id')=?", (request_id,)).fetchone()
+            if previous:
+                saved = json.loads(previous[0])
+                if saved.get('selections') != selections or saved.get('reason') != reason.strip() or saved.get('actor') != actor:
+                    raise ValueError('Approval request ID was reused with different content.')
+                return {'approved': len(selections), 'request_id': request_id}
+            pending, seen = [], set()
+            for choice in selections:
+                if not isinstance(choice, dict) or choice.get('action') not in ('retry_validation', 'waive_validation', 'reconsider'):
+                    raise ValueError('Unsupported blocker action.')
+                event_id = choice.get('id')
+                if not isinstance(event_id, str) or not re.fullmatch(r'[a-f0-9]{64}', event_id) or event_id in seen:
+                    raise ValueError('Invalid or duplicate event selection.')
+                seen.add(event_id)
+                row = db.execute('SELECT data FROM events WHERE id=?', (event_id,)).fetchone()
+                if not row:
+                    raise ValueError('Integration event not found.')
+                event = json.loads(row[0])
+                if any(choice.get(key) != event.get(key) for key in ('repository', 'target', 'updated_at')):
+                    raise ValueError('Blocker changed. Refresh and review it again.')
+                if event['state'] not in ('blocked', 'deferred', 'validation_pending', 'validation_failed', 'validation_waived'):
+                    raise ValueError('This event requires inspection, not bulk approval.')
+                action = choice['action']
+                if action == 'waive_validation' and role != 'admin':
+                    raise ValueError('Only an administrator can waive validation.')
+                verified = event.get('verification') or {}
+                incorporated = verified.get('target_incorporated') and not verified.get('conflicts') and not verified.get('merging')
+                if action in ('retry_validation', 'waive_validation') and not incorporated:
+                    raise ValueError('Validation actions require verified incorporation without conflicts.')
+                if action == 'reconsider' and (incorporated or event['state'] not in ('blocked', 'deferred')):
+                    raise ValueError('Use a validation action for an incorporated commit.')
+                if action != 'waive_validation':
+                    row = db.execute('SELECT data FROM settings WHERE repository=?', (event['repository'],)).fetchone()
+                    if not row or not json.loads(row[0]).get('enabled'):
+                        raise ValueError('Coordination is paused. Resume it before requesting work.')
+                pending.append((event, action))
+            for event, action in pending:
+                approved_head = None
+                try:
+                    approved_head = project_git.git(self.store.projects / event['path'], 'rev-parse', 'HEAD').strip()
+                except (ValueError, OSError):
+                    raise ValueError('Inspect the affected checkout before approving.')
+                approval = dict(request_id=request_id, action=action, reason=reason.strip(),
+                                actor=actor, target=event['target'], path=event['path'],
+                                at=datetime.now(timezone.utc).isoformat(),
+                                expires_at=(datetime.now(timezone.utc) + timedelta(seconds=APPROVAL_TTL_SECONDS)).isoformat(),
+                                approved_head=approved_head)
+                event['operator_approval'] = approval
+                if action == 'waive_validation':
+                    ok, _, detail, fresh = self.approval_check(event)
+                    if not ok:
+                        raise ValueError(detail)
+                    event['verification'] = fresh
+                if action == 'waive_validation':
+                    event['state'] = 'validation_waived'
+                else:
+                    event.update(state='validation_ready' if action == 'retry_validation' else 'waiting',
+                                 attempt=event.get('attempt', 0) + 1)
+                    event.pop('job_id', None)
+                    if action == 'reconsider':
+                        event.pop('recovery', None)
+                self.save(db, event)
+                self.audit(db, dict(action='blocker_approval', repository=event['repository'],
+                                    profile_id=event['profile_id'], state=event['state'], approval=approval))
+            self.audit(db, dict(action='blocker_review', approval_id=request_id,
+                                selections=selections, reason=reason.strip(), actor=actor))
+        return {'approved': len(selections), 'request_id': request_id}
 
     def ready(self, profile_id, run_id=None):
         jobs = self._dispatch_jobs if self._dispatch_jobs is not None else self.store.job_records()
@@ -236,6 +412,10 @@ class IntegrationCoordinator:
     def submit(self, event, phase, prompt, profile_id=None):
         if self.stopped.is_set():
             return None
+        approval = event.get('operator_approval')
+        if approval and approval.get('target') == event.get('target'):
+            prompt = ('Operator review for this checkout and exact commit only: ' + json.dumps(approval) +
+                      '\nThis does not change runtime permissions or authorize installs, push or deployment.\n' + prompt)
         profile_id = profile_id or event['profile_id']
         run = self.ready(profile_id, event['run_id'] if profile_id == event['profile_id'] else None)
         if not run:
@@ -268,6 +448,22 @@ class IntegrationCoordinator:
                     # Enabled coordination authorizes worker delivery; summary
                     # availability must not freeze unrelated workers.
                     state = event['state']
+                    if state in ('waiting', 'ready', 'validation_ready') and event.get('operator_approval'):
+                        # An approval is point-in-time: expire it and re-verify the
+                        # exact checkout immediately before any approved delivery.
+                        ok, code, detail, fresh = self.approval_check(event)
+                        if not ok:
+                            approval = event['operator_approval']
+                            event.update(state='blocked', blocker=code, reason=detail,
+                                         verification=fresh or event.get('verification') or {},
+                                         operator_approval={**approval, 'invalidated': code, 'invalidated_at': stamp()})
+                            self.audit(db, dict(action='approval_invalid', repository=event['repository'],
+                                                profile_id=event['profile_id'], target=event['target'],
+                                                actor=approval.get('actor'), reason=code))
+                            self.save(db, event)
+                            continue
+                        if fresh is not None:
+                            event['verification'] = fresh
                     job = jobs.get(event.get('job_id'))
                     if state in ('deciding', 'integrating', 'validating'):
                         if not job or job['state'] in ('uncertain', 'needs_attention', 'released'):
@@ -293,8 +489,11 @@ class IntegrationCoordinator:
                                     outcome = 'validation_failed' if tests['status'] == 'failed' else 'validation_pending'
                                 event.update(state=outcome,
                                              verification=dict(target_incorporated=not behind, conflicts=tree['conflicts'], merging=tree['merging']),
+                                             blocker='verification_failed' if outcome == 'blocked' else normalize_blocker(result.get('blocker')) if outcome in ('validation_pending', 'validation_failed') else '',
                                              reason=str(result.get('reason') or ('Commit incorporated; reported tests passed.' if outcome == 'completed' else 'Integration or reported test results require review.'))[:1000],
                                              tests=dict(status=tests.get('status'), summary=str(tests.get('summary', ''))[:1000]) if isinstance(tests, dict) else {})
+                                if event.get('blocker') == TOOLCHAIN:
+                                    self.missing_toolchain(settings.get(event['repository'], {}), event)
                             else:
                                 raw = job.get('result', '').strip()
                                 raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw)
@@ -305,10 +504,14 @@ class IntegrationCoordinator:
                                 if not isinstance(decision, dict):
                                     decision = {}
                                 choice = decision.get('decision')
-                                event.update(state={'integrate_now': 'ready', 'defer': 'deferred', 'blocked': 'blocked'}.get(choice, 'needs_attention'),
+                                decision_state = {'integrate_now': 'ready', 'defer': 'deferred', 'blocked': 'blocked'}.get(choice, 'needs_attention')
+                                blocker = normalize_blocker(decision.get('blocker')) if decision_state == 'blocked' else ''
+                                event.update(state=decision_state, blocker=blocker,
                                              reason=str(decision.get('reason', 'Reply must contain a valid integration decision.'))[:2000],
                                              checkpoint=str(decision.get('checkpoint', ''))[:1000],
                                              deferred_after=[j['id'] for j in jobs.values() if not j.get('integration_event') and event['profile_id'] in j.get('participants', [j.get('profile_id')])])
+                                if blocker == TOOLCHAIN:
+                                    self.missing_toolchain(settings.get(event['repository'], {}), event)
                                 advance_pending = event['state'] == 'ready' or advance_pending
                     elif state == 'deferred':
                         completed = [j for j in jobs.values() if not j.get('integration_event') and
@@ -322,7 +525,7 @@ class IntegrationCoordinator:
                     elif state == 'validation_ready':
                         prompt = (f"Validation only in your assigned checkout {self.store.projects / event['path']} for exact commit {event['target']}. "
                                   "Do not merge again, switch branches, reset, stash or deploy. Confirm the commit is still incorporated and no merge/rebase/conflicts remain. "
-                                  'Run required checks and return ONLY JSON: {"outcome":"integrated|blocked","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands, results and missing checks"},"reason":"..."}. '
+                                  'Run required checks and return ONLY JSON: {"outcome":"integrated|blocked","blocker":"missing_toolchain|missing_permissions|owner_restriction|read_only_role|task_conflict|state_conflict|unspecified","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands, results and missing checks"},"reason":"..."}. '
                                   "Missing required checks mean not_run even if other suites pass. Preserve current work; report any blocker.")
                         job_id = self.submit(event, 'validation', prompt)
                         if job_id:
@@ -332,8 +535,8 @@ class IntegrationCoordinator:
                                   f"Your assigned checkout is {self.store.projects / event['path']}. "
                                   "This is a new integration request authorized by the repository owner enabling coordination, separate from any completed read-only review. Assess relevance to your current task. This message requests a decision only; do not execute a merge or change files in this step. A developer assigned implementation work may choose integrate_now; a separate authorized merge request follows. A temporary read-only review task does not itself revoke the developer role. Preserve any explicit owner restriction against integration. "
                                   "For a clean fast-forward, assess readiness and task checkpoints without performing a full code review. The gateway selects the merge path before delivery; the merge request includes the recovery ref and procedure. "
-                                  'Respond ONLY with JSON: {"decision":"integrate_now|defer|blocked","reason":"...","checkpoint":"..."}. '
-                                  "Choose blocked for an explicit owner prohibition, read-only assigned role, or unavailable permissions/toolchain. Choose defer for a task checkpoint. Do not treat the decision-only instruction itself as a prohibition on choosing integrate_now.")
+                                  'Respond ONLY with JSON: {"decision":"integrate_now|defer|blocked","blocker":"missing_toolchain|missing_permissions|owner_restriction|read_only_role|task_conflict|state_conflict|unspecified","reason":"...","checkpoint":"..."}. '
+                                  "Set blocker only when blocked. Choose blocked for an explicit owner prohibition, read-only assigned role, or unavailable permissions/toolchain. Choose defer for a task checkpoint. Do not treat the decision-only instruction itself as a prohibition on choosing integrate_now.")
                         job_id = self.submit(event, 'decision', prompt)
                         if job_id:
                             event.update(state='deciding', job_id=job_id, reason='')
@@ -354,7 +557,7 @@ class IntegrationCoordinator:
                                   "Inspect any existing merge/rebase first; do not start another or automatically finish an unrelated operation. "
                                   f"Read-only preflight selected {event['merge_mode']}: use {command} {event['target']} after rechecking the checkout. "
                                   "Resolve conflicts and run relevant tests. Return ONLY JSON with "
-                                  '{"outcome":"integrated|blocked","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands and results"},"reason":"..."}. '
+                                  '{"outcome":"integrated|blocked","blocker":"missing_toolchain|missing_permissions|owner_restriction|read_only_role|task_conflict|state_conflict|unspecified","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands and results"},"reason":"..."}. '
                                   "Never claim tests passed if they were not run. "
                                   "Never discard unrelated changes, reset, force-push or deploy. Respect your assigned permissions; report blockers.\n\n"
                                   "Follow this gateway-bundled worker skill for the authorized merge:\n" + merge_skill())
@@ -370,7 +573,7 @@ class IntegrationCoordinator:
             # Coordinator receives the actual collected decisions, never guessed responses.
             for repository, config in settings.items():
                 reports = [e for e in events if e['repository'] == repository]
-                if not any(e['state'] in ('deferred', 'blocked', 'completed', 'needs_attention', 'validation_pending', 'validation_failed') for e in reports):
+                if not any(e['state'] in ('deferred', 'blocked', 'completed', 'needs_attention', 'validation_pending', 'validation_failed', 'validation_waived') for e in reports):
                     continue
                 if not config.get('enabled') or not reports:
                     continue
@@ -389,7 +592,9 @@ class IntegrationCoordinator:
                     entry.update(reason=str(event.get('reason', ''))[:500], checkpoint=str(event.get('checkpoint', ''))[:200])
                     # Supply evidence here so the summarizer need not access another
                     # agent's checkout. Tests remain worker-reported, not gateway-run.
-                    entry.update(tests=event.get('tests', {}), verification=event.get('verification', {}))
+                    entry.update(validation_run=event.get('validation_run'), tests=event.get('tests', {}), verification=event.get('verification', {}), operator_approval=event.get('operator_approval'),
+                                 blocker=event.get('blocker') or '',
+                                 blocker_label=blocker_label(event.get('blocker')) if event.get('blocker') else '')
                     recovery = event.get('recovery') or {}
                     entry['recovery'] = {k: recovery.get(k) for k in ('ref', 'commit')}
                     if len(json.dumps([*bounded, entry])) > 6000:
@@ -429,7 +634,19 @@ class IntegrationCoordinator:
                               coordinator_path=run.get('worktree_path'))
                 report = next((job for job in jobs if job['id'] == config.get('report_job_id')), {})
                 config.update(report_state=report.get('state', 'waiting' if config.get('report_pending') else None), report_error=report.get('error', ''))
+            # One snapshot can be audited by more than one ready-state save;
+            # list each reference once, newest first.
+            recoveries, seen = [], set()
+            for row in db.execute("SELECT data FROM audit WHERE json_extract(data, '$.recovery') IS NOT NULL AND json_extract(data, '$.state')='ready' ORDER BY sequence DESC"):
+                entry = json.loads(row[0])
+                reference = (entry.get('recovery') or {}).get('ref')
+                # Git refs are scoped to a repository, not globally unique.
+                identity = (entry.get('repository'), reference)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                recoveries.append(entry)
             return dict(configurations=configurations,
-                        recoveries=[json.loads(r[0]) for r in db.execute("SELECT data FROM audit WHERE json_extract(data, '$.recovery') IS NOT NULL AND json_extract(data, '$.state')='ready' ORDER BY sequence DESC")],
+                        recoveries=recoveries,
                         audit=[dict(json.loads(r[1]), sequence=r[0]) for r in db.execute('SELECT sequence,data FROM audit ORDER BY sequence DESC LIMIT 200')],
                         events=[json.loads(r[0]) for r in db.execute('SELECT data FROM events ORDER BY rowid DESC LIMIT 100')])

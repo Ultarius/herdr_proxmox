@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from organizations import OrganizationStore
@@ -29,7 +30,10 @@ from herdr_server import HerdrServer
 from herdr_ids import is_workspace_id
 from resource_usage import resources
 from organization_transfer import export_configuration, import_configuration
+from operators import Operators
+from sdk_install import SdkInstall
 from updates import Updates
+from validation import ValidationRuns
 
 ROOT = Path(os.environ.get('HERDR_WEB_ROOT', '/opt/herdr-web/public')).resolve()
 PROJECTS = Path(os.environ.get('HERDR_PROJECTS', '/home/herdr/projects')).resolve()
@@ -115,6 +119,13 @@ class BrowserSessions:
             entry = self.entries.get(key)
             return bool(entry and entry[0] > time.time() and hmac.compare_digest(entry[1], token))
 
+    def operator(self, key, resolver):
+        """Resolve the session's identity at request time, so revocation takes effect."""
+        with self.lock:
+            entry = self.entries.get(key)
+            token = entry[1] if entry and entry[0] > time.time() else None
+        return resolver(token) if token else None
+
     def revoke(self, key):
         with self.lock:
             self.entries.pop(key, None)
@@ -132,6 +143,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def validation_log(self, run_id):
+        try:
+            run, content = self.server.validation.log(run_id)
+        except ValueError as exc:
+            self.reply(400, {'error': str(exc)[:500]})
+            return
+        payload = content.encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Disposition', f'attachment; filename="validation-{run["id"]}.log"')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Content-Security-Policy', "default-src 'none'; sandbox")
+        self.send_header('X-Validation-State', str(run.get('state')))
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def session_key(self):
         cookies = SimpleCookie()
         try:
@@ -144,15 +173,30 @@ class Handler(BaseHTTPRequestHandler):
         secure = '; Secure' if getattr(self.server, 'cookie_secure', False) else ''
         return f'herdr_session={key}; Path=/api/; Max-Age={age}; HttpOnly; SameSite=Strict{secure}'
 
+    def resolve_operator(self, token):
+        """Map a bearer token to a named operator, or to the shared administrator."""
+        if not isinstance(token, str) or not token:
+            return None
+        operators = getattr(self.server, 'operators', None)
+        identity = operators.identify(token) if operators is not None else None
+        if identity is not None:
+            return identity
+        if hmac.compare_digest(token.encode(), self.server.token.encode()):
+            return {'name': 'dashboard', 'role': 'admin', 'master': True}
+        return None
+
     def authenticated(self):
         supplied = self.headers.get('Authorization', '')
-        expected = 'Bearer ' + self.server.token
-        bearer = hmac.compare_digest(supplied.encode(), expected.encode())
-        if not bearer and not (
-                getattr(self.server, 'sessions', None) and
-                self.server.sessions.valid(self.session_key(), self.server.token)):
+        token = supplied[len('Bearer '):] if supplied.startswith('Bearer ') else ''
+        identity = self.resolve_operator(token)
+        bearer = identity is not None
+        if not bearer:
+            sessions = getattr(self.server, 'sessions', None)
+            identity = sessions.operator(self.session_key(), self.resolve_operator) if sessions else None
+        if identity is None:
             self.reply(401, {'error': 'Invalid dashboard token. Disconnect and enter the correct token.'})
             return False
+        self.operator = identity
         if not bearer and self.command == 'POST' and not self.headers.get('Origin'):
             self.reply(403, {'error': 'A same-origin browser request is required.'})
             return False
@@ -171,7 +215,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self.same_origin():
                 return
             sessions = getattr(self.server, 'sessions', None)
-            self.reply(200, {'authenticated': bool(sessions and sessions.valid(self.session_key(), self.server.token))})
+            identity = sessions.operator(self.session_key(), self.resolve_operator) if sessions else None
+            self.reply(200, {'authenticated': identity is not None,
+                             'operator': identity['name'] if identity else None,
+                             'role': identity['role'] if identity else None})
             return
         if self.path == '/logs/view':
             content = Path(__file__).with_name('log_view.html').read_bytes()
@@ -187,13 +234,17 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/api/'):
             if not self.authenticated():
                 return
+            if self.path.startswith('/api/validation/log?'):
+                query = parse_qs(urlsplit(self.path).query)
+                self.validation_log((query.get('id') or [''])[0])
+                return
             if self.path == '/api/resources':
                 self.reply(200, resources.snapshot())
                 return
             if self.path == '/api/organizations/export':
                 self.reply(200, export_configuration(self.server.organizations))
                 return
-            if self.path not in ('/api/snapshot', '/api/organizations', '/api/organizations/directory', '/api/organizations/state', '/api/projects/jobs', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates', '/api/models', '/api/integration'):
+            if self.path not in ('/api/snapshot', '/api/organizations', '/api/organizations/directory', '/api/organizations/state', '/api/projects/jobs', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates', '/api/models', '/api/integration', '/api/sdk', '/api/validation'):
                 self.reply(404, {'error': 'Unknown endpoint.'})
                 return
             try:
@@ -202,6 +253,12 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if self.path == '/api/models':
                     self.reply(200, model_catalog.snapshot())
+                    return
+                if self.path == '/api/sdk':
+                    self.reply(200, self.server.sdk_install.snapshot())
+                    return
+                if self.path == '/api/validation':
+                    self.reply(200, self.server.validation.snapshot())
                     return
                 if self.path == '/api/integration':
                     # Served from memory; the watcher owns the Git work.
@@ -283,13 +340,16 @@ class Handler(BaseHTTPRequestHandler):
                 sessions.revoke(self.session_key())
                 self.reply(200, {'authenticated': False}, self.session_cookie('', 0))
                 return
-            expected = 'Bearer ' + self.server.token
-            if not hmac.compare_digest(self.headers.get('Authorization', '').encode(), expected.encode()):
+            supplied = self.headers.get('Authorization', '')
+            token = supplied[len('Bearer '):] if supplied.startswith('Bearer ') else ''
+            identity = self.resolve_operator(token)
+            if identity is None:
                 self.reply(401, {'error': 'Invalid dashboard token.'})
                 return
             sessions.revoke(self.session_key())
-            key = sessions.create(self.server.token)
-            self.reply(200, {'authenticated': True}, self.session_cookie(key, sessions.lifetime))
+            key = sessions.create(token)
+            self.reply(200, {'authenticated': True, 'operator': identity['name'], 'role': identity['role']},
+                       self.session_cookie(key, sessions.lifetime))
             return
         if self.path == '/log-data':
             if not self.same_origin():
@@ -320,11 +380,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self.authenticated():
             return
+        actor = getattr(self, 'operator', {}).get('name', 'dashboard_operator')
+        role = getattr(self, 'operator', {}).get('role', 'operator')
         actions = {f'/api/workspaces/{name}': name for name in ('create', 'focus', 'rename')}
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'remove_agent', 'remove_group')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/repair', '/api/organizations/history', '/api/organizations/activity'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/organizations/history', '/api/organizations/activity'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -338,14 +400,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, self.server.organizations.activity(body))
             elif self.path == '/api/organizations/history':
                 self.reply(200, self.server.organizations.history(body))
+            elif self.path == '/api/sdk/install':
+                if role != 'admin':
+                    raise ValueError('Only an administrator can install the development SDK.')
+                self.reply(200, self.server.sdk_install.install(body))
+            elif self.path == '/api/validation/run':
+                self.reply(200, self.server.validation.submit(body, actor=actor))
             elif self.path == '/api/integration/configure':
-                self.reply(200, self.server.coordinator.configure(body))
+                if 'auto_sdk' in body and role != 'admin':
+                    raise ValueError('Only an administrator can change automatic SDK installation.')
+                self.reply(200, self.server.coordinator.configure(body, actor=actor, role=role))
                 self.server.integration.wake()
             elif self.path == '/api/integration/retry':
-                self.reply(200, self.server.coordinator.retry(body.get('id')))
+                self.reply(200, self.server.coordinator.retry(body.get('id'), actor=actor))
+                self.server.integration.wake()
+            elif self.path == '/api/integration/blockers':
+                self.reply(200, self.server.coordinator.review_blockers(body, actor=actor, role=role))
                 self.server.integration.wake()
             elif self.path == '/api/integration/repair':
-                self.reply(200, self.server.coordinator.repair_report(body))
+                self.reply(200, self.server.coordinator.repair_report(body, actor=actor))
                 self.server.integration.wake()
             elif self.path == '/api/projects/git':
                 self.reply(200, project_git.inspect(PROJECTS, body))
@@ -419,17 +492,21 @@ def main():
     if bind not in ('127.0.0.1', '0.0.0.0'):
         raise SystemExit('Invalid HERDR_WEB_BIND.')
     policy = TOKEN_FILE.parent / 'dashboard-access.json'
+    operators = Operators(Path('/etc/herdr/operators.json'))
+    sdk_install = SdkInstall()
     cli_setup = CliSetup()
     organizations = OrganizationStore(DATABASE, PROJECTS, command, runtime_status=cli_setup.status, model_validator=lambda profile: model_catalog.validate_selection(cli_setup, PROJECTS, profile))
     run_logs = RunLogs(DATABASE.parent / 'run-logs', BIN)
     ssh_access = SshAccess()
     projects = ProjectJobs(PROJECTS, DATABASE.with_name('projects.sqlite3'))
-    coordinator = IntegrationCoordinator(DATABASE.with_name('integration.sqlite3'), organizations)
+    coordinator = IntegrationCoordinator(DATABASE.with_name('integration.sqlite3'), organizations,
+                                         sdk_request=lambda: sdk_install.install({}))
+    validation = ValidationRuns(PROJECTS, coordinator.event, record=coordinator.record_validation_run)
     integration = IntegrationWatcher(PROJECTS, organizations.active_checkouts, coordinator=coordinator,
                                      wake_event=organizations.jobs_changed)
     integration.wake()
     try:
-        serve_gateway(bind, 8787, policy, token, {'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator}, cookie_secure=secure_setting == '1')
+        serve_gateway(bind, 8787, policy, token, {'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator, 'operators': operators, 'sdk_install': sdk_install, 'validation': validation}, cookie_secure=secure_setting == '1')
     finally:
         coordinator.close()
         integration.close()

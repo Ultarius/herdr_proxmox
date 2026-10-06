@@ -1,6 +1,8 @@
 import importlib.util
 import json
 from pathlib import Path
+import sys
+import tempfile
 import threading
 import unittest
 from unittest.mock import patch
@@ -10,6 +12,8 @@ from urllib.request import Request, urlopen
 spec = importlib.util.spec_from_file_location('session_gateway', Path(__file__).parents[1] / 'web/gateway/server.py')
 gateway = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gateway)
+sys.path.insert(0, str(Path(__file__).parents[1] / 'web/gateway'))
+from operators import token_digest
 
 
 class BrowserSessionTests(unittest.TestCase):
@@ -64,3 +68,21 @@ class BrowserSessionTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as error:
             self.request('/api/session', 'POST', Authorization='Bearer wrong', Origin=self.base)
         self.assertEqual(error.exception.code, 401)
+
+    def test_operator_tokens_carry_their_identity_and_lose_it_on_removal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'operators.json'
+            entries = [{'name': 'damien', 'role': 'admin', 'token_sha256': token_digest('operator-secret')},
+                       {'name': 'kit', 'role': 'operator', 'token_sha256': token_digest('viewer-secret')}]
+            path.write_text(json.dumps({'operators': entries}))
+            self.server.operators = gateway.Operators(path)
+            response = self.request('/api/session', 'POST', Authorization='Bearer viewer-secret', Origin=self.base)
+            identity = json.load(response)
+            self.assertEqual((identity['authenticated'], identity['operator'], identity['role']), (True, 'kit', 'operator'))
+            cookie = response.headers['Set-Cookie'].split(';')[0]
+            restored = json.load(self.request('/api/session', Cookie=cookie))
+            self.assertEqual((restored['operator'], restored['role']), ('kit', 'operator'))
+            path.write_text(json.dumps({'operators': [entries[0]]}))
+            self.assertFalse(json.load(self.request('/api/session', Cookie=cookie))['authenticated'])
+            master = json.load(self.request('/api/session', 'POST', Authorization='Bearer secret', Origin=self.base))
+            self.assertEqual((master['operator'], master['role']), ('dashboard', 'admin'))

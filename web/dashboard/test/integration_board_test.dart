@@ -31,6 +31,15 @@ void main() {
             expect(jsonDecode(request.body)['id'], isIn(['event1', 'pending']));
             return http.Response('{}', 200);
           }
+          if (endpoint.endsWith('/integration/blockers')) {
+            final body = jsonDecode(request.body);
+            expect(body['reason'], 'Tools repaired; reassess selected work');
+            expect(body['selections'], hasLength(2));
+            expect(body['selections'][0]['action'], 'retry_validation');
+            expect(body['selections'][1]['action'], 'reconsider');
+            actions.add('blockers');
+            return http.Response('{}', 200);
+          }
           if (endpoint.endsWith('/integration/repair')) {
             final body = jsonDecode(request.body);
             expect(body['job_id'], 'report1');
@@ -65,6 +74,13 @@ void main() {
                       'at': '2026-10-06',
                       'profile_id': 'worker',
                       'reason': 'Snapshot pinned',
+                    },
+                    {
+                      'repository': 'repo',
+                      'action': 'report_repair',
+                      'at': '2026-10-06',
+                      'profile_id': 'coord',
+                      'reason': 'recovered',
                     },
                   ],
                   'events': enabled
@@ -184,13 +200,20 @@ void main() {
       await tester.tap(find.text('Close'));
       await tester.pumpAndSettle();
       await tester.ensureVisible(find.text('Recovery · Max'));
+      expect(find.text('repo · saved123 · before integration'), findsOneWidget);
       await tester.tap(find.text('Recovery · Max'));
       await tester.pumpAndSettle();
       expect(
         find.byWidgetPredicate(
           (w) =>
               w is SelectableText &&
-              (w.data ?? '').contains('git worktree add --detach'),
+              (w.data ?? '').contains('git worktree add --detach') &&
+              (w.data ?? '').contains(
+                'restore --source=refs/herdr/recovery/saved123 --worktree -- .',
+              ) &&
+              (w.data ?? '').contains(
+                'read-tree refs/herdr/recovery/saved123^2',
+              ),
         ),
         findsOneWidget,
       );
@@ -204,6 +227,10 @@ void main() {
         ),
         findsOneWidget,
       );
+      expect(find.text('transition · ready'), findsOneWidget);
+      // A repair entry has neither state nor enabled; it must not read as paused.
+      expect(find.text('report_repair'), findsOneWidget);
+      expect(find.text('report_repair · paused'), findsNothing);
       expect(find.text('Max · deferred'), findsOneWidget);
       expect(find.textContaining('After tests'), findsOneWidget);
       await tester.ensureVisible(find.text('Ask again'));
@@ -211,6 +238,29 @@ void main() {
       await tester.tap(find.text('Ask again'));
       await tester.pumpAndSettle();
       expect(actions, ['configure', 'repair', 'retry', 'retry']);
+      await tester.ensureVisible(find.text('Review blockers'));
+      await tester.tap(find.text('Review blockers'));
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<FilledButton>(
+              find.widgetWithText(FilledButton, 'Approve selected actions'),
+            )
+            .onPressed,
+        isNull,
+      );
+      await tester.tap(find.text('Select all eligible actions'));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Reason for approval'),
+        'Tools repaired; reassess selected work',
+      );
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('Approve selected actions'));
+      await tester.tap(find.text('Approve selected actions'));
+      await tester.pumpAndSettle();
+      expect(actions.last, 'blockers');
+
       // New report controls and validation labels must also fit phone widths.
       tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.resetDevicePixelRatio);
@@ -221,6 +271,12 @@ void main() {
         expect(tester.takeException(), isNull);
         await tester.ensureVisible(find.text('Create fresh summary'));
         await tester.tap(find.text('Create fresh summary'));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        await tester.tap(find.text('Cancel'));
+        await tester.pumpAndSettle();
+        await tester.ensureVisible(find.text('Review blockers'));
+        await tester.tap(find.text('Review blockers'));
         await tester.pumpAndSettle();
         expect(tester.takeException(), isNull);
         await tester.tap(find.text('Cancel'));
@@ -260,4 +316,197 @@ void main() {
       await BlocScope.reset();
     },
   );
+
+  testWidgets('SDK, exact-commit validation and blocker labels stay scoped', (
+    tester,
+  ) async {
+    final calls = <String>[];
+    var queued = false;
+    final connection = DashboardBloc(
+      client: MockClient((request) async {
+        final endpoint = request.url.path;
+        calls.add(request.url.toString());
+        if (endpoint.endsWith('/integration/configure')) {
+          expect(jsonDecode(request.body)['auto_sdk'], isTrue);
+          return http.Response('{}', 200);
+        }
+        if (endpoint.endsWith('/sdk/install')) {
+          expect(request.method, 'POST');
+          queued = true;
+          return http.Response(jsonEncode({'state': 'queued'}), 200);
+        }
+        if (endpoint.endsWith('/validation/run')) {
+          expect(jsonDecode(request.body)['id'], 'e1');
+          return http.Response('{}', 200);
+        }
+        if (endpoint.endsWith('/validation/log'))
+          return http.Response('runner log text', 200);
+        if (endpoint.endsWith('/sdk'))
+          return http.Response(
+            jsonEncode({
+              'state': queued ? 'queued' : 'idle',
+              'installed': false,
+              'supported': true,
+            }),
+            200,
+          );
+        if (endpoint.endsWith('/validation'))
+          return http.Response(
+            jsonEncode({
+              'runs': [
+                {
+                  'id': 'r1',
+                  'run_id': 'r1',
+                  'event_id': 'e1',
+                  'state': 'complete',
+                  'target': 'abc123',
+                  'command': 'scripts/build-web.sh',
+                  'exit_code': 0,
+                },
+              ],
+            }),
+            200,
+          );
+        if (endpoint.endsWith('/integration'))
+          return http.Response(
+            jsonEncode({
+              'coordination': {
+                'configurations': [
+                  {
+                    'repository': 'repo',
+                    'enabled': true,
+                    'profile_id': 'coord',
+                    'organization_id': 'org1',
+                    'auto_sdk': false,
+                  },
+                ],
+                'events': [
+                  {
+                    'id': 'e1',
+                    'repository': 'repo',
+                    'name': 'Worker',
+                    'state': 'blocked',
+                    'path': 'repo',
+                    'target': 'abc123',
+                    'reason': 'Flutter missing',
+                    'blocker': 'missing_toolchain',
+                    'blocker_label': 'Missing toolchain',
+                  },
+                ],
+              },
+            }),
+            200,
+          );
+        return http.Response('{"workspaces":[],"agents":[]}', 200);
+      }),
+    );
+    BlocScope.register<DashboardBloc>(() => connection);
+    connection.connect('token');
+    await connection.stream.firstWhere(
+      (_) => connection.state.refreshed != null,
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(child: IntegrationBoard(repository: 'repo')),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Integration coordinator'));
+    await tester.pumpAndSettle();
+    expect(find.text('Signed in: dashboard · admin'), findsOneWidget);
+    expect(find.text('Development SDK missing'), findsOneWidget);
+    expect(
+      find.textContaining('Blocker: Missing toolchain'),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('Exact-commit validation: complete'),
+      findsOneWidget,
+    );
+    await tester.ensureVisible(find.text('Install pinned SDK'));
+    await tester.tap(find.text('Install pinned SDK'));
+    await tester.pumpAndSettle();
+    expect(calls.where((c) => c.endsWith('/api/sdk/install')), hasLength(1));
+    expect(find.text('Installation running'), findsOneWidget);
+    await tester.ensureVisible(
+      find.text('Install the development SDK automatically'),
+    );
+    await tester.tap(find.text('Install the development SDK automatically'));
+    await tester.pumpAndSettle();
+    expect(calls.where((c) => c.endsWith('/api/integration/configure')), hasLength(1));
+    await tester.ensureVisible(find.byTooltip('Download validation log'));
+    await tester.tap(find.byTooltip('Download validation log'));
+    await tester.pumpAndSettle();
+    expect(
+      calls.where((c) => c.contains('/api/validation/log?id=r1')),
+      hasLength(1),
+    );
+    await tester.ensureVisible(find.text('Worker · blocked'));
+    await tester.tap(find.text('Worker · blocked'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Validate exact commit'));
+    await tester.pumpAndSettle();
+    expect(
+      calls.where((c) => c.endsWith('/api/validation/run')),
+      hasLength(1),
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+    await connection.disconnect();
+    await BlocScope.reset();
+  });
+
+  testWidgets('operators see their identity and cannot install the SDK', (
+    tester,
+  ) async {
+    final connection = DashboardBloc(
+      client: MockClient((request) async {
+        final endpoint = request.url.path;
+        if (endpoint.endsWith('/api/session'))
+          return http.Response(
+            jsonEncode({
+              'authenticated': true,
+              'operator': 'kit',
+              'role': 'operator',
+            }),
+            200,
+          );
+        if (endpoint.endsWith('/sdk'))
+          return http.Response(
+            jsonEncode({'state': 'idle', 'installed': false, 'supported': true}),
+            200,
+          );
+        if (endpoint.endsWith('/integration'))
+          return http.Response(jsonEncode({'coordination': {}}), 200);
+        return http.Response('{"workspaces":[],"agents":[]}', 200);
+      }),
+    );
+    BlocScope.register<DashboardBloc>(() => connection);
+    await connection.signIn('token');
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(child: IntegrationBoard(repository: 'repo')),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Integration coordinator'));
+    await tester.pumpAndSettle();
+    expect(find.text('Signed in: kit · operator'), findsOneWidget);
+    expect(
+      find.text('Only an administrator can request the SDK installation.'),
+      findsOneWidget,
+    );
+    expect(
+      tester
+          .widget<FilledButton>(find.widgetWithText(FilledButton, 'Install pinned SDK'))
+          .onPressed,
+      isNull,
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+    await connection.disconnect();
+    await BlocScope.reset();
+  });
 }

@@ -140,6 +140,16 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(self.event()['state'], 'needs_attention')
         self.assertFalse(any('merge exact commit' in c['prompt'] for c in self.store.calls))
 
+    def test_configure_persists_only_boolean_automatic_sdk_installation(self):
+        with patch('integration_coordinator.project_git.inspect', return_value={'repository': True, 'repository_path': 'repo'}):
+            with self.assertRaisesRegex(ValueError, 'boolean'):
+                self.service.configure(dict(repository='repo', profile_id='coordinator', enabled=True, auto_sdk='yes'))
+            self.service.configure(dict(repository='repo', profile_id='coordinator', enabled=True, auto_sdk=True))
+            self.assertIs(self.service.snapshot()['configurations'][0]['auto_sdk'], True)
+            self.service.configure(dict(repository='repo', enabled=False))
+            configuration = self.service.snapshot()['configurations'][0]
+            self.assertEqual((configuration['enabled'], configuration['auto_sdk']), (False, True))
+
     def test_new_main_supersedes_only_undelivered_work(self):
         self.service.observe([self.notice])
         self.service.observe([dict(self.notice, target='b' * 40)])
@@ -421,3 +431,236 @@ class CoordinatorTests(unittest.TestCase):
             self.service.retry(self.event()['id'])
         with self.assertRaisesRegex(ValueError, 'paused'):
             self.service.repair_report(dict(repository='repo', job_id='report1', mode='recover'))
+
+    def test_recovery_reference_is_listed_once_after_repeated_ready_saves(self):
+        self.service.observe([self.notice])
+        self.service.tick()
+        self.answer({'decision': 'integrate_now', 'reason': 'Relevant'})
+        # A failing merge preflight keeps the event ready and audits the same
+        # recovery again; the dashboard must not list the snapshot twice.
+        with patch('integration_coordinator.merge_mode', side_effect=ValueError('checkout unavailable')):
+            self.service.tick()
+        self.assertEqual(self.event()['state'], 'ready')
+        self.assertIn('checkout unavailable', self.event()['reason'])
+        recoveries = self.service.snapshot()['recoveries']
+        self.assertEqual([entry['recovery']['ref'] for entry in recoveries],
+                         ['refs/herdr/recovery/test'])
+
+    def test_recovery_references_are_scoped_to_the_repository(self):
+        # Separate Git object databases may contain the same ref name.
+        from contextlib import closing
+        with closing(self.service.connect()) as db, db:
+            for repository in ('repo', 'other-repo'):
+                self.service.audit(db, dict(repository=repository, state='ready',
+                    recovery={'ref': 'refs/herdr/recovery/shared', 'commit': repository}))
+        recoveries = self.service.snapshot()['recoveries']
+        self.assertEqual({entry['repository'] for entry in recoveries}, {'repo', 'other-repo'})
+
+    def blocker_review_body(self, action='waive_validation', state='validation_pending'):
+        git = patch('integration_coordinator.project_git.git', side_effect=lambda path, *args, **kwargs: '0' if args[0] == 'rev-list' else 'a' * 40)
+        git.start()
+        self.addCleanup(git.stop)
+        summary = patch('integration_coordinator.project_git.summary', return_value={'conflicts': 0, 'merging': False})
+        summary.start()
+        self.addCleanup(summary.stop)
+        self.service.observe([self.notice])
+        event = self.event()
+        event.update(state=state, tests={'status': 'not_run', 'summary': 'Flutter missing'},
+                     verification={'target_incorporated': True, 'conflicts': 0, 'merging': False},
+                     recovery={'ref': 'refs/herdr/recovery/test'})
+        with closing(self.service.connect()) as db, db:
+            self.service.save(db, event)
+        event = self.event()
+        return dict(request_id='c' * 32, reason='Operator accepts missing frontend validation',
+                    selections=[dict({k: event[k] for k in ('id', 'repository', 'target', 'updated_at')}, action=action)])
+
+    def test_blocker_waiver_preserves_evidence_and_is_durably_idempotent(self):
+        body = self.blocker_review_body()
+        result = self.service.review_blockers(body)
+        self.assertEqual(self.event()['state'], 'validation_waived')
+        self.assertEqual(self.event()['tests']['status'], 'not_run')
+        self.assertEqual(self.event()['recovery']['ref'], 'refs/herdr/recovery/test')
+        self.assertEqual(self.event()['operator_approval']['actor'], 'dashboard_operator')
+        audit = self.service.snapshot()['audit']
+        restarted = IntegrationCoordinator(self.path, self.store)
+        self.assertEqual(restarted.review_blockers(body), result)
+        self.assertEqual(restarted.snapshot()['audit'], audit)
+        self.assertEqual(self.store.calls, [])
+        with self.assertRaisesRegex(ValueError, 'different content'):
+            restarted.review_blockers(dict(body, reason='different'))
+
+    def test_blocker_batch_rejects_stale_or_unsafe_selection_atomically(self):
+        body = self.blocker_review_body()
+        stale = dict(body['selections'][0], updated_at='old')
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            self.service.review_blockers(dict(body, selections=[stale]))
+        unknown = dict(body['selections'][0], id='d' * 64)
+        with self.assertRaises(ValueError):
+            self.service.review_blockers(dict(body, selections=[body['selections'][0], unknown]))
+        self.assertEqual(self.event()['state'], 'validation_pending')
+        with self.assertRaises(ValueError):
+            self.service.review_blockers(dict(body, selections=[dict(body['selections'][0], action='install_tools')]))
+        body = self.blocker_review_body(state='needs_attention')
+        with self.assertRaisesRegex(ValueError, 'inspection'):
+            self.service.review_blockers(body)
+
+    def test_blocker_validation_retry_keeps_snapshot_and_respects_pause(self):
+        body = self.blocker_review_body(action='retry_validation')
+        with patch('integration_coordinator.project_git.git', return_value='f' * 40), patch(
+                'integration_coordinator.project_git.summary', return_value={'conflicts': 0, 'merging': False}):
+            self.service.review_blockers(body)
+        self.assertEqual(self.event()['state'], 'validation_ready')
+        self.assertEqual(self.event()['recovery']['ref'], 'refs/herdr/recovery/test')
+        body = self.blocker_review_body(action='retry_validation')
+        body['request_id'] = 'e' * 32
+        with closing(self.service.connect()) as db, db:
+            config = json.loads(db.execute('SELECT data FROM settings').fetchone()[0])
+            config['enabled'] = False
+            db.execute('UPDATE settings SET data=?', (json.dumps(config),))
+        with self.assertRaisesRegex(ValueError, 'paused'):
+            self.service.review_blockers(body)
+
+    def test_blocker_waiver_cannot_bypass_unresolved_conflicts(self):
+        body = self.blocker_review_body()
+        event = self.event()
+        event['verification']['conflicts'] = 1
+        with closing(self.service.connect()) as db, db:
+            self.service.save(db, event)
+        body['selections'][0]['updated_at'] = self.event()['updated_at']
+        with self.assertRaisesRegex(ValueError, 'without conflicts'):
+            self.service.review_blockers(body)
+
+    def test_blocked_decisions_store_a_structured_category(self):
+        self.service.observe([self.notice])
+        self.service.tick()
+        self.answer({'decision': 'blocked', 'blocker': 'missing_toolchain', 'reason': 'No Flutter'})
+        self.assertEqual(self.event()['state'], 'blocked')
+        self.assertEqual(self.event()['blocker'], 'missing_toolchain')
+        self.service.observe([dict(self.notice, target='b' * 40)])
+        self.service.tick()
+        self.answer({'decision': 'blocked', 'blocker': 'not_a_category', 'reason': 'Unclear'})
+        self.assertEqual(self.event()['blocker'], 'unspecified')
+
+    def test_only_administrators_may_waive_validation(self):
+        body = self.blocker_review_body()
+        with self.assertRaisesRegex(ValueError, 'administrator'):
+            self.service.review_blockers(body, role='operator')
+        self.assertEqual(self.event()['state'], 'validation_pending')
+
+    def test_blocker_review_records_the_operator_identity(self):
+        body = self.blocker_review_body()
+        result = self.service.review_blockers(body, actor='damien')
+        self.assertEqual(result['approved'], 1)
+        self.assertEqual(self.event()['operator_approval']['actor'], 'damien')
+        reviews = [entry for entry in self.service.snapshot()['audit'] if entry.get('action') == 'blocker_review']
+        self.assertEqual(reviews[0]['actor'], 'damien')
+
+    def test_missing_toolchain_queues_one_opt_in_sdk_request(self):
+        queued = []
+        service = IntegrationCoordinator(self.path, self.store, sdk_request=lambda: queued.append(True))
+        with closing(service.connect()) as db, db:
+            config = json.loads(db.execute('SELECT data FROM settings').fetchone()[0])
+            config['auto_sdk'] = True
+            db.execute('UPDATE settings SET data=?', (json.dumps(config),))
+        service.observe([self.notice])
+        service.tick()
+        event = service.snapshot()['events'][0]
+        self.store.jobs[event['job_id']].update(
+            state='answered', result=json.dumps({'decision': 'blocked', 'blocker': 'missing_toolchain', 'reason': 'No Flutter'}))
+        service.tick()
+        self.assertEqual(queued, [True])
+        self.assertTrue(service.snapshot()['events'][0]['sdk_requested'])
+        service.tick()
+        self.assertEqual(queued, [True])
+
+    def test_missing_toolchain_does_not_install_without_the_opt_in(self):
+        queued = []
+        service = IntegrationCoordinator(self.path, self.store, sdk_request=lambda: queued.append(True))
+        service.observe([self.notice])
+        service.tick()
+        event = service.snapshot()['events'][0]
+        self.store.jobs[event['job_id']].update(
+            state='answered', result=json.dumps({'decision': 'blocked', 'blocker': 'missing_toolchain', 'reason': 'No Flutter'}))
+        service.tick()
+        self.assertEqual(queued, [])
+        self.assertFalse(service.snapshot()['events'][0].get('sdk_requested'))
+
+    def approval_event(self, **approval):
+        self.service.observe([self.notice])
+        event = self.event()
+        event.update(state='validation_ready', recovery={'ref': 'refs/herdr/recovery/test'},
+                     operator_approval=dict(action='retry_validation', target=event['target'],
+                                            path=event['path'], actor='damien', **approval))
+        with closing(self.service.connect()) as db, db:
+            self.service.save(db, event)
+        return self.event()
+
+    def test_expired_approval_is_never_delivered(self):
+        self.approval_event(expires_at='2000-01-01T00:00:00+00:00', approved_head='f' * 40)
+        self.service.tick()
+        event = self.event()
+        self.assertEqual(event['state'], 'blocked')
+        self.assertEqual(event['blocker'], 'approval_expired')
+        self.assertIn('expired', event['reason'])
+        self.assertFalse(any(call['profile_id'] == 'worker' for call in self.store.calls))
+        actions = [entry.get('action') for entry in self.service.snapshot()['audit']]
+        self.assertIn('approval_invalid', actions)
+
+    def test_checkout_change_after_approval_blocks_delivery(self):
+        self.approval_event(expires_at='2999-01-01T00:00:00+00:00', approved_head='f' * 40)
+        with patch('integration_coordinator.project_git.git', return_value='b' * 40):
+            self.service.tick()
+        self.assertEqual(self.event()['blocker'], 'approval_stale')
+        self.assertFalse(any(call['profile_id'] == 'worker' for call in self.store.calls))
+
+    def test_fresh_verification_blocks_stale_incorporation(self):
+        self.approval_event(expires_at='2999-01-01T00:00:00+00:00', approved_head='f' * 40)
+
+        def fake_git(path, *args, **kwargs):
+            return 'f' * 40 if args[:2] == ('rev-parse', 'HEAD') else '2'
+
+        with patch('integration_coordinator.project_git.git', side_effect=fake_git), patch(
+                'integration_coordinator.project_git.summary', return_value={'conflicts': 0, 'merging': False}):
+            self.service.tick()
+        event = self.event()
+        self.assertEqual(event['state'], 'blocked')
+        self.assertEqual(event['blocker'], 'verification_failed')
+        self.assertFalse(any(call['profile_id'] == 'worker' for call in self.store.calls))
+
+    def test_non_admin_cannot_enable_automatic_root_installation(self):
+        with self.assertRaisesRegex(ValueError, 'administrator'):
+            self.service.configure({'repository': 'repo', 'auto_sdk': True}, actor='kit', role='operator')
+
+    def test_operator_cannot_replay_another_operators_approval(self):
+        body = self.blocker_review_body()
+        self.service.review_blockers(body, actor='damien')
+        with self.assertRaisesRegex(ValueError, 'different content'):
+            self.service.review_blockers(body, actor='kit')
+
+    def test_waiver_requires_fresh_git_verification(self):
+        body = self.blocker_review_body()
+        with patch('integration_coordinator.project_git.git', side_effect=lambda path, *args: '1' if args[0] == 'rev-list' else 'a' * 40):
+            with self.assertRaisesRegex(ValueError, 'no longer confirms'):
+                self.service.review_blockers(body)
+        self.assertEqual(self.event()['state'], 'validation_pending')
+
+    def test_merged_work_with_missing_toolchain_queues_authorized_sdk_install(self):
+        from unittest.mock import Mock
+        self.service.sdk_request = Mock()
+        with closing(self.service.connect()) as db, db:
+            config = json.loads(db.execute('SELECT data FROM settings').fetchone()[0])
+            config['auto_sdk'] = True
+            db.execute('UPDATE settings SET data=?', (json.dumps(config),))
+        self.service.observe([self.notice])
+        self.service.tick()
+        self.answer({'decision': 'integrate_now'})
+        self.service.tick()
+        self.store.jobs[self.event()['job_id']].update(state='answered', result=json.dumps({
+            'outcome': 'integrated', 'blocker': 'missing_toolchain', 'tests': {'status': 'not_run'}}))
+        with patch('integration_coordinator.project_git.git', return_value='0'), patch(
+                'integration_coordinator.project_git.summary', return_value={'conflicts': 0, 'merging': False}):
+            self.service.tick()
+            self.service.tick()
+        self.assertEqual(self.event()['state'], 'validation_pending')
+        self.assertEqual(self.event()['blocker'], 'missing_toolchain')
+        self.service.sdk_request.assert_called_once_with()

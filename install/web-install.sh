@@ -28,6 +28,31 @@ Unit=herdr-update.service
 [Install]
 WantedBy=multi-user.target
 EOF
+# The SDK service installs the pinned toolchain on request. Like the updater it
+# takes no arguments: the only accepted request is a bare install action.
+install -d -o root -g root -m 0755 /var/lib/herdr-sdk
+install -d -o herdr -g herdr -m 0700 /var/lib/herdr-sdk-requests
+install -o root -g root -m 0755 install/sdk-install.py /usr/local/sbin/herdr-sdk-install
+cat >/etc/systemd/system/herdr-sdk.service <<'EOF'
+[Unit]
+Description=Install the pinned development SDK when requested
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/herdr-sdk-install
+TimeoutStartSec=1800
+UMask=0022
+EOF
+cat >/etc/systemd/system/herdr-sdk.path <<'EOF'
+[Unit]
+Description=Watch for authenticated dashboard SDK install requests
+[Path]
+PathExists=/var/lib/herdr-sdk-requests/request.json
+Unit=herdr-sdk.service
+[Install]
+WantedBy=multi-user.target
+EOF
+install -d -o root -g root -m 0755 /etc/herdr
+install -o root -g root -m 0755 install/operator-admin.py /usr/local/sbin/herdr-operator
 apt-get -o Acquire::Retries=5 install -y python3 dbus-user-session
 install -d -o herdr -g herdr -m 0700 /home/herdr/.config/systemd/user
 cat >/home/herdr/.config/systemd/user/herdr-session.service <<'EOF'
@@ -86,6 +111,7 @@ install -d /etc/systemd/system/herdr-web.service.d
 printf '[Service]\nEnvironment=HERDR_WEB_BIND=%s\n' "$bind" > /etc/systemd/system/herdr-web.service.d/listen.conf
 systemctl daemon-reload
 systemctl enable --now herdr-update.path
+systemctl enable --now herdr-sdk.path
 systemctl enable --now herdr-web
 systemctl restart herdr-web
 systemctl is-active --quiet herdr-web

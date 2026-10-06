@@ -60,13 +60,22 @@ or root SSH authentication. The selection persists in
 `~/.config/herdr-web/dashboard-access.json` and survives normal reinstall.
 For console recovery, run the web installer as root with `HERDR_WEB_BIND=0.0.0.0`.
 
-Every API operation requires the dashboard token and the same-origin policy.
+Every API operation requires a dashboard token and the same-origin policy.
 Status responses contain no credential values. Terminal input is not written
 to gateway logs; output is held in a bounded memory buffer and cleared on close.
 The vendor CLI itself persists credentials in its usual user configuration or
 keyring. Up to four sessions are allowed, with one per CLI; abandoned sessions
 expire after ten minutes without polling/input. A lost browser response may
 leave a session until expiry. Sessions do not survive gateway restart.
+
+Named operators are optional. As root on the container, `herdr-operator add
+<name> --role admin|operator` prints a token once and stores only its SHA-256 in
+`/etc/herdr/operators.json`; `list`, `rotate` and `remove` manage them.
+Identities are resolved at request time, so `remove` or `rotate` revokes existing
+browser sessions immediately. The shared dashboard token remains the bootstrap
+administrator and is reported as `dashboard`. Coordinator audit records, blocker
+approvals and validation runs carry the authenticated operator name and role;
+`waive_validation` requires the admin role.
 
 Rebuild the web assets, copy the complete gateway directory and reinstall the
 web service using the existing deployment instructions. `pty_exec.py` and
