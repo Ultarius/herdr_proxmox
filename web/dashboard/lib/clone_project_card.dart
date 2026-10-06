@@ -105,6 +105,7 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
           ),
           const SizedBox(height: 16),
           TextField(
+            key: const PageStorageKey('clone-url-field'),
             controller: url,
             enabled: !busy,
             decoration: const InputDecoration(
@@ -115,6 +116,7 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
           ),
           const SizedBox(height: 12),
           TextField(
+            key: const PageStorageKey('clone-folder-field'),
             controller: folder,
             enabled: !busy,
             decoration: const InputDecoration(

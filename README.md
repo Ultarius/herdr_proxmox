@@ -2,10 +2,11 @@
 
 A standalone two-stage installer: `ct/herdr.sh` creates an unprivileged Debian 13
 LXC, then `install/herdr-install.sh` installs official Herdr in that container.
-Default resources are 2 cores, 4 GiB RAM, and a 16 GiB disk; agent workloads may
-need more. The container remains unprivileged; nesting is enabled for Debian 13's
-systemd compatibility. Automatic template selection matches the host architecture
-(amd64 on x86-64, arm64 on ARM64), and mismatched explicit templates are rejected.
+Default resources are 4 cores, 8 GiB RAM, a 32 GiB disk and 2 GiB swap; agent
+workloads may need more. The container remains unprivileged; nesting is enabled
+for Debian 13's systemd compatibility. Automatic template selection matches the
+host architecture (amd64 on x86-64, arm64 on ARM64), and mismatched explicit
+templates are rejected.
 
 ## Relationship to Paperclip
 
@@ -52,19 +53,20 @@ By default it downloads the newest Debian 13 standard template to `local`, uses
 explicitly as shown below. CLI-only installation provides console access unless
 you supply a public SSH key for SSH access.
 
-### Custom CPU, RAM and disk
+### Custom CPU, RAM, disk and swap
 
 The Community Scripts style environment properties are supported:
 
 ```bash
-var_cpu="5" var_ram="10240" var_disk="24" \
+var_cpu="6" var_ram="12288" var_disk="48" var_swap="4096" \
   bash -c "$(curl -fsSL https://raw.githubusercontent.com/Ultarius/herdr_proxmox/main/ct/herdr.sh)"
 ```
 
-This creates **5 CPU cores, 10 GiB RAM (10240 MiB), and a 24 GiB root disk**.
-Defaults are `var_cpu=2`, `var_ram=4096`, and `var_disk=16`. Values must be positive
-integers. Explicit `--cores`, `--memory` and `--disk` options take precedence over
-environment properties.
+This creates **6 CPU cores, 12 GiB RAM (12288 MiB), a 48 GiB root disk and 4 GiB swap**.
+Defaults are `var_cpu=4`, `var_ram=8192`, `var_disk=32` and `var_swap=2048`. CPU,
+memory and disk must be positive integers; swap may be `0` to disable it. Explicit
+`--cores`, `--memory`, `--disk` and `--swap` options take precedence over environment
+properties.
 
 ### Dashboard downloads and unattended installation
 
@@ -126,7 +128,7 @@ bash ct/herdr.sh \
 The same options work remotely:
 
 ```bash
-var_cpu="5" var_ram="10240" var_disk="24" \
+var_cpu="6" var_ram="12288" var_disk="48" var_swap="4096" \
   bash -c "$(curl -fsSL https://raw.githubusercontent.com/Ultarius/herdr_proxmox/main/ct/herdr.sh)" \
   -- --template local:vztmpl/<exact-debian-13-template-filename> \
   --storage local-lvm --bridge vmbr0 --ssh-key /root/herdr.pub
@@ -587,4 +589,4 @@ Before a merge request, the gateway pins a stash-shaped snapshot under `refs/her
 
 ### Development agent toolchain
 
-For an LXC used for Flutter development, explicitly run `bash install/dev-tools-install.sh` as root from this repository. It installs Flutter 3.44.8 for the `herdr` user, selects the exact stable architecture from the official manifest, verifies SHA-256 before extraction, and adds `flutter` and `dart` under `~/.local/bin`. Existing unrelated launchers are preserved. Run `scripts/build-web.sh` as `herdr` from the assigned repository/worktree to validate the dashboard and shell. Dashboard-only installations do not need this SDK. Existing OpenCode processes must be relaunched to pick up saved dashboard-output permission policies; changing a profile does not change a running process.
+For an LXC used for Flutter development, explicitly run `bash install/dev-tools-install.sh` as root from this repository. It installs Flutter 3.44.8 for the `herdr` user, selects the exact stable architecture from the official manifest, verifies SHA-256 before extraction, and adds `flutter` and `dart` under `~/.local/bin`. Existing unrelated launchers are preserved. The SDK, package cache and build outputs add several GiB, so size `var_disk` with headroom for them. Run `scripts/build-web.sh` as `herdr` from the assigned repository/worktree to validate the dashboard and shell. Dashboard-only installations do not need this SDK. Existing OpenCode processes must be relaunched to pick up saved dashboard-output permission policies; changing a profile does not change a running process.

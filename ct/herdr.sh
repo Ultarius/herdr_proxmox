@@ -14,9 +14,10 @@ Usage: bash ct/herdr.sh [options]
   --bridge NAME      Network bridge (default: vmbr0)
   --ip CIDR|dhcp     IPv4 configuration (default: dhcp)
   --gateway IP      Gateway for static IPv4
-  --cores N         CPU cores (default: var_cpu or 2)
-  --memory MB       Memory in MiB (default: var_ram or 4096)
-  --disk GB         Root disk in GiB (default: var_disk or 16)
+  --cores N         CPU cores (default: var_cpu or 4)
+  --memory MB       Memory in MiB (default: var_ram or 8192)
+  --disk GB         Root disk in GiB (default: var_disk or 32)
+  --swap MB         Swap in MiB; 0 disables swap (default: var_swap or 2048)
   --ssh-key FILE    Public key for the herdr user (optional)
   --description TEXT  Container description (optional)
   --web             Install the dashboard with direct LAN access
@@ -33,19 +34,19 @@ EOF
 }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 template=${HERDR_TEMPLATE:-} storage=${HERDR_STORAGE:-local-lvm} ctid='' bridge=vmbr0 ip=dhcp gateway=''
-cores=${var_cpu:-2} memory=${var_ram:-4096} disk=${var_disk:-16}
+cores=${var_cpu:-4} memory=${var_ram:-8192} disk=${var_disk:-32} swap=${var_swap:-2048}
 ssh_key=${HERDR_SSH_KEY:-} description='' web=${HERDR_WEB:-} archive='' checkout=''
 while (($#)); do
   case "$1" in
     --help|-h) usage; exit 0 ;;
     --web) web=1; shift ;;
     --no-web) web=0; shift ;;
-    --template|--storage|--ctid|--bridge|--ip|--gateway|--cores|--memory|--disk|--ssh-key|--description)
+    --template|--storage|--ctid|--bridge|--ip|--gateway|--cores|--memory|--disk|--swap|--ssh-key|--description)
       (($# >= 2)) || die "Missing value for $1"
       case "$1" in
         --template) template=$2 ;; --storage) storage=$2 ;; --ctid) ctid=$2 ;;
         --bridge) bridge=$2 ;; --ip) ip=$2 ;; --gateway) gateway=$2 ;;
-        --cores) cores=$2 ;; --memory) memory=$2 ;; --disk) disk=$2 ;; --ssh-key) ssh_key=$2 ;;
+        --cores) cores=$2 ;; --memory) memory=$2 ;; --disk) disk=$2 ;; --swap) swap=$2 ;; --ssh-key) ssh_key=$2 ;;
         --description) description=$2 ;;
       esac
       shift 2 ;;
@@ -87,6 +88,7 @@ fi
 for value in "$cores" "$memory" "$disk"; do
   [[ $value =~ ^[1-9][0-9]*$ ]] || die 'Resource values must be positive integers.'
 done
+[[ $swap =~ ^[0-9]+$ ]] || die 'Swap must be a non-negative integer; 0 disables swap.'
 trap '[[ -z $checkout ]] || rm -rf -- "$checkout"' EXIT
 source_file=${BASH_SOURCE[0]:-}
 repo=''
@@ -167,7 +169,7 @@ created=0
 trap 'rc=$?; [[ -z $archive ]] || rm -f -- "$archive"; [[ -z $checkout ]] || rm -rf -- "$checkout"; if ((rc != 0 && created)); then printf "Installation failed. CT %s is preserved for diagnosis; inspect it with pct enter %s.\n" "$ctid" "$ctid" >&2; fi' EXIT
 pct create "$ctid" "$template" --hostname herdr --ostype debian \
   --arch "$architecture" --features nesting=1 \
-  --unprivileged 1 --cores "$cores" --memory "$memory" --swap 512 \
+  --unprivileged 1 --cores "$cores" --memory "$memory" --swap "$swap" \
   --rootfs "$storage:$disk" --net0 "$network" --onboot 1 --tags 'ai;dev-tools' "${metadata[@]}"
 created=1
 pct start "$ctid"

@@ -293,12 +293,16 @@ class _DashboardState extends State<Dashboard> {
                           expandedCrossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             TextField(
+                              // TextField scroll offsets must not share the
+                              // ExpansionTile's stored boolean expansion state.
+                              key: const PageStorageKey('workspace-name-field'),
                               controller: label,
                               decoration: const InputDecoration(
                                 labelText: 'New workspace name',
                               ),
                             ),
                             TextField(
+                              key: const PageStorageKey('workspace-path-field'),
                               controller: cwd,
                               decoration: const InputDecoration(
                                 labelText:

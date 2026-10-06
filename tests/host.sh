@@ -2,7 +2,7 @@
 # Mock Proxmox commands: no containers or host settings are touched.
 set -Eeuo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-unset var_cpu var_ram var_disk HERDR_TEMPLATE HERDR_STORAGE HERDR_SSH_KEY HERDR_WEB HERDR_REF HERDR_RELEASE
+unset var_cpu var_ram var_disk var_swap HERDR_TEMPLATE HERDR_STORAGE HERDR_SSH_KEY HERDR_WEB HERDR_REF HERDR_RELEASE
 export HERDR_WEB=0
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
@@ -69,20 +69,27 @@ export PATH="$tmp/bin:$PATH"
 (umask 077; bash "$tmp/ct/herdr.sh" --template local:vztmpl/debian-13-standard_test_amd64.tar.zst --storage local-lvm --description herdr-ci-test >"$tmp/output")
 grep -q '^create 987654321 .*--unprivileged 1' "$HERDR_TEST_LOG"
 grep -q '^create .*--arch amd64 --features nesting=1' "$HERDR_TEST_LOG"
+grep -q '^create .*--cores 4 --memory 8192 --swap 2048 .*--rootfs local-lvm:32' "$HERDR_TEST_LOG"
 grep -q '^create .*--description herdr-ci-test$' "$HERDR_TEST_LOG"
 grep -q '^push .*herdr-install.sh' "$HERDR_TEST_LOG"
 grep -q '^push .*agents-install.sh' "$HERDR_TEST_LOG"
 grep -q '^exec .*bash /root/herdr-install.sh' "$HERDR_TEST_LOG"
-var_cpu=5 var_ram=10240 var_disk=24 bash "$tmp/ct/herdr.sh" --template local:vztmpl/debian-13-standard_test_amd64.tar.zst --storage local-lvm >"$tmp/output"
-grep -q '^create .*--cores 5 --memory 10240 .*--rootfs local-lvm:24' "$HERDR_TEST_LOG"
+var_cpu=5 var_ram=10240 var_disk=24 var_swap=4096 bash "$tmp/ct/herdr.sh" --template local:vztmpl/debian-13-standard_test_amd64.tar.zst --storage local-lvm >"$tmp/output"
+grep -q '^create .*--cores 5 --memory 10240 --swap 4096 .*--rootfs local-lvm:24' "$HERDR_TEST_LOG"
 var_cpu=5 bash "$tmp/ct/herdr.sh" --cores 3 >"$tmp/output"
-grep -q '^create .*--cores 3 --memory 4096' "$HERDR_TEST_LOG"
+grep -q '^create .*--cores 3 --memory 8192 --swap 2048' "$HERDR_TEST_LOG"
+var_swap=1024 bash "$tmp/ct/herdr.sh" --swap 3072 >"$tmp/output"
+grep -q '^create .*--swap 3072' "$HERDR_TEST_LOG"
+var_swap=0 bash "$tmp/ct/herdr.sh" >"$tmp/output"
+grep -q '^create .*--cores 4 --memory 8192 --swap 0' "$HERDR_TEST_LOG"
 grep -q '^pveam download local debian-13-standard_13.1-1_amd64.tar.zst$' "$HERDR_TEST_LOG"
 before=$(wc -l <"$HERDR_TEST_LOG")
 if bash "$tmp/ct/herdr.sh" --template local:vztmpl/debian-13-standard_13.6-1_arm64.tar.zst >"$tmp/output" 2>&1; then exit 1; fi
 grep -q 'Template must match the host architecture (amd64)' "$tmp/output"
 [[ $(wc -l <"$HERDR_TEST_LOG") == "$before" ]]
 if var_ram=oops bash "$tmp/ct/herdr.sh" >"$tmp/output" 2>&1; then exit 1; fi
+[[ $(wc -l <"$HERDR_TEST_LOG") == "$before" ]]
+if var_swap=oops bash "$tmp/ct/herdr.sh" >"$tmp/output" 2>&1; then exit 1; fi
 [[ $(wc -l <"$HERDR_TEST_LOG") == "$before" ]]
 if bash "$tmp/ct/herdr.sh" --template local:vztmpl/debian-13-standard_test_amd64.tar.zst --storage local-lvm --ip 'dhcp,bridge=bad' >"$tmp/output" 2>&1; then exit 1; fi
 [[ $(wc -l <"$HERDR_TEST_LOG") == "$before" ]]
