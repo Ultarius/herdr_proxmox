@@ -33,8 +33,15 @@ if [[ ! -d $sdk ]]; then
   runuser -u herdr -- tar --no-same-owner -xJf "$staging/sdk.tar.xz" -C "$staging/unpack"
   runuser -u herdr -- mv "$staging/unpack/flutter" "$sdk"
 fi
-runuser -u herdr -- env HOME=/home/herdr "$sdk/bin/flutter" config --no-analytics
-runuser -u herdr -- env HOME=/home/herdr "$sdk/bin/flutter" --version --machine | python3 -c 'import json,sys; assert json.load(sys.stdin)["frameworkVersion"] == sys.argv[1], "Installed Flutter version does not match the project pin"' "$version"
+# runuser preserves the caller's environment and working directory. Root's
+# Android/XDG settings and /root cwd must not leak into Flutter initialization.
+cd /home/herdr
+flutter_as_herdr() {
+  runuser -u herdr -- env -i HOME=/home/herdr USER=herdr LOGNAME=herdr \
+    PATH=/usr/local/bin:/usr/bin:/bin "$sdk/bin/flutter" "$@"
+}
+flutter_as_herdr config --no-analytics
+flutter_as_herdr --version --machine | python3 -c 'import json,sys; assert json.load(sys.stdin)["frameworkVersion"] == sys.argv[1], "Installed Flutter version does not match the project pin"' "$version"
 for command in flutter dart; do
   link="/home/herdr/.local/bin/$command"
   if [[ -e $link || -L $link ]]; then

@@ -39,3 +39,10 @@ class FlutterReleaseTests(unittest.TestCase):
         self.assertNotIn('flutter_infra_release/flutter/releases', installer)
         self.assertIn('$origin/releases_linux.json', installer)
         self.assertIn('$origin/${release[0]}', installer)
+
+    def test_flutter_initialization_does_not_inherit_root_environment_or_cwd(self):
+        installer = (Path(__file__).parents[1] / 'install/dev-tools-install.sh').read_text()
+        self.assertIn('runuser -u herdr -- env -i HOME=/home/herdr USER=herdr LOGNAME=herdr', installer)
+        self.assertLess(installer.index('cd /home/herdr'), installer.index('flutter_as_herdr config'))
+        self.assertIn('flutter_as_herdr --version --machine', installer)
+        self.assertNotIn('runuser -u herdr -- env HOME=', installer)
