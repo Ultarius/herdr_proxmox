@@ -11,9 +11,23 @@ from pathlib import Path
 import subprocess
 import tempfile
 from project_files import project_directory
+from repository_lock import repository_lock
 
 
 def git(path, *arguments, timeout=15, index_file=None):
+    # Compound callers (snapshots and base updates) hold this reentrant lock
+    # throughout their checks and mutations; individual Git mutations also join.
+    # Read-only queries such as `worktree list` never take the lock.
+    mutates = any(arg in ('fetch', 'update-ref', 'commit-tree', 'write-tree', 'read-tree') for arg in arguments)
+    if not mutates and 'worktree' in arguments:
+        mutates = any(arg in ('add', 'remove', 'prune', 'move', 'repair') for arg in arguments)
+    if mutates:
+        with repository_lock(path):
+            return _git(path, *arguments, timeout=timeout, index_file=index_file)
+    return _git(path, *arguments, timeout=timeout, index_file=index_file)
+
+
+def _git(path, *arguments, timeout=15, index_file=None):
     environment = dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_OPTIONAL_LOCKS='0')
     for key in list(environment):
         if key.startswith('GIT_') and key not in ('GIT_TERMINAL_PROMPT', 'GIT_OPTIONAL_LOCKS'):
@@ -133,8 +147,13 @@ def inspect(root, body):
             # Report the failed fetch beside the local status instead of
             # discarding information the operator can still act on.
             fetch_error = str(error)
-    base = None
-    for candidate in ('refs/remotes/origin/main', 'refs/remotes/origin/master'):
+    base = body.get('base')
+    if base is not None:
+        if not isinstance(base, str) or not base.startswith('refs/remotes/'):
+            raise ValueError('Choose a remote-tracking base ref.')
+        git(repository, 'check-ref-format', base)
+        git(repository, 'rev-parse', '--verify', base + '^{commit}')
+    for candidate in (() if base else ('refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master')):
         try:
             git(repository, 'rev-parse', '--verify', candidate)
             base = candidate
@@ -160,10 +179,28 @@ def inspect(root, body):
             # A checkout that cannot be inspected stays visible with its error
             # rather than disappearing from the list.
             worktrees.append(dict(path=candidate.relative_to(root).as_posix(), cwd=str(candidate), error=str(error)))
-    return dict(repository_path=(common.resolve().parent if common.name == '.git' else repository).relative_to(root).as_posix(), repository=True, last_fetch=last_fetch, fetch_error=fetch_error, worktrees=worktrees, limited=len(paths) > 20)
+    shared = common.resolve().parent if common.name == '.git' else repository
+    plan = None
+    if shared.is_relative_to(root) and base:
+        try:
+            branch = git(shared, 'symbolic-ref', '--short', 'HEAD').strip()
+            plan = dict(path=shared.relative_to(root).as_posix(), branch=branch, base=base,
+                        head=git(shared, 'rev-parse', 'HEAD').strip(),
+                        target=git(shared, 'rev-parse', '--verify', base + '^{commit}').strip())
+        except ValueError:
+            pass
+    from base_updates import history
+    return dict(repository_path=shared.relative_to(root).as_posix(), repository=True, last_fetch=last_fetch, fetch_error=fetch_error, worktrees=worktrees, limited=len(paths) > 20,
+                base_update=plan, base_updates=history(common.resolve()))
 
 
 def recovery_snapshot(root, value, key):
+    path = project_directory(Path(root).resolve(), str(Path(root).resolve() / value))
+    with repository_lock(path):
+        return _recovery_snapshot(root, value, key)
+
+
+def _recovery_snapshot(root, value, key):
     """Create a pinned stash-shaped commit without changing files or the real index.
 
     Includes non-ignored untracked files. Ignored files and submodule working

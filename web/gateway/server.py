@@ -307,7 +307,7 @@ class Handler(BaseHTTPRequestHandler):
             except sqlite3.Error:
                 self.reply(503, {'error': 'Organization storage is unavailable. Check the gateway service logs and available disk space.'})
             return
-        from urllib.parse import unquote, urlsplit
+        from urllib.parse import unquote
         path = (ROOT / unquote(urlsplit(self.path).path).lstrip('/')).resolve()
         if not path.is_relative_to(ROOT):
             self.reply(404, {'error': 'Not found.'})
@@ -386,7 +386,7 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'remove_agent', 'remove_group')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/organizations/history', '/api/organizations/activity'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -417,12 +417,19 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == '/api/integration/blockers':
                 self.reply(200, self.server.coordinator.review_blockers(body, actor=actor, role=role))
                 self.server.integration.wake()
+            elif self.path == '/api/integration/recover':
+                self.reply(200, self.server.coordinator.recover_worker(body, actor=actor))
+                self.server.integration.wake()
             elif self.path == '/api/integration/repair':
                 self.reply(200, self.server.coordinator.repair_report(body, actor=actor))
                 self.server.integration.wake()
             elif self.path == '/api/projects/git':
-                self.reply(200, project_git.inspect(PROJECTS, body))
-                if body.get('action') == 'fetch':
+                if body.get('action') == 'update_base':
+                    from base_updates import update
+                    self.reply(200, update(PROJECTS, body, actor, role, self.server.organizations.checkout_in_use))
+                else:
+                    self.reply(200, project_git.inspect(PROJECTS, body))
+                if body.get('action') in ('fetch', 'update_base'):
                     self.server.integration.wake()
             elif self.path == '/api/projects/browse':
                 self.reply(200, project_explorer.browse(PROJECTS, body))

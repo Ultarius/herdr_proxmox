@@ -200,11 +200,29 @@ class OrganizationTests(unittest.TestCase):
         org = self.organization()
         profile = self.hire(org)
         job_id = self.action('launch', organization_id=org, profile_id=profile)
-        self.drain()
+        from contextlib import nullcontext
+        from unittest.mock import patch
+        # This fixture deliberately uses a fake .git directory to isolate the
+        # Herdr launch failure; repository locking is exercised with real Git.
+        with patch('repository_lock.repository_lock', return_value=nullcontext()):
+            self.drain()
         job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == job_id)
         self.assertEqual(job['state'], 'needs_attention')
         self.assertIn('Worktree unavailable', job['error'])
         self.assertFalse(any(args[:2] in (('workspace', 'create'), ('agent', 'start')) for args, _ in self.calls))
+
+    def test_shared_checkout_gate_does_not_block_independent_worker_jobs(self):
+        from unittest.mock import patch
+        run = dict(id='launch', kind='launch', profile_id='worker', state='persona_sent',
+                   source_project=str(self.projects), worktree_path=str(self.projects / 'worker'))
+        chat = dict(id='chat', kind='chat', profile_id='worker', state='running', runs=[run])
+        data = dict(profiles=[dict(id='worker', project=str(self.projects))], jobs=[run, chat],
+                    member_states={'worker': {'status': 'working'}})
+        with patch.object(self.store, 'snapshot', return_value=data):
+            self.assertFalse(self.store.checkout_in_use(self.projects))
+            self.assertTrue(self.store.checkout_in_use(self.projects / 'worker'))
+            run.pop('worktree_path')
+            self.assertTrue(self.store.checkout_in_use(self.projects))
 
     def test_worktree_can_be_explicitly_disabled(self):
         (self.projects / '.git').mkdir()

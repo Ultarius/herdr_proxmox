@@ -5,7 +5,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -55,6 +55,22 @@ class BrowserSessionTests(unittest.TestCase):
             self.request('/api/snapshot', Cookie=cookie)
         self.assertEqual(error.exception.code, 401)
 
+    def test_validation_log_download_returns_utf8_attachment_with_cookie_auth(self):
+        run_id = 'a' * 32
+        content = 'All tests passed!\n' + '\u2500' * 200_000
+        self.server.validation = Mock()
+        self.server.validation.log.return_value = ({'id': run_id, 'state': 'complete'}, content)
+        response = self.request('/api/session', 'POST', Authorization='Bearer secret', Origin=self.base)
+        cookie = response.headers['Set-Cookie'].split(';')[0]
+        with self.request('/api/validation/log?id=' + run_id, Cookie=cookie) as downloaded:
+            self.assertEqual(downloaded.status, 200)
+            self.assertEqual(downloaded.headers['Content-Type'], 'text/plain; charset=utf-8')
+            self.assertEqual(downloaded.headers['Content-Disposition'], f'attachment; filename="validation-{run_id}.log"')
+            self.assertEqual(downloaded.headers['X-Validation-State'], 'complete')
+            self.assertEqual(int(downloaded.headers['Content-Length']), len(content.encode()))
+            self.assertEqual(downloaded.read().decode(), content)
+        self.server.validation.log.assert_called_once_with(run_id)
+
     def test_expiry_rotation_and_secure_cookie(self):
         response = self.request('/api/session', 'POST', Authorization='Bearer secret', Origin=self.base.replace('http:', 'https:'))
         self.assertNotIn('; Secure', response.headers['Set-Cookie'])
@@ -67,7 +83,26 @@ class BrowserSessionTests(unittest.TestCase):
             self.assertFalse(self.server.sessions.valid(key, 'secret'))
         with self.assertRaises(HTTPError) as error:
             self.request('/api/session', 'POST', Authorization='Bearer wrong', Origin=self.base)
-        self.assertEqual(error.exception.code, 401)
+            self.assertEqual(error.exception.code, 401)
+
+    def test_base_update_requires_admin_and_keeps_actor_identity(self):
+        self.server.organizations = Mock()
+        self.server.organizations.checkout_in_use.return_value = False
+        body = json.dumps({'action': 'update_base', 'request_id': 'update-1'}).encode()
+        def post(token):
+            return urlopen(Request(self.base + '/api/projects/git', data=body,
+                                   headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'}))
+        self.server.operators = Mock()
+        self.server.operators.identify.side_effect = lambda token: ({'name': 'kit', 'role': 'operator'} if token == 'worker-token' else None)
+        with self.assertRaises(HTTPError) as error:
+            post('worker-token')
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn('administrator', error.exception.read().decode())
+        self.server.integration = Mock()
+        with patch('base_updates.update', return_value={'state': 'complete'}) as update:
+            self.assertEqual(json.load(post('secret')), {'state': 'complete'})
+            self.assertEqual(update.call_args.args[2:4], ('dashboard', 'admin'))
+            self.server.integration.wake.assert_called_once()
 
     def test_operator_tokens_carry_their_identity_and_lose_it_on_removal(self):
         with tempfile.TemporaryDirectory() as folder:

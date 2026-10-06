@@ -209,6 +209,49 @@ class IntegrationCoordinator:
                                 actor=actor or 'dashboard_operator'))
         return {'resolution': resolution}
 
+    def recover_worker(self, body, actor=None):
+        if (not isinstance(body, dict) or body.get('inspected') is not True
+                or body.get('mode') not in ('recover', 'validate')):
+            raise ValueError('Inspect the worker conversation and choose a recovery action.')
+        event = self.event(body.get('id'))
+        if not event:
+            raise ValueError('Integration event not found.')
+        with self.lock, closing(self.connect()) as db, db:
+            event = json.loads(db.execute('SELECT data FROM events WHERE id=?', (event['id'],)).fetchone()[0])
+            job_id = body.get('job_id')
+            if (event.get('repaired_job_id') == job_id and event.get('repair_mode') == body['mode']
+                    and event.get('repair_actor') == (actor or 'dashboard_operator')):
+                return event
+            if event['state'] != 'needs_attention' or not job_id or event.get('job_id') != job_id:
+                raise ValueError('The interrupted job changed. Refresh before recovering.')
+            jobs = {j['id']: j for j in self.store.job_records()}
+            job = jobs.get(job_id)
+            if job is None:
+                raise ValueError('The original worker job is missing.')
+            phase = event.get('interrupted_phase')
+            if phase not in ('deciding', 'integrating', 'validating'):
+                phase = ('validating' if 'Validation only in your assigned checkout' in job.get('prompt', '')
+                         else 'integrating' if event.get('recovery') else 'deciding')
+            if body['mode'] == 'validate':
+                cwd = self.store.projects / event['path']
+                behind = int(project_git.git(cwd, 'rev-list', '--count', 'HEAD..' + event['target']).strip())
+                tree = project_git.summary(self.store.projects, cwd)
+                if behind or tree['conflicts'] or tree['merging']:
+                    raise ValueError('Validation only requires the target incorporated without conflicts or active operations.')
+                event['verification'] = dict(target_incorporated=True, conflicts=0, merging=False)
+            self.store.resolve_worker_job(job_id, event['profile_id'], event['id'], body['mode'])
+            event.update(state=phase if body['mode'] == 'recover' else 'validation_ready',
+                         repaired_job_id=job_id, repair_mode=body['mode'],
+                         repair_actor=actor or 'dashboard_operator', reason='')
+            if body['mode'] == 'validate':
+                event.pop('job_id', None)
+                event['attempt'] = event.get('attempt', 0) + 1
+            self.save(db, event)
+            self.audit(db, dict(action='worker_repair', repository=event['repository'],
+                                profile_id=event['profile_id'], job_id=job_id, state=event['state'],
+                                reason=body['mode'], actor=actor or 'dashboard_operator'))
+        return event
+
     def retry(self, event_id, actor=None):
         if not isinstance(event_id, str) or not re.fullmatch(r'[a-f0-9]{64}', event_id):
             raise ValueError('Invalid integration event ID.')
@@ -467,7 +510,8 @@ class IntegrationCoordinator:
                     job = jobs.get(event.get('job_id'))
                     if state in ('deciding', 'integrating', 'validating'):
                         if not job or job['state'] in ('uncertain', 'needs_attention', 'released'):
-                            event.update(state='needs_attention', reason='Inspect the existing agent job; delivery may have occurred.')
+                            event.update(state='needs_attention', interrupted_phase=state,
+                                         reason='Inspect the existing agent job; delivery may have occurred.')
                         elif job['state'] == 'answered':
                             if state in ('integrating', 'validating'):
                                 # Completion is verified from Git, not accepted on a model claim.
@@ -526,7 +570,10 @@ class IntegrationCoordinator:
                         prompt = (f"Validation only in your assigned checkout {self.store.projects / event['path']} for exact commit {event['target']}. "
                                   "Do not merge again, switch branches, reset, stash or deploy. Confirm the commit is still incorporated and no merge/rebase/conflicts remain. "
                                   'Run required checks and return ONLY JSON: {"outcome":"integrated|blocked","blocker":"missing_toolchain|missing_permissions|owner_restriction|read_only_role|task_conflict|state_conflict|unspecified","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands, results and missing checks"},"reason":"..."}. '
-                                  "Missing required checks mean not_run even if other suites pass. Preserve current work; report any blocker.")
+                                  "Missing required checks mean not_run even if other suites pass. Preserve current work; report any blocker. "
+                                  "Do not edit tests or work around privileged test failures with sudo, Docker, user namespaces or broad /etc access. "
+                                  "Report test isolation defects with the failing command and traceback; tests that ran and failed remain failed.\n\n"
+                                  "Follow the validation failure guidance in this worker skill:\n" + merge_skill())
                         job_id = self.submit(event, 'validation', prompt)
                         if job_id:
                             event.update(state='validating', job_id=job_id)
@@ -546,6 +593,9 @@ class IntegrationCoordinator:
                         if not self.ready(event['profile_id'], event['run_id']):
                             continue
                         if not event.get('recovery'):
+                            # Do not hold a SQLite write transaction while
+                            # waiting for another repository mutation to finish.
+                            db.commit()
                             event['recovery'] = project_git.recovery_snapshot(
                                 self.store.projects, event['path'], identity(event['id'], event.get('attempt', 0)))
                             self.save(db, event)
@@ -568,6 +618,7 @@ class IntegrationCoordinator:
                 except (ValueError, OSError) as error:
                     event.update(reason=str(error)[:2000])
                     if event['state'] in ('deciding', 'integrating', 'validating'):
+                        event['interrupted_phase'] = event['state']
                         event['state'] = 'needs_attention'
                     self.save(db, event)
             # Coordinator receives the actual collected decisions, never guessed responses.

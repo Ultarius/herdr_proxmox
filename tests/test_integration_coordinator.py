@@ -356,6 +356,9 @@ class CoordinatorTests(unittest.TestCase):
         prompt = self.store.calls[-1]['prompt']
         self.assertIn('Validation only', prompt)
         self.assertIn('Do not merge again', prompt)
+        self.assertIn('Do not edit tests', prompt)
+        self.assertIn('Report test isolation defects', prompt)
+        self.assertIn('Do not request broad access such as `/etc/*`', prompt)
         self.assertEqual(self.store.calls[-1]['profile_id'], 'worker')
         self.store.jobs[self.event()['job_id']].update(state='answered', result=json.dumps({
             'outcome': 'integrated', 'tests': {'status': 'passed', 'summary': 'All required checks passed'}}))

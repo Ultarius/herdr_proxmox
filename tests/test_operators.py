@@ -53,6 +53,7 @@ class OperatorTests(unittest.TestCase):
                 output = io.StringIO()
                 with patch.object(admin, 'PATH', path), \
                         patch.object(admin.os, 'geteuid', return_value=0, create=True), \
+                        patch.object(admin.os, 'chown', create=True), \
                         patch.object(sys, 'argv', ['herdr-operator', *argv]), \
                         redirect_stdout(output):
                     admin.main()

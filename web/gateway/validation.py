@@ -204,6 +204,19 @@ class ValidationRuns:
         return commands
 
     def _cleanup(self, checkout, worktree):
+        if checkout is not None and checkout.exists():
+            from repository_lock import repository_lock
+            try:
+                with repository_lock(checkout):
+                    self._cleanup_locked(checkout, worktree)
+            except (ValueError, OSError):
+                # Leave the recoverable temporary checkout rather than race a
+                # mutation after a lock timeout. A later cleanup can prune it.
+                pass
+        else:
+            self._cleanup_locked(checkout, worktree)
+
+    def _cleanup_locked(self, checkout, worktree):
         if worktree.exists() and checkout is not None and checkout.exists():
             try:
                 project_git.git(checkout, 'worktree', 'remove', '--force', str(worktree), timeout=60)

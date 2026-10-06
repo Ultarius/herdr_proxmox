@@ -173,7 +173,10 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
                 : client.post(uri, headers: headers, body: jsonEncode(body)))
             .timeout(
               Duration(
-                seconds: path == 'projects/clone'
+                seconds:
+                    path == 'projects/clone' ||
+                        (path == 'projects/git' &&
+                            ['fetch', 'update_base'].contains(body?['action']))
                     ? 135
                     : path == 'models'
                     ? 35

@@ -1,3 +1,4 @@
+import 'dart:math';
 import 'package:juice/juice.dart';
 import 'clipboard_copy.dart';
 import 'dashboard_bloc.dart';
@@ -19,6 +20,7 @@ class _ProjectGitPanelState extends State<ProjectGitPanel> {
   Timer? timer;
   bool showProgress = true;
   String? notifying;
+  bool updatingBase = false;
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
   @override
   void initState() {
@@ -56,6 +58,116 @@ class _ProjectGitPanelState extends State<ProjectGitPanel> {
         setState(() => error = e.toString());
     } finally {
       if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> updateBase() async {
+    final initial = data?['base_update'];
+    if (initial is! Map || updatingBase) return;
+    final base = TextEditingController(text: '${initial['base']}');
+    final branch = TextEditingController(text: '${initial['branch']}');
+    final selected = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Update base branch'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: branch,
+                decoration: const InputDecoration(
+                  labelText: 'Expected destination branch',
+                ),
+              ),
+              TextField(
+                controller: base,
+                decoration: const InputDecoration(
+                  labelText: 'Remote-tracking comparison ref',
+                ),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'Only the shared checkout will advance. Local changes, divergent history and active work prevent the update. Agent worktrees keep their own branches.',
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Review exact target'),
+          ),
+        ],
+      ),
+    );
+    final selectedBase = base.text.trim(), selectedBranch = branch.text.trim();
+    base.dispose();
+    branch.dispose();
+    if (selected != true || !mounted) return;
+    final epoch = connection.generation;
+    setState(() {
+      updatingBase = true;
+      error = null;
+    });
+    try {
+      final inspected = await connection.request('projects/git', {
+        'path': initial['path'],
+        'base': selectedBase,
+      });
+      if (!mounted || epoch != connection.generation) return;
+      final plan = inspected['base_update'];
+      if (plan is! Map || plan['branch'] != selectedBranch)
+        throw Exception('Destination branch changed. Refresh before updating.');
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text('Advance $selectedBranch?'),
+          content: SelectableText(
+            'Checkout: ${plan['path']}\nCurrent: ${plan['head']}\nTarget: ${plan['target']}\nComparison: $selectedBase\n\nThe old HEAD will be pinned for recovery and the request audited. This is a fast-forward only.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Update base branch'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted || epoch != connection.generation)
+        return;
+      final requestId =
+          '${DateTime.now().microsecondsSinceEpoch}-${Random.secure().nextInt(1 << 32)}';
+      final result = await connection.request('projects/git', {
+        ...Map<String, dynamic>.from(plan),
+        'action': 'update_base',
+        'request_id': requestId,
+      });
+      if (!mounted || epoch != connection.generation) return;
+      if (result['state'] != 'complete')
+        throw Exception(result['reason'] ?? 'Base update requires review.');
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Base checkout updated. Agent worktrees continue independently.',
+          ),
+        ),
+      );
+      await load();
+    } catch (e) {
+      if (mounted && epoch == connection.generation)
+        setState(() => error = e.toString());
+    } finally {
+      if (mounted && epoch == connection.generation)
+        setState(() => updatingBase = false);
     }
   }
 
@@ -239,6 +351,21 @@ class _ProjectGitPanelState extends State<ProjectGitPanel> {
         ),
       for (final tree in data?['worktrees'] as List? ?? [])
         (tree['error'] != null ? failedCard(tree) : treeCard(tree)),
+      if ((data?['base_updates'] as List? ?? []).isNotEmpty)
+        ExpansionTile(
+          title: const Text('Base update audit & recovery'),
+          children: [
+            for (final entry in data!['base_updates'])
+              ListTile(
+                title: Text(
+                  '${entry['selection']?['branch']} · ${entry['state']}',
+                ),
+                subtitle: SelectableText(
+                  '${entry['actor']} · ${entry['at']}\n${entry['old_head']} → ${entry['target']}\n${entry['reason'] ?? entry['note'] ?? ''}\nRecovery: ${entry['recovery_ref'] ?? 'No branch change recorded'}\nRecover into a separate checkout; preserve the current branch.',
+                ),
+              ),
+          ],
+        ),
       if (data?['limited'] == true)
         const Text('Showing the first 20 checkouts.'),
     ],
@@ -301,6 +428,19 @@ class _ProjectGitPanelState extends State<ProjectGitPanel> {
               ),
             ],
           ),
+          if (tree['path'] == data?['base_update']?['path'])
+            OutlinedButton.icon(
+              onPressed:
+                  updatingBase ||
+                      loading ||
+                      connection.operator.value['role'] != 'admin'
+                  ? null
+                  : updateBase,
+              icon: const Icon(Icons.sync),
+              label: Text(
+                updatingBase ? 'Updating base branch…' : 'Update base branch',
+              ),
+            ),
           if (tree['upstream'] != null)
             Text(
               '${tree['upstream']} · ${tree['ahead']} ahead · ${tree['behind']} behind',
@@ -327,9 +467,9 @@ class _ProjectGitPanelState extends State<ProjectGitPanel> {
                       'Clipboard unavailable over HTTP; merge instructions downloaded instead.',
                 );
                 if (context.mounted)
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text(message)),
-                  );
+                  ScaffoldMessenger.of(
+                    context,
+                  ).showSnackBar(SnackBar(content: Text(message)));
               },
               icon: const Icon(Icons.copy_outlined),
               label: const Text('Copy merge instructions'),

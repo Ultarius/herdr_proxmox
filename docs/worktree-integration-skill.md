@@ -1,5 +1,35 @@
 # Worker integration skill
 
+## Dashboard recovery and shared base updates
+
+An interrupted worker event exposes **Recover saved result** and **Continue
+validation only** in its details. Inspect the original conversation first. Both
+actions require the original session to be idle and unchanged. Recovery reads
+bounded, non-symlink output and lets the existing state machine parse the reply
+and verify Git. Validation continuation retires uncertain delivery only after
+verifying incorporation, no conflicts and no active operation; it preserves the
+recovery snapshot and queues checks without another merge. Actions are audited
+with the operator and are idempotent for the selected original job.
+
+**Update base branch** is an administrator-only action on the shared checkout.
+Review the expected local branch, remote-tracking comparison ref and exact target
+commit. The gateway refuses local changes, divergent history, changed selections,
+active Git operations and managed work using that checkout. Ignored local files
+are never silently overwritten and repository hooks are disabled for this
+administrative operation. It pins the old HEAD
+under `refs/herdr/base-updates/`, audits the attempt, fast-forwards to the exact SHA
+and verifies HEAD. Base update audit and recovery refs are visible in Git changes.
+This does not deploy software or advance any worker branch. Recover the old HEAD
+into a separate checkout; do not reset a branch that may now contain new work.
+
+Gateway mutations share an exclusive lock keyed by the canonical Git common
+directory, including linked worktrees. Fetch, snapshots, validation worktree
+creation/removal and launch-time worktree creation join this lock. It is reentrant
+within a thread and excludes other gateway processes. External Git clients and
+agents do not automatically obey it: state rechecks and Git's own locks still
+apply. Locks are released before waiting for worker replies. New worker notices
+remain the watcher's existing idempotent flow, rather than fabricated notifications.
+
 The assigned worker merges an exact supplied commit in its existing worktree.
 The gateway pins the recovery snapshot before delivery, serializes work per agent
 and verifies incorporation and conflict state. The coordinator summarizes supplied

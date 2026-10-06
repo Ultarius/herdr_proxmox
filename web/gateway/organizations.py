@@ -212,6 +212,32 @@ class OrganizationStore:
         with self.lock, closing(self.connect()) as db:
             return [json.loads(row['data']) for row in db.execute('SELECT data FROM profiles ORDER BY rowid')]
 
+    def checkout_in_use(self, path):
+        """Fail closed for busy/uncertain managed jobs bound to this checkout.
+
+        Called while the caller holds the repository operation lock, so the
+        snapshot must not run agent-list CLI queries; without live status a
+        bound launch counts as busy rather than idle.
+        """
+        wanted = Path(path).resolve()
+        data = self.snapshot(live_status=False)
+        profiles = {p['id']: p for p in data['profiles']}
+        runs = {j['id']: j for j in data['jobs'] if j['kind'] == 'launch'}
+        def matches(run):
+            value = run.get('worktree_path') or run.get('source_project') or profiles.get(run.get('profile_id'), {}).get('project')
+            return value is not None and Path(value).resolve() == wanted
+        for job in data['jobs']:
+            if job['kind'] == 'launch' and job['state'] != 'released' and matches(job):
+                if job['state'] != 'persona_sent' or data['member_states'].get(job['profile_id'], {}).get('status') not in ('idle', 'done', 'off'):
+                    return True
+            if job['state'] in ('queued', 'running', 'uncertain', 'needs_attention'):
+                bindings = job.get('runs') or [r for r in runs.values()
+                                              if r.get('profile_id') == job.get('profile_id') and r['state'] != 'released']
+                explicit_path = job['kind'] == 'launch' or job.get('worktree_path') or job.get('source_project')
+                if (explicit_path and matches(job)) or any(matches(runs.get(r.get('id'), r)) for r in bindings):
+                    return True
+        return False
+
     def active_checkouts(self):
         """Where each launched agent works, for the background Git watcher.
 
@@ -504,6 +530,43 @@ class OrganizationStore:
             self.jobs_changed.set()
         return job
 
+    def resolve_worker_job(self, job_id, profile_id, event_id, mode):
+        """Resolve uncertain integration delivery without sending terminal input."""
+        if mode not in ('recover', 'validate'):
+            raise ValueError('Choose saved result recovery or validation only.')
+        with self.lock:
+            lock = self.agent_locks.setdefault(profile_id, threading.RLock())
+        if not lock.acquire(blocking=False):
+            raise ValueError('The worker is executing a job. Wait before recovering.')
+        try:
+            with self.lock, closing(self.connect()) as db:
+                job = self.get(db, 'jobs', job_id)
+                if (job['kind'] != 'chat' or job.get('profile_id') != profile_id
+                        or job.get('integration_event') != event_id):
+                    raise ValueError('Job does not belong to this worker integration event.')
+                if job.get('repair_resolution') == mode:
+                    return mode
+                if job['state'] not in ('answered', 'uncertain', 'needs_attention'):
+                    raise ValueError('Only answered or interrupted worker jobs can be recovered.')
+                jobs = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs')]
+                if any(j['state'] in ('queued', 'running') and profile_id in
+                       j.get('participants', [j.get('profile_id')]) for j in jobs):
+                    raise ValueError('Wait for queued or running worker jobs before recovering.')
+            from collaboration import current_run
+            if not job.get('runs'):
+                raise ValueError('Worker job has no recoverable session binding.')
+            for binding in job['runs']:
+                current_run(self, binding)  # Original session must be unchanged and idle.
+            if mode == 'recover':
+                self.resolve_coordinator_report(job_id, profile_id, 'recover')
+                self.update_job(job_id, repair_resolution=mode)
+            else:
+                self.update_job(job_id, state='superseded', previous_state=job['state'],
+                                previous_error=job.get('error', ''), repair_resolution=mode, resolved_at=now())
+            return mode
+        finally:
+            lock.release()
+
     def resolve_coordinator_report(self, job_id, profile_id, mode):
         """Recover output or retire uncertain delivery under the agent's lock.
 
@@ -664,8 +727,10 @@ class OrganizationStore:
                     job = self.update_job(job_id, worktree_path=str(checkout), worktree_branch=branch,
                                           source_project=project, workspace_mode='worktree')
                     # Never fall back to the shared checkout after a Git/Herdr failure.
-                    created = self.command('worktree', 'create', '--cwd', project, '--branch', branch,
-                                           '--path', str(checkout), '--label', profile['name'], '--no-focus', timeout=120)
+                    from repository_lock import repository_lock
+                    with repository_lock(project):
+                        created = self.command('worktree', 'create', '--cwd', project, '--branch', branch,
+                                               '--path', str(checkout), '--label', profile['name'], '--no-focus', timeout=120)
                 else:
                     job = self.update_job(job_id, workspace_mode='workspace', source_project=project,
                                           workspace_note='Not a Git repository; using the selected directory.' if profile.get('use_worktree', True) else '')

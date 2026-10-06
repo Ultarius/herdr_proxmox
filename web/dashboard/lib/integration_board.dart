@@ -71,6 +71,40 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
         as Map?;
   }
 
+  Future<void> recoverWorker(Map event, String mode) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(
+          mode == 'recover'
+              ? 'Recover saved worker result'
+              : 'Continue with validation only',
+        ),
+        content: const Text(
+          'Inspect the original worker conversation first. Recovery requires the same session to be idle. Validation only also verifies the target is already incorporated; it never repeats the merge.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('I inspected the conversation'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true && mounted) {
+      await action('integration/recover', {
+        'id': event['id'],
+        'job_id': event['job_id'],
+        'mode': mode,
+        'inspected': true,
+      });
+    }
+  }
+
   Future<void> downloadValidationLog(Map run) async {
     final epoch = connection.generation;
     setState(() => busy = true);
@@ -745,6 +779,27 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
                     ),
                   ),
                   actions: [
+                    if (event['state'] == 'needs_attention' &&
+                        event['job_id'] != null) ...[
+                      TextButton(
+                        onPressed: busy
+                            ? null
+                            : () {
+                                Navigator.pop(context);
+                                recoverWorker(event, 'recover');
+                              },
+                        child: const Text('Recover saved result'),
+                      ),
+                      TextButton(
+                        onPressed: busy
+                            ? null
+                            : () {
+                                Navigator.pop(context);
+                                recoverWorker(event, 'validate');
+                              },
+                        child: const Text('Continue validation only'),
+                      ),
+                    ],
                     if (validationRun(event) != 'running')
                       TextButton.icon(
                         onPressed: busy || '${event['target'] ?? ''}'.isEmpty
