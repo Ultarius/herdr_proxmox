@@ -29,6 +29,72 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
           .where((p) => p['id'] == id)
           .firstOrNull?['name'] ??
       '$id';
+
+  String eventStatus(Map event) {
+    if (event['state'] == 'validation_ready') {
+      return 'Merged · validation queued';
+    }
+    if (event['state'] == 'validating') {
+      return 'Merged · validating';
+    }
+    if (event['state'] == 'validation_pending' ||
+        (event['state'] == 'blocked' &&
+            event['verification']?['target_incorporated'] == true &&
+            event['tests']?['status'] == 'not_run')) {
+      return 'Merged · validation pending';
+    }
+    if (event['state'] == 'validation_failed' ||
+        (event['state'] == 'blocked' &&
+            event['verification']?['target_incorporated'] == true &&
+            event['tests']?['status'] == 'failed')) {
+      return 'Merged · validation failed';
+    }
+    return '${event['state']}';
+  }
+
+  Future<void> repair(Map config, {required bool fresh}) async {
+    final epoch = connection.generation;
+    if (fresh) {
+      final inspected = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Create a fresh coordinator summary?'),
+          content: const Text(
+            'Inspect the coordinator conversation first. The previous request must no longer be running. This retires the old report and queues a new summary of current evidence. It preserves audit history and does not replay merges. If the old run was released, the same profile will be relaunched.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Inspected · create summary'),
+            ),
+          ],
+        ),
+      );
+      if (inspected != true || !mounted) return;
+    }
+    await action('integration/repair', {
+      'repository': widget.repository,
+      'job_id': config['report_job_id'],
+      'mode': fresh ? 'fresh' : 'recover',
+      if (fresh) 'inspected': true,
+    });
+    if (mounted && epoch == connection.generation && error == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            fresh
+                ? 'Fresh summary requested. The gateway waits for the coordinator to be ready.'
+                : 'Saved coordinator report recovered.',
+          ),
+        ),
+      );
+    }
+  }
+
   Timer? timer;
   @override
   void initState() {
@@ -148,10 +214,48 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
           const Text(
             'The gateway queues exact-commit updates. Enabling coordination lets workers merge after choosing integrate_now; deferred work waits for a checkpoint. Workers can also report a blocker. The coordinator summarizes supplied Git verification, worker-reported tests and recovery references; it does not need access to other worktrees. Inspect a pending permission request in Org chart → Chat. Existing worktrees and sessions stay in place.',
           ),
+          if (config?['report_state'] == 'waiting')
+            ListTile(
+              leading: const Icon(Icons.schedule),
+              title: const Text('Fresh summary waiting'),
+              subtitle: Text(
+                config?['coordinator_state'] == 'persona_sent'
+                    ? 'Awaiting collected worker outcomes; the coordinator is ready.'
+                    : 'Coordinator is not ready (${config?['coordinator_state'] ?? 'not launched'}). '
+                          '${config?['coordinator_error'] ?? ''} '
+                          'Inspect its run; the summary is delivered once it is ready.',
+              ),
+            ),
+          if (config != null && config['enabled'] != true)
+            const Text(
+              'Coordination is paused. Resume it to request retries; delivered jobs still finish.',
+            ),
           if (config?['report_state'] == 'uncertain' ||
               config?['report_state'] == 'needs_attention')
-            Text(
-              'Coordinator report needs attention. ${config?['report_error'] ?? ''} Inspect the conversation in Org chart → Chat. If it cannot be recovered, stop the old session and release its run in Org chart → Runs before launching a replacement.',
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Coordinator report needs attention. ${config?['report_error'] ?? ''} Inspect the conversation in Org chart → Chat. Worker integration continues independently.',
+                ),
+                Wrap(
+                  spacing: 12,
+                  children: [
+                    TextButton(
+                      onPressed: busy || config?['enabled'] != true
+                          ? null
+                          : () => repair(config, fresh: false),
+                      child: const Text('Recover saved report'),
+                    ),
+                    TextButton(
+                      onPressed: busy || config?['enabled'] != true
+                          ? null
+                          : () => repair(config, fresh: true),
+                      child: const Text('Create fresh summary'),
+                    ),
+                  ],
+                ),
+              ],
             ),
           const SizedBox(height: 12),
           if (config?['enabled'] != true)
@@ -187,7 +291,7 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
             const Padding(
               padding: EdgeInsets.only(top: 12),
               child: Text(
-                'No worker events yet. The background scan runs every 60 seconds. Fetch remote updates to check main.',
+                'No worker events yet. Job completion and remote fetches wake the watcher; a 60-second background scan remains as a fallback.',
               ),
             ),
           const SizedBox(height: 12),
@@ -264,17 +368,17 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
                     ? Icons.check_circle_outline
                     : Icons.pending_actions,
               ),
-              title: Text('${event['name']} · ${event['state']}'),
+              title: Text('${event['name']} · ${eventStatus(event)}'),
               subtitle: Text(
                 '${event['path']} → ${event['target']}\n${event['reason'] ?? ''}${(event['checkpoint'] ?? '').isEmpty ? '' : '\nCheckpoint: ${event['checkpoint']}'}',
               ),
               onTap: () => showDialog<void>(
                 context: context,
                 builder: (context) => AlertDialog(
-                  title: Text('${event['name']} · ${event['state']}'),
+                  title: Text('${event['name']} · ${eventStatus(event)}'),
                   content: SingleChildScrollView(
                     child: SelectableText(
-                      'Checkout: ${event['path']}\nTarget: ${event['target']}\nUpdated: ${displayTime(event['updated_at'])}\nReason: ${event['reason'] ?? ''}\nCheckpoint: ${event['checkpoint'] ?? ''}\nJob: ${event['job_id'] ?? 'Not submitted'}\nTests: ${event['tests']?['status'] ?? 'Not reported'}\n${event['tests']?['summary'] ?? ''}\nRecovery: ${event['recovery']?['ref'] ?? 'Not created yet; required before merge delivery'}',
+                      'Checkout: ${event['path']}\nTarget: ${event['target']}\nUpdated: ${displayTime(event['updated_at'])}\nReason: ${event['reason'] ?? ''}\nCheckpoint: ${event['checkpoint'] ?? ''}\nJob: ${event['job_id'] ?? 'Not submitted'}\nMerge mode: ${event['merge_mode'] ?? 'Not recorded'}\nGit verification: ${event['verification'] ?? 'Not recorded'}\nTests (worker-reported): ${event['tests']?['status'] ?? 'Not reported'}\n${event['tests']?['summary'] ?? ''}\nRecovery: ${event['recovery']?['ref'] ?? 'Not created yet; required before merge delivery'}',
                     ),
                   ),
                   actions: [
@@ -285,14 +389,24 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
                   ],
                 ),
               ),
-              trailing: ['deferred', 'blocked'].contains(event['state'])
+              trailing:
+                  [
+                    'deferred',
+                    'blocked',
+                    'validation_pending',
+                    'validation_failed',
+                  ].contains(event['state'])
                   ? TextButton(
-                      onPressed: busy
+                      onPressed: busy || config?['enabled'] != true
                           ? null
                           : () => action('integration/retry', {
                               'id': event['id'],
                             }),
-                      child: const Text('Ask again'),
+                      child: Text(
+                        eventStatus(event).startsWith('Merged')
+                            ? 'Retry validation'
+                            : 'Ask again',
+                      ),
                     )
                   : null,
             ),

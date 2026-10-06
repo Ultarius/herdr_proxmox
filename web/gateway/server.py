@@ -324,7 +324,7 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'remove_agent', 'remove_group')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/organizations/history', '/api/organizations/activity'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/repair', '/api/organizations/history', '/api/organizations/activity'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -340,10 +340,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, self.server.organizations.history(body))
             elif self.path == '/api/integration/configure':
                 self.reply(200, self.server.coordinator.configure(body))
+                self.server.integration.wake()
             elif self.path == '/api/integration/retry':
                 self.reply(200, self.server.coordinator.retry(body.get('id')))
+                self.server.integration.wake()
+            elif self.path == '/api/integration/repair':
+                self.reply(200, self.server.coordinator.repair_report(body))
+                self.server.integration.wake()
             elif self.path == '/api/projects/git':
                 self.reply(200, project_git.inspect(PROJECTS, body))
+                if body.get('action') == 'fetch':
+                    self.server.integration.wake()
             elif self.path == '/api/projects/browse':
                 self.reply(200, project_explorer.browse(PROJECTS, body))
             elif self.path == '/api/projects/clone':
@@ -418,7 +425,9 @@ def main():
     ssh_access = SshAccess()
     projects = ProjectJobs(PROJECTS, DATABASE.with_name('projects.sqlite3'))
     coordinator = IntegrationCoordinator(DATABASE.with_name('integration.sqlite3'), organizations)
-    integration = IntegrationWatcher(PROJECTS, organizations.active_checkouts, coordinator=coordinator)
+    integration = IntegrationWatcher(PROJECTS, organizations.active_checkouts, coordinator=coordinator,
+                                     wake_event=organizations.jobs_changed)
+    integration.wake()
     try:
         serve_gateway(bind, 8787, policy, token, {'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator}, cookie_secure=secure_setting == '1')
     finally:

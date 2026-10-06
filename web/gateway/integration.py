@@ -1,10 +1,7 @@
 """Background integration notices for checkouts where agents are working.
 
-This watcher is read-only. It records where a checkout drifted from its base
-branch or has unresolved conflicts so the operator can decide what to do. It
-never prompts an agent, never merges, resets or stashes anything, and it lets a
-busy agent finish its current work: notices are advisory and a merge is only
-ever requested by an operator, through an explicit dashboard action.
+Git inspection is read-only. When coordination is enabled by the operator,
+the durable coordinator queues worker decisions and merges. Busy workers wait.
 
 The gateway keeps running when no dashboard is connected, so drift is detected
 even while nobody is watching. Fetches stay operator-initiated; each notice
@@ -24,7 +21,7 @@ BASE_TTL = 300
 
 
 class IntegrationWatcher:
-    def __init__(self, root, checkouts, interval=INTERVAL, coordinator=None):
+    def __init__(self, root, checkouts, interval=INTERVAL, coordinator=None, wake_event=None):
         self.root = Path(root).resolve()
         self.checkouts = checkouts
         self.coordinator = coordinator
@@ -34,11 +31,16 @@ class IntegrationWatcher:
         self.checked = None
         self.bases = {}
         self.stopped = threading.Event()
+        self.wake_event = wake_event if wake_event is not None else threading.Event()
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
     def close(self):
         self.stopped.set()
+        self.wake_event.set()
+
+    def wake(self):
+        self.wake_event.set()
 
     def base_for(self, repository):
         """Cached base ref for a repository, re-resolved occasionally so a later
@@ -61,7 +63,11 @@ class IntegrationWatcher:
         return base
 
     def _loop(self):
-        while not self.stopped.wait(self.interval):
+        while not self.stopped.is_set():
+            self.wake_event.wait(self.interval)
+            self.wake_event.clear()
+            if self.stopped.is_set():
+                break
             try:
                 self.refresh()
             except Exception:
@@ -90,7 +96,8 @@ class IntegrationWatcher:
             self.checked = datetime.now(timezone.utc).isoformat()
         if self.coordinator is not None and not self.stopped.is_set():
             self.coordinator.observe(notices)
-            self.coordinator.tick()
+            if self.coordinator.tick():
+                self.wake()
         return notices
 
     def notice(self, profile_id, run_id, name, path):

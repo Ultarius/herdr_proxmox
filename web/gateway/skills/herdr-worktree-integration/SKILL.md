@@ -41,8 +41,12 @@ permissions or authorize interaction with other agents.
 4. If local changes could be overwritten, defer or report a blocker with the
    affected paths. The recovery snapshot does not make destructive commands safe.
    Do not automatically stash, reset, clean, discard files or commit unrelated work.
-5. Merge the exact supplied commit into your existing branch with
-   `git merge --no-edit <target>`. Do not substitute `git pull`, a moving main ref
+5. For a clean checkout, first use `git merge --ff-only <target>` when HEAD is
+   an ancestor of the target. This updates the branch without a merge commit.
+   If histories have diverged, use `git merge --no-edit <target>` instead.
+   A fast-forward refusal is not evidence of conflicts. Do not blindly retry a
+   failed command: first exclude dirty files, permissions and active operations.
+   Do not substitute `git pull`, a moving main ref
    or a rebase. If already incorporated, proceed to validation without another merge.
 6. Resolve conflicts only within the assigned scope, preserving both the intended
    upstream changes and your work. Stage only resolved files. If resolution requires

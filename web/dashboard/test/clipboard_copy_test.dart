@@ -1,7 +1,23 @@
+import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:herdr_dashboard/clipboard_copy.dart';
 
 void main() {
+  testWidgets('a stalled clipboard falls back instead of hanging', (
+    tester,
+  ) async {
+    var downloaded = false;
+    final result = copyTextOrDownload(
+      'text',
+      'file.txt',
+      copy: (_) => Completer<void>().future,
+      download: (_, __) async => downloaded = true,
+    );
+    await tester.pump(const Duration(seconds: 3));
+    expect(await result, contains('downloaded instead'));
+    expect(downloaded, isTrue);
+  });
+
   test(
     'reports failure when both clipboard and download are unavailable',
     () async {

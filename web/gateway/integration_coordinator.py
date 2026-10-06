@@ -17,6 +17,11 @@ def merge_skill():
     return (Path(__file__).parent / 'skills/herdr-worktree-integration/SKILL.md').read_text(encoding='utf-8')
 
 
+def merge_mode(checkout, target):
+    """Read-only classification; the worker rechecks before any mutation."""
+    return 'fast_forward' if int(project_git.git(checkout, 'rev-list', '--count', target + '..HEAD').strip()) == 0 else 'merge'
+
+
 def stamp():
     return datetime.now(timezone.utc).isoformat()
 
@@ -54,11 +59,12 @@ class IntegrationCoordinator:
     def save(self, db, event):
         previous = db.execute('SELECT data FROM events WHERE id=?', (event['id'],)).fetchone()
         previous = json.loads(previous[0]) if previous else {}
-        if any(previous.get(k) != event.get(k) for k in ('state', 'job_id', 'reason', 'recovery')):
+        if any(previous.get(k) != event.get(k) for k in ('state', 'job_id', 'reason', 'recovery', 'tests', 'verification', 'merge_mode')):
             self.audit(db, dict(event_id=event['id'], repository=event['repository'],
                                 profile_id=event['profile_id'], name=event.get('name'), path=event['path'],
                                 action='transition', before=previous.get('state'), state=event['state'],
-                                reason=event.get('reason'), job_id=event.get('job_id'), recovery=event.get('recovery')))
+                                reason=event.get('reason'), job_id=event.get('job_id'), recovery=event.get('recovery'),
+                                tests=event.get('tests'), verification=event.get('verification'), merge_mode=event.get('merge_mode')))
         event['updated_at'] = stamp()
         db.execute('INSERT OR REPLACE INTO events VALUES (?, ?)', (event['id'], json.dumps(event)))
 
@@ -154,6 +160,39 @@ class IntegrationCoordinator:
                              coordinator_id=config['profile_id'], organization_id=config['organization_id'])
                 self.save(db, event)
 
+    def repair_report(self, body):
+        if (not isinstance(body, dict) or not isinstance(body.get('repository'), str)
+                or body.get('mode') not in ('recover', 'fresh')):
+            raise ValueError('Choose saved reply recovery or a fresh summary.')
+        if body['mode'] == 'fresh' and body.get('inspected') is not True:
+            raise ValueError('Inspect the previous conversation before requesting a fresh summary.')
+        with self.lock, closing(self.connect()) as db, db:
+            row = db.execute('SELECT data FROM settings WHERE repository=?', (body.get('repository'),)).fetchone()
+            if not row:
+                raise ValueError('Coordinator is not configured for this repository.')
+            config = json.loads(row[0])
+            report_id = body.get('job_id')
+            if not isinstance(report_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', report_id):
+                raise ValueError('Select the interrupted report.')
+            wanted = 'recovered' if body['mode'] == 'recover' else 'fresh'
+            if config.get('repaired_report_id') == report_id and config.get('repair_resolution') == wanted:
+                return {'resolution': config.get('repair_resolution')}
+            if not config.get('enabled'):
+                raise ValueError('Coordination is paused. Resume it before repairing the report.')
+            if config.get('report_job_id') != report_id:
+                raise ValueError('The coordinator report changed. Refresh before repairing it.')
+            resolution = self.store.resolve_coordinator_report(report_id, config['profile_id'], body['mode'])
+            config.update(repaired_report_id=report_id, repair_resolution=resolution)
+            if resolution == 'fresh':
+                config['report_epoch'] = config.get('report_epoch', 0) + 1
+                config.pop('report_job_id', None)
+                config.pop('report_digest', None)
+                config['report_pending'] = True
+            db.execute('UPDATE settings SET data=? WHERE repository=?', (json.dumps(config), config['repository']))
+            self.audit(db, dict(action='report_repair', repository=config['repository'],
+                                profile_id=config['profile_id'], job_id=report_id, reason=resolution))
+        return {'resolution': resolution}
+
     def retry(self, event_id):
         if not isinstance(event_id, str) or not re.fullmatch(r'[a-f0-9]{64}', event_id):
             raise ValueError('Invalid integration event ID.')
@@ -162,11 +201,19 @@ class IntegrationCoordinator:
             if not row:
                 raise ValueError('Integration event not found.')
             event = json.loads(row[0])
-            if event['state'] not in ('deferred', 'blocked'):
-                raise ValueError('Only deferred or blocked decisions may be retried. Inspect uncertain jobs first.')
-            event.update(state='waiting', attempt=event.get('attempt', 0) + 1, reason='')
+            config = db.execute('SELECT data FROM settings WHERE repository=?', (event['repository'],)).fetchone()
+            config = json.loads(config[0]) if config else {}
+            if not config.get('enabled'):
+                raise ValueError('Coordination is paused. Resume it before requesting retries.')
+            if event['state'] not in ('deferred', 'blocked', 'validation_pending', 'validation_failed'):
+                raise ValueError('Only deferred, blocked or pending/failed validation events may be retried. Inspect uncertain jobs first.')
+            validate = event['state'] in ('validation_pending', 'validation_failed') or (
+                event.get('verification', {}).get('target_incorporated') and not event.get('verification', {}).get('conflicts')
+                and not event.get('verification', {}).get('merging'))
+            event.update(state='validation_ready' if validate else 'waiting', attempt=event.get('attempt', 0) + 1, reason='')
             event.pop('job_id', None)
-            event.pop('recovery', None)  # A new attempt needs a fresh checkpoint; older refs remain pinned.
+            if not validate:
+                event.pop('recovery', None)  # A new merge needs a fresh checkpoint.
             self.save(db, event)
         return event
 
@@ -204,29 +251,29 @@ class IntegrationCoordinator:
         return job_id
 
     def tick(self):
+        """Advance durable events once; returns True when another tick can progress."""
         with self.lock, closing(self.connect()) as db, db:
+            advance_pending = False
             settings = {r[0]: json.loads(r[1]) for r in db.execute('SELECT * FROM settings')}
-            events = [json.loads(r[0]) for r in db.execute("SELECT data FROM events ORDER BY CASE WHEN json_extract(data, '$.state') IN ('waiting','ready','deciding','integrating','deferred') THEN 0 ELSE 1 END, rowid DESC LIMIT 100")]
+            events = [json.loads(r[0]) for r in db.execute("SELECT data FROM events ORDER BY CASE WHEN json_extract(data, '$.state') IN ('waiting','ready','deciding','integrating','deferred','validation_ready','validating') THEN 0 ELSE 1 END, rowid DESC LIMIT 100")]
             self._dispatch_jobs = list(self.store.job_records())
             jobs = {j['id']: j for j in self._dispatch_jobs}
             for event in events:
-                if event['state'] not in ('waiting', 'ready', 'deciding', 'integrating', 'deferred'):
+                if event['state'] not in ('waiting', 'ready', 'deciding', 'integrating', 'deferred', 'validation_ready', 'validating'):
                     continue
-                if not settings.get(event['repository'], {}).get('enabled'):
+                if (not settings.get(event['repository'], {}).get('enabled')
+                        and event['state'] not in ('deciding', 'integrating', 'validating')):
                     continue
                 try:
-                    coordinator = max((j for j in self._dispatch_jobs if j['kind'] == 'launch' and j.get('profile_id') == event['coordinator_id']), key=lambda j: j.get('created_at', ''), default=None)
-                    if event['state'] in ('waiting', 'ready') and (not coordinator or coordinator['state'] != 'persona_sent'):
-                        event['reason'] = 'Coordinator launch is not ready. Inspect its run before worker delivery.'
-                        self.save(db, event)
-                        continue
+                    # Enabled coordination authorizes worker delivery; summary
+                    # availability must not freeze unrelated workers.
                     state = event['state']
                     job = jobs.get(event.get('job_id'))
-                    if state in ('deciding', 'integrating'):
+                    if state in ('deciding', 'integrating', 'validating'):
                         if not job or job['state'] in ('uncertain', 'needs_attention', 'released'):
                             event.update(state='needs_attention', reason='Inspect the existing agent job; delivery may have occurred.')
                         elif job['state'] == 'answered':
-                            if state == 'integrating':
+                            if state in ('integrating', 'validating'):
                                 # Completion is verified from Git, not accepted on a model claim.
                                 cwd = self.store.projects / event['path']
                                 behind = int(project_git.git(cwd, 'rev-list', '--count', 'HEAD..' + event['target']).strip())
@@ -240,10 +287,13 @@ class IntegrationCoordinator:
                                     result = {}
                                 tests = result.get('tests', {})
                                 passed = isinstance(tests, dict) and tests.get('status') == 'passed'
-                                done = not behind and not tree['conflicts'] and not tree['merging'] and result.get('outcome') == 'integrated' and passed
-                                event.update(state='completed' if done else 'blocked',
+                                merged = not behind and not tree['conflicts'] and not tree['merging'] and result.get('outcome') == 'integrated'
+                                outcome = 'completed' if merged and passed else 'blocked'
+                                if merged and isinstance(tests, dict) and tests.get('status') in ('failed', 'not_run'):
+                                    outcome = 'validation_failed' if tests['status'] == 'failed' else 'validation_pending'
+                                event.update(state=outcome,
                                              verification=dict(target_incorporated=not behind, conflicts=tree['conflicts'], merging=tree['merging']),
-                                             reason=str(result.get('reason') or ('Commit incorporated; reported tests passed.' if done else 'Integration or reported test results require review.'))[:1000],
+                                             reason=str(result.get('reason') or ('Commit incorporated; reported tests passed.' if outcome == 'completed' else 'Integration or reported test results require review.'))[:1000],
                                              tests=dict(status=tests.get('status'), summary=str(tests.get('summary', ''))[:1000]) if isinstance(tests, dict) else {})
                             else:
                                 raw = job.get('result', '').strip()
@@ -259,6 +309,7 @@ class IntegrationCoordinator:
                                              reason=str(decision.get('reason', 'Reply must contain a valid integration decision.'))[:2000],
                                              checkpoint=str(decision.get('checkpoint', ''))[:1000],
                                              deferred_after=[j['id'] for j in jobs.values() if not j.get('integration_event') and event['profile_id'] in j.get('participants', [j.get('profile_id')])])
+                                advance_pending = event['state'] == 'ready' or advance_pending
                     elif state == 'deferred':
                         completed = [j for j in jobs.values() if not j.get('integration_event') and
                                      j['id'] not in event.get('deferred_after', []) and
@@ -267,10 +318,20 @@ class IntegrationCoordinator:
                         if completed:
                             event.update(state='waiting', attempt=event.get('attempt', 0) + 1)
                             event.pop('job_id', None)
+                            advance_pending = True
+                    elif state == 'validation_ready':
+                        prompt = (f"Validation only in your assigned checkout {self.store.projects / event['path']} for exact commit {event['target']}. "
+                                  "Do not merge again, switch branches, reset, stash or deploy. Confirm the commit is still incorporated and no merge/rebase/conflicts remain. "
+                                  'Run required checks and return ONLY JSON: {"outcome":"integrated|blocked","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands, results and missing checks"},"reason":"..."}. '
+                                  "Missing required checks mean not_run even if other suites pass. Preserve current work; report any blocker.")
+                        job_id = self.submit(event, 'validation', prompt)
+                        if job_id:
+                            event.update(state='validating', job_id=job_id)
                     elif state == 'waiting':
                         prompt = (f"Integration inbox: main advanced to exact commit {event['target']}. "
                                   f"Your assigned checkout is {self.store.projects / event['path']}. "
                                   "This is a new integration request authorized by the repository owner enabling coordination, separate from any completed read-only review. Assess relevance to your current task. This message requests a decision only; do not execute a merge or change files in this step. A developer assigned implementation work may choose integrate_now; a separate authorized merge request follows. A temporary read-only review task does not itself revoke the developer role. Preserve any explicit owner restriction against integration. "
+                                  "For a clean fast-forward, assess readiness and task checkpoints without performing a full code review. The gateway selects the merge path before delivery; the merge request includes the recovery ref and procedure. "
                                   'Respond ONLY with JSON: {"decision":"integrate_now|defer|blocked","reason":"...","checkpoint":"..."}. '
                                   "Choose blocked for an explicit owner prohibition, read-only assigned role, or unavailable permissions/toolchain. Choose defer for a task checkpoint. Do not treat the decision-only instruction itself as a prohibition on choosing integrate_now.")
                         job_id = self.submit(event, 'decision', prompt)
@@ -286,9 +347,12 @@ class IntegrationCoordinator:
                                 self.store.projects, event['path'], identity(event['id'], event.get('attempt', 0)))
                             self.save(db, event)
                             db.commit()  # Durable recovery and audit must precede terminal delivery.
+                        event['merge_mode'] = merge_mode(self.store.projects / event['path'], event['target'])
+                        command = 'git merge --ff-only' if event['merge_mode'] == 'fast_forward' else 'git merge --no-edit'
                         prompt = (f"You chose integrate_now. In your assigned checkout {self.store.projects / event['path']}, "
                                   f"Recovery snapshot is pinned at {event['recovery']['ref']}. Preserve your current work and merge exact commit {event['target']} into your existing branch. "
                                   "Inspect any existing merge/rebase first; do not start another or automatically finish an unrelated operation. "
+                                  f"Read-only preflight selected {event['merge_mode']}: use {command} {event['target']} after rechecking the checkout. "
                                   "Resolve conflicts and run relevant tests. Return ONLY JSON with "
                                   '{"outcome":"integrated|blocked","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands and results"},"reason":"..."}. '
                                   "Never claim tests passed if they were not run. "
@@ -300,13 +364,13 @@ class IntegrationCoordinator:
                     self.save(db, event)
                 except (ValueError, OSError) as error:
                     event.update(reason=str(error)[:2000])
-                    if event['state'] in ('deciding', 'integrating'):
+                    if event['state'] in ('deciding', 'integrating', 'validating'):
                         event['state'] = 'needs_attention'
                     self.save(db, event)
             # Coordinator receives the actual collected decisions, never guessed responses.
             for repository, config in settings.items():
                 reports = [e for e in events if e['repository'] == repository]
-                if not any(e['state'] in ('deferred', 'blocked', 'completed', 'needs_attention') for e in reports):
+                if not any(e['state'] in ('deferred', 'blocked', 'completed', 'needs_attention', 'validation_pending', 'validation_failed') for e in reports):
                     continue
                 if not config.get('enabled') or not reports:
                     continue
@@ -332,7 +396,7 @@ class IntegrationCoordinator:
                         break
                     bounded.append(entry)
                 payload = json.dumps(bounded)
-                digest = report_digest(reports, bounded)
+                digest = identity(report_digest(reports, bounded), config.get('report_epoch', 0))
                 if config.get('report_digest') == digest:
                     continue
                 report = dict(id=digest, profile_id=config['profile_id'], run_id='', attempt=0)
@@ -346,8 +410,10 @@ class IntegrationCoordinator:
                 except ValueError:
                     job_id = None
                 if job_id:
-                    config.update(report_digest=digest, report_job_id=job_id)
+                    config.update(report_digest=digest, report_job_id=job_id, report_pending=False)
                     db.execute('UPDATE settings SET data=? WHERE repository=?', (json.dumps(config), repository))
+
+            return advance_pending
 
     def snapshot(self):
         # A reader must not wait for dispatch/network work holding the writer lock.
@@ -362,7 +428,7 @@ class IntegrationCoordinator:
                               coordinator_error=run.get('error', ''), coordinator_run_id=run.get('id'),
                               coordinator_path=run.get('worktree_path'))
                 report = next((job for job in jobs if job['id'] == config.get('report_job_id')), {})
-                config.update(report_state=report.get('state'), report_error=report.get('error', ''))
+                config.update(report_state=report.get('state', 'waiting' if config.get('report_pending') else None), report_error=report.get('error', ''))
             return dict(configurations=configurations,
                         recoveries=[json.loads(r[0]) for r in db.execute("SELECT data FROM audit WHERE json_extract(data, '$.recovery') IS NOT NULL AND json_extract(data, '$.state')='ready' ORDER BY sequence DESC")],
                         audit=[dict(json.loads(r[1]), sequence=r[0]) for r in db.execute('SELECT sequence,data FROM audit ORDER BY sequence DESC LIMIT 200')],

@@ -57,6 +57,9 @@ class CoordinatorTests(unittest.TestCase):
         recovery = patch('integration_coordinator.project_git.recovery_snapshot', return_value=dict(ref='refs/herdr/recovery/test', commit='b' * 40))
         self.recovery = recovery.start()
         self.addCleanup(recovery.stop)
+        plan = patch('integration_coordinator.merge_mode', return_value='fast_forward')
+        plan.start()
+        self.addCleanup(plan.stop)
         self.notice = dict(repository='repo', target='a' * 40, behind=1, profile_id='worker',
                            run_id='worker', name='Max', path='repo', branch='feature', base='origin/main')
 
@@ -215,12 +218,12 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue(any(a.get('recovery') for a in recovered['audit']))
 
 
-    def test_failed_coordinator_launch_blocks_worker_delivery_and_is_visible(self):
+    def test_failed_coordinator_launch_does_not_block_worker_delivery_and_is_visible(self):
         self.store.jobs['coordinator'].update(state='needs_attention', error='Invalid root pane')
         self.service.observe([self.notice])
         self.service.tick()
-        self.assertEqual(self.store.calls, [])
-        self.assertEqual(self.event()['state'], 'waiting')
+        self.assertEqual(self.store.calls[0]['profile_id'], 'worker')
+        self.assertEqual(self.event()['state'], 'deciding')
         config = self.service.snapshot()['configurations'][0]
         self.assertEqual(config['coordinator_state'], 'needs_attention')
         self.assertEqual(config['coordinator_error'], 'Invalid root pane')
@@ -240,15 +243,15 @@ class CoordinatorTests(unittest.TestCase):
             self.assertEqual(self.event()['tests']['summary'], 'test command')
             self.assertEqual(len(self.service.snapshot()['audit']), before)
 
-    def test_decision_finishes_during_coordinator_outage_but_merge_waits(self):
+    def test_decision_and_merge_continue_during_coordinator_outage(self):
         self.service.observe([self.notice])
         self.service.tick()
         self.store.jobs['coordinator']['state'] = 'needs_attention'
         self.answer({'decision': 'integrate_now', 'reason': 'Ready'})
         self.assertEqual(self.event()['state'], 'ready')
         self.service.tick()
-        self.assertEqual(self.event()['state'], 'ready')
-        self.assertEqual(len(self.store.calls), 1)
+        self.assertEqual(self.event()['state'], 'integrating')
+        self.assertEqual(len(self.store.calls), 2)
 
     def test_merge_result_finishes_during_coordinator_outage(self):
         self.service.observe([self.notice])
@@ -321,3 +324,100 @@ class CoordinatorTests(unittest.TestCase):
                         {'recovery': {'ref': 'refs/herdr/recovery/new'}}):
             changed = [dict(original[0], **changes)]
             self.assertNotEqual(report_digest(original, original), report_digest(changed, original))
+
+    def test_missing_tests_preserve_merge_and_validation_retry_does_not_merge(self):
+        self.service.observe([self.notice])
+        self.service.tick()
+        self.answer({'decision': 'integrate_now'})
+        self.service.tick()
+        recovery = self.event()['recovery']
+        self.store.jobs[self.event()['job_id']].update(state='answered', result=json.dumps({
+            'outcome': 'integrated', 'tests': {'status': 'not_run', 'summary': 'Flutter missing; Python passed'}}))
+        with patch('integration_coordinator.project_git.git', return_value='0'), patch(
+                'integration_coordinator.project_git.summary', return_value={'conflicts': 0, 'merging': False}):
+            self.service.tick()
+        self.assertEqual(self.event()['state'], 'validation_pending')
+        self.assertTrue(self.event()['verification']['target_incorporated'])
+        self.service.retry(self.event()['id'])
+        self.service.tick()
+        self.assertEqual(self.event()['state'], 'validating')
+        self.assertEqual(self.event()['recovery'], recovery)
+        self.assertEqual(self.recovery.call_count, 1)
+        prompt = self.store.calls[-1]['prompt']
+        self.assertIn('Validation only', prompt)
+        self.assertIn('Do not merge again', prompt)
+        self.assertEqual(self.store.calls[-1]['profile_id'], 'worker')
+        self.store.jobs[self.event()['job_id']].update(state='answered', result=json.dumps({
+            'outcome': 'integrated', 'tests': {'status': 'passed', 'summary': 'All required checks passed'}}))
+        with patch('integration_coordinator.project_git.git', return_value='0'), patch(
+                'integration_coordinator.project_git.summary', return_value={'conflicts': 0, 'merging': False}):
+            self.service.tick()
+        self.assertEqual(self.event()['state'], 'completed')
+
+    def test_divergent_branch_dispatches_a_normal_merge(self):
+        self.service.observe([self.notice])
+        self.service.tick()
+        self.answer({'decision': 'integrate_now'})
+        with patch('integration_coordinator.merge_mode', return_value='merge'):
+            self.service.tick()
+        self.assertEqual(self.event()['merge_mode'], 'merge')
+        self.assertIn('use git merge --no-edit ' + self.notice['target'], self.store.calls[-1]['prompt'])
+
+    def test_failed_tests_and_conflicts_are_not_completed(self):
+        for target, status, conflicts, expected in (
+                ('b' * 40, 'failed', 0, 'validation_failed'),
+                ('c' * 40, 'passed', 1, 'blocked')):
+            with self.subTest(status=status, conflicts=conflicts):
+                self.service.observe([dict(self.notice, target=target)])
+                self.service.tick()
+                self.answer({'decision': 'integrate_now'})
+                self.service.tick()
+                self.store.jobs[self.event()['job_id']].update(state='answered', result=json.dumps({
+                    'outcome': 'integrated', 'tests': {'status': status, 'summary': 'Check output'}}))
+                with patch('integration_coordinator.project_git.git', return_value='0'), patch(
+                        'integration_coordinator.project_git.summary', return_value={'conflicts': conflicts, 'merging': False}):
+                    self.service.tick()
+                self.assertEqual(self.event()['state'], expected)
+
+    def test_pause_collects_inflight_result_without_delivering_new_work(self):
+        self.service.observe([self.notice])
+        self.service.tick()
+        self.answer({'decision': 'integrate_now'})
+        self.service.tick()
+        with patch('integration_coordinator.project_git.inspect', return_value={'repository': True, 'repository_path': 'repo'}):
+            self.service.configure(dict(repository='repo', enabled=False))
+        self.store.jobs[self.event()['job_id']].update(state='answered', result=json.dumps({
+            'outcome': 'integrated', 'tests': {'status': 'passed', 'summary': 'Tests passed'}}))
+        before = len(self.store.calls)
+        with patch('integration_coordinator.project_git.git', return_value='0'), patch(
+                'integration_coordinator.project_git.summary', return_value={'conflicts': 0, 'merging': False}):
+            self.service.tick()
+        self.assertEqual(self.event()['state'], 'completed')
+        self.assertEqual(len(self.store.calls), before)
+
+    def test_pending_report_waits_then_clears_once_dispatched(self):
+        with closing(self.service.connect()) as db, db:
+            self.service.save(db, dict(id='e' * 64, repository='repo', profile_id='worker', name='Max',
+                                       path='repo', target='a' * 40, state='blocked',
+                                       coordinator_id='coordinator', organization_id='org', reason='Blocker'))
+            config = json.loads(db.execute('SELECT data FROM settings').fetchone()[0])
+            config.update(report_pending=True)
+            config.pop('report_job_id', None)
+            config.pop('report_digest', None)
+            db.execute('UPDATE settings SET data=?', (json.dumps(config),))
+        self.assertEqual(self.service.snapshot()['configurations'][0]['report_state'], 'waiting')
+        self.service.tick()
+        config = self.service.snapshot()['configurations'][0]
+        self.assertFalse(config['report_pending'])
+        self.assertEqual(config['report_state'], 'queued')
+
+    def test_paused_coordination_rejects_retries_and_repairs(self):
+        self.service.observe([self.notice])
+        self.service.tick()
+        self.answer({'decision': 'defer', 'reason': 'Later'})
+        with patch('integration_coordinator.project_git.inspect', return_value={'repository': True, 'repository_path': 'repo'}):
+            self.service.configure(dict(repository='repo', enabled=False))
+        with self.assertRaisesRegex(ValueError, 'paused'):
+            self.service.retry(self.event()['id'])
+        with self.assertRaisesRegex(ValueError, 'paused'):
+            self.service.repair_report(dict(repository='repo', job_id='report1', mode='recover'))

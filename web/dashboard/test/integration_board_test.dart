@@ -11,6 +11,9 @@ void main() {
     'coordinator enablement is explicit, and deferred work can be reconsidered',
     (tester) async {
       var enabled = false;
+      var paused = false;
+      var reportState = 'uncertain';
+      var validationState = 'validation_pending';
       final actions = <String>[];
       final connection = DashboardBloc(
         client: MockClient((request) async {
@@ -25,7 +28,15 @@ void main() {
           }
           if (endpoint.endsWith('/integration/retry')) {
             actions.add('retry');
-            expect(jsonDecode(request.body)['id'], 'event1');
+            expect(jsonDecode(request.body)['id'], isIn(['event1', 'pending']));
+            return http.Response('{}', 200);
+          }
+          if (endpoint.endsWith('/integration/repair')) {
+            final body = jsonDecode(request.body);
+            expect(body['job_id'], 'report1');
+            expect(body['mode'], 'fresh');
+            expect(body['inspected'], isTrue);
+            actions.add('repair');
             return http.Response('{}', 200);
           }
           if (endpoint.endsWith('/integration'))
@@ -36,12 +47,13 @@ void main() {
                       ? [
                           {
                             'repository': 'repo',
-                            'enabled': true,
+                            'enabled': !paused,
                             'profile_id': 'coord',
                             'coordinator_state': 'needs_attention',
                             'coordinator_error': 'Invalid root pane',
-                            'report_state': 'uncertain',
+                            'report_state': reportState,
                             'report_error': 'Delivery interrupted',
+                            'report_job_id': 'report1',
                           },
                         ]
                       : [],
@@ -57,6 +69,23 @@ void main() {
                   ],
                   'events': enabled
                       ? [
+                          {
+                            'id': 'pending',
+                            'repository': 'repo',
+                            'name': 'Worker',
+                            'state': validationState,
+                            'path': 'repo',
+                            'target': 'abc123',
+                            'tests': {
+                              'status': 'not_run',
+                              'summary': 'Flutter missing; Python passed',
+                            },
+                            'verification': {
+                              'target_incorporated': true,
+                              'conflicts': 0,
+                              'merging': false,
+                            },
+                          },
                           {
                             'id': 'event2',
                             'repository': 'repo',
@@ -122,6 +151,23 @@ void main() {
         findsOneWidget,
       );
       expect(find.byTooltip('Refresh coordination'), findsOneWidget);
+      await tester.ensureVisible(find.text('Create fresh summary'));
+      await tester.tap(find.text('Create fresh summary'));
+      await tester.pumpAndSettle();
+      expect(actions, ['configure']);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Create fresh summary'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Inspected · create summary'));
+      await tester.pumpAndSettle();
+      expect(actions, ['configure', 'repair']);
+      await tester.ensureVisible(
+        find.text('Worker · Merged · validation pending'),
+      );
+      expect(find.text('Worker · Merged · validation pending'), findsOneWidget);
+      await tester.tap(find.text('Retry validation'));
+      await tester.pumpAndSettle();
       await tester.ensureVisible(find.text('Maya · deciding'));
       await tester.tap(find.text('Maya · deciding'));
       await tester.pumpAndSettle();
@@ -164,7 +210,51 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(find.text('Ask again'));
       await tester.pumpAndSettle();
-      expect(actions, ['configure', 'retry']);
+      expect(actions, ['configure', 'repair', 'retry', 'retry']);
+      // New report controls and validation labels must also fit phone widths.
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+      for (final width in [320.0, 390.0]) {
+        tester.view.physicalSize = Size(width, 844);
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        await tester.ensureVisible(find.text('Create fresh summary'));
+        await tester.tap(find.text('Create fresh summary'));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        await tester.tap(find.text('Cancel'));
+        await tester.pumpAndSettle();
+      }
+      tester.view.physicalSize = const Size(1200, 1200);
+      paused = true;
+      reportState = 'waiting';
+      await tester.ensureVisible(find.byTooltip('Refresh coordination'));
+      await tester.tap(find.byTooltip('Refresh coordination'));
+      await tester.pumpAndSettle();
+      expect(find.text('Fresh summary waiting'), findsOneWidget);
+      expect(
+        tester
+            .widget<TextButton>(
+              find.widgetWithText(TextButton, 'Retry validation'),
+            )
+            .onPressed,
+        isNull,
+      );
+      for (final state in ['validation_ready', 'validating']) {
+        validationState = state;
+        await tester.ensureVisible(find.byTooltip('Refresh coordination'));
+        await tester.tap(find.byTooltip('Refresh coordination'));
+        await tester.pumpAndSettle();
+        expect(
+          find.text(
+            state == 'validating'
+                ? 'Worker · Merged · validating'
+                : 'Worker · Merged · validation queued',
+          ),
+          findsOneWidget,
+        );
+      }
       await tester.pumpWidget(const SizedBox.shrink());
       await connection.disconnect();
       await BlocScope.reset();

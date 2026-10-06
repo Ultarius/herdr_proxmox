@@ -1,5 +1,6 @@
 import 'package:flutter/services.dart';
 import 'artifact_download.dart';
+import 'clipboard_available.dart';
 
 /// Copy text, or download it when the browser has no clipboard API.
 ///
@@ -15,7 +16,10 @@ Future<String> copyTextOrDownload(
   Future<void> Function(String content, String filename)? download,
 }) async {
   try {
-    await (copy ?? _copy)(text);
+    if (copy == null && !clipboardAvailable()) {
+      throw UnsupportedError('Clipboard requires a secure browser context.');
+    }
+    await (copy ?? _copy)(text).timeout(const Duration(seconds: 3));
     return copied;
   } catch (_) {
     try {

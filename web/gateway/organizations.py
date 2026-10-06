@@ -76,6 +76,9 @@ class OrganizationStore:
         self.runtime_status = runtime_status
         self.model_validator = model_validator
         self.lock = threading.RLock()
+        # One-way notification only: never call the watcher while holding a
+        # store/profile lock or SQLite transaction.
+        self.jobs_changed = threading.Event()
         self.worker = ThreadPoolExecutor(max_workers=4, thread_name_prefix='organization')
         self.agent_locks = {}
         self.futures = set()
@@ -497,7 +500,65 @@ class OrganizationStore:
             job = self.get(db, 'jobs', job_id)
             job.update(**changes, updated_at=now())
             self.put(db, 'jobs', job)
+        if changes.get('state') in ('answered', 'persona_sent', 'needs_attention', 'delivered', 'artifact_ready'):
+            self.jobs_changed.set()
         return job
+
+    def resolve_coordinator_report(self, job_id, profile_id, mode):
+        """Recover output or retire uncertain delivery under the agent's lock.
+
+        Never send terminal input here. The coordinator queues a new, auditable
+        summary only after this operator action has resolved the previous job.
+        """
+        if mode not in ('recover', 'fresh'):
+            raise ValueError('Unsupported report repair mode.')
+        with self.lock:
+            lock = self.agent_locks.setdefault(profile_id, threading.RLock())
+        if not lock.acquire(blocking=False):
+            raise ValueError('Coordinator is still executing a job. Wait before repairing its report.')
+        try:
+            with self.lock, closing(self.connect()) as db:
+                job = self.get(db, 'jobs', job_id)
+                if job['kind'] != 'chat' or job.get('profile_id') != profile_id:
+                    raise ValueError('Report does not belong to the configured coordinator.')
+                if job['state'] == 'answered' and mode == 'recover':
+                    return 'recovered'
+                if job['state'] == 'superseded' and mode == 'fresh':
+                    return 'fresh'
+                if job['state'] not in ('uncertain', 'needs_attention'):
+                    raise ValueError('Only interrupted coordinator reports can be repaired.')
+                jobs = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs ORDER BY rowid')]
+                if any(j['state'] in ('queued', 'running') and profile_id in
+                       j.get('participants', [j.get('profile_id')]) for j in jobs):
+                    raise ValueError('Wait for the coordinator\'s queued or running work before repairing.')
+                runs = [j for j in jobs if j['kind'] == 'launch' and j.get('profile_id') == profile_id and j['state'] != 'released']
+            if mode == 'recover':
+                from collaboration import current_run, read_contribution
+                for binding in job.get('runs', []):
+                    current_run(self, binding)  # Checks the original session is idle and unchanged.
+                if not job.get('runs'):
+                    raise ValueError('Report has no recoverable session binding.')
+                directory = self.path.parent / 'chat-replies' / job_id
+                if directory.is_symlink() or directory.parent.is_symlink():
+                    raise ValueError('Reply directories must not be symlinks.')
+                try:
+                    reply = read_contribution(directory / 'reply.md')
+                except (ValueError, OSError) as error:
+                    raise ValueError('Coordinator report reply is missing, empty or invalid (maximum 40000 bytes).') from error
+                self.update_job(job_id, state='answered', result=reply, result_format='markdown',
+                                previous_error=job.get('error', ''), error='', recovered_at=now())
+                return 'recovered'
+            if runs:
+                if runs[-1]['state'] != 'persona_sent':
+                    raise ValueError('Inspect and release the unsuccessful coordinator run before relaunching.')
+                self.identity(runs[-1])  # Never inject a summary into a busy/blocked session.
+            else:
+                self.action('launch', dict(request_id=hashlib.sha256(('repair:' + job_id).encode()).hexdigest(),
+                                          organization_id=job['organization_id'], profile_id=profile_id))
+            self.update_job(job_id, state='superseded', previous_state=job['state'], resolved_at=now())
+            return 'fresh'
+        finally:
+            lock.release()
 
     def identity(self, run, ready=True, agent=None):
         if agent is None:

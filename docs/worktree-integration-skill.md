@@ -5,6 +5,35 @@ The gateway pins the recovery snapshot before delivery, serializes work per agen
 and verifies incorporation and conflict state. The coordinator summarizes supplied
 evidence. It does not perform merges or require access to workers' checkouts.
 
+Read-only preflight selects a fast-forward (`git merge --ff-only <exact-commit>`)
+when HEAD is an ancestor of the target. Diverged histories use the regular merge
+path. Workers recheck their checkout before mutation; they never blindly retry
+after a dirty-tree, permission or operation-state failure. Both paths still pin
+recovery first and preserve the assigned branch.
+
+Merged commits with missing or failing tests use `validation_pending` or
+`validation_failed`, shown as “Merged · validation pending/failed.” **Retry
+validation** requests only checks: it does not merge again or replace the existing
+recovery snapshot. Legacy blocked events with verified incorporation can also
+use this path. Git verification and worker-reported test results remain separate
+in the event details and audit history.
+
+Worker jobs advance independently of the coordinator summary session. Job
+completion and explicit fetches wake the watcher through a one-way event;
+the 60-second scan remains a fallback. Store notifications never call back into
+integration code while holding a database or agent lock.
+Pausing coordination stops new dispatches but still collects and verifies the
+results of requests already delivered.
+
+For an interrupted coordinator report, **Recover saved report** reads bounded,
+non-symlink reply output only after checking the original session is idle and
+unchanged. If there is no recoverable output, inspect the conversation and choose
+**Create fresh summary**. The gateway retires the interrupted job, increments the
+report generation, and queues current evidence once. It rejects busy sessions.
+If the old binding was released, the same profile is relaunched; the gateway does
+not kill a terminal or widen permissions automatically. Both repair choices are
+audited and safe to retry after a lost HTTP response.
+
 The canonical procedure is
 `web/gateway/skills/herdr-worktree-integration/SKILL.md`. The gateway includes it in
 merge requests so agents on older commits receive the current procedure without
@@ -29,3 +58,5 @@ it is a workflow guard, not a sandbox or proof of Git authorization.
 
 Sources: [Herdr agent skill documentation](https://herdr.dev/docs/agent-skill/)
 and [OpenCode skill discovery](https://opencode.ai/docs/skills/).
+
+Coordinator summaries may describe work completed while the summary session was unavailable. They reconstruct supplied event evidence; they do not imply that the coordinator supervised those operations. Fresh summaries show a waiting status until dispatch is possible. Paused coordination stops new retry delivery while collecting in-flight results.

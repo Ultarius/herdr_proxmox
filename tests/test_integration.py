@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'web/gateway'))
 import integration
 from integration import IntegrationWatcher
 import project_git
+from integration_coordinator import merge_mode
 
 
 @unittest.skipUnless(shutil.which('git'), 'Git required')
@@ -68,6 +70,53 @@ class IntegrationTests(unittest.TestCase):
         # The check is read-only.
         self.assertEqual(agent.read_text(), 'agent work in progress\n')
         self.assertEqual(project_git.git(self.repo, 'rev-parse', 'HEAD').strip(), self.base)
+
+    def test_merge_preflight_classifies_fast_forward_and_divergence_without_mutation(self):
+        self.advance_main()
+        target = project_git.git(self.repo, 'rev-parse', 'origin/main').strip()
+        self.assertEqual(merge_mode(self.repo, target), 'fast_forward')
+        (self.repo / 'local.txt').write_text('local branch change')
+        self.run_git('add', 'local.txt')
+        self.run_git('commit', '-m', 'local change')
+        head = project_git.git(self.repo, 'rev-parse', 'HEAD').strip()
+        self.assertEqual(merge_mode(self.repo, target), 'merge')
+        self.assertEqual(project_git.git(self.repo, 'rev-parse', 'HEAD').strip(), head)
+        self.assertEqual((self.repo / 'file.txt').read_text(), 'before\n')
+
+    def test_wake_during_refresh_triggers_another_refresh(self):
+        started, release, repeated = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+        def refresh(watcher):
+            calls.append(True)
+            if len(calls) == 1:
+                started.set()
+                release.wait(2)
+            else:
+                repeated.set()
+        with patch.object(IntegrationWatcher, 'refresh', refresh):
+            watcher = self.watcher([])
+            try:
+                watcher.wake()
+                self.assertTrue(started.wait(2))
+                watcher.wake()  # The wake remains set while refresh is running.
+                release.set()
+                self.assertTrue(repeated.wait(2))
+            finally:
+                release.set()
+                watcher.close()
+                watcher.thread.join(2)
+
+    def test_wake_event_refreshes_without_waiting_for_periodic_interval(self):
+        refreshed = threading.Event()
+        wake = threading.Event()
+        with patch.object(IntegrationWatcher, 'refresh', side_effect=lambda: refreshed.set()):
+            watcher = IntegrationWatcher(self.root, lambda: [], interval=3600, wake_event=wake)
+            self.watchers.append(watcher)
+            wake.set()
+            self.assertTrue(refreshed.wait(2), 'Job notification did not wake the watcher')
+            watcher.close()
+            watcher.thread.join(2)
+            self.assertFalse(watcher.thread.is_alive())
 
     def test_current_checkout_produces_no_notice(self):
         watcher = self.watcher([('p1', 'r1', 'Max', str(self.repo))])
