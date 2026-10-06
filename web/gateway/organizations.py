@@ -1,6 +1,4 @@
 """Durable organization records and explicit, non-retrying Herdr jobs."""
-from project_files import project_directory
-from permissions import accessible_paths, permission_mode, prepare_permissions
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import closing
 from datetime import datetime, timezone
@@ -13,6 +11,10 @@ import subprocess
 import threading
 import time
 import uuid
+
+from project_files import project_directory
+from permissions import accessible_paths, permission_mode, prepare_permissions
+from herdr_ids import is_pane_id, is_workspace_id
 
 
 def now():
@@ -516,8 +518,11 @@ class OrganizationStore:
             raise ValueError('Unexpected Herdr workspace creation response.')
         root_pane = created.get('root_pane')
         pane = root_pane.get('pane_id') if isinstance(root_pane, dict) else None
-        if isinstance(pane, str) and re.fullmatch(r'w[0-9]+:p[0-9]+', pane):
-            return pane, created.get('workspace', {}).get('workspace_id')
+        if is_pane_id(pane):
+            metadata = created.get('workspace')
+            workspace = metadata.get('workspace_id') if isinstance(metadata, dict) else None
+            # Keep only valid metadata that belongs to the authoritative root pane.
+            return pane, workspace if is_workspace_id(workspace) and is_pane_id(pane, workspace) else None
         # Some installed Herdr versions omit a usable root pane in creation
         # responses. Re-read authoritative records for the exact created cwd.
         response = self.command('workspace', 'list')
@@ -528,14 +533,14 @@ class OrganizationStore:
         if len(matches) != 1:
             raise ValueError('Cannot uniquely resolve the created checkout workspace. Inspect its terminal before retrying.')
         workspace = matches[0].get('workspace_id')
-        if not isinstance(workspace, str) or not re.fullmatch(r'w[0-9]+', workspace):
+        if not is_workspace_id(workspace):
             raise ValueError('Created workspace has an unsupported ID.')
         response = self.command('pane', 'list', '--workspace', workspace)
         panes = response if isinstance(response, list) else response.get('panes', [])
         if len(panes) != 1:
             raise ValueError('Created workspace must have exactly one pane before agent launch.')
         pane = panes[0].get('pane_id')
-        if not isinstance(pane, str) or not re.fullmatch(re.escape(workspace) + r':p[0-9]+', pane):
+        if not is_pane_id(pane, workspace):
             raise ValueError('Herdr did not return a valid root pane ID for the created workspace.')
         return pane, workspace
 

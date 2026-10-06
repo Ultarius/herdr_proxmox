@@ -57,6 +57,25 @@ class OrganizationTests(unittest.TestCase):
         self.store.command = command
         self.assertEqual(self.store.created_pane({}, str(self.projects)), ('w42:p1', 'w42'))
 
+    def test_created_pane_accepts_letter_counters_in_both_response_paths(self):
+        self.assertEqual(self.store.created_pane(
+            {'root_pane': {'pane_id': 'wA:pB'}, 'workspace': {'workspace_id': 'wA'}},
+            str(self.projects)), ('wA:pB', 'wA'))
+        self.store.command = lambda *args, **kwargs: (
+            {'workspaces': [dict(workspace_id='wB', cwd=str(self.projects))]}
+            if args == ('workspace', 'list') else {'panes': [dict(pane_id='wB:pA')]})
+        self.assertEqual(self.store.created_pane({}, str(self.projects)), ('wB:pA', 'wB'))
+
+    def test_direct_root_pane_normalizes_unusable_workspace_metadata(self):
+        for metadata in (None, 'unexpected', {}, {'workspace_id': None},
+                         {'workspace_id': '--help'}, {'workspace_id': 'wB'}):
+            with self.subTest(metadata=metadata):
+                self.assertEqual(self.store.created_pane(
+                    {'root_pane': {'pane_id': 'wA:pB'}, 'workspace': metadata},
+                    str(self.projects)), ('wA:pB', None))
+        self.assertEqual(self.store.created_pane(
+            {'root_pane': {'pane_id': 'wA:pB'}}, str(self.projects)), ('wA:pB', None))
+
     def test_created_pane_rejects_ambiguous_checkout_or_wrong_workspace_pane(self):
         self.store.command = lambda *args, **kwargs: {'workspaces': [
             dict(workspace_id='w42', worktree=dict(checkout_path=str(self.projects))),
@@ -74,9 +93,9 @@ class OrganizationTests(unittest.TestCase):
             if args[:2] == ('workspace', 'create'):
                 return {'type': 'workspace_created'}
             if args == ('workspace', 'list'):
-                return {'workspaces': [dict(workspace_id='w42', worktree=dict(checkout_path=str(self.projects)))]}
-            if args == ('pane', 'list', '--workspace', 'w42'):
-                return {'panes': [dict(pane_id='w42:p1')]}
+                return {'workspaces': [dict(workspace_id='wB', worktree=dict(checkout_path=str(self.projects)))]}
+            if args == ('pane', 'list', '--workspace', 'wB'):
+                return {'panes': [dict(pane_id='wB:pA')]}
             return original(*args, **kwargs)
         self.store.command = command
         org = self.organization()
@@ -85,10 +104,10 @@ class OrganizationTests(unittest.TestCase):
         self.drain()
         job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == run)
         self.assertEqual(job['state'], 'persona_sent', job.get('error'))
-        self.assertEqual(job['pane_id'], 'w42:p1')
+        self.assertEqual(job['pane_id'], 'wB:pA')
         starts = [args for args, _ in self.calls if args[:2] == ('agent', 'start')]
         self.assertEqual(len(starts), 1)
-        self.assertEqual(starts[0][6], 'w42:p1')
+        self.assertEqual(starts[0][6], 'wB:pA')
 
     def test_ambiguous_launch_never_sends_agent_input(self):
         original = self.store.command

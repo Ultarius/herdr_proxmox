@@ -372,12 +372,20 @@ class CollaborationTests(unittest.TestCase):
         self.assertEqual(self.job(job_id)['state'], 'needs_attention')
 
     def test_live_names_preserve_aliases_and_distinguish_groups(self):
-        self.group()
+        group_id = self.group()
         agents = list(self.agents.values())
         labeled = self.store.label_agents(agents)
         self.assertEqual([a['name'] for a in labeled], [a['name'] for a in agents])
-        self.assertEqual([a['display_name'] for a in labeled], ['Max', 'Iris', 'Planning'])
-        self.assertEqual(labeled[-1]['entity_type'], 'group')
+        # Member launches run concurrently, so compare by name instead of
+        # relying on the order Herdr returns agents in.
+        by_display = {a['display_name']: a for a in labeled if 'display_name' in a}
+        self.assertEqual(sorted(by_display), ['Iris', 'Max', 'Planning'])
+        self.assertEqual(by_display['Max']['profile_id'], self.max)
+        self.assertEqual(by_display['Max']['entity_type'], 'agent')
+        self.assertEqual(by_display['Iris']['profile_id'], self.iris)
+        self.assertEqual(by_display['Iris']['entity_type'], 'agent')
+        self.assertEqual(by_display['Planning']['group_id'], group_id)
+        self.assertEqual(by_display['Planning']['entity_type'], 'group')
         changed = dict(agents[0], agent_session={'value': 'replacement'})
         self.assertNotIn('display_name', self.store.label_agents([changed])[0])
         unknown = dict(name='external-agent', pane_id='w999:p1', agent='codex')

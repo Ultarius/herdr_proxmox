@@ -90,6 +90,10 @@ class GatewayTests(unittest.TestCase):
             gateway.workspace_action('create', {'cwd': directory, 'label': 'My project; echo hello'})
             args = command.call_args.args
             self.assertEqual(args, ('workspace', 'create', '--cwd', str(Path(directory).resolve()), '--label', 'My project; echo hello', '--no-focus'))
+            gateway.workspace_action('focus', {'id': 'wA'})
+            self.assertEqual(command.call_args.args, ('workspace', 'focus', 'wA'))
+            gateway.workspace_action('rename', {'id': 'wB', 'label': 'Coordinator'})
+            self.assertEqual(command.call_args.args, ('workspace', 'rename', 'wB', 'Coordinator'))
             with self.assertRaises(ValueError):
                 gateway.workspace_action('create', {'cwd': str(Path(directory).parent), 'label': 'escape'})
             with self.assertRaises(ValueError):

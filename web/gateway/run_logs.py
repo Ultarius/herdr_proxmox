@@ -10,6 +10,8 @@ import threading
 import time
 import uuid
 
+from herdr_ids import is_pane_id
+
 MAX_FILE = 10_000_000
 MAX_TOTAL = 100_000_000
 PAGE = 65536
@@ -92,7 +94,7 @@ class RunLogs:
         if action == 'save':
             pane, source = body.get('pane'), body.get('source', 'visible')
             label = body.get('label', pane)
-            if not isinstance(pane, str) or not re.fullmatch(r'w[0-9]+:p[0-9]+', pane):
+            if not is_pane_id(pane):
                 raise ValueError('Use a pane ID such as w1:p1.')
             if source not in ('visible', 'recent-unwrapped'):
                 raise ValueError('Unsupported history source.')

@@ -24,6 +24,11 @@ class RunLogTests(unittest.TestCase):
     def save(self):
         return self.logs.action('save', {'pane': 'w1:p1', 'label': 'Run snapshot', 'source': 'visible'})
 
+    def test_save_accepts_letter_counters(self):
+        with patch.object(self.logs, 'reader', return_value=b'hello') as reader:
+            self.logs.action('save', {'pane': 'wA:pB', 'label': 'Coordinator'})
+            reader.assert_called_once_with('herdr', 'wA:pB', 'visible')
+
     def test_persistence_metadata_size_and_bounded_preview(self):
         self.logs.reader = lambda *args: b'x' * 1_000_000
         item = self.save()

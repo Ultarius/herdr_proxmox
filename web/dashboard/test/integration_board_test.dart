@@ -56,6 +56,14 @@ void main() {
                   'events': enabled
                       ? [
                           {
+                            'id': 'event2',
+                            'repository': 'repo',
+                            'name': 'Maya',
+                            'state': 'deciding',
+                            'path': 'repo',
+                            'target': 'abc123',
+                          },
+                          {
                             'id': 'event1',
                             'repository': 'repo',
                             'name': 'Max',
@@ -108,6 +116,21 @@ void main() {
       expect(find.text('Coordinator: needs_attention'), findsOneWidget);
       expect(find.text('Invalid root pane'), findsOneWidget);
       expect(find.byTooltip('Refresh coordination'), findsOneWidget);
+      await tester.ensureVisible(find.text('Maya · deciding'));
+      await tester.tap(find.text('Maya · deciding'));
+      await tester.pumpAndSettle();
+      expect(
+        find.byWidgetPredicate(
+          (w) =>
+              w is SelectableText &&
+              (w.data ?? '').contains(
+                'Recovery: Not created yet; required before merge delivery',
+              ),
+        ),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Close'));
+      await tester.pumpAndSettle();
       await tester.ensureVisible(find.text('Recovery · Max'));
       await tester.tap(find.text('Recovery · Max'));
       await tester.pumpAndSettle();

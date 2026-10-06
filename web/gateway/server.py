@@ -7,7 +7,6 @@ import json
 import mimetypes
 import os
 from pathlib import Path
-import re
 import sqlite3
 import subprocess
 import sys
@@ -27,6 +26,7 @@ from run_logs import RunLogs
 from ssh_access import SshAccess
 from dashboard_access import DashboardAccess, configured_bind
 from herdr_server import HerdrServer
+from herdr_ids import is_workspace_id
 from updates import Updates
 
 ROOT = Path(os.environ.get('HERDR_WEB_ROOT', '/opt/herdr-web/public')).resolve()
@@ -75,7 +75,7 @@ def workspace_action(name, body):
         validate_label(label)
         return command('workspace', 'create', '--cwd', str(path), '--label', label, '--no-focus')
     workspace_id = body.get('id', '')
-    if not isinstance(workspace_id, str) or not re.fullmatch(r'w[0-9]+', workspace_id):
+    if not is_workspace_id(workspace_id):
         raise ValueError('Invalid workspace ID.')
     if name == 'focus':
         return command('workspace', 'focus', workspace_id)
