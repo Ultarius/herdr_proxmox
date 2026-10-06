@@ -18,10 +18,13 @@ if [[ ! -d $sdk ]]; then
   staging=$(mktemp -d)
   trap 'rm -rf -- "$staging"' EXIT
   chmod 0755 "$staging"
-  origin=https://storage.googleapis.com/flutter_infra_release/flutter/releases
+  # Release archives live under /releases; /flutter contains engine artifacts.
+  origin=https://storage.googleapis.com/flutter_infra_release/releases
+  printf 'Downloading official Flutter release manifest.\n'
   curl -fsSL --http1.1 --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 "$origin/releases_linux.json" -o "$staging/releases.json"
   python3 "$(dirname -- "${BASH_SOURCE[0]}")/flutter-release.py" "$version" "$architecture" <"$staging/releases.json" >"$staging/selected"
   mapfile -t release <"$staging/selected"
+  printf 'Downloading Flutter %s (%s): %s/%s\n' "$version" "$architecture" "$origin" "${release[0]}"
   curl -fsSL --http1.1 --retry 3 --retry-all-errors --connect-timeout 10 --max-time 1800 "$origin/${release[0]}" -o "$staging/sdk.tar.xz"
   printf '%s  %s\n' "${release[1]}" "$staging/sdk.tar.xz" | sha256sum --check --status
   chmod 0644 "$staging/sdk.tar.xz"

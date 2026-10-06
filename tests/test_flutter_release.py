@@ -32,3 +32,10 @@ class FlutterReleaseTests(unittest.TestCase):
         self.assertIn('version=3.44.8', installer)
         self.assertIn('v=="3.44.8"', build)
         self.assertLess(installer.index('sha256sum --check'), installer.index('tar --no-same-owner'))
+
+    def test_installer_uses_release_bucket_not_engine_artifact_prefix(self):
+        installer = (Path(__file__).parents[1] / 'install/dev-tools-install.sh').read_text()
+        self.assertIn('origin=https://storage.googleapis.com/flutter_infra_release/releases\n', installer)
+        self.assertNotIn('flutter_infra_release/flutter/releases', installer)
+        self.assertIn('$origin/releases_linux.json', installer)
+        self.assertIn('$origin/${release[0]}', installer)
