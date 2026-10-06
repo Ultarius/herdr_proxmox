@@ -334,15 +334,15 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
       var sdkData = sdk, validationData = validation;
       try {
         sdkData = Map<String, dynamic>.from(await connection.request('sdk'));
-      } catch (_) {
-        // Older gateways may not expose the SDK service yet.
+      } catch (e) {
+        sdkData = {'state': 'unavailable', 'error': e.toString()};
       }
       try {
         validationData = Map<String, dynamic>.from(
           await connection.request('validation'),
         );
-      } catch (_) {
-        // Runner history is optional for the rest of the board.
+      } catch (e) {
+        validationData = {'error': e.toString()};
       }
       if (mounted && epoch == connection.generation)
         setState(() {
@@ -558,6 +558,33 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
                       'enabled': true,
                       'auto_sdk': value,
                     }),
+            ),
+          if (sdk['state'] == 'unavailable')
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.warning_amber_outlined),
+              title: const Text('SDK status unavailable'),
+              subtitle: Text(
+                '${sdk['error']}\nVerify that the updated gateway was restarted.',
+              ),
+            )
+          else if (sdk['state'] != null &&
+              sdk['supported'] != true &&
+              sdk['installed'] != true)
+            const ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.build_outlined),
+              title: Text('SDK installation service is not configured'),
+              subtitle: Text(
+                'Run bash /opt/herdr-web/install/web-install.sh as root inside the LXC to register the SDK service, then refresh this board.',
+              ),
+            ),
+          if (validation['error'] != null)
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.warning_amber_outlined),
+              title: const Text('Validation runner unavailable'),
+              subtitle: Text('${validation['error']}'),
             ),
           if (sdk['installed'] == true)
             const ListTile(

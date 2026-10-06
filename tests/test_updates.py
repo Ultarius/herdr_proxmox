@@ -68,7 +68,11 @@ class UpdateTests(unittest.TestCase):
             def download(url, destination, limit):
                 destination.write_text('0' * 64 + '  herdr-proxmox.tar.gz' if url.endswith('.sha256') else 'corrupt archive')
             mocks.enter_context(patch.object(worker, 'download', side_effect=download))
-            service = mocks.enter_context(patch.object(worker, 'service'))
+            def inspect_service(action):
+                if action == 'start' and (root / 'VERSION').read_text() == 'v0.2.0':
+                    self.assertEqual((root / 'install/web-install.sh').read_text(), 'new installer')
+                    self.assertTrue((root / 'install/sdk-install.py').exists())
+            service = mocks.enter_context(patch.object(worker, 'service', side_effect=inspect_service))
             with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
                 worker.main()
             service.assert_not_called()
@@ -83,6 +87,8 @@ class UpdateTests(unittest.TestCase):
             (root / 'web/public').mkdir()
             (root / 'web/gateway/server.py').write_text('old gateway')
             (root / 'VERSION').write_text('v0.1.0')
+            (root / 'install').mkdir()
+            (root / 'install/web-install.sh').write_text('old installer')
             config.mkdir()
             (config / 'organizations.sqlite3').write_bytes(b'original database')
             request.write_text('{"version":"v0.2.0"}')
@@ -91,6 +97,9 @@ class UpdateTests(unittest.TestCase):
                 target = package / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text('')
+            (package / 'install').mkdir()
+            (package / 'install/web-install.sh').write_text('new installer')
+            (package / 'install/sdk-install.py').write_text('new sdk worker')
             (package / 'VERSION').write_text('v0.2.0')
             archive = base / 'archive.tar.gz'
             with tarfile.open(archive, 'w:gz') as file:
@@ -107,11 +116,17 @@ class UpdateTests(unittest.TestCase):
             mocks.enter_context(patch.object(tarfile.TarFile, 'chown'))
             mocks.enter_context(patch.object(worker, 'download', side_effect=download))
             mocks.enter_context(patch.object(worker.subprocess, 'run'))
-            service = mocks.enter_context(patch.object(worker, 'service'))
+            def inspect_service(action):
+                if action == 'start' and (root / 'VERSION').read_text() == 'v0.2.0':
+                    self.assertEqual((root / 'install/web-install.sh').read_text(), 'new installer')
+                    self.assertTrue((root / 'install/sdk-install.py').exists())
+            service = mocks.enter_context(patch.object(worker, 'service', side_effect=inspect_service))
             mocks.enter_context(patch.object(worker, 'urlopen', side_effect=OSError('unavailable')))
             mocks.enter_context(patch.object(worker.time, 'sleep'))
             with self.assertRaisesRegex(ValueError, 'startup check'):
                 worker.main()
+            self.assertEqual((root / 'install/web-install.sh').read_text(), 'old installer')
+            self.assertFalse((root / 'install/sdk-install.py').exists())
             self.assertEqual((root / 'VERSION').read_text(), 'v0.1.0')
             self.assertEqual((root / 'web/gateway/server.py').read_text(), 'old gateway')
             self.assertEqual((config / 'organizations.sqlite3').read_bytes(), b'original database')

@@ -88,6 +88,8 @@ def main():
             backup = STATE / ('backup-' + str(time.time_ns()))
             backup.mkdir(mode=0o700)
             shutil.copytree(ROOT / 'web', backup / 'web')
+            if (ROOT / 'install').exists():
+                shutil.copytree(ROOT / 'install', backup / 'install')
             config = CONFIG
             shutil.copytree(config, backup / 'config')
             if (ROOT / 'VERSION').exists():
@@ -99,6 +101,13 @@ def main():
                 for installed in (ROOT / 'web' / part).rglob('*'):
                     installed.chmod(0o755 if installed.is_dir() else 0o644)
                 (ROOT / 'web' / part).chmod(0o755)
+            # Keep service installers matched to the deployed gateway. Copy only;
+            # privileged setup remains an explicit root/operator action.
+            if (source / 'install').is_dir():
+                shutil.copytree(source / 'install', ROOT / 'install', dirs_exist_ok=True)
+                (ROOT / 'install').chmod(0o755)
+                for installed in (ROOT / 'install').rglob('*'):
+                    installed.chmod(0o755 if installed.is_dir() else 0o644)
             shutil.copy2(source / 'VERSION', ROOT / 'VERSION')
             service('start')
             # Gateway loads storage on startup; HTTP verifies it actually serves requests.
@@ -117,6 +126,10 @@ def main():
             service('stop')
             shutil.rmtree(ROOT / 'web')
             shutil.copytree(backup / 'web', ROOT / 'web')
+            if (ROOT / 'install').exists():
+                shutil.rmtree(ROOT / 'install')
+            if (backup / 'install').exists():
+                shutil.copytree(backup / 'install', ROOT / 'install')
             config = CONFIG
             shutil.rmtree(config)
             shutil.copytree(backup / 'config', config)

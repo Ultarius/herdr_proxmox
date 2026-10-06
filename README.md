@@ -284,7 +284,10 @@ update**. The root-owned `herdr-update.path` service watches a fixed request
 location; the gateway itself remains unprivileged. The updater downloads only
 from this repository, verifies the published SHA-256 checksum, validates archive
 paths and sizes, and replaces the gateway and compiled dashboard together.
-It does not execute release installer scripts or update the Herdr CLI.
+It syncs the release's `install` directory but never executes installer scripts,
+refreshes root-owned copies under `/usr/local/sbin` or changes systemd units;
+after a release that changes those, rerun `bash /opt/herdr-web/install/web-install.sh`
+as root. The Herdr CLI is not updated.
 
 The gateway is stopped while its installed files and configuration/database are
 backed up under `/var/lib/herdr-updater/backup-*`. Projects and agent terminals

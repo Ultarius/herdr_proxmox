@@ -18,6 +18,9 @@ void main() {
       final connection = DashboardBloc(
         client: MockClient((request) async {
           final endpoint = request.url.path;
+          if (endpoint.endsWith('/sdk') || endpoint.endsWith('/validation')) {
+            return http.Response('{"error":"Service unavailable"}', 503);
+          }
           if (endpoint.endsWith('/integration/configure')) {
             actions.add('configure');
             final body = jsonDecode(request.body);
@@ -157,6 +160,8 @@ void main() {
       await tester.tap(find.text('Integration coordinator'));
       await tester.pumpAndSettle();
       expect(find.text('Not configured'), findsOneWidget);
+      expect(find.text('SDK status unavailable'), findsOneWidget);
+      expect(find.text('Validation runner unavailable'), findsOneWidget);
       await tester.tap(find.text('Enable coordinator'));
       await tester.pumpAndSettle();
       expect(actions, ['configure']);
@@ -408,7 +413,9 @@ void main() {
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
-          body: SingleChildScrollView(child: IntegrationBoard(repository: 'repo')),
+          body: SingleChildScrollView(
+            child: IntegrationBoard(repository: 'repo'),
+          ),
         ),
       ),
     );
@@ -417,10 +424,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Signed in: dashboard · admin'), findsOneWidget);
     expect(find.text('Development SDK missing'), findsOneWidget);
-    expect(
-      find.textContaining('Blocker: Missing toolchain'),
-      findsOneWidget,
-    );
+    expect(find.textContaining('Blocker: Missing toolchain'), findsOneWidget);
     expect(
       find.textContaining('Exact-commit validation: complete'),
       findsOneWidget,
@@ -435,7 +439,10 @@ void main() {
     );
     await tester.tap(find.text('Install the development SDK automatically'));
     await tester.pumpAndSettle();
-    expect(calls.where((c) => c.endsWith('/api/integration/configure')), hasLength(1));
+    expect(
+      calls.where((c) => c.endsWith('/api/integration/configure')),
+      hasLength(1),
+    );
     await tester.ensureVisible(find.byTooltip('Download validation log'));
     await tester.tap(find.byTooltip('Download validation log'));
     await tester.pumpAndSettle();
@@ -448,10 +455,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('Validate exact commit'));
     await tester.pumpAndSettle();
-    expect(
-      calls.where((c) => c.endsWith('/api/validation/run')),
-      hasLength(1),
-    );
+    expect(calls.where((c) => c.endsWith('/api/validation/run')), hasLength(1));
     await tester.pumpWidget(const SizedBox.shrink());
     await connection.disconnect();
     await BlocScope.reset();
@@ -474,7 +478,11 @@ void main() {
           );
         if (endpoint.endsWith('/sdk'))
           return http.Response(
-            jsonEncode({'state': 'idle', 'installed': false, 'supported': true}),
+            jsonEncode({
+              'state': 'idle',
+              'installed': false,
+              'supported': true,
+            }),
             200,
           );
         if (endpoint.endsWith('/integration'))
@@ -487,7 +495,9 @@ void main() {
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
-          body: SingleChildScrollView(child: IntegrationBoard(repository: 'repo')),
+          body: SingleChildScrollView(
+            child: IntegrationBoard(repository: 'repo'),
+          ),
         ),
       ),
     );
@@ -501,7 +511,9 @@ void main() {
     );
     expect(
       tester
-          .widget<FilledButton>(find.widgetWithText(FilledButton, 'Install pinned SDK'))
+          .widget<FilledButton>(
+            find.widgetWithText(FilledButton, 'Install pinned SDK'),
+          )
           .onPressed,
       isNull,
     );

@@ -16,7 +16,7 @@ import stat
 STATE = Path('/var/lib/herdr-sdk')
 REQUEST = Path('/var/lib/herdr-sdk-requests/request.json')
 INSTALLER = Path('/opt/herdr-web/install/dev-tools-install.sh')
-OUTPUT_LIMIT = 4000
+OUTPUT_LIMIT = 1800
 TIMEOUT_SECONDS = 1800
 
 
@@ -39,7 +39,9 @@ def install():
     result = subprocess.run(['bash', str(INSTALLER)], capture_output=True, text=True,
                             timeout=TIMEOUT_SECONDS,
                             env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'})
-    tail = (result.stdout or result.stderr or '').strip()[-OUTPUT_LIMIT:]
+    # Keep stderr even when apt/curl produced stdout; it usually contains
+    # the actual installer failure, and the status message retains the final tail.
+    tail = ((result.stdout or '') + '\n' + (result.stderr or '')).strip()[-OUTPUT_LIMIT:]
     if result.returncode:
         raise ValueError('SDK installation failed. Inspect journalctl -u herdr-sdk. ' + tail)
     return tail

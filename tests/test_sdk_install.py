@@ -98,6 +98,12 @@ class SdkWorkerTests(unittest.TestCase):
             self.assertEqual(saved['state'], 'failed')
             self.assertIn('failed', saved['error'])
 
+    def test_installer_failure_keeps_stderr_after_noisy_stdout(self):
+        result = Mock(returncode=1, stdout='apt output ' * 1000, stderr='Pinned SDK release is unavailable')
+        with patch.object(worker.subprocess, 'run', return_value=result):
+            with self.assertRaisesRegex(ValueError, 'Pinned SDK release is unavailable'):
+                worker.install()
+
 
 if __name__ == '__main__':
     unittest.main()
