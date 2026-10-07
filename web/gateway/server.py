@@ -34,6 +34,8 @@ from operators import Operators
 from sdk_install import SdkInstall
 from updates import Updates
 from validation import ValidationRuns
+from github_api import GitHub, GitHubError
+from contributions import Contributions
 
 ROOT = Path(os.environ.get('HERDR_WEB_ROOT', '/opt/herdr-web/public')).resolve()
 PROJECTS = Path(os.environ.get('HERDR_PROJECTS', '/home/herdr/projects')).resolve()
@@ -265,6 +267,15 @@ class Handler(BaseHTTPRequestHandler):
                 query = parse_qs(urlsplit(self.path).query)
                 self.validation_log((query.get('id') or [''])[0])
                 return
+            if self.path.startswith('/api/tasks/detail?'):
+                query = parse_qs(urlsplit(self.path).query)
+                try:
+                    self.reply(200, self.server.contributions.detail((query.get('id') or [''])[0]))
+                except sqlite3.Error:
+                    self.reply(503, {'error': 'Task storage is unavailable. Retry after checking the gateway service.'})
+                except (ValueError, OSError) as error:
+                    self.reply(400, {'error': str(error)[:500]})
+                return
             if self.path.startswith('/api/validation/artifact?'):
                 query = parse_qs(urlsplit(self.path).query)
                 self.validation_artifact((query.get('id') or [''])[0], (query.get('kind') or ['static'])[0])
@@ -279,10 +290,21 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/api/organizations/export':
                 self.reply(200, export_configuration(self.server.organizations))
                 return
-            if self.path not in ('/api/snapshot', '/api/organizations', '/api/organizations/directory', '/api/organizations/state', '/api/projects/jobs', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates', '/api/models', '/api/integration', '/api/sdk', '/api/validation'):
+            if self.path not in ('/api/snapshot', '/api/organizations', '/api/organizations/directory', '/api/organizations/state', '/api/projects/jobs', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates', '/api/models', '/api/integration', '/api/sdk', '/api/validation', '/api/tasks', '/api/github'):
                 self.reply(404, {'error': 'Unknown endpoint.'})
                 return
             try:
+                if self.path == '/api/tasks':
+                    # Task read access intentionally matches organization and
+                    # repository read access. It grants no publication rights.
+                    self.reply(200, self.server.contributions.snapshot(role=self.operator['role']))
+                    return
+                if self.path == '/api/github':
+                    if self.operator['role'] != 'admin':
+                        self.reply(403, {'error': 'Only an administrator can view GitHub publishing configuration.'})
+                        return
+                    self.reply(200, self.server.github.snapshot())
+                    return
                 if self.path == '/api/projects/jobs':
                     self.reply(200, self.server.projects.snapshot())
                     return
@@ -334,6 +356,8 @@ class Handler(BaseHTTPRequestHandler):
                     'workspaces': listing(command('workspace', 'list'), 'workspaces'),
                     'agents': agents,
                 })
+            except sqlite3.Error:
+                self.reply(503, {'error': 'Dashboard storage is unavailable. Retry after checking the gateway service.'})
             except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
                 if self.path == '/api/snapshot' and isinstance(exc, ValueError) and 'server_not_running' in str(exc):
                     self.reply(200, {'herdr_server': 'stopped', 'workspaces': [], 'agents': []})
@@ -421,7 +445,7 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'remove_agent', 'remove_group')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/updates/promote', '/api/updates/rollback', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -429,7 +453,13 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < size <= (2_000_000 if self.path == '/api/organizations/import' else 65536):
                 raise ValueError('Invalid request size.')
             body = json.loads(self.rfile.read(size))
-            if self.path == '/api/organizations/import':
+            if self.path == '/api/github/configure':
+                if role != 'admin':
+                    raise ValueError('Only an administrator can configure GitHub publishing.')
+                self.reply(200, self.server.github.configure(body))
+            elif self.path.startswith('/api/tasks/'):
+                self.reply(200, self.server.contributions.action(self.path.rsplit('/', 1)[1], body, actor, role))
+            elif self.path == '/api/organizations/import':
                 self.reply(200, import_configuration(self.server.organizations, body))
             elif self.path == '/api/organizations/activity':
                 self.reply(200, self.server.organizations.activity(body))
@@ -486,6 +516,10 @@ class Handler(BaseHTTPRequestHandler):
                 if role != 'admin':
                     raise ValueError('Only an administrator can roll back a deployment.')
                 self.reply(200, self.server.updates.rollback(actor))
+            elif self.path == '/api/updates/provenance':
+                if role != 'admin':
+                    raise ValueError('Only an administrator can repair deployment provenance.')
+                self.reply(200, self.server.updates.provenance(actor))
             elif self.path == '/api/herdr-server/start':
                 self.reply(200, self.server.herdr_server.start(body))
             elif self.path == '/api/dashboard-access':
@@ -500,6 +534,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, self.server.organizations.action(organization_actions[self.path], body))
             else:
                 self.reply(200, workspace_action(actions[self.path], body))
+        except GitHubError as exc:
+            # HTTP 401 is reserved for dashboard authentication. An upstream
+            # 401 must not revoke a valid browser session or erase task state.
+            self.reply(502, {'error': str(exc)[:500], 'source': 'github', 'github_status': exc.status})
         except (ValueError, UnicodeError) as exc:
             self.reply(400, {'error': str(exc)[:500]})
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -548,6 +586,8 @@ def main():
     sdk_install = SdkInstall()
     cli_setup = CliSetup()
     organizations = OrganizationStore(DATABASE, PROJECTS, command, runtime_status=cli_setup.status, model_validator=lambda profile: model_catalog.validate_selection(cli_setup, PROJECTS, profile))
+    github = GitHub(DATABASE.parent / 'github.json')
+    contributions = Contributions(DATABASE.with_name('tasks.sqlite3'), PROJECTS, organizations, github)
     run_logs = RunLogs(DATABASE.parent / 'run-logs', BIN)
     ssh_access = SshAccess()
     projects = ProjectJobs(PROJECTS, DATABASE.with_name('projects.sqlite3'))
@@ -563,16 +603,27 @@ def main():
             raise ValueError('Build service projects do not match the gateway.')
         build_queue = BuildQueue(configuration['queue'])
         minimum_build_space = configuration.get('minimum_free_bytes', 2 * 1024**3)
-    validation = ValidationRuns(PROJECTS, coordinator.event, record=coordinator.record_validation_run, queue=build_queue, minimum_free_bytes=minimum_build_space)
+    coordinator.build_service = build_queue is not None
+    def build_event(event_id):
+        return contributions.build_event(event_id) or coordinator.event(event_id)
+
+    def record_build(event_id, summary):
+        if not contributions.record_build(event_id, summary):
+            coordinator.record_validation_run(event_id, summary)
+
+    validation = ValidationRuns(PROJECTS, build_event, record=record_build, queue=build_queue, minimum_free_bytes=minimum_build_space)
+    contributions.validation = validation
     integration = IntegrationWatcher(PROJECTS, organizations.active_checkouts, coordinator=coordinator,
                                      wake_event=organizations.jobs_changed)
     # Durable queue results reach their integration events even without a browser.
     integration.build_results = validation.snapshot
     integration.schedule_builds = lambda: coordinator.schedule_builds(validation)
     integration.wake()
+    contributions.start()
     try:
-        serve_gateway(bind, 8787, policy, token, {'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator, 'operators': operators, 'sdk_install': sdk_install, 'validation': validation}, cookie_secure=secure_setting == '1')
+        serve_gateway(bind, 8787, policy, token, {'github': github, 'contributions': contributions, 'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator, 'operators': operators, 'sdk_install': sdk_install, 'validation': validation}, cookie_secure=secure_setting == '1')
     finally:
+        contributions.close()
         coordinator.close()
         integration.close()
         projects.close()

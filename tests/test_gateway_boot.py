@@ -27,6 +27,11 @@ class GatewayBootTests(unittest.TestCase):
                     self.assertEqual(services['integration'].build_results, services['validation'].snapshot)
                     self.assertEqual(services['validation'].queue is not None, enabled)
                     self.assertEqual(services['validation'].snapshot()['executor'], 'service' if enabled else 'gateway')
+                    # Task publication and task builds must share the real graph.
+                    self.assertIs(services['contributions'].validation, services['validation'])
+                    self.assertIs(services['contributions'].github, services['github'])
+                    self.assertIs(services['contributions'].store, services['organizations'])
+                    self.assertEqual(services['contributions'].snapshot()['tasks'], [])
                     services['integration'].schedule_builds()
                     self.assertEqual(services['coordinator'].snapshot()['events'], [])
                 with patch.multiple(server, PROJECTS=projects, TOKEN_FILE=token,

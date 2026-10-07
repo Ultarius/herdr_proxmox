@@ -69,7 +69,7 @@ class ValidationRunTests(unittest.TestCase):
             if current['state'] != 'running':
                 return current
             time.sleep(0.05)
-        self.fail('validation run did not finish')
+        self.fail('validation run did not finish: ' + json.dumps(current) + '\n' + self.runs.log(run['id'])[1])
 
     @unittest.skipUnless(BASH, 'a POSIX bash is unavailable')
     def test_exact_commit_is_validated_with_a_downloadable_log(self):
@@ -105,7 +105,7 @@ class ValidationRunTests(unittest.TestCase):
         self.target = commit(self.repository, 'independent checks')
         with patch.object(validation, 'BASH', BASH):
             run = self.submit_and_wait()
-        self.assertEqual(run['state'], 'failed')
+        self.assertEqual(run['state'], 'failed', self.runs.log(run['id'])[1])
         self.assertEqual([c['status'] for c in run['checks']], ['failed', 'passed', 'passed', 'passed'])
         self.assertFalse(run['required_checks_verified'])
         self.assertIn('frontend-still-ran', self.runs.log(run['id'])[1])
@@ -121,7 +121,7 @@ class ValidationRunTests(unittest.TestCase):
         self.assertEqual(run['checks'][0]['status'], 'passed')
         self.assertEqual(run['checks'][1]['status'], 'waived')
         self.assertFalse(run['required_checks_verified'])
-        self.assertEqual(run['state'], 'failed')
+        self.assertEqual(run['state'], 'failed', self.runs.log(run['id'])[1])
         self.assertNotIn('artifact', run)
 
     def test_a_missing_script_is_an_error_not_a_failed_validation(self):
@@ -180,7 +180,7 @@ class ValidationRunTests(unittest.TestCase):
         self.target = commit(self.repository, 'static output')
         with patch.object(validation, 'BASH', BASH):
             run = self.submit_and_wait()
-        self.assertEqual(run['state'], 'complete')
+        self.assertEqual(run['state'], 'complete', self.runs.log(run['id'])[1])
         self.assertEqual(run['artifact']['target'], self.target)
         self.assertFalse(run['artifact']['deployment_authorized'])
         folder = self.runs.root / run['id']
@@ -229,7 +229,7 @@ class ValidationRunTests(unittest.TestCase):
         self.target = commit(self.repository, 'linked output')
         with patch.object(validation, 'BASH', BASH):
             run = self.submit_and_wait()
-        self.assertEqual(run['state'], 'complete')
+        self.assertEqual(run['state'], 'complete', self.runs.log(run['id'])[1])
         self.assertNotIn('artifact', run)
         self.assertIn('symlinks', run['artifact_error'])
 
@@ -258,7 +258,7 @@ class ValidationRunTests(unittest.TestCase):
         self.target = commit(self.repository, 'self modifying build')
         with patch.object(validation, 'BASH', BASH):
             run = self.submit_and_wait()
-        self.assertEqual(run['state'], 'failed')
+        self.assertEqual(run['state'], 'failed', self.runs.log(run['id'])[1])
         checks = {check['id']: check for check in run['checks']}
         self.assertEqual(checks['runner:worktree-clean']['status'], 'failed')
         self.assertEqual(checks['runner:exact-commit']['status'], 'passed')
@@ -286,7 +286,7 @@ class ValidationRunTests(unittest.TestCase):
                      operator_approval={'actor': 'admin', 'reason': 'Earlier tools unavailable'}, reason='Validation waived')
         with patch.object(self.runs, 'lookup', return_value=event), patch.object(validation, 'BASH', BASH):
             run = self.submit_and_wait()
-        self.assertEqual(run['state'], 'complete')
+        self.assertEqual(run['state'], 'complete', self.runs.log(run['id'])[1])
         self.assertEqual(run['artifact']['task_id'], 'task-job')
         self.assertEqual(run['artifact']['validation_waiver']['approval']['actor'], 'admin')
         self.assertEqual(event['state'], 'validation_waived')
@@ -306,7 +306,7 @@ class ValidationRunTests(unittest.TestCase):
         self.target = commit(self.repository, 'both suites')
         with patch.object(validation, 'BASH', BASH):
             run = self.submit_and_wait()
-        self.assertEqual(run['state'], 'complete')
+        self.assertEqual(run['state'], 'complete', self.runs.log(run['id'])[1])
         self.assertEqual(run['command'], 'scripts/validate.sh + scripts/build-web.sh')
         _, content = self.runs.log(run['id'])
         self.assertLessEqual(len(content), validation.OUTPUT_LIMIT)

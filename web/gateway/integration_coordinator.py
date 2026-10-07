@@ -48,6 +48,8 @@ class IntegrationCoordinator:
         self.path, self.store = Path(path), store
         # Fixed-purpose, best-effort hook for an opt-in SDK install request.
         self.sdk_request = sdk_request
+        # Set by the gateway once the durable build queue is available.
+        self.build_service = False
         self.lock = threading.RLock()
         self.stopped = threading.Event()
         self._dispatch_jobs = None
@@ -129,6 +131,8 @@ class IntegrationCoordinator:
         auto_build = body.get('auto_build')
         if 'auto_build' in body and type(auto_build) is not bool:
             raise ValueError('Automatic builds must be a boolean.')
+        if auto_build is True and not self.build_service:
+            raise ValueError('Install the durable build service before enabling automatic builds.')
         org_id = body.get('organization_id')
         profile_id = body.get('profile_id')
         with self.lock, closing(self.connect()) as db, db:

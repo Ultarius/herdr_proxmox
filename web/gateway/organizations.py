@@ -162,7 +162,10 @@ class OrganizationStore:
         for table in ('profiles', 'groups'):
             data[table] = [item for item in data[table] if not item.get('removed_at')]
         if directory:
-            data['profiles'] = [{k: p[k] for k in ('id', 'organization_id', 'name', 'runtime', 'group_id') if k in p} for p in data['profiles']]
+            # Task assignment needs the repository and worktree mode; a worktree
+            # agent is the only kind that can own a task branch.
+            data['profiles'] = [{k: p[k] for k in ('id', 'organization_id', 'name', 'runtime', 'group_id',
+                                                    'project', 'use_worktree') if k in p} for p in data['profiles']]
             return data
         states = {}
         live = None
@@ -465,6 +468,15 @@ class OrganizationStore:
                             raise ValueError('Inspect and release the previous run before launching again.')
                         item = dict(id=uuid.uuid4().hex, organization_id=org_id, kind='launch', profile_id=profile['id'],
                                     profile=profile, organization=org, alias='hire_' + uuid.uuid4().hex[:20])
+                        if body.get('task_id') is not None:
+                            task_id = body.get('task_id')
+                            if (not isinstance(task_id, str) or not re.fullmatch(r'[a-f0-9]{32}', task_id)
+                                    or body.get('worktree_branch') != 'herdr/task-' + task_id[:12]
+                                    or not re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', str(body.get('start_sha', '')))
+                                    or not profile.get('use_worktree', True)):
+                                raise ValueError('Invalid task branch or starting commit.')
+                            item.update(task_id=task_id, worktree_branch=body['worktree_branch'],
+                                        start_sha=body['start_sha'], task_prompt=text(body, 'task_prompt', 10000))
                         self.project(profile['project'])
                     else:
                         sender = self.get(db, 'profiles', text(body, 'sender_id', 40), org_id)
@@ -723,7 +735,12 @@ class OrganizationStore:
                         raise ValueError('Worktree directory must remain inside the projects directory.')
                     root.mkdir(exist_ok=True, mode=0o700)
                     checkout = root / job['id']
-                    branch = 'codex/herdr-' + job['id']
+                    branch = job.get('worktree_branch') or 'codex/herdr-' + job['id']
+                    import project_git
+                    configured_base = project_git.configured_base(project)
+                    if configured_base and not job.get('start_sha'):
+                        job = self.update_job(job_id, start_sha=project_git.git(
+                            project, 'rev-parse', '--verify', configured_base + '^{commit}').strip())
                     job = self.update_job(job_id, worktree_path=str(checkout), worktree_branch=branch,
                                           source_project=project, workspace_mode='worktree')
                     # Never fall back to the shared checkout after a Git/Herdr failure.
@@ -731,6 +748,17 @@ class OrganizationStore:
                     with repository_lock(project):
                         created = self.command('worktree', 'create', '--cwd', project, '--branch', branch,
                                                '--path', str(checkout), '--label', profile['name'], '--no-focus', timeout=120)
+                        if job.get('start_sha'):
+                            # Pin only this new, clean checkout before starting any
+                            # agent. Never reset an existing or live task checkout.
+                            if (project_git.git(checkout, 'symbolic-ref', '--short', 'HEAD').strip() != branch
+                                    or project_git.git(checkout, 'status', '--porcelain=v1', '--untracked-files=all').strip()
+                                    or project_git.merge_state(checkout)):
+                                raise ValueError('New task checkout is not clean on its assigned branch.')
+                            project_git.git(checkout, 'cat-file', '-e', job['start_sha'] + '^{commit}')
+                            project_git.git(checkout, 'reset', '--hard', job['start_sha'])
+                            if project_git.git(checkout, 'rev-parse', 'HEAD').strip() != job['start_sha']:
+                                raise ValueError('Task checkout did not reach its recorded starting commit.')
                 else:
                     job = self.update_job(job_id, workspace_mode='workspace', source_project=project,
                                           workspace_note='Not a Git repository; using the selected directory.' if profile.get('use_worktree', True) else '')
@@ -748,6 +776,9 @@ class OrganizationStore:
                           'Read and follow the project owner instructions. Adopt this persona for this conversation. '
                           'Acknowledge readiness and wait for an assigned task. Use Herdr agent commands for explicit delegation; '
                           'do not interpret a delivered prompt or idle status as proof of completed work.')
+                prompt += '\nNever push branches or create pull requests without explicit publication authorization. Dashboard task publishing is administrator-controlled.'
+                if job.get('task_prompt'):
+                    prompt += '\n\nAssigned task (start now in this checkout):\n' + job['task_prompt']
                 if profile.get('group_id'):
                     # Do not deliver an imperative group description as the startup task.
                     # Purpose, roster and output paths arrive together in the discussion.
@@ -761,6 +792,10 @@ class OrganizationStore:
                         'other agents, inspect project or home directories, search for past artifacts, '
                         'or create files. You may read herdr --skill for the command reference.'
                     )
+                    # Group launches replace the prompt above, so restate the
+                    # publication boundary instead of losing it here.
+                    prompt += ('\nNever push branches or create pull requests without explicit '
+                               'publication authorization. Dashboard task publishing is administrator-controlled.')
                     self.command('agent', 'prompt', job['alias'], prompt, '--wait', '--timeout', '180000', timeout=190)
                     self.identity(job)
                 else:

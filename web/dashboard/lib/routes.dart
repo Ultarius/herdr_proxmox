@@ -8,6 +8,18 @@ import 'app_shell.dart';
 import 'group_page.dart';
 import 'project_explorer_page.dart';
 import 'builds_page.dart';
+import 'tasks_page.dart';
+
+class TasksRoute extends AppRoute {
+  @override
+  Uri toUri() => Uri.parse('/tasks');
+  @override
+  Widget build(AppCoordinator coordinator, BuildContext context) => AppShell(
+    coordinator: coordinator,
+    section: 'tasks',
+    child: const TasksPage(),
+  );
+}
 
 class BuildsRoute extends AppRoute {
   @override
@@ -141,6 +153,7 @@ class AppCoordinator extends Coordinator<AppRoute> {
       '/organization' => OrganizationRoute(),
       '/configuration' => CliSetupRoute(),
       '/builds' => BuildsRoute(),
+      '/tasks' => TasksRoute(),
       '/logs' => LogsRoute(),
       '/explorer' => ExplorerRoute(uri.queryParameters['path'] ?? ''),
       _ => NotFoundRoute(uri),

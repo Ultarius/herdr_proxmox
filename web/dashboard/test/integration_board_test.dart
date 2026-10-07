@@ -363,6 +363,7 @@ void main() {
         if (endpoint.endsWith('/validation'))
           return http.Response(
             jsonEncode({
+              'executor': 'service',
               'runs': [
                 {
                   'id': 'r1',

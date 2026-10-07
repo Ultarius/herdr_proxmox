@@ -48,6 +48,17 @@ class IntegrationWatcher:
     def base_for(self, repository):
         """Cached base ref for a repository, re-resolved occasionally so a later
         fetch that creates origin/main is noticed."""
+        configured = project_git.configured_base(repository)
+        if configured:
+            try:
+                project_git.git(repository, 'rev-parse', '--verify', configured)
+            except ValueError:
+                # A configured base that no longer exists locally cannot be
+                # compared or updated. Fall back to detection instead of
+                # reporting an error for every checkout in this repository.
+                configured = None
+            else:
+                return configured
         now = time.monotonic()
         with self.lock:
             cached = self.bases.get(repository)

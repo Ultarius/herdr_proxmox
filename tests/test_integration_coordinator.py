@@ -79,6 +79,9 @@ class CoordinatorTests(unittest.TestCase):
         with patch('integration_coordinator.project_git.inspect', return_value={'repository': True, 'repository_path': 'repo'}):
             with self.assertRaisesRegex(ValueError, 'boolean'):
                 self.service.configure(dict(repository='repo', auto_build='yes'))
+            with self.assertRaisesRegex(ValueError, 'build service'):
+                self.service.configure(dict(repository='repo', profile_id='coordinator', auto_build=True))
+            self.service.build_service = True
             self.service.configure(dict(repository='repo', profile_id='coordinator', auto_build=True))
         self.service.observe([self.notice])
         event = self.event()
@@ -100,6 +103,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(self.event()['automatic_build_id'], 'c' * 32)
 
     def test_auto_build_queue_backpressure_is_visible_and_retried_without_audit_spam(self):
+        self.service.build_service = True
         with patch('integration_coordinator.project_git.inspect', return_value={'repository': True, 'repository_path': 'repo'}):
             self.service.configure(dict(repository='repo', profile_id='coordinator', auto_build=True))
         self.service.observe([self.notice])
@@ -143,6 +147,7 @@ class CoordinatorTests(unittest.TestCase):
         git('add', '.')
         git('commit', '-m', 'build fixture')
         target = git('rev-parse', 'HEAD')
+        self.service.build_service = True
         with patch('integration_coordinator.project_git.inspect', return_value={'repository': True, 'repository_path': 'repo'}):
             self.service.configure(dict(repository='repo', profile_id='coordinator', auto_build=True))
         self.service.observe([dict(self.notice, target=target), dict(self.notice, target=target, run_id='second-run')])

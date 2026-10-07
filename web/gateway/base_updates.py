@@ -49,6 +49,9 @@ def update(root, body, actor, role, busy=None):
         raise ValueError('Invalid destination branch.')
     root = Path(root).resolve()
     path = project_directory(root, str(root / body['path']))
+    configured = project_git.configured_base(path)
+    if configured and body['base'] != configured:
+        raise ValueError('Base update must use the configured repository base branch.')
     common = common_directory(path)
     if common.name != '.git' or path != common.parent or not common.is_relative_to(root):
         raise ValueError('Base updates apply only to the shared repository checkout.')

@@ -175,7 +175,9 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
             .timeout(
               Duration(
                 seconds:
-                    path == 'projects/clone' ||
+                    path.startsWith('tasks/') ||
+                        path == 'github/configure' ||
+                        path == 'projects/clone' ||
                         (path == 'projects/git' &&
                             ['fetch', 'update_base'].contains(body?['action']))
                     ? 135

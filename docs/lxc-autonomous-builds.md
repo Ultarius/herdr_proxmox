@@ -77,7 +77,10 @@ Max's next integration; this latest worker job was still running during review.
 
 Step zero is one configured base ref per repository, shared by the watcher,
 base updates and scheduled fetches. Validation must consume its pinned event
-SHA, never re-resolve a moving branch. This consistency is not implemented yet.
+SHA, never re-resolve a moving branch. Tasks now record an explicit repository
+base consumed by the watcher, base updates, inspection and future worktree
+launches. Unconfigured legacy repositories retain base auto-detection; scheduled
+fetch policy is still separate. See [task contributions](task-contributions.md).
 
 The current runner rejects a second running validation globally under its
 submission lock and collects a bounded output tail. These are existing code

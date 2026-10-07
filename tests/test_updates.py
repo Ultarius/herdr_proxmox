@@ -25,7 +25,8 @@ class UpdateTests(unittest.TestCase):
     def test_release_source_provenance_is_preserved_and_mismatches_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
-            self.assertIsNone(worker.release_identity(source, 'v0.0.24')['source_sha'])
+            with patch.object(worker, 'resolve_tag_sha', return_value=None):
+                self.assertIsNone(worker.release_identity(source, 'v0.0.24')['source_sha'])
             metadata = dict(build_id='v0.0.24', source_sha='c' * 40, deployment_mode='release')
             (source / 'BUILD.json').write_text(json.dumps(metadata))
             self.assertEqual(worker.release_identity(source, 'v0.0.24')['source_sha'], 'c' * 40)
@@ -399,3 +400,93 @@ class UpdateTests(unittest.TestCase):
             worker.wait_for_ready('x' * 32)
             with self.assertRaisesRegex(ValueError, 'startup check'):
                 worker.wait_for_ready('y' * 32)
+
+    def test_release_tag_resolution_handles_light_and_annotated_tags(self):
+        responses = {
+            'tags/v0.0.24': {'object': {'type': 'commit', 'sha': 'a' * 40}},
+            'tags/v0.0.25': {'object': {'type': 'tag', 'sha': 'c' * 40, 'url': 'https://api.example.test/tag/25'}},
+            'git/tags/' + 'c' * 40: {'object': {'type': 'commit', 'sha': 'b' * 40}},
+        }
+        def respond(request, timeout=None):
+            key = next(name for name in responses if name in request.full_url)
+            response = MagicMock()
+            response.read.return_value = json.dumps(responses[key]).encode()
+            response.__enter__.return_value = response
+            return response
+        with patch.object(worker, 'urlopen', side_effect=respond):
+            self.assertEqual(worker.resolve_tag_sha('v0.0.24'), 'a' * 40)
+            self.assertEqual(worker.resolve_tag_sha('v0.0.25'), 'b' * 40)
+        with patch.object(worker, 'urlopen', side_effect=OSError('offline')):
+            self.assertIsNone(worker.resolve_tag_sha('v0.0.24'))
+
+    def test_release_identity_resolves_the_tag_when_the_package_has_none(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder)
+            with patch.object(worker, 'resolve_tag_sha', return_value='c' * 40) as resolve:
+                identity = worker.release_identity(source, 'v0.0.9')
+            resolve.assert_called_once_with('v0.0.9')
+            self.assertEqual(identity['source_sha'], 'c' * 40)
+            self.assertEqual(identity['deployment_mode'], 'release')
+
+    def test_provenance_repair_records_the_tag_commit_without_restarting(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            base = Path(folder)
+            root, state = base / 'installed', base / 'state'
+            root.mkdir()
+            state.mkdir()
+            (state / 'status.json').write_text(json.dumps({'backup': 'previous-backup'}))
+            (root / 'BUILD.json').write_text(json.dumps(dict(
+                build_id='v0.0.24', package_version='v0.0.24', deployment_mode='release', source_sha=None)))
+            request = base / 'request.json'
+            request.write_text('{"mode":"provenance","actor":"damien"}')
+            for name, value in [('ROOT', root), ('STATE', state), ('REQUEST', request)]:
+                mocks.enter_context(patch.object(worker, name, value))
+            mocks.enter_context(patch.object(worker.os, 'geteuid', return_value=0, create=True))
+            service = mocks.enter_context(patch.object(worker, 'service'))
+            mocks.enter_context(patch.object(worker, 'resolve_tag_sha', return_value='d' * 40))
+            worker.main()
+            service.assert_not_called()
+            self.assertEqual(json.loads((root / 'BUILD.json').read_text())['source_sha'], 'd' * 40)
+            saved = json.loads((state / 'status.json').read_text())
+            self.assertEqual(saved['backup'], 'previous-backup')
+            self.assertEqual((saved['state'], saved['mode'], saved['source_sha']), ('complete', 'provenance', 'd' * 40))
+
+    def test_provenance_gateway_action_requires_an_unresolved_release(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            queue = root / 'queue'
+            queue.mkdir()
+            (root / 'VERSION').write_text('v0.0.24')
+            service = updates.Updates(root, queue, root / 'status.json')
+            (root / 'BUILD.json').write_text(json.dumps(dict(
+                build_id='v0.0.24', package_version='v0.0.24', deployment_mode='release', source_sha=None)))
+            with patch.object(updates, 'latest_release', return_value=dict(tag_name='v0.0.24', html_url='')):
+                self.assertTrue(service.snapshot()['provenance_repairable'])
+            self.assertEqual(service.provenance('damien'), {'state': 'queued', 'mode': 'provenance'})
+            self.assertEqual(json.loads((queue / 'request.json').read_text()), {'mode': 'provenance', 'actor': 'damien'})
+            (queue / 'request.json').unlink()
+            (root / 'BUILD.json').write_text(json.dumps(dict(
+                build_id='v0.0.24', deployment_mode='release', source_sha='e' * 40)))
+            with patch.object(updates, 'latest_release', return_value=dict(tag_name='v0.0.24', html_url='')):
+                self.assertFalse(service.snapshot()['provenance_repairable'])
+            with self.assertRaisesRegex(ValueError, 'unresolved source provenance'):
+                service.provenance()
+
+    def test_completed_provenance_status_does_not_break_snapshot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'VERSION').write_text('v0.0.24')
+            (root / 'status.json').write_text(json.dumps(dict(
+                state='complete', mode='provenance', source_sha='a' * 40)))
+            service = updates.Updates(root, root / 'queue', root / 'status.json')
+            with patch.object(updates, 'latest_release', return_value=dict(tag_name='v0.0.24', html_url='')):
+                self.assertEqual(service.snapshot()['state'], 'complete')
+
+    def test_tag_resolution_rejects_non_commit_and_cycles(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        for kind in ('tree', 'tag'):
+            response.read.return_value = json.dumps({'object': {'type': kind, 'sha': 'a' * 40}}).encode()
+            with patch.object(worker, 'urlopen', return_value=response) as request:
+                self.assertIsNone(worker.resolve_tag_sha('v0.0.24'))
+                self.assertLessEqual(request.call_count, 2)

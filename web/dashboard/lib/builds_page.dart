@@ -19,6 +19,7 @@ class _BuildsPageState extends State<BuildsPage> {
   int queued = 0;
   String? error;
   String? actionError;
+  String? downloading;
   bool acting = false;
   bool busy = false;
   Timer? timer;
@@ -80,8 +81,6 @@ class _BuildsPageState extends State<BuildsPage> {
           'Required checks not passed: ${(manifest['checks'] as List? ?? []).where((c) => c is Map && c['required'] != false && c['status'] != 'passed').map((c) => c['id']).join(', ')}\n'
           'Evidence complete: ${manifest['required_checks_verified'] == true}. '
           'Review the log; administrator approval never changes an underlying check result.',
-          // The package records only a script-set exit status today; do not
-          // imply that administrator approval creates per-check evidence.
         ),
         actions: [
           TextButton(
@@ -163,28 +162,98 @@ class _BuildsPageState extends State<BuildsPage> {
     }
   }
 
+  void notify(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
   Future<void> download(Map<String, dynamic> run, String kind) async {
     final epoch = connection.generation;
+    if (downloading != null) return;
+    setState(() {
+      downloading = '${run['id']}:$kind';
+      error = null;
+    });
     try {
       if (kind == 'artifact' || kind == 'deployment') {
         final content = await connection.bytes(
           'validation/artifact?id=${run['id']}&kind=${kind == 'deployment' ? 'deployment' : 'static'}',
         );
+        final manifest =
+            run[kind == 'deployment' ? 'deployment_package' : 'artifact']
+                as Map;
+        final expected = manifest['bytes'];
+        if (expected is! int || expected < 0 || content.length != expected) {
+          throw Exception(
+            'Downloaded size ${content.length} does not match the manifest ($expected bytes).',
+          );
+        }
         if (epoch != connection.generation) return;
         await downloadBinaryArtifact(content, '$kind-${run['id']}.tar.gz');
-      } else if (kind == 'manifest') {
-        await downloadArtifact(
-          const JsonEncoder.withIndent('  ').convert(run['artifact']),
-          'build-${run['id']}.json',
+        notify(
+          '$kind package fetched and handed to the browser · ${content.length} bytes verified.',
         );
+      } else if (kind == 'manifest') {
+        final text = const JsonEncoder.withIndent(
+          '  ',
+        ).convert(run['artifact']);
+        await downloadArtifact(text, 'build-${run['id']}.json');
+        notify('Manifest fetched · ${utf8.encode(text).length} bytes.');
       } else {
         final content = await connection.text('validation/log?id=${run['id']}');
         if (epoch != connection.generation) return;
         await downloadArtifact(content, 'validation-${run['id']}.log');
+        notify('Log fetched · ${utf8.encode(content).length} bytes.');
       }
     } catch (e) {
-      if (mounted && epoch == connection.generation)
+      if (mounted && epoch == connection.generation) {
         setState(() => error = '$e');
+        notify('Download failed: $e');
+      }
+    } finally {
+      if (mounted) setState(() => downloading = null);
+    }
+  }
+
+  Future<void> repairProvenance() async {
+    final epoch = connection.generation;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Resolve release source identity?'),
+        content: const Text(
+          'The release tag is resolved to its exact commit through the GitHub API and '
+          'recorded as the running build provenance. Only deployment identity metadata is updated; services are not restarted.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Resolve source identity'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted || epoch != connection.generation) return;
+    if (acting) return;
+    setState(() {
+      acting = true;
+      actionError = null;
+    });
+    try {
+      await connection.request('updates/provenance', const {});
+      if (mounted && epoch == connection.generation)
+        notify('Source identity resolution queued.');
+      await refresh();
+    } catch (e) {
+      if (mounted) setState(() => actionError = '$e');
+    } finally {
+      if (mounted) setState(() => acting = false);
     }
   }
 
@@ -209,6 +278,16 @@ class _BuildsPageState extends State<BuildsPage> {
       ),
       const SizedBox(height: 12),
       Text('Build executor: $executor · $queued queued'),
+      if (executor != 'service')
+        const ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(Icons.warning_amber_outlined),
+          title: Text('Durable build service not installed'),
+          subtitle: Text(
+            'Builds run inside the gateway and stop with it; automatic builds stay off. '
+            'Install it as root inside the container: bash /opt/herdr-web/install/build-install.sh',
+          ),
+        ),
       const Text(
         'Build exact integration commits from Git changes. Static artifacts and full gateway/UI packages are separate. Downloading a package does not authorize deployment.',
       ),
@@ -232,8 +311,22 @@ class _BuildsPageState extends State<BuildsPage> {
         Card(
           child: Padding(
             padding: const EdgeInsets.all(16),
-            child: SelectableText(
-              'Running build: ${identity!['build_id'] ?? 'Unknown for this installation'}\nSource: ${identity!['source_sha'] ?? 'Unknown'}\nPackage: ${identity!['package_version'] ?? 'Unknown'}\nDeployment mode: ${identity!['deployment_mode'] ?? 'Unknown'}',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SelectableText(
+                  'Running build: ${identity!['build_id'] ?? 'Unknown for this installation'}\nSource: ${identity!['source_sha'] ?? 'Unknown'}\nPackage: ${identity!['package_version'] ?? 'Unknown'}\nDeployment mode: ${identity!['deployment_mode'] ?? 'Unknown'}',
+                ),
+                if (connection.operator.value['role'] == 'admin' &&
+                    deployment?['provenance_repairable'] == true &&
+                    deployment?['supported'] == true &&
+                    !['queued', 'running'].contains(deployment?['state']))
+                  TextButton.icon(
+                    onPressed: acting ? null : repairProvenance,
+                    icon: const Icon(Icons.link),
+                    label: const Text('Resolve source identity'),
+                  ),
+              ],
             ),
           ),
         ),
@@ -313,24 +406,32 @@ class _BuildsPageState extends State<BuildsPage> {
                   spacing: 12,
                   children: [
                     TextButton.icon(
-                      onPressed: () => download(run, 'log'),
+                      onPressed: downloading == null
+                          ? () => download(run, 'log')
+                          : null,
                       icon: const Icon(Icons.description_outlined),
                       label: const Text('Download log'),
                     ),
                     if (run['artifact'] is Map) ...[
                       TextButton.icon(
-                        onPressed: () => download(run, 'artifact'),
+                        onPressed: downloading == null
+                            ? () => download(run, 'artifact')
+                            : null,
                         icon: const Icon(Icons.download),
                         label: const Text('Download static artifact'),
                       ),
                       TextButton(
-                        onPressed: () => download(run, 'manifest'),
+                        onPressed: downloading == null
+                            ? () => download(run, 'manifest')
+                            : null,
                         child: const Text('Download manifest'),
                       ),
                     ],
                     if (run['deployment_package'] is Map)
                       TextButton.icon(
-                        onPressed: () => download(run, 'deployment'),
+                        onPressed: downloading == null
+                            ? () => download(run, 'deployment')
+                            : null,
                         icon: const Icon(Icons.inventory_2_outlined),
                         label: const Text('Download gateway + UI package'),
                       ),
@@ -351,6 +452,9 @@ class _BuildsPageState extends State<BuildsPage> {
                       ),
                   ],
                 ),
+                if (downloading != null &&
+                    downloading!.startsWith('${run['id']}:'))
+                  const LinearProgressIndicator(),
               ],
             ),
           ),

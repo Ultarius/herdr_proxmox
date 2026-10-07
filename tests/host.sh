@@ -117,7 +117,7 @@ touch "$tmp/web/public/index.html" "$tmp/web/public/main.dart.js" "$tmp/web/publ
 printf 'ssh-ed25519 AAAA test\n' >"$tmp/public.key"
 export HERDR_TEST_WEB_CONTENTS="$tmp/web-contents"
 bash "$tmp/ct/herdr.sh" --web --ssh-key "$tmp/public.key" --template local:vztmpl/debian-13-standard_test_amd64.tar.zst >"$tmp/output"
-for file in cli_setup.py pty_exec.py run_logs.py log_view.html skills/herdr-worktree-integration/SKILL.md; do grep -q "web/gateway/$file" "$HERDR_TEST_WEB_CONTENTS"; done
+for file in cli_setup.py pty_exec.py run_logs.py log_view.html skills/herdr-worktree-integration/SKILL.md contributions.py github_api.py github_askpass.py; do grep -q "web/gateway/$file" "$HERDR_TEST_WEB_CONTENTS"; done
 grep -q 'install/sdk-install.py' "$HERDR_TEST_WEB_CONTENTS"
 grep -q 'install/operator-admin.py' "$HERDR_TEST_WEB_CONTENTS"
 grep -q 'install/build-install.sh' "$HERDR_TEST_WEB_CONTENTS"

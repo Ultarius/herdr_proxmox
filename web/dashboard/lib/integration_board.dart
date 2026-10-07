@@ -601,11 +601,17 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
               title: const Text('Build incorporated commits automatically'),
-              subtitle: const Text(
-                'Requires the build service. Queue the exact commit after gateway Git verification; failed builds need an explicit retry. Deployment remains an administrator action.',
+              subtitle: Text(
+                validation['executor'] == 'service'
+                    ? 'Queue the exact commit after gateway Git verification; failed builds need an explicit retry. Deployment remains an administrator action.'
+                    : 'Requires the durable build service. Install it as root inside the container: bash /opt/herdr-web/install/build-install.sh',
               ),
               value: config?['auto_build'] == true,
-              onChanged: busy || connection.operator.value['role'] != 'admin'
+              onChanged:
+                  busy ||
+                      connection.operator.value['role'] != 'admin' ||
+                      (validation['executor'] != 'service' &&
+                          config?['auto_build'] != true)
                   ? null
                   : (value) => action('integration/configure', {
                       'repository': widget.repository,

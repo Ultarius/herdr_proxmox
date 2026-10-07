@@ -76,6 +76,25 @@ class Updates:
             self._request(dict(mode='rollback', actor=str(actor)[:80]))
             return {'state': 'queued', 'mode': 'rollback'}
 
+    def provenance(self, actor='dashboard'):
+        """Queue a best-effort GitHub tag-to-commit repair for a release install."""
+        with self.lock:
+            if not self.queue.is_dir():
+                raise ValueError('Install the updater service as root first.')
+            if self._busy(self._status()):
+                raise ValueError('A deployment is already running.')
+            identity_path = self.root / 'BUILD.json'
+            try:
+                identity = json.loads(identity_path.read_text())
+            except (OSError, ValueError) as error:
+                raise ValueError('Deployment identity is missing or unreadable.') from error
+            if (not isinstance(identity, dict) or identity.get('deployment_mode') == 'local'
+                    or not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', str(identity.get('build_id', '')))
+                    or re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', str(identity.get('source_sha', '')))):
+                raise ValueError('Only release deployments with unresolved source provenance can be repaired.')
+            self._request(dict(mode='provenance', actor=str(actor)[:80]))
+            return {'state': 'queued', 'mode': 'provenance'}
+
     def snapshot(self, force=False):
         with self.lock:
             now = time.monotonic()
@@ -114,20 +133,29 @@ class Updates:
                 and tuple(map(int, latest[1:].split('.'))) > tuple(map(int, installed[1:].split('.'))))
             )
             identity_path = self.root / 'BUILD.json'
-            local_mode = False
+            identity = None
             if identity_path.exists():
                 try:
-                    local_mode = json.loads(identity_path.read_text()).get('deployment_mode') == 'local'
-                except (OSError, ValueError, AttributeError):
-                    local_mode = True  # Unknown identity must not be silently overwritten.
-            return dict(installed=installed, latest=latest, available=newer,
+                    identity = json.loads(identity_path.read_text())
+                except (OSError, ValueError):
+                    identity = None
+            local_mode = identity_path.exists() and (
+                not isinstance(identity, dict) or identity.get('deployment_mode') == 'local')
+            source_sha = identity.get('source_sha') if isinstance(identity, dict) else None
+            provenance_repairable = bool(
+                isinstance(identity, dict) and identity.get('deployment_mode') != 'local'
+                and re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', str(identity.get('build_id', '')))
+                and not re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', str(source_sha or '')))
+            return dict(status, installed=installed, latest=latest, available=newer,
                         supported=self.queue.is_dir() and not local_mode,
                         local_supported=self.queue.is_dir(),
+                        source_sha=source_sha if isinstance(source_sha, str) else None,
+                        provenance_repairable=provenance_repairable,
                         rollback_available=bool(raw.get('backup')),
                         deployment_mode='local' if local_mode else 'release',
                         release_url=cached['html_url'] if cached else None,
                         check_error=error,
-                        notes=cached.get('body', '')[:12000] if cached else '', **status)
+                        notes=cached.get('body', '')[:12000] if cached else '')
 
     def install(self, body):
         info = self.snapshot()

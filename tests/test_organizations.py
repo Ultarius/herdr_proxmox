@@ -153,6 +153,46 @@ class OrganizationTests(unittest.TestCase):
         self.assertIn('uses codex', job['error'])
         self.assertFalse(any(args[:2] == ('workspace', 'create') for args, _ in self.calls))
 
+    def test_task_launch_pins_recorded_base_before_agent_starts(self):
+        def git(*args):
+            return subprocess.run(['git', '-C', str(self.projects), *args], check=True,
+                                  capture_output=True, text=True, timeout=20).stdout
+        git('init')
+        git('config', 'user.name', 'Test')
+        git('config', 'user.email', 'test@example.test')
+        (self.projects / 'file').write_text('base')
+        git('add', '.')
+        git('commit', '-m', 'base')
+        base = git('rev-parse', 'HEAD').strip()
+        (self.projects / 'file').write_text('newer shared checkout')
+        git('commit', '-am', 'newer')
+        shared = git('rev-parse', 'HEAD').strip()
+        original = self.store.command
+        checkout = None
+        def command(*args, **kwargs):
+            nonlocal checkout
+            if args[:2] == ('worktree', 'create'):
+                checkout = Path(args[args.index('--path') + 1])
+                git('worktree', 'add', '-b', args[args.index('--branch') + 1], str(checkout))
+                return {'root_pane': {'pane_id': 'w999:p1'}}
+            if args[:2] == ('agent', 'start'):
+                self.assertEqual(subprocess.run(['git', '-C', str(checkout), 'rev-parse', 'HEAD'],
+                    capture_output=True, text=True, check=True).stdout.strip(), base)
+            return original(*args, **kwargs)
+        self.store.command = command
+        org = self.organization()
+        profile = self.hire(org)
+        job_id = self.action('launch', organization_id=org, profile_id=profile,
+                            task_id='a' * 32, worktree_branch='herdr/task-' + 'a' * 12,
+                            start_sha=base, task_prompt='Implement this task. Never push.')
+        self.drain()
+        job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == job_id)
+        self.assertEqual(job['state'], 'persona_sent', job.get('error'))
+        self.assertEqual(job['worktree_branch'], 'herdr/task-' + 'a' * 12)
+        self.assertEqual(git('rev-parse', 'HEAD').strip(), shared)
+        prompts = [args[3] for args, _ in self.calls if args[:2] == ('agent', 'prompt')]
+        self.assertTrue(any('Assigned task (start now' in prompt for prompt in prompts))
+
     def test_git_launch_defaults_to_separate_committed_worktree(self):
         def git(*args):
             subprocess.run(['git', *args], check=True, capture_output=True, timeout=20)
@@ -191,7 +231,7 @@ class OrganizationTests(unittest.TestCase):
         self.assertTrue(checkout.exists())  # Release never deletes agent work.
 
     def test_worktree_failure_does_not_launch_in_shared_directory(self):
-        (self.projects / '.git').mkdir()
+        subprocess.run(['git', 'init', str(self.projects)], check=True, capture_output=True)
         original = self.store.command
         def command(*args, **kwargs):
             if args[:2] == ('worktree', 'create'):
@@ -201,12 +241,9 @@ class OrganizationTests(unittest.TestCase):
         org = self.organization()
         profile = self.hire(org)
         job_id = self.action('launch', organization_id=org, profile_id=profile)
-        from contextlib import nullcontext
-        from unittest.mock import patch
-        # This fixture deliberately uses a fake .git directory to isolate the
-        # Herdr launch failure; repository locking is exercised with real Git.
-        with patch('repository_lock.repository_lock', return_value=nullcontext()):
-            self.drain()
+        # Real metadata exercises the configured-base and locking preflight;
+        # the Herdr command itself still fails before any agent can start.
+        self.drain()
         job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == job_id)
         self.assertEqual(job['state'], 'needs_attention')
         self.assertIn('Worktree unavailable', job['error'])

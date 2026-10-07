@@ -40,6 +40,15 @@ class IntegrationTests(unittest.TestCase):
     def run_git(self, *args):
         subprocess.run(['git', '-C', str(self.repo), *args], check=True, capture_output=True)
 
+    def test_explicit_task_base_overrides_legacy_default_and_cache(self):
+        self.run_git('update-ref', 'refs/remotes/origin/release', self.base)
+        watcher = self.watcher([])
+        self.assertEqual(watcher.base_for(self.repo), 'refs/remotes/origin/main')
+        project_git.configured_base(self.repo, 'refs/remotes/origin/release')
+        self.assertEqual(watcher.base_for(self.repo), 'refs/remotes/origin/release')
+        status = project_git.inspect(self.root, dict(path='repo'))
+        self.assertTrue(all(tree['base'] == 'origin/release' for tree in status['worktrees']))
+
     def watcher(self, checkouts):
         # A long interval keeps the thread out of the assertions.
         watcher = IntegrationWatcher(self.root, lambda: checkouts, interval=3600)

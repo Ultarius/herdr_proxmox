@@ -107,7 +107,7 @@ class ValidationRuns:
                         try:
                             self._record_result(event_id, run)
                             delivered.write_text(stamp())
-                        except (ValueError, OSError):
+                        except (ValueError, OSError, sqlite3.Error):
                             # Retry delivery after transient storage failures; never
                             # redispatch a build just because its feedback was lost.
                             continue
@@ -251,14 +251,15 @@ class ValidationRuns:
             if self.record is not None:
                 try:
                     self._record_result(run['event_id'], run)
-                except (ValueError, OSError):
+                except (ValueError, OSError, sqlite3.Error):
                     pass
 
     def _record_result(self, event_id, run):
         self.record(event_id, dict(run_id=run['id'], state=run['state'], target=run['target'],
-            command=run.get('command'), exit_code=run.get('exit_code'), checks=run.get('checks', []),
-            required_checks_verified=run.get('required_checks_verified', False),
-            finished_at=run.get('finished_at'), actor=run.get('actor')))
+                                   command=run.get('command'), exit_code=run.get('exit_code'), checks=run.get('checks', []),
+                                   required_checks_verified=run.get('required_checks_verified', False),
+                                   finished_at=run.get('finished_at'), note=run.get('note'),
+                                   actor=run.get('actor')))
 
     def _integrity_checks(self, worktree, target):
         results = []

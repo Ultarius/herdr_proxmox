@@ -237,9 +237,9 @@ class _AppShellState extends State<AppShell> {
                           'Clipboard unavailable over HTTP; instructions downloaded instead.',
                     );
                     if (context.mounted)
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text(message)),
-                      );
+                      ScaffoldMessenger.of(
+                        context,
+                      ).showSnackBar(SnackBar(content: Text(message)));
                   },
                   icon: const Icon(Icons.copy_outlined, size: 18),
                   label: const Text('Copy instructions'),
@@ -354,6 +354,7 @@ class _AppShellState extends State<AppShell> {
             OrganizationRoute(),
             'organization',
           ),
+          nav('Tasks', Icons.task_alt, TasksRoute(), 'tasks'),
           nav('Agent activity', Icons.bolt_outlined, AgentsRoute(), 'agents'),
           heading('WORKSPACE'),
           nav(
@@ -364,7 +365,12 @@ class _AppShellState extends State<AppShell> {
           ),
           nav('Terminal logs', Icons.subject, LogsRoute(), 'logs'),
           nav('CLI accounts', Icons.terminal, CliSetupRoute(), 'configuration'),
-          nav('Builds & deployments', Icons.build_outlined, BuildsRoute(), 'builds'),
+          nav(
+            'Builds & deployments',
+            Icons.build_outlined,
+            BuildsRoute(),
+            'builds',
+          ),
           heading('AGENTS'),
           if (profiles.isEmpty)
             Padding(

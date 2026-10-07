@@ -23,9 +23,13 @@ STATE = Path('/var/lib/herdr-updater')
 REQUEST = Path('/var/lib/herdr-update-requests/request.json')
 CONFIG = Path('/home/herdr/.config/herdr-web')
 LOCAL_ARTIFACTS = Path('/home/herdr/herdr-validation')
+REPOSITORY = 'Ultarius/herdr_proxmox'
 REQUIRED = ('web/gateway/server.py', 'web/public/index.html',
             'web/public/main.dart.js', 'web/public/dashboard/index.html', 'VERSION')
 RELEASE = re.compile(r'v[0-9]+\.[0-9]+\.[0-9]+')
+# Operator state that outlives any single deployment: task records and the
+# GitHub publishing credential.
+PRESERVED_CONFIG = ('tasks.sqlite3', 'github.json')
 BUILD_ID = re.compile(r'[a-f0-9]{32}')
 SHA256 = re.compile(r'[a-f0-9]{64}')
 SOURCE = re.compile(r'(?:[a-f0-9]{40}|[a-f0-9]{64})')
@@ -75,10 +79,10 @@ def read_request():
     if not isinstance(payload, dict):
         raise ValueError('Invalid update request.')
     mode = payload.get('mode', 'release')
-    if mode not in ('release', 'local', 'rollback'):
+    if mode not in ('release', 'local', 'rollback', 'provenance'):
         raise ValueError('Invalid deployment mode.')
-    if mode == 'rollback':
-        return dict(mode='rollback', actor=str(payload.get('actor', ''))[:80])
+    if mode in ('rollback', 'provenance'):
+        return dict(mode=mode, actor=str(payload.get('actor', ''))[:80])
     if mode == 'local':
         build_id, digest, path = payload.get('build_id'), payload.get('sha256'), payload.get('path')
         if not isinstance(build_id, str) or not BUILD_ID.fullmatch(build_id):
@@ -117,6 +121,32 @@ def extract(archive, staging):
     return source
 
 
+def resolve_tag_sha(version):
+    """Best-effort GitHub tag-to-commit lookup; never blocks an installation."""
+    if not isinstance(version, str) or not RELEASE.fullmatch(version):
+        return None
+    headers = {'User-Agent': 'herdr-proxmox-updater', 'Accept': 'application/vnd.github+json'}
+    try:
+        url = f'https://api.github.com/repos/{REPOSITORY}/git/ref/tags/{version}'
+        seen = set()
+        for _ in range(5):
+            with urlopen(Request(url, headers=headers), timeout=15) as response:
+                target = json.loads(response.read(100_000)).get('object') or {}
+            sha = str(target.get('sha', ''))
+            if not SOURCE.fullmatch(sha):
+                return None
+            if target.get('type') == 'commit':
+                return sha
+            if target.get('type') != 'tag' or sha in seen:
+                return None
+            seen.add(sha)
+            # Never follow response-supplied URLs outside the fixed API origin.
+            url = f'https://api.github.com/repos/{REPOSITORY}/git/tags/{sha}'
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    return None
+
+
 def release_identity(source, version):
     identity = dict(build_id=version, source_sha=None,
                     package_version=version, deployment_mode='release')
@@ -128,6 +158,10 @@ def release_identity(source, version):
                 or not SOURCE.fullmatch(str(supplied.get('source_sha', '')))):
             raise ValueError('Release build identity does not match the package.')
         identity['source_sha'] = supplied['source_sha']
+    else:
+        # Legacy or repackaged releases carry no BUILD.json. Resolve the tag's
+        # commit as a best-effort association, not proof of the archive's contents.
+        identity['source_sha'] = resolve_tag_sha(version)
     return identity
 
 
@@ -200,6 +234,14 @@ def backup_current():
 
 def restore(backup):
     service('stop')
+    # Tasks and GitHub credentials were created after this deployment backup.
+    # Restoring the older configuration directory must not silently discard
+    # them, and an older gateway cannot read them either way.
+    preserved = {}
+    for name in PRESERVED_CONFIG:
+        source = CONFIG / name
+        if source.is_file() and not source.is_symlink():
+            preserved[name] = source.read_bytes()
     try:
         shutil.rmtree(ROOT / 'web')
         shutil.copytree(backup / 'web', ROOT / 'web')
@@ -209,6 +251,10 @@ def restore(backup):
             shutil.copytree(backup / 'install', ROOT / 'install')
         shutil.rmtree(CONFIG)
         shutil.copytree(backup / 'config', CONFIG)
+        for name, content in preserved.items():
+            target = CONFIG / name
+            target.write_bytes(content)
+            target.chmod(0o600)
         subprocess.run(['chown', '-R', 'herdr:herdr', str(CONFIG)], check=True)
         (ROOT / 'VERSION').unlink(missing_ok=True)
         if (backup / 'VERSION').exists():
@@ -249,6 +295,35 @@ def rollback(actor=''):
     status('complete', mode='rollback', actor=actor, restored=str(backup), safety=str(safety), backup=str(safety))
 
 
+def provenance(actor='', backup=None):
+    """Resolve a release tag commit for an installed deployment that lacks it."""
+    identity_path = ROOT / 'BUILD.json'
+    try:
+        identity = json.loads(identity_path.read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError('Deployment identity is missing or unreadable.') from error
+    if not isinstance(identity, dict) or identity.get('deployment_mode') == 'local':
+        raise ValueError('Local deployments carry their own source provenance.')
+    version = identity.get('package_version') or identity.get('build_id')
+    if not isinstance(version, str) or not RELEASE.fullmatch(version):
+        raise ValueError('Only release deployments can resolve source provenance.')
+    if SOURCE.fullmatch(str(identity.get('source_sha', ''))):
+        status('complete', mode='provenance', actor=actor, build_id=version,
+               backup=backup, source_sha=identity['source_sha'], note='Source identity was already recorded.')
+        return
+    resolved = resolve_tag_sha(version)
+    if not resolved:
+        raise ValueError('The GitHub release tag commit could not be resolved.')
+    identity['source_sha'] = resolved
+    # Readers must see either the old identity or the complete replacement.
+    temporary = ROOT / 'BUILD.json.tmp'
+    with temporary.open('x') as output:
+        json.dump(identity, output)
+    temporary.chmod(0o644)
+    temporary.replace(identity_path)
+    status('complete', mode='provenance', actor=actor, build_id=version, source_sha=resolved, backup=backup)
+
+
 def main():
     if os.geteuid() != 0:
         raise SystemExit('Run as root through herdr-update.service.')
@@ -280,6 +355,9 @@ def main():
                **{key: request[key] for key in ('version', 'build_id', 'actor') if key in request})
         if request['mode'] == 'rollback':
             rollback(request.get('actor', ''))
+            return
+        if request['mode'] == 'provenance':
+            provenance(request.get('actor', ''), previous_backup)
             return
         expected = None
         with tempfile.TemporaryDirectory(prefix='herdr-update-') as staging:

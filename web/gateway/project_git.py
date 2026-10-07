@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import json
 from project_files import project_directory
 from repository_lock import repository_lock
 
@@ -18,7 +19,7 @@ def git(path, *arguments, timeout=15, index_file=None):
     # Compound callers (snapshots and base updates) hold this reentrant lock
     # throughout their checks and mutations; individual Git mutations also join.
     # Read-only queries such as `worktree list` never take the lock.
-    mutates = any(arg in ('fetch', 'update-ref', 'commit-tree', 'write-tree', 'read-tree') for arg in arguments)
+    mutates = any(arg in ('fetch', 'push', 'reset', 'update-ref', 'commit-tree', 'write-tree', 'read-tree') for arg in arguments)
     if not mutates and 'worktree' in arguments:
         mutates = any(arg in ('add', 'remove', 'prune', 'move', 'repair') for arg in arguments)
     if mutates:
@@ -86,6 +87,51 @@ def merge_state(path):
                for name in ('MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD'))
 
 
+def configured_base(repository, selected=None):
+    """One explicit base shared by tasks, inspection, watcher and base updates."""
+    from repository_lock import common_directory
+    path = Path(repository).resolve()
+    if selected is None and not any((parent / '.git').exists() for parent in (path, *path.parents)):
+        return None  # The watcher also accepts ordinary, non-Git workspaces.
+    location = common_directory(repository) / 'herdr-base.json'
+    if selected is not None:
+        if not isinstance(selected, str) or not selected.startswith('refs/remotes/origin/') or selected.endswith('/HEAD'):
+            raise ValueError('Configure an explicit origin base branch.')
+        git(repository, 'check-ref-format', selected)
+        git(repository, 'rev-parse', '--verify', selected + '^{commit}')
+        with repository_lock(repository):
+            previous = configured_base(repository)
+            if previous and previous != selected:
+                try:
+                    git(repository, 'rev-parse', '--verify', previous + '^{commit}')
+                except ValueError:
+                    # The previously configured branch no longer exists locally.
+                    # Replacing it is the only way out; refusing would strand
+                    # tasks, the watcher and base updates for this repository.
+                    previous = None
+                else:
+                    raise ValueError('Repository already uses a different configured base branch.')
+            temporary = location.with_suffix('.tmp')
+            temporary.write_text(json.dumps(dict(base_ref=selected)))
+            temporary.replace(location)
+        return selected
+    if not location.exists():
+        return None
+    if location.is_symlink() or location.stat().st_size > 4096:
+        return None  # An unusable file must not disable every Git operation here.
+    try:
+        value = json.loads(location.read_text())['base_ref']
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(value, str) or not value.startswith('refs/remotes/origin/') or value.endswith('/HEAD'):
+        return None
+    try:
+        git(repository, 'check-ref-format', value)
+    except ValueError:
+        return None
+    return value
+
+
 def summary(root, path, base=None):
     """Integration state for one checkout, without the changed-file list."""
     tree = checkout(root, path, base)
@@ -148,6 +194,11 @@ def inspect(root, body):
             # discarding information the operator can still act on.
             fetch_error = str(error)
     base = body.get('base')
+    configured = configured_base(repository)
+    if configured:
+        if base is not None and base != configured:
+            raise ValueError('Inspection must use the configured repository base branch.')
+        base = configured
     if base is not None:
         if not isinstance(base, str) or not base.startswith('refs/remotes/'):
             raise ValueError('Choose a remote-tracking base ref.')

@@ -9,6 +9,8 @@ The worker owning the checkout performs the merge. The gateway queues decisions,
 pins recovery snapshots and verifies incorporation. The coordinator summarizes
 supplied evidence; it does not merge or inspect other workers' directories.
 
+Task branches are published only through administrator dashboard actions. Do not push, open pull requests, update the shared base checkout, or deploy during worker integration. Report your commit and evidence for review.
+
 ## Scope and readiness
 
 An integration assessment asks only for `integrate_now`, `defer`, or `blocked`.
