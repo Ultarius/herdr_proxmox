@@ -294,9 +294,18 @@ class _ModelFieldsState extends State<ModelFields> {
             selected: selectedProvider,
             offered: [
               for (final provider in catalog.providers)
-                CatalogChoice(id: provider, label: provider),
+                CatalogChoice(
+                  id: provider,
+                  label: provider == 'opencode-go'
+                      ? 'OpenCode Go (opencode-go)'
+                      : provider == 'opencode'
+                      ? 'OpenCode Zen (opencode)'
+                      : provider,
+                ),
             ],
-            helper: 'OpenCode launches provider/model, so both are required.',
+            helper:
+                'Go subscriptions use opencode-go; opencode selects Zen. '
+                'Connect the matching provider in CLI accounts. Listing a model does not prove account access.',
             manual: manualProvider,
             toggleManual: () => manualProvider = !manualProvider,
             clearManual: () => manualProvider = false,

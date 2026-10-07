@@ -161,7 +161,9 @@ def validate_selection(cli, projects, profile):
     catalog = discover_models(cli, projects, {'runtime': 'opencode', 'project': project})
     selected = next((m for m in catalog['models'] if m['provider'] == profile['provider'] and m['id'] == profile['model']), None)
     if selected is None:
-        raise ValueError('Selected OpenCode model is unavailable. Refresh models before launching.')
+        raise ValueError(f"Selected OpenCode provider/model is unavailable: "
+                         f"{profile['provider']}/{profile['model']}. Connect the matching provider in CLI accounts, "
+                         'then refresh models. OpenCode Go uses opencode-go; opencode selects Zen.')
     if profile.get('reasoning'):
         if not catalog['supports_variants']:
             raise ValueError('Explicit reasoning variants require OpenCode v2 for interactive launches. Choose Model default or upgrade OpenCode.')

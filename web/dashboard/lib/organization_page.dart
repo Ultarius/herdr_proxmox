@@ -586,6 +586,15 @@ class _OrganizationPageState extends State<OrganizationPage> {
                                   Text(
                                     'State: ${job['state']} · ${job['updated_at']}',
                                   ),
+                                  if (job['kind'] == 'launch' &&
+                                      job['profile'] is Map<String, dynamic>)
+                                    Text(
+                                      'Model at launch: ${savedModelLabel(job['profile'] as Map<String, dynamic>)} · Reasoning: ${savedReasoningLabel(job['profile'] as Map<String, dynamic>)}',
+                                    ),
+                                  if (job['launch_arguments'] is List)
+                                    SelectableText(
+                                      'Arguments sent to Herdr: ${(job['launch_arguments'] as List).join(' ')}',
+                                    ),
                                   if (job['alias'] != null)
                                     SelectableText(
                                       'Herdr name: ${job['alias']} · Pane: ${job['pane_id'] ?? 'not allocated'}',

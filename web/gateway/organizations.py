@@ -777,6 +777,9 @@ class OrganizationStore:
                 job = self.update_job(job_id, pane_id=pane, workspace_id=workspace)
                 self.wait_for_shell(pane)
                 arguments = launch_arguments(profile) + prepare_permissions(profile, self.path.parent)
+                # Record the exact executable arguments sent to Herdr, separately
+                # from the editable profile and any later in-TUI model changes.
+                job = self.update_job(job_id, launch_arguments=arguments)
                 self.command('agent', 'start', job['alias'], '--kind', profile['runtime'], '--pane', pane, '--timeout', '60000', *(['--', *arguments] if arguments else []), timeout=70)
                 agent = self.identity(job)
                 job = self.update_job(job_id, agent_session=agent.get('agent_session'))

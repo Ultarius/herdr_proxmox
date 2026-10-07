@@ -276,6 +276,8 @@ class OrganizationTests(unittest.TestCase):
     def test_model_settings_persist_and_reach_runtime_arguments(self):
         org = self.organization()
         settings = [
+            ('opencode', dict(provider='opencode-go', model='deepseek-v4.1-flash'), ['--model', 'opencode-go/deepseek-v4.1-flash']),
+            ('opencode', dict(provider='opencode', model='deepseek-v4.1-flash'), ['--model', 'opencode/deepseek-v4.1-flash']),
             ('opencode', dict(provider='openai', model='test-model', reasoning='high'), ['--model', 'openai/test-model#high']),
             ('codex', dict(provider='openai', model='test-model', reasoning='high'), ['--model', 'test-model', '--config', 'model_provider="openai"', '--config', 'model_reasoning_effort="high"']),
             ('claude', dict(provider='anthropic', model='sonnet', reasoning='high'), ['--model', 'sonnet', '--effort', 'high']),
@@ -291,6 +293,7 @@ class OrganizationTests(unittest.TestCase):
             self.assertEqual(run['state'], 'persona_sent', run['error'])
             call = next(args for args, _ in self.calls if args[:3] == ('agent', 'start', run['alias']))
             self.assertEqual(list(call[call.index('--') + 1:]), expected)
+            self.assertEqual(run['launch_arguments'], expected)
         for config in [dict(provider='openai'), dict(model='test-model'), dict(provider='-bad', model='model')]:
             with self.assertRaises(ValueError):
                 self.hire(org, runtime='opencode', **config)

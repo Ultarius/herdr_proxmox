@@ -87,3 +87,18 @@ origin checks, command allowlisting, input validation and Flutter prompt/input/
 cleanup interaction tests. Linux CI additionally executes a real PTY test for
 controlling-terminal input, output, resize and process termination. Provider
 OAuth success requires an actual account and is not exercised by credential-free CI.
+
+### Provider selection at agent launch
+
+The gateway creates a Herdr pane/worktree, then invokes
+`herdr agent start <alias> --kind opencode --pane <pane> -- --model <provider>/<model>`.
+Herdr starts the OpenCode executable in that pane and forwards the arguments.
+`opencode` is the runtime kind; it is not a request to select OpenCode Go.
+The model provider `opencode` selects Zen; `opencode-go` selects Go. The same
+model name under these provider IDs is a different selection.
+
+Launch jobs retain the profile snapshot and exact arguments sent to Herdr.
+Runs displays this historical selection; it is not live model telemetry.
+Editing the profile applies to the next launch, and switching models inside the
+OpenCode TUI does not update that launch record. Explicit selection uses the
+CLI's existing provider credentials; launching does not sign in a provider.

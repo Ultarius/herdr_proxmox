@@ -37,6 +37,9 @@ class ModelCatalogTests(unittest.TestCase):
             for change in ({'model': 'missing'}, {'reasoning': 'max'}):
                 with self.assertRaises(ValueError):
                     model_catalog.validate_selection(cli, Path('.'), dict(profile, **change))
+            # The error names what was attempted, so a Zen/Go mix-up is visible.
+            with self.assertRaisesRegex(ValueError, 'openai/missing'):
+                model_catalog.validate_selection(cli, Path('.'), dict(profile, model='missing'))
             data['supports_variants'] = False
             with self.assertRaisesRegex(ValueError, 'v2'):
                 model_catalog.validate_selection(cli, Path('.'), profile)

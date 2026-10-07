@@ -71,6 +71,42 @@ void main() {
     await tester.pumpAndSettle();
   }
 
+  testWidgets('Go provider selects Go models independently of Zen', (
+    tester,
+  ) async {
+    final provider = TextEditingController(text: 'opencode-go');
+    final model = TextEditingController(text: 'same-model');
+    final reasoning = TextEditingController();
+    addTearDown(provider.dispose);
+    addTearDown(model.dispose);
+    addTearDown(reasoning.dispose);
+    await open(
+      tester,
+      runtime: 'opencode',
+      provider: provider,
+      model: model,
+      reasoning: reasoning,
+      options: const RuntimeCatalog(
+        models: [
+          CatalogModel(
+            provider: 'opencode',
+            id: 'same-model',
+            name: 'Zen model',
+          ),
+          CatalogModel(
+            provider: 'opencode-go',
+            id: 'same-model',
+            name: 'Go model',
+          ),
+        ],
+      ),
+    );
+    expect(find.text('OpenCode Go (opencode-go)'), findsOneWidget);
+    expect(find.text('Go model'), findsOneWidget);
+    expect(find.text('Zen model'), findsNothing);
+    expect(provider.text, 'opencode-go');
+  });
+
   testWidgets('model and reasoning dropdowns offer the catalog', (
     tester,
   ) async {
