@@ -649,10 +649,23 @@ class _TasksPageState extends State<TasksPage> {
                                   final bytes = await connection.bytes(
                                     'tasks/patch?id=${task['id']}',
                                   );
+                                  if (!mounted) return;
+                                  final head = '${task['head_sha']}';
+                                  final suffix = head.length >= 12
+                                      ? head.substring(0, 12)
+                                      : head;
                                   await downloadBinaryArtifact(
                                     bytes,
-                                    'herdr-${task['id']}.patch',
+                                    'herdr-${task['id']}-$suffix.patch',
                                     contentType: 'text/x-patch',
+                                  );
+                                  if (!mounted) return;
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text(
+                                        'Candidate patch fetched (${bytes.length} bytes) and handed to the browser.',
+                                      ),
+                                    ),
                                   );
                                 } catch (exception) {
                                   if (mounted)

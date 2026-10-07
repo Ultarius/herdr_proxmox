@@ -276,6 +276,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header('Content-Disposition', 'attachment; filename="' + filename + '"')
                     self.send_header('Content-Length', str(len(content)))
                     self.send_header('Cache-Control', 'no-store')
+                    self.send_header('X-Content-Type-Options', 'nosniff')
                     self.end_headers()
                     self.wfile.write(content)
                 except (ValueError, OSError) as error:
