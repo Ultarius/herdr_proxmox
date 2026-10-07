@@ -223,6 +223,40 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
           if ((job['error'] as String? ?? '').isNotEmpty)
             Text('${job['error']}'),
           if (job['delivery'] is Map) delivery(job),
+          if (job['kind'] == 'chat' &&
+              ['needs_attention', 'uncertain'].contains(job['state']))
+            TextButton(
+              onPressed: busy
+                  ? null
+                  : () async {
+                      final inspected = await showDialog<bool>(
+                        context: context,
+                        builder: (context) => AlertDialog(
+                          title: const Text('Recover saved reply'),
+                          content: const Text(
+                            'Confirm you inspected the original conversation and the agent is idle. Recovery reads the saved reply without resending the prompt.',
+                          ),
+                          actions: [
+                            TextButton(
+                              onPressed: () => Navigator.pop(context, false),
+                              child: const Text('Cancel'),
+                            ),
+                            FilledButton(
+                              onPressed: () => Navigator.pop(context, true),
+                              child: const Text('I inspected the conversation'),
+                            ),
+                          ],
+                        ),
+                      );
+                      if (inspected == true && mounted)
+                        await submit('recover', {
+                          'job_id': job['id'],
+                          'chat': true,
+                          'inspected': true,
+                        });
+                    },
+              child: const Text('Recover saved reply'),
+            ),
           if ((job['result'] as String? ?? '').isNotEmpty) ...[
             Text(
               job['kind'] == 'chat'

@@ -1,3 +1,4 @@
+import 'artifact_download.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'clipboard_copy.dart';
@@ -140,7 +141,8 @@ class _TasksPageState extends State<TasksPage> {
         });
       }
     } catch (e) {
-      if (mounted && epoch == connection.generation) setState(() => readError = '$e');
+      if (mounted && epoch == connection.generation)
+        setState(() => readError = '$e');
     }
   }
 
@@ -148,17 +150,24 @@ class _TasksPageState extends State<TasksPage> {
     if (busy || !admin) return;
     final epoch = connection.generation;
     final selection = '$action:$body';
-    final request = requests.putIfAbsent(selection, () => 'task-${newRequestId()}');
+    final request = requests.putIfAbsent(
+      selection,
+      () => 'task-${newRequestId()}',
+    );
     setState(() {
       busy = true;
       error = null;
     });
     try {
-      await connection.request('tasks/$action', {...body, 'request_id': request});
+      await connection.request('tasks/$action', {
+        ...body,
+        'request_id': request,
+      });
       requests.remove(selection);
       await refresh();
     } catch (e) {
-      if (mounted && epoch == connection.generation) setState(() => error = '$e');
+      if (mounted && epoch == connection.generation)
+        setState(() => error = '$e');
     } finally {
       if (mounted) setState(() => busy = false);
     }
@@ -189,7 +198,9 @@ class _TasksPageState extends State<TasksPage> {
                     obscureText: true,
                     enableSuggestions: false,
                     autocorrect: false,
-                    decoration: const InputDecoration(labelText: 'Personal access token'),
+                    decoration: const InputDecoration(
+                      labelText: 'Personal access token',
+                    ),
                     maxLength: 255,
                   ),
                   TextField(
@@ -216,7 +227,8 @@ class _TasksPageState extends State<TasksPage> {
           ],
         ),
       );
-      if (confirmed != true || !mounted || epoch != connection.generation) return;
+      if (confirmed != true || !mounted || epoch != connection.generation)
+        return;
       setState(() {
         busy = true;
         error = null;
@@ -231,7 +243,8 @@ class _TasksPageState extends State<TasksPage> {
       });
       await refresh();
     } catch (e) {
-      if (mounted && epoch == connection.generation) setState(() => error = '$e');
+      if (mounted && epoch == connection.generation)
+        setState(() => error = '$e');
     } finally {
       token.clear();
       token.dispose();
@@ -245,9 +258,10 @@ class _TasksPageState extends State<TasksPage> {
     try {
       final directory = await connection.request('organizations/directory');
       if (!mounted || epoch != connection.generation) return;
-      final profiles = List<Map<String, dynamic>>.from(
-        directory['profiles'] ?? [],
-      ).where((p) => p['group_id'] == null && p['use_worktree'] != false).toList();
+      final profiles =
+          List<Map<String, dynamic>>.from(directory['profiles'] ?? [])
+              .where((p) => p['group_id'] == null && p['use_worktree'] != false)
+              .toList();
       if (profiles.isEmpty)
         throw StateError('Hire a worktree agent before creating a task.');
       final title = TextEditingController();
@@ -271,7 +285,9 @@ class _TasksPageState extends State<TasksPage> {
                       TextField(
                         controller: title,
                         maxLength: 120,
-                        decoration: const InputDecoration(labelText: 'Task title'),
+                        decoration: const InputDecoration(
+                          labelText: 'Task title',
+                        ),
                       ),
                       TextField(
                         controller: description,
@@ -279,7 +295,8 @@ class _TasksPageState extends State<TasksPage> {
                         maxLines: 8,
                         maxLength: 8000,
                         decoration: const InputDecoration(
-                          labelText: 'Change, acceptance criteria and required checks',
+                          labelText:
+                              'Change, acceptance criteria and required checks',
                         ),
                       ),
                       TextField(
@@ -299,9 +316,15 @@ class _TasksPageState extends State<TasksPage> {
                         builder: (context, value, _) {
                           // Only an agent already assigned to the typed
                           // repository can own its task branch.
-                          final wanted = value.text.trim().replaceAll('\\', '/');
+                          final wanted = value.text.trim().replaceAll(
+                            '\\',
+                            '/',
+                          );
                           final matches = profiles.where((p) {
-                            final project = '${p['project']}'.replaceAll('\\', '/');
+                            final project = '${p['project']}'.replaceAll(
+                              '\\',
+                              '/',
+                            );
                             return wanted.isEmpty ||
                                 project == wanted ||
                                 project.endsWith('/$wanted');
@@ -317,11 +340,14 @@ class _TasksPageState extends State<TasksPage> {
                                 'Hire a worktree agent for it in Organization first.',
                               ),
                             );
-                          final selected = matches.any((p) => '${p['id']}' == profile)
+                          final selected =
+                              matches.any((p) => '${p['id']}' == profile)
                               ? profile
                               : '${matches.first['id']}';
                           return DropdownButtonFormField<String>(
-                            key: ValueKey(matches.map((p) => p['id']).join(',')),
+                            key: ValueKey(
+                              matches.map((p) => p['id']).join(','),
+                            ),
                             initialValue: selected,
                             isExpanded: true,
                             decoration: const InputDecoration(
@@ -375,7 +401,8 @@ class _TasksPageState extends State<TasksPage> {
       if (body != null && mounted && epoch == connection.generation)
         await act('create', body);
     } catch (e) {
-      if (mounted && epoch == connection.generation) setState(() => error = '$e');
+      if (mounted && epoch == connection.generation)
+        setState(() => error = '$e');
     }
   }
 
@@ -386,7 +413,8 @@ class _TasksPageState extends State<TasksPage> {
         await connection.request('tasks/detail?id=${task['id']}'),
       );
     } catch (e) {
-      if (mounted && epoch == connection.generation) setState(() => error = '$e');
+      if (mounted && epoch == connection.generation)
+        setState(() => error = '$e');
       return;
     }
     if (!mounted || epoch != connection.generation) return;
@@ -407,7 +435,9 @@ class _TasksPageState extends State<TasksPage> {
                 const Text(
                   'Publishing uploads this commit to GitHub. It does not merge, deploy, or prove validation passed. No force-push is used.',
                 ),
-                SelectableText('${task['diff_stat'] ?? ''}\n${task['diff'] ?? ''}'),
+                SelectableText(
+                  '${task['diff_stat'] ?? ''}\n${task['diff'] ?? ''}',
+                ),
                 if (task['diff_truncated'] == true)
                   const Text(
                     'Diff truncated. Inspect the full change in Project explorer before approving.',
@@ -429,13 +459,17 @@ class _TasksPageState extends State<TasksPage> {
       ),
     );
     if (approved == true && mounted && epoch == connection.generation) {
-      await act('publish', {'task_id': task['id'], 'head_sha': task['head_sha']});
+      await act('publish', {
+        'task_id': task['id'],
+        'head_sha': task['head_sha'],
+      });
     }
   }
 
   Widget _buildEvidence(String target, Map<dynamic, dynamic> build) {
     final unverified =
-        build['state'] == 'complete' && build['required_checks_verified'] != true;
+        build['state'] == 'complete' &&
+        build['required_checks_verified'] != true;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -447,7 +481,8 @@ class _TasksPageState extends State<TasksPage> {
           ),
         if (build['note'] != null) Text('${build['note']}'),
         for (final check in (build['checks'] as List? ?? []))
-          if (check is Map) Text('${check['id'] ?? check['name']}: ${check['status']}'),
+          if (check is Map)
+            Text('${check['id'] ?? check['name']}: ${check['status']}'),
       ],
     );
   }
@@ -521,7 +556,10 @@ class _TasksPageState extends State<TasksPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('${task['title']}', style: Theme.of(context).textTheme.titleLarge),
+                Text(
+                  '${task['title']}',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
                 Text('${taskState(task)} · ${task['repository']}'),
                 SelectableText(
                   'Branch: ${task['branch']}\nBase: ${task['base_ref']} · ${task['base_sha']}',
@@ -531,7 +569,9 @@ class _TasksPageState extends State<TasksPage> {
                 if (task['error'] != null)
                   Text(
                     '${task['error']}',
-                    style: TextStyle(color: Theme.of(context).colorScheme.error),
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
                   ),
                 if (task['candidate_changed'] == true)
                   const Text(
@@ -551,7 +591,9 @@ class _TasksPageState extends State<TasksPage> {
                       !['merged', 'closed'].contains('${task['state']}'))
                     Text(
                       'GitHub reports that this pull request conflicts and cannot merge cleanly.',
-                      style: TextStyle(color: Theme.of(context).colorScheme.error),
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
                     ),
                   if (task['last_sync'] != null)
                     Text('Pull request status last read ${task['last_sync']}.'),
@@ -564,15 +606,19 @@ class _TasksPageState extends State<TasksPage> {
                 if (task['checks'] is List) ...[
                   for (final check in task['checks'])
                     if (check is Map)
-                      Text('${check['name']}: ${check['conclusion'] ?? check['status']}'),
+                      Text(
+                        '${check['name']}: ${check['conclusion'] ?? check['status']}',
+                      ),
                 ],
                 if (task['statuses'] is List) ...[
                   for (final check in task['statuses'])
-                    if (check is Map) Text('${check['context']}: ${check['state']}'),
+                    if (check is Map)
+                      Text('${check['context']}: ${check['state']}'),
                 ],
                 if (task['reviews'] is List) ...[
                   for (final item in task['reviews'])
-                    if (item is Map) Text('${item['user']?['login']}: ${item['state']}'),
+                    if (item is Map)
+                      Text('${item['user']?['login']}: ${item['state']}'),
                 ],
                 const SizedBox(height: 12),
                 Wrap(
@@ -594,24 +640,50 @@ class _TasksPageState extends State<TasksPage> {
                             : null,
                         child: const Text('Capture candidate'),
                       ),
+                    if (task['head_sha'] != null)
+                      OutlinedButton(
+                        onPressed: busy
+                            ? null
+                            : () async {
+                                try {
+                                  final bytes = await connection.bytes(
+                                    'tasks/patch?id=${task['id']}',
+                                  );
+                                  await downloadBinaryArtifact(
+                                    bytes,
+                                    'herdr-${task['id']}.patch',
+                                    contentType: 'text/x-patch',
+                                  );
+                                } catch (exception) {
+                                  if (mounted)
+                                    setState(
+                                      () => error = exception.toString(),
+                                    );
+                                }
+                              },
+                        child: const Text('Download candidate patch'),
+                      ),
                     if (task['head_sha'] != null &&
                         !['merged', 'closed'].contains(task['state']))
                       OutlinedButton(
-                        onPressed: admin && !busy && github['configured'] == true
+                        onPressed:
+                            admin && !busy && github['configured'] == true
                             ? () => review(task)
                             : null,
                         child: const Text('Review and publish'),
                       ),
                     if (task['publish'] != null && task['pull'] == null)
                       FilledButton(
-                        onPressed: admin && !busy && github['configured'] == true
+                        onPressed:
+                            admin && !busy && github['configured'] == true
                             ? () => act('pull', {'task_id': task['id']})
                             : null,
                         child: const Text('Open draft PR'),
                       ),
                     if (task['pull'] is Map)
                       OutlinedButton(
-                        onPressed: admin && !busy && github['configured'] == true
+                        onPressed:
+                            admin && !busy && github['configured'] == true
                             ? () => act('refresh', {'task_id': task['id']})
                             : null,
                         child: const Text('Refresh PR status'),

@@ -160,6 +160,7 @@ class OrganizationTests(unittest.TestCase):
         git('init')
         git('config', 'user.name', 'Test')
         git('config', 'user.email', 'test@example.test')
+        (self.projects / '.gitignore').write_text('.ci-cache/\n')
         (self.projects / 'file').write_text('base')
         git('add', '.')
         git('commit', '-m', 'base')
@@ -182,16 +183,23 @@ class OrganizationTests(unittest.TestCase):
         self.store.command = command
         org = self.organization()
         profile = self.hire(org)
+        deployed = (Path(gateway.__file__).parent / 'skills/herdr-worktree-integration').resolve().as_posix()
         job_id = self.action('launch', organization_id=org, profile_id=profile,
                             task_id='a' * 32, worktree_branch='herdr/task-' + 'a' * 12,
-                            start_sha=base, task_prompt='Implement this task. Never push.')
+                            start_sha=base,
+                            task_prompt='Implement this task. Read ' + deployed + '/references/tools.md. Never push.')
         self.drain()
         job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == job_id)
         self.assertEqual(job['state'], 'persona_sent', job.get('error'))
         self.assertEqual(job['worktree_branch'], 'herdr/task-' + 'a' * 12)
         self.assertEqual(git('rev-parse', 'HEAD').strip(), shared)
         prompts = [args[3] for args, _ in self.calls if args[:2] == ('agent', 'prompt')]
-        self.assertTrue(any('Assigned task (start now' in prompt for prompt in prompts))
+        assigned = next(prompt for prompt in prompts if 'Assigned task (start now' in prompt)
+        # The delivered prompt reads the checkout-local copy, never the deployed
+        # bundle, so no external-directory approval is required.
+        self.assertIn('.ci-cache/herdr-guidance/', assigned)
+        self.assertIn('/references/tools.md', assigned)
+        self.assertNotIn(deployed, assigned)
 
     def test_git_launch_defaults_to_separate_committed_worktree(self):
         def git(*args):

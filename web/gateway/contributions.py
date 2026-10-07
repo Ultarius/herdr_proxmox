@@ -7,6 +7,7 @@ reconciled after restart by repeating the same administrator request ID.
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import hashlib
+import threading
 import json
 import os
 from pathlib import Path
@@ -275,6 +276,51 @@ class Contributions:
         return task
 
 
+    def patch(self, task_id, limit=20 * 1024 * 1024):
+        """Export immutable candidate trees, never a truncated review diff."""
+        import subprocess
+        task = self.get(task_id)
+        base, head = task.get('base_sha'), task.get('head_sha')
+        if not base or not head or not SHA.fullmatch(base) or not SHA.fullmatch(head):
+            raise ValueError('Capture a candidate before downloading its patch.')
+        path = self.path_for(task)
+        # Verify the exact commits under the repository lock, then stream the
+        # diff without it: holding the lock for up to 30 seconds would fail
+        # concurrent launches, base updates and candidate capture.
+        with repository_lock(path):
+            for sha in (base, head):
+                try:
+                    project_git.git(path, 'cat-file', '-e', sha + '^{commit}')
+                except ValueError:
+                    raise ValueError('Candidate commits are no longer available; fetch the repository '
+                                     'and capture the candidate again.') from None
+        environment = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        process = subprocess.Popen(['git', '-C', str(path), 'diff', '--binary', '--full-index',
+                                    '--no-ext-diff', '--no-textconv', base, head, '--'],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment)
+        timer = threading.Timer(30, process.kill)
+        timer.start()
+        try:
+            content = bytearray()
+            while True:
+                chunk = process.stdout.read(65536)
+                if not chunk:
+                    break
+                content.extend(chunk)
+                if len(content) > limit:
+                    raise ValueError('Candidate patch exceeds the download size limit; it was not truncated.')
+            if process.wait() != 0:
+                raise ValueError('Candidate patch generation failed or timed out.')
+        finally:
+            timer.cancel()
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            process.stdout.close()
+        checksum = hashlib.sha256(content).hexdigest()
+        metadata = f'# Herdr task {task_id}\n# Base {base}\n# Candidate {head}\n# Diff SHA256 {checksum}\n'
+        return metadata.encode() + bytes(content), f'herdr-{task_id}-{head[:12]}.patch'
+
     def snapshot(self, role='admin'):
         with closing(self.connect()) as db:
             tasks = [json.loads(row[0]) for row in db.execute('SELECT data FROM tasks ORDER BY rowid DESC LIMIT 100')]
@@ -412,6 +458,7 @@ class Contributions:
                 task_id=task['id'], worktree_branch=task['branch'], start_sha=task['base_sha'],
                 task_prompt='Task: ' + task['title'] + '\n' + task['description'] +
                     '\nWork only in your assigned task branch. Implement, run required checks, and commit your changes. '
+                    'Commit using git -c user.name=Herdr-Agent -c user.email=agent@herdr.local commit. Never infer the operator identity or change global Git config. '
                     'Never push, open a pull request, update the shared checkout or deploy. '
                     'Report commands and actual results; missing checks are not passes. Publishing is a dashboard administrator action.\n\n'
                     'Task-local tool acquisition policy:\n' + task_tool_guidance()))

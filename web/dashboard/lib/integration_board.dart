@@ -841,6 +841,43 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
                         child: const Text('Continue validation only'),
                       ),
                     ],
+                    TextButton(
+                      onPressed: busy || connection.operator.value['role'] != 'admin'
+                          ? null
+                          : () async {
+                              final confirmed = await showDialog<bool>(
+                                context: context,
+                                builder: (context) => AlertDialog(
+                                  title: const Text('Repair worker guidance'),
+                                  content: const Text(
+                                    'Inspect the worker first and confirm it is idle. Modified guidance is quarantined and rebuilt. This does not resend the job. Administrator access is required.',
+                                  ),
+                                  actions: [
+                                    TextButton(
+                                      onPressed: () =>
+                                          Navigator.pop(context, false),
+                                      child: const Text('Cancel'),
+                                    ),
+                                    FilledButton(
+                                      onPressed: () =>
+                                          Navigator.pop(context, true),
+                                      child: const Text(
+                                        'I inspected the idle worker',
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                              if (confirmed == true && mounted) {
+                                Navigator.pop(context);
+                                await action('integration/guidance', {
+                                  'id': event['id'],
+                                  'inspected': true,
+                                });
+                              }
+                            },
+                      child: const Text('Repair worker guidance'),
+                    ),
                     if (validationRun(event) != 'running')
                       TextButton.icon(
                         onPressed: busy || '${event['target'] ?? ''}'.isEmpty

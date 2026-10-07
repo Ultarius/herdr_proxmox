@@ -52,6 +52,9 @@ class Store:
 
 class CoordinatorTests(unittest.TestCase):
     def setUp(self):
+        bundle = patch('worker_guidance.local_bundle', return_value=Path(__file__).parents[1] / 'web/gateway/skills/herdr-worktree-integration')
+        bundle.start()
+        self.addCleanup(bundle.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -238,6 +241,24 @@ class CoordinatorTests(unittest.TestCase):
                 'integration_coordinator.project_git.summary', return_value={'conflicts': 0, 'merging': False}):
             self.service.tick()
         self.assertEqual(self.event()['state'], 'blocked')
+
+    def test_guidance_repair_requires_inspection_and_never_resends(self):
+        self.service.observe([self.notice])
+        self.service.tick()
+        event = self.event()
+        with self.assertRaisesRegex(ValueError, 'Inspect the idle worker'):
+            self.service.repair_guidance({'id': event['id']}, actor='damien')
+        before = len(self.store.calls)
+        with patch.object(self.store, 'repair_guidance', create=True,
+                          return_value='/repo/.ci-cache/herdr-guidance') as repair:
+            result = self.service.repair_guidance({'id': event['id'], 'inspected': True}, actor='damien')
+        self.assertEqual(result, {'bundle': '/repo/.ci-cache/herdr-guidance'})
+        repair.assert_called_once_with(event['profile_id'], self.store.projects / event['path'])
+        # Repair rebuilds files only: no prompt, no job, and no event transition.
+        self.assertEqual(len(self.store.calls), before)
+        self.assertEqual(self.event()['state'], event['state'])
+        self.assertTrue(any(entry.get('action') == 'guidance_repair' and entry.get('actor') == 'damien'
+                            for entry in self.service.snapshot()['audit']))
 
     def test_malformed_decision_does_not_authorize_merge_and_pause_prevents_delivery(self):
         self.service.observe([self.notice])

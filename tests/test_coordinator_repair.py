@@ -48,6 +48,20 @@ class ReportRepairTests(unittest.TestCase):
         path.write_text(text, encoding='utf-8')
         return path
 
+    def test_ordinary_chat_recovery_after_timeout_is_idempotent_without_input(self):
+        self.save_reply('Late ordinary answer')
+        body = dict(job_id=self.report['id'], organization_id=self.org, inspected=True)
+        before = len(self.calls)
+        self.assertEqual(self.store.recover_chat(body, 'reviewer'), {'resolution': 'recovered'})
+        self.assertEqual(self.store.recover_chat(body, 'reviewer'), {'resolution': 'recovered'})
+        job = next(j for j in self.store.job_records() if j['id'] == self.report['id'])
+        self.assertEqual(job['result'], 'Late ordinary answer')
+        self.assertEqual(job['previous_error'], 'Uncertain terminal delivery')
+        self.assertEqual(job['recovered_by'], 'reviewer')
+        self.assertFalse(any(call[0:2] == ('agent', 'prompt') for call in self.calls[before:]))
+        with self.assertRaisesRegex(ValueError, 'Inspect'):
+            self.store.recover_chat(dict(body, inspected=False), 'reviewer')
+
     def test_recovery_reads_the_attempt_reply_from_delivery_evidence(self):
         # Existing jobs keep reply.md; an attempt file recorded before submission
         # is the one recovery reads, and a stale legacy file is ignored.

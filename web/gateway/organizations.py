@@ -544,6 +544,45 @@ class OrganizationStore:
             self.jobs_changed.set()
         return job
 
+    def recover_chat(self, body, actor):
+        if not isinstance(body, dict) or body.get('inspected') is not True:
+            raise ValueError('Inspect the idle conversation before recovering a reply.')
+        with self.lock, closing(self.connect()) as db:
+            job = self.get(db, 'jobs', text(body, 'job_id', 40), text(body, 'organization_id', 40))
+        if job['kind'] != 'chat':
+            raise ValueError('Select an interrupted chat reply.')
+        resolution = self.resolve_coordinator_report(job['id'], job['profile_id'], 'recover')
+        if not job.get('recovered_by'):
+            self.update_job(job['id'], recovered_by=actor)
+        return {'resolution': resolution}
+
+    def repair_guidance(self, profile_id, checkout):
+        from collaboration import current_run
+        from worker_guidance import local_bundle
+        with self.lock:
+            lock = self.agent_locks.setdefault(profile_id, threading.RLock())
+        if not lock.acquire(blocking=False):
+            raise ValueError('Worker is executing a job. Wait before repairing guidance.')
+        try:
+            jobs = self.job_records()
+            runs = [j for j in jobs if j['kind'] == 'launch' and
+                    j.get('profile_id') == profile_id and j['state'] == 'persona_sent' and
+                    Path(j.get('worktree_path') or j.get('source_project') or '').resolve() == Path(checkout).resolve()]
+            if len(runs) != 1:
+                raise ValueError('Guidance recovery requires one unchanged worker session.')
+            if not runs[0].get('worktree_path'):
+                raise ValueError('Guidance recovery requires an isolated worker worktree, not a shared checkout.')
+            if any(j['state'] in ('queued', 'running') and profile_id in
+                   j.get('participants', [j.get('profile_id')]) for j in jobs):
+                raise ValueError('Wait for queued or running worker jobs before repairing guidance.')
+            if any(pid != profile_id and Path(path).resolve() == Path(checkout).resolve()
+                   for pid, _, _, path in self.active_checkouts()):
+                raise ValueError('Guidance recovery requires an exclusive worker checkout.')
+            current_run(self, runs[0])
+            return str(local_bundle(checkout, recover=True))
+        finally:
+            lock.release()
+
     def resolve_worker_job(self, job_id, profile_id, event_id, mode):
         """Resolve uncertain integration delivery without sending terminal input."""
         if mode not in ('recover', 'validate'):
@@ -592,22 +631,22 @@ class OrganizationStore:
         with self.lock:
             lock = self.agent_locks.setdefault(profile_id, threading.RLock())
         if not lock.acquire(blocking=False):
-            raise ValueError('Coordinator is still executing a job. Wait before repairing its report.')
+            raise ValueError('The agent is still executing a job. Wait before repairing its reply.')
         try:
             with self.lock, closing(self.connect()) as db:
                 job = self.get(db, 'jobs', job_id)
                 if job['kind'] != 'chat' or job.get('profile_id') != profile_id:
-                    raise ValueError('Report does not belong to the configured coordinator.')
+                    raise ValueError('Select an interrupted chat reply for the matching agent.')
                 if job['state'] == 'answered' and mode == 'recover':
                     return 'recovered'
                 if job['state'] == 'superseded' and mode == 'fresh':
                     return 'fresh'
                 if job['state'] not in ('uncertain', 'needs_attention'):
-                    raise ValueError('Only interrupted coordinator reports can be repaired.')
+                    raise ValueError('Only interrupted chat replies can be repaired.')
                 jobs = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs ORDER BY rowid')]
                 if any(j['state'] in ('queued', 'running') and profile_id in
                        j.get('participants', [j.get('profile_id')]) for j in jobs):
-                    raise ValueError('Wait for the coordinator\'s queued or running work before repairing.')
+                    raise ValueError('Wait for this agent\'s queued or running work before repairing.')
                 runs = [j for j in jobs if j['kind'] == 'launch' and j.get('profile_id') == profile_id and j['state'] != 'released']
             if mode == 'recover':
                 from collaboration import current_run, read_contribution
@@ -776,6 +815,9 @@ class OrganizationStore:
                 pane, workspace = self.created_pane(created, job.get('worktree_path', project))
                 job = self.update_job(job_id, pane_id=pane, workspace_id=workspace)
                 self.wait_for_shell(pane)
+                if job.get('task_prompt'):
+                    from worker_guidance import local_bundle
+                    guidance = local_bundle(job.get('worktree_path', project))
                 arguments = launch_arguments(profile) + prepare_permissions(profile, self.path.parent)
                 # Record the exact executable arguments sent to Herdr, separately
                 # from the editable profile and any later in-TUI model changes.
@@ -791,7 +833,9 @@ class OrganizationStore:
                           'do not interpret a delivered prompt or idle status as proof of completed work.')
                 prompt += '\nNever push branches or create pull requests without explicit publication authorization. Dashboard task publishing is administrator-controlled.'
                 if job.get('task_prompt'):
-                    prompt += '\n\nAssigned task (start now in this checkout):\n' + job['task_prompt']
+                    deployed = (Path(__file__).parent / 'skills/herdr-worktree-integration').resolve().as_posix()
+                    task_prompt = job['task_prompt'].replace(deployed, guidance.as_posix())
+                    prompt += '\n\nAssigned task (start now in this checkout):\n' + task_prompt
                 if profile.get('group_id'):
                     # Do not deliver an imperative group description as the startup task.
                     # Purpose, roster and output paths arrive together in the discussion.

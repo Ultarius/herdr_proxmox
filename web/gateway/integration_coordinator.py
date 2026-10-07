@@ -16,13 +16,16 @@ from blockers import TOOLCHAIN, label as blocker_label, normalize as normalize_b
 APPROVAL_TTL_SECONDS = 24 * 60 * 60
 
 
-def merge_skill():
+def merge_skill(checkout=None):
     # Deliver the bundled procedure even when the worker's older checkout lacks
     # project-local skills. It grants no extra OpenCode permissions.
     directory = Path(__file__).parent / 'skills/herdr-worktree-integration'
+    if checkout is not None:
+        from worker_guidance import local_bundle
+        directory = local_bundle(checkout)
     entry = (directory / 'SKILL.md').read_text(encoding='utf-8')
     # An existing worker may have an older checkout without these files.
-    # Anchor references to the deployed bundle; never flatten them into chat.
+    # Anchor references to the checkout copy for workers; never flatten them into chat.
     for name in ('merge.md', 'tools.md', 'validation.md', 'report.md'):
         resource = directory / 'references' / name
         if resource.is_symlink() or not resource.is_file():
@@ -195,6 +198,20 @@ class IntegrationCoordinator:
                 event = dict(notice, id=key, state='waiting', created_at=stamp(), reason='',
                              coordinator_id=config['profile_id'], organization_id=config['organization_id'])
                 self.save(db, event)
+
+    def repair_guidance(self, body, actor=None):
+        if not isinstance(body, dict) or body.get('inspected') is not True:
+            raise ValueError('Inspect the idle worker before repairing its guidance.')
+        with self.lock, closing(self.connect()) as db, db:
+            event = self.event(body.get('id'))
+            if not event:
+                raise ValueError('Integration event not found.')
+            path = self.store.projects / event['path']
+            bundle = self.store.repair_guidance(event['profile_id'], path)
+            self.audit(db, dict(action='guidance_repair', repository=event['repository'],
+                                profile_id=event['profile_id'], actor=actor or 'dashboard_operator',
+                                reason='Verified checkout guidance restored', path=str(path)))
+        return {'bundle': bundle}
 
     def repair_report(self, body, actor=None):
         if (not isinstance(body, dict) or not isinstance(body.get('repository'), str)
@@ -595,7 +612,7 @@ class IntegrationCoordinator:
                                   "Missing required checks mean not_run even if other suites pass. Preserve current work; report any blocker. "
                                   "Do not edit tests or work around privileged test failures with sudo, Docker, user namespaces or broad /etc access. "
                                   "Report test isolation defects with the failing command and traceback; tests that ran and failed remain failed.\n\n"
-                                  "Follow the validation failure guidance in this worker skill:\n" + merge_skill())
+                                  "Follow the validation failure guidance in this worker skill:\n" + merge_skill(self.store.projects / event['path']))
                         job_id = self.submit(event, 'validation', prompt)
                         if job_id:
                             event.update(state='validating', job_id=job_id)
@@ -632,7 +649,7 @@ class IntegrationCoordinator:
                                   '{"outcome":"integrated|blocked","blocker":"missing_toolchain|missing_permissions|owner_restriction|read_only_role|task_conflict|state_conflict|unspecified","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands and results"},"reason":"..."}. '
                                   "Never claim tests passed if they were not run. "
                                   "Never discard unrelated changes, reset, force-push or deploy. Respect your assigned permissions; report blockers.\n\n"
-                                  "Follow this gateway-bundled worker skill for the authorized merge:\n" + merge_skill())
+                                  "Follow this gateway-bundled worker skill for the authorized merge:\n" + merge_skill(self.store.projects / event['path']))
                         job_id = self.submit(event, 'merge', prompt)
                         if job_id:
                             event.update(state='integrating', job_id=job_id)

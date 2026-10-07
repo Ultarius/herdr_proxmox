@@ -122,3 +122,52 @@ The dashboard never runs privileged commands. A root oneshot service (`herdr-sdk
 **Validate exact commit** on an event materializes its target commit in a detached Git worktree beside the projects directory — never in the checkout the coordinator may deliver — and runs the first fixed script found there (`scripts/validate.sh`, then `scripts/build-web.sh`). No caller-supplied command is accepted; output is bounded and the worktree is removed when the run finishes. The board shows the runner state and offers **Download validation log**; the result is attached to the event as `validation_run` and audited as `validation_run`.
 
 Operator identities are stored under `/etc/herdr/operators.json`, with a root-owned parent directory: a root-owned file inside the agent's writable home is insufficient protection against replacement. Recreate named tokens with `herdr-operator` if you used the earlier home-directory prototype. Automatic SDK provisioning requires administrator authorization. Validation worktrees isolate Git changes, not executable code: only validate repositories trusted to execute as the `herdr` user. Linux timeout handling stops the full process group; gateway restarts mark unfinished runs interrupted for operator inspection. Runs are serialized to limit resource pressure, and output is collected as a bounded tail. When both validation entrypoints exist, both suites run; an early failure stops the remaining suite.
+
+### Worker reference access
+
+New development-task launches and integration/validation prompts copy the
+release-matched router and references into the assigned checkout under ignored
+`.ci-cache/herdr-guidance/<content-hash>`. Workers read those local paths instead
+of `/opt/herdr-web`, avoiding external-directory approval for required guidance.
+The gateway prepares a narrow local Git exclusion, refuses symlink directories/files,
+and rejects modified existing copies. It preserves tracked ignore rules and grants
+no broader CLI permissions. Unsafe Git exclusion metadata fails preparation.
+Existing sessions/prompts keep their old paths until a new request is prepared.
+
+
+### Local exclusion and recovery
+
+Guidance preparation preserves Git's local `info/exclude` and adds only
+`/.ci-cache/herdr-guidance/`, under the repository lock. No committed ignore
+rule is required. Linked worktrees use the metadata location resolved by Git.
+
+Administrators can select **Repair worker guidance** in an integration event.
+After inspection confirmation, the gateway locks the worker, refuses queued or
+running work and shared checkouts, and verifies the original session is idle
+and unchanged. Damaged copies are quarantined before resources are rebuilt.
+Healthy copies are unchanged on repeated recovery. Repairs are audited and do
+not resend jobs. Unsafe directory symlinks still require inspection.
+
+These are preparation-time integrity checks, not isolation between agents
+sharing one Unix account. Modification after preparation remains possible.
+
+
+### Candidate transfer and late chat replies
+
+Tasks with a captured candidate expose **Download candidate patch**, independently
+of GitHub configuration. The authenticated endpoint exports the recorded base
+and candidate trees with binary data and full object IDs. Header comments record
+the task, both SHAs, and the SHA256 of the diff body. Downloads exceeding 20 MiB
+fail explicitly; generation stops after 30 seconds. Exports never change branches
+or include uncommitted work. This transfers file changes, not commit history.
+
+Ordinary chat messages in `needs_attention` or `uncertain` now expose **Recover
+saved reply**. After inspection confirmation, recovery uses the original idle,
+unchanged session and attempt-specific reply filename. It rejects queued work,
+unsafe or missing output, preserves the previous error, records the recovering
+operator, and is idempotent. No prompt is resent. This also works on older jobs.
+Deployment of this update is needed before using it on existing timed-out jobs.
+
+New task instructions specify `Herdr-Agent <agent@herdr.local>` using per-command
+Git identity options. Agents must not infer operator attribution or alter global
+Git configuration. Existing commits retain their original attribution.

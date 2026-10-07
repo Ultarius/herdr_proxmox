@@ -23,6 +23,44 @@ import project_git
 import server
 
 
+class PatchExportTests(unittest.TestCase):
+    def test_binary_patch_is_exact_and_applies_without_modifying_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def git(*args):
+                return subprocess.check_output(['git', '-C', str(root), *args]).decode().strip()
+            git('init')
+            (root / 'text.txt').write_text('base')
+            git('add', '.')
+            git('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'base')
+            base = git('rev-parse', 'HEAD')
+            (root / 'binary.dat').write_bytes(b'\x00binary\xff')
+            (root / 'text.txt').write_text('candidate')
+            git('add', '.')
+            git('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'candidate')
+            head = git('rev-parse', 'HEAD')
+            service = object.__new__(Contributions)
+            service.get = MagicMock(return_value=dict(base_sha=base, head_sha=head))
+            service.path_for = MagicMock(return_value=root)
+            content, filename = service.patch('task')
+            self.assertIn(b'GIT binary patch', content)
+            self.assertIn(base.encode(), content)
+            self.assertIn(head.encode(), content)
+            self.assertTrue(filename.endswith('.patch'))
+            self.assertEqual(git('status', '--porcelain'), '')
+            with self.assertRaisesRegex(ValueError, 'not truncated'):
+                service.patch('task', limit=1)
+            git('checkout', '--detach', base)
+            patchfile = root.parent / (root.name + '.patch')
+            try:
+                patchfile.write_bytes(content)
+                git('apply', str(patchfile))
+                self.assertEqual((root / 'text.txt').read_text(), 'candidate')
+                self.assertEqual((root / 'binary.dat').read_bytes(), b'\x00binary\xff')
+            finally:
+                patchfile.unlink(missing_ok=True)
+
+
 class GitHubTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -177,6 +215,8 @@ class ContributionTests(unittest.TestCase):
         self.assertNotIn(resource.read_text(encoding='utf-8').strip(), prompt)
         self.assertNotIn('## Merge procedure', prompt)
         self.assertIn('Never push', arguments['task_prompt'])
+        self.assertIn('user.name=Herdr-Agent', prompt)
+        self.assertIn('Never infer the operator identity', prompt)
         self.assertEqual(project_git.configured_base(self.repo), self.task['base_ref'])
         self.assertEqual(launched['state'], 'implementing')
         self.service.action('launch', dict(request_id='again', task_id=self.task['id']), 'admin', 'admin')

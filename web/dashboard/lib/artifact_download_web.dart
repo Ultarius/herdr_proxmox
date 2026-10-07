@@ -2,10 +2,14 @@ import 'dart:js_interop';
 import 'dart:typed_data';
 import 'package:web/web.dart' as web;
 
-Future<void> downloadBinaryArtifact(Uint8List content, String filename) async {
+Future<void> downloadBinaryArtifact(
+  Uint8List content,
+  String filename, {
+  String contentType = 'application/gzip',
+}) async {
   final blob = web.Blob(
     [content.toJS].toJS,
-    web.BlobPropertyBag(type: 'application/gzip'),
+    web.BlobPropertyBag(type: contentType),
   );
   final url = web.URL.createObjectURL(blob);
   final link = web.HTMLAnchorElement()

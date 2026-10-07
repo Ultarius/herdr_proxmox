@@ -6,7 +6,11 @@ Future<void> downloadArtifact(String content, String filename) async {
   );
 }
 
-Future<void> downloadBinaryArtifact(Uint8List content, String filename) async {
+Future<void> downloadBinaryArtifact(
+  Uint8List content,
+  String filename, {
+  String contentType = 'application/gzip',
+}) async {
   throw UnsupportedError(
     'Artifact download is available in the web dashboard.',
   );
