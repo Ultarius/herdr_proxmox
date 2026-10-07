@@ -42,11 +42,33 @@ class ReportRepairTests(unittest.TestCase):
         self.body = dict(repository='repo', job_id=self.report['id'], mode='recover')
         self.store.jobs_changed.clear()
 
-    def save_reply(self, text):
-        path = self.store.path.parent / 'chat-replies' / self.report['id'] / 'reply.md'
+    def save_reply(self, text, name='reply.md'):
+        path = self.store.path.parent / 'chat-replies' / self.report['id'] / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding='utf-8')
         return path
+
+    def test_recovery_reads_the_attempt_reply_from_delivery_evidence(self):
+        # Existing jobs keep reply.md; an attempt file recorded before submission
+        # is the one recovery reads, and a stale legacy file is ignored.
+        name = 'reply-abcdefabcdef.md'
+        self.store.update_job(self.report['id'],
+                              delivery=dict(stage='session_idle_reply_pending', reply_name=name))
+        self.save_reply('Attempt evidence', name=name)
+        self.save_reply('Stale legacy content')
+        result = self.service.repair_report(self.body)
+        self.assertEqual(result['resolution'], 'recovered')
+        job = self.store.job_records()[-1]
+        self.assertEqual(job['result'], 'Attempt evidence')
+        self.assertEqual(job['delivery']['stage'], 'reply_verified')
+        self.assertTrue(job['delivery']['recovered'])
+
+    def test_recovery_refuses_an_unexpected_reply_file_name(self):
+        self.store.update_job(self.report['id'],
+                              delivery=dict(stage='session_idle_reply_pending', reply_name='../escape.md'))
+        self.save_reply('content')
+        with self.assertRaisesRegex(ValueError, 'unsupported reply file name'):
+            self.service.repair_report(self.body)
 
     def worker_event(self, phase='integrating'):
         event_id = 'a' * 64
@@ -146,6 +168,12 @@ class ReportRepairTests(unittest.TestCase):
         self.assertEqual(job['state'], 'answered')
         self.assertIn('validation pending', job['result'])
         self.assertEqual(job['previous_error'], 'Uncertain terminal delivery')
+        self.assertEqual(job['error'], '')
+        # Recovery verifies saved reply delivery without pretending the terminal
+        # turn was proven by the CLI.
+        self.assertEqual(job['delivery']['stage'], 'reply_verified')
+        self.assertTrue(job['delivery']['recovered'])
+        self.assertGreater(job['delivery']['bytes'], 0)
         self.assertTrue(self.store.jobs_changed.is_set())
         self.assertFalse(any(args[:2] == ('agent', 'prompt') for args, _ in self.calls[before:]))
         audit = self.service.snapshot()['audit']
@@ -153,7 +181,7 @@ class ReportRepairTests(unittest.TestCase):
         self.assertEqual(self.service.snapshot()['audit'], audit)
 
     def test_missing_reply_requires_explicit_inspection_before_fresh_summary(self):
-        with self.assertRaisesRegex(ValueError, 'Coordinator report reply'):
+        with self.assertRaisesRegex(ValueError, 'Reply recovery failed'):
             self.service.repair_report(self.body)
         with self.assertRaisesRegex(ValueError, 'Inspect'):
             self.service.repair_report(dict(self.body, mode='fresh'))

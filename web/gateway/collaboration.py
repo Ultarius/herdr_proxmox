@@ -197,11 +197,34 @@ def current_run(store, run, ready=True):
     return current
 
 
-def prompt_and_wait(store, run, prompt, wait=180):
+def prompt_and_wait(store, run, prompt, wait=180, job_id=None, reply_name=None):
     run = current_run(store, run)
-    store.command('agent', 'prompt', run['alias'], prompt, '--wait', '--timeout', str(wait * 1000), timeout=wait + 10)
+    if job_id:
+        evidence = dict(stage='submitting', started_at=now(), alias=run['alias'], wait_seconds=wait)
+        if reply_name:
+            # Persist the attempt's exact reply file before any terminal input.
+            evidence['reply_name'] = reply_name
+        store.update_job(job_id, delivery=evidence)
+    # A successful CLI return is evidence of a command response, not proof that
+    # the model processed this turn. Only the job-specific reply proves delivery.
+    response = store.command('agent', 'prompt', run['alias'], prompt, '--wait', '--timeout', str(wait * 1000), timeout=wait + 10)
+    if job_id:
+        evidence.update(stage='command_returned', returned_at=now())
+        if isinstance(response, dict):
+            # The live CLI returns {"agent": {...}}. Retain only bounded scalar
+            # protocol fields; never persist echoed prompts or terminal output.
+            source = response.get('agent') if isinstance(response.get('agent'), dict) else response
+            evidence['response'] = {k: v for k, v in source.items()
+                                    if k in ('type', 'status', 'state', 'detected', 'kind', 'completed',
+                                             'timed_out', 'timeout')
+                                    and isinstance(v, (str, bool, int)) and len(str(v)) <= 160}
+        store.update_job(job_id, delivery=evidence)
     # Blocked, replaced, or released bindings never count as completed turns.
     current_run(store, run)
+    if job_id:
+        evidence.update(stage='session_idle_reply_pending', checked_at=now())
+        store.update_job(job_id, delivery=evidence)
+        return evidence
 
 
 def wait_seconds(body):
@@ -212,12 +235,29 @@ def wait_seconds(body):
     return value
 
 
-def read_contribution(path, limit=40000):
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > limit:
-        raise ValueError(f'Agent did not produce a valid discussion document (maximum {limit} bytes).')
-    result = path.read_text(encoding='utf-8').strip()
+def read_contribution(path, limit=40000, label='discussion document'):
+    """Read bounded output; preserve the exact reason for operator recovery."""
+    prefix = f'Agent did not produce a valid {label}'
+    if path.is_symlink():
+        raise ValueError(f'{prefix}: symlink rejected at {path}.')
+    try:
+        if not path.is_file():
+            raise ValueError(f'{prefix}: file missing or not a regular file at {path}.')
+        size = path.stat().st_size
+        if size > limit:
+            raise ValueError(f'{prefix}: {size} bytes exceeds maximum {limit} at {path}.')
+        # Bound the actual read too, rather than trusting a pre-read stat alone.
+        with path.open('rb') as stream:
+            data = stream.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError(f'{prefix}: exceeds maximum {limit} bytes at {path}.')
+        result = data.decode('utf-8').strip()
+    except FileNotFoundError:
+        raise ValueError(f'{prefix}: file missing at {path}.') from None
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f'{prefix}: unreadable UTF-8 file at {path} ({type(error).__name__}).') from error
     if not result:
-        raise ValueError('Agent produced an empty discussion document.')
+        raise ValueError(f'{prefix}: empty file at {path}.')
     return result
 
 
@@ -318,23 +358,34 @@ def execute(store, job):
     if job['kind'] == 'chat':
         run = job['runs'][0]
         directory = store.path.parent / 'chat-replies' / job['id']
-        directory.mkdir(parents=True, mode=0o700)
-        reply = directory / 'reply.md'
+        if directory.is_symlink() or directory.parent.is_symlink():
+            raise ValueError('Reply directories must not be symlinks.')
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        # One file per execution attempt: a late or repeated invocation can never
+        # overwrite, or be mistaken for, another attempt's reply. Legacy jobs
+        # keep reading their original reply.md.
+        reply_name = 'reply-' + uuid.uuid4().hex[:12] + '.md'
+        reply = directory / reply_name
         prompt = (
             f"User message:\n{job['prompt']}\n\n"
+            "Returning JSON in the conversation does not replace saving this file. "
+            f"Reply contract for job {job['id']}. "
             "Dashboard reply delivery: answer the user message in this conversation. "
-            f"Write your final answer as UTF-8 Markdown to exactly {reply}, below 40 KB. "
-            "The file must contain only your answer, including relevant code and examples. "
+            f"Write the exact final reply the task requires as UTF-8 to exactly {reply}, below 40 KB: "
+            "Markdown for an ordinary answer, or exactly the JSON the task specifies with no prose around it. "
+            "The file must contain only that reply, including relevant code and examples. "
             "Exclude terminal menus, status panels, prior conversation, prompt echoes and tool logs. "
             "Do not change the substance of the user's request. Use your file-writing tools to save "
             "this reply file even for a read-only advisory role; do not modify other files unless "
             "the user's request authorizes it. Finish after saving. If you cannot write the file, "
             "report that limitation rather than claiming delivery."
         )
-        prompt_and_wait(store, run, prompt, job.get('wait_seconds', 180))
-        result = read_contribution(reply)
+        evidence = prompt_and_wait(store, run, prompt, job.get('wait_seconds', 180), job_id=job['id'],
+                                   reply_name=reply_name)
+        result = read_contribution(reply, label='chat reply')
         store.update_job(job['id'], state='answered', result=result, result_format='markdown',
-                         reply_name='reply.md')
+                         reply_name=reply_name, delivery=dict(evidence, stage='reply_verified',
+                         verified_at=now(), bytes=len(result.encode('utf-8'))))
         return
     group_run = job['group_run']
     with store.lock, closing(store.connect()) as db:

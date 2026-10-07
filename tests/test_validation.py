@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -321,6 +322,54 @@ class ValidationRunTests(unittest.TestCase):
             run = self.submit_and_wait()
         self.assertEqual(run['state'], 'error')
         self.assertIn('exceeded', self.runs.log(run['id'])[1])
+
+    def test_concurrent_readers_cannot_break_atomic_run_replacement(self):
+        # Windows denies os.replace while a reader holds run.json open. The
+        # runner serializes its own reads and writes, so polling during a run
+        # cannot turn a failure into a spurious run error.
+        folder = self.runs.root / ('c' * 32)
+        folder.mkdir(parents=True)
+        run = dict(id='c' * 32, state='running', started_at='2026-01-01T00:00:00+00:00')
+        failures, stop = [], threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                self.runs._read(folder)
+
+        readers = [threading.Thread(target=reader, daemon=True) for _ in range(4)]
+        for thread in readers:
+            thread.start()
+        try:
+            for _ in range(300):
+                self.runs._write(folder, run)
+        except OSError as error:
+            failures.append(error)
+        finally:
+            stop.set()
+            for thread in readers:
+                thread.join(timeout=5)
+        self.assertEqual(failures, [])
+        self.assertFalse((folder / 'run.tmp').exists())
+
+    def test_transient_windows_replace_denial_is_retried(self):
+        # A reader outside this process can still hold the file; the bounded
+        # retry keeps the run from failing for a transient denial.
+        folder = self.runs.root / ('d' * 32)
+        folder.mkdir(parents=True)
+        run = dict(id='d' * 32, state='running')
+        real_replace = Path.replace
+        calls = []
+
+        def replace(target_path, target):
+            calls.append(target)
+            if len(calls) <= 2:
+                raise PermissionError('access denied')
+            return real_replace(target_path, target)
+
+        with patch.object(Path, 'replace', replace):
+            self.runs._write(folder, run)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.runs._read(folder)['state'], 'running')
 
     def test_symlinked_scripts_are_not_validation_entrypoints(self):
         with patch.object(Path, 'is_symlink', return_value=True):

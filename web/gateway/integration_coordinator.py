@@ -532,7 +532,8 @@ class IntegrationCoordinator:
                     if state in ('deciding', 'integrating', 'validating'):
                         if not job or job['state'] in ('uncertain', 'needs_attention', 'released'):
                             event.update(state='needs_attention', interrupted_phase=state,
-                                         reason='Inspect the existing agent job; delivery may have occurred.')
+                                         reason=((job.get('error') or 'Inspect the existing agent job; delivery may have occurred.')
+                                                 if job else 'The original agent job is missing.')[:1000])
                         elif job['state'] == 'answered':
                             if state in ('integrating', 'validating'):
                                 # Completion is verified from Git, not accepted on a model claim.
@@ -590,7 +591,7 @@ class IntegrationCoordinator:
                     elif state == 'validation_ready':
                         prompt = (f"Validation only in your assigned checkout {self.store.projects / event['path']} for exact commit {event['target']}. "
                                   "Do not merge again, switch branches, reset, stash or deploy. Confirm the commit is still incorporated and no merge/rebase/conflicts remain. "
-                                  'Run required checks and return ONLY JSON: {"outcome":"integrated|blocked","blocker":"missing_toolchain|missing_permissions|owner_restriction|read_only_role|task_conflict|state_conflict|unspecified","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands, results and missing checks"},"reason":"..."}. '
+                                  'Run required checks and save ONLY JSON in the job reply file specified by Dashboard reply delivery: {"outcome":"integrated|blocked","blocker":"missing_toolchain|missing_permissions|owner_restriction|read_only_role|task_conflict|state_conflict|unspecified","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands, results and missing checks"},"reason":"..."}. '
                                   "Missing required checks mean not_run even if other suites pass. Preserve current work; report any blocker. "
                                   "Do not edit tests or work around privileged test failures with sudo, Docker, user namespaces or broad /etc access. "
                                   "Report test isolation defects with the failing command and traceback; tests that ran and failed remain failed.\n\n"
@@ -627,7 +628,7 @@ class IntegrationCoordinator:
                                   f"Recovery snapshot is pinned at {event['recovery']['ref']}. Preserve your current work and merge exact commit {event['target']} into your existing branch. "
                                   "Inspect any existing merge/rebase first; do not start another or automatically finish an unrelated operation. "
                                   f"Read-only preflight selected {event['merge_mode']}: use {command} {event['target']} after rechecking the checkout. "
-                                  "Resolve conflicts and run relevant tests. Return ONLY JSON with "
+                                  "Resolve conflicts and run relevant tests. Save ONLY JSON in the job reply file specified by Dashboard reply delivery, with "
                                   '{"outcome":"integrated|blocked","blocker":"missing_toolchain|missing_permissions|owner_restriction|read_only_role|task_conflict|state_conflict|unspecified","commit":"full HEAD SHA","tests":{"status":"passed|failed|not_run","summary":"commands and results"},"reason":"..."}. '
                                   "Never claim tests passed if they were not run. "
                                   "Never discard unrelated changes, reset, force-push or deploy. Respect your assigned permissions; report blockers.\n\n"

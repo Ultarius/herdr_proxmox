@@ -221,3 +221,29 @@ personas on the same runtime, leader-to-worker delegation, a reply, blocked
 authentication, double-click/retry behavior, disconnect/reconnect, process
 replacement and container restart. No plugins were installed or executed during
 this review, and no live multi-agent compatibility test has been performed.
+
+### Chat reply delivery evidence
+
+Chat jobs persist bounded delivery evidence before submission, after the CLI
+returns, and after the original session is checked idle and unchanged. These
+stages do not prove the model processed the request. Only a nonempty, bounded
+UTF-8 reply in that attempt's own reply file makes it answered: each execution
+attempt writes a unique `reply-<id>.md` recorded in the delivery evidence before
+submission, so a late or repeated invocation can never overwrite or be mistaken
+for another attempt's reply. Legacy jobs keep their original `reply.md`. CLI
+evidence stores only short status/type fields, never echoed prompts or terminal
+output.
+
+The chat record shows the delivery stage, its timestamps, the reply file name
+and the job ID beside the error. The labels keep an acknowledged CLI return
+distinct from a verified reply so the dashboard never implies acknowledgment or
+completion that was not proven.
+
+The reply contract explicitly requires saving the file even when the requested
+answer is JSON. Missing, empty, oversized, symlinked and unreadable files have
+separate errors including the expected path; integration events surface the
+job error directly. Uncertain delivery never triggers an automatic resend.
+Inspect the conversation, recover a saved result if it exists, or explicitly
+choose validation-only continuation when Git incorporation is verified. Recovery
+preserves the previous error and marks the reply verified without terminal input.
+Older jobs retain their existing evidence; an update cannot prove past delivery.

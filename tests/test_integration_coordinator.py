@@ -469,6 +469,8 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(self.recovery.call_count, 1)
         prompt = self.store.calls[-1]['prompt']
         self.assertIn('Validation only', prompt)
+        self.assertIn('save ONLY JSON in the job reply file', prompt)
+        self.assertNotIn('return ONLY JSON', prompt)
         self.assertIn('Do not merge again', prompt)
         self.assertIn('Do not edit tests', prompt)
         self.assertIn('Report test isolation defects', prompt)

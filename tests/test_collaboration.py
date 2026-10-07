@@ -173,6 +173,108 @@ class CollaborationTests(unittest.TestCase):
         inspected = self.store.action('inspect', dict(request_id=uuid.uuid4().hex, organization_id=self.org, profile_id=self.max))
         self.assertEqual(inspected['status'], 'idle')
 
+    def test_missing_chat_reply_records_delivery_without_redispatch(self):
+        self.writes = False
+        job_id = self.action('chat', organization_id=self.org, profile_id=self.max, prompt='Validate only')
+        self.drain()
+        job = self.job(job_id)
+        self.assertEqual(job['state'], 'needs_attention')
+        self.assertEqual(job['delivery']['stage'], 'session_idle_reply_pending')
+        self.assertIn('valid chat reply: file missing', job['error'])
+        self.assertIn(job_id, job['error'])
+        self.assertIn('Delivery stage: session_idle_reply_pending', job['error'])
+        self.assertIn('Org chart → Chat', job['error'])
+        prompts = [a for a, _ in self.calls if a[:2] == ('agent', 'prompt') and 'Validate only' in a[3]]
+        self.assertEqual(len(prompts), 1)
+        self.assertIn('Returning JSON in the conversation does not replace saving this file', prompts[0][3])
+        # The reply contract must not force Markdown when the task requires JSON.
+        self.assertIn('exactly the JSON the task specifies', prompts[0][3])
+
+    def test_cli_response_is_bounded_and_does_not_claim_reply_delivery(self):
+        self.writes = False
+        def response(*args, **kwargs):
+            value = self.simulate(*args, **kwargs)
+            if args[:2] == ('agent', 'prompt'):
+                return dict(status='done', completed=True, prompt='private echo', output='private output', type='x' * 161)
+            return value
+        with patch.object(self.store, 'command', side_effect=response):
+            job_id = self.action('chat', organization_id=self.org, profile_id=self.max, prompt='Hello')
+            self.drain()
+        job = self.job(job_id)
+        self.assertEqual(job['state'], 'needs_attention')
+        self.assertEqual(job['delivery']['response'], dict(status='done', completed=True))
+        self.assertIn('started_at', job['delivery'])
+        self.assertIn('returned_at', job['delivery'])
+
+    def test_live_agent_response_shape_is_captured_without_terminal_output(self):
+        # store.command returns the CLI's result field, which for agent prompt is
+        # {"agent": {...}}. Only bounded scalar protocol evidence may be stored.
+        self.writes = False
+        def response(*args, **kwargs):
+            value = self.simulate(*args, **kwargs)
+            if args[:2] == ('agent', 'prompt'):
+                return dict(agent=dict(status='idle', kind='codex', name='max', pane_id='w1:p2',
+                                       output='private terminal output'))
+            return value
+        with patch.object(self.store, 'command', side_effect=response):
+            job_id = self.action('chat', organization_id=self.org, profile_id=self.max, prompt='Hello')
+            self.drain()
+        job = self.job(job_id)
+        self.assertEqual(job['delivery']['response'], dict(status='idle', kind='codex'))
+        self.assertNotIn('output', job['delivery']['response'])
+
+    def test_chat_command_exception_preserves_uncertain_submission(self):
+        def uncertain(*args, **kwargs):
+            if args[:2] == ('agent', 'prompt'):
+                raise TimeoutError('wait expired')
+            return self.simulate(*args, **kwargs)
+        with patch.object(self.store, 'command', side_effect=uncertain):
+            job_id = self.action('chat', organization_id=self.org, profile_id=self.max, prompt='Hello')
+            self.drain()
+        job = self.job(job_id)
+        self.assertEqual(job['state'], 'needs_attention')
+        self.assertEqual(job['delivery']['stage'], 'submitting')
+        self.assertIn('wait expired', job['error'])
+
+    def test_chat_verified_reply_is_required_for_success(self):
+        job_id = self.action('chat', organization_id=self.org, profile_id=self.max, prompt='Hello')
+        self.drain()
+        job = self.job(job_id)
+        self.assertEqual(job['state'], 'answered')
+        self.assertEqual(job['delivery']['stage'], 'reply_verified')
+        self.assertGreater(job['delivery']['bytes'], 0)
+        # Each attempt reads only the file it was told to write.
+        self.assertRegex(job['delivery']['reply_name'], r'^reply-[a-f0-9]{12}\.md$')
+        self.assertEqual(job['reply_name'], job['delivery']['reply_name'])
+        reply = self.store.path.parent / 'chat-replies' / job_id / job['delivery']['reply_name']
+        self.assertTrue(reply.is_file())
+
+    def test_a_stale_reply_file_cannot_satisfy_a_new_attempt(self):
+        # A legacy reply.md (or a late write) is never accepted for an attempt
+        # that was told to write a different file.
+        job_id = self.action('chat', organization_id=self.org, profile_id=self.max, prompt='Hello')
+        directory = self.store.path.parent / 'chat-replies' / job_id
+        directory.mkdir(parents=True, exist_ok=True)
+        stale = directory / 'reply.md'
+        stale.write_text('stale answer from another attempt', encoding='utf-8')
+        self.writes = False
+        self.drain()
+        job = self.job(job_id)
+        self.assertEqual(job['state'], 'needs_attention')
+        self.assertNotEqual(job.get('result'), 'stale answer from another attempt')
+        self.assertRegex(job['delivery']['reply_name'], r'^reply-[a-f0-9]{12}\.md$')
+        self.assertIn(job['delivery']['reply_name'], job['error'])
+        # Recovery and execution never quarantine another attempt's file.
+        self.assertTrue(stale.is_file())
+
+    def test_reply_diagnostics_distinguish_empty_oversized_and_encoding(self):
+        from collaboration import read_contribution
+        reply = self.store.path.parent / 'diagnostic.md'
+        for data, reason in ((b'', 'empty file'), (b'x' * 40001, 'exceeds maximum'), (b'\xff', 'unreadable UTF-8')):
+            reply.write_bytes(data)
+            with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
+                read_contribution(reply, label='chat reply')
+
     def test_chat_wait_seconds_is_bounded_and_forwarded(self):
         for value in (5, 3601, '180', True):
             with self.assertRaises(ValueError):

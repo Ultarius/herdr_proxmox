@@ -46,6 +46,10 @@ class ValidationRuns:
         self.root = Path(root) if root else self.projects.parent / 'herdr-validation'
         self.timeout = timeout
         self.lock = threading.Lock()
+        # run.json is replaced atomically, but on Windows os.replace fails while
+        # a concurrent reader holds the target open. Serialize our own readers and
+        # writers, and retry briefly for readers outside this process.
+        self.files = threading.Lock()
         self.queue = queue
         self.external = external or queue is not None
         self.minimum_free_bytes = minimum_free_bytes
@@ -57,15 +61,25 @@ class ValidationRuns:
                 self._write(folder, run)
 
     def _write(self, folder, run):
-        temporary = folder / 'run.tmp'
-        temporary.write_text(json.dumps(run, indent=2))
-        temporary.replace(folder / 'run.json')
+        with self.files:
+            temporary = folder / 'run.tmp'
+            temporary.write_text(json.dumps(run, indent=2))
+            for attempt in range(50):
+                try:
+                    temporary.replace(folder / 'run.json')
+                    return
+                except PermissionError:
+                    if attempt == 49:
+                        temporary.unlink(missing_ok=True)
+                        raise
+                    time.sleep(0.005)
 
     def _read(self, folder):
-        try:
-            return json.loads((folder / 'run.json').read_text())
-        except (OSError, ValueError):
-            return None
+        with self.files:
+            try:
+                return json.loads((folder / 'run.json').read_text())
+            except (OSError, ValueError):
+                return None
 
     def _history(self):
         try:

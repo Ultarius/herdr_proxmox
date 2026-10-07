@@ -217,4 +217,98 @@ void main() {
       BlocScope.endAll();
     },
   );
+  test(
+    'delivery labels distinguish an acknowledged CLI return from a verified reply',
+    () {
+      expect(deliveryLabel('submitting'), 'Submitting the prompt');
+      expect(
+        deliveryLabel('command_returned'),
+        'CLI returned (acknowledgment only)',
+      );
+      expect(deliveryLabel('session_idle_reply_pending'), contains('reply file'));
+      expect(deliveryLabel('reply_verified'), 'Reply verified');
+      expect(deliveryLabel(null), 'No delivery evidence');
+      expect(deliveryLabel('future-stage'), 'future-stage');
+    },
+  );
+
+  testWidgets('chat records show the delivery stage beside the error', (
+    tester,
+  ) async {
+    final connection = DashboardBloc(
+      client: MockClient((request) async {
+        if (request.url.path.endsWith('/inspect'))
+          return http.Response('{"status":"idle","output":"Ready"}', 200);
+        if ((request.url.path.endsWith('/organizations') ||
+            request.url.path.endsWith('/state') ||
+            request.url.path.endsWith('/activity')))
+          return http.Response(
+            jsonEncode({
+              'groups': [],
+              'jobs': [
+                {
+                  'id': 'chat-1',
+                  'organization_id': 'org',
+                  'kind': 'chat',
+                  'profile_id': 'max',
+                  'state': 'needs_attention',
+                  'prompt': 'Validate only',
+                  'error':
+                      'Agent did not produce a valid chat reply: file missing at /tmp/reply-x.md. Delivery stage: command_returned.',
+                  'delivery': {
+                    'stage': 'command_returned',
+                    'reply_name': 'reply-abcdefabcdef.md',
+                    'started_at': '2026-01-01T00:00:00+00:00',
+                    'returned_at': '2026-01-01T00:01:00+00:00',
+                  },
+                },
+              ],
+            }),
+            200,
+          );
+        return http.Response('{"workspaces":[],"agents":[]}', 200);
+      }),
+    );
+    BlocScope.register<DashboardBloc>(
+      () => connection,
+      lifecycle: BlocLifecycle.permanent,
+    );
+    final connected = connection.stream.firstWhere(
+      (_) => connection.state.connected,
+    );
+    connection.connect('token');
+    await connected;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: CollaborationPanel(
+              organization: const {'id': 'org'},
+              profiles: const [
+                {'id': 'max', 'name': 'Max', 'role': 'Developer'},
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    // Chat records are shown for the selected agent.
+    await tester.tap(find.byType(DropdownButtonFormField<String>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Max').last);
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Delivery: CLI returned (acknowledgment only)'),
+      findsOneWidget,
+    );
+    expect(find.text('Reply file: reply-abcdefabcdef.md'), findsOneWidget);
+    expect(find.text('Job chat-1'), findsOneWidget);
+    expect(find.textContaining('file missing'), findsOneWidget);
+    expect(find.textContaining('reply verified'), findsNothing);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    connection.disconnect();
+    BlocScope.endAll();
+  });
 }

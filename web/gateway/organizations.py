@@ -619,11 +619,19 @@ class OrganizationStore:
                 if directory.is_symlink() or directory.parent.is_symlink():
                     raise ValueError('Reply directories must not be symlinks.')
                 try:
-                    reply = read_contribution(directory / 'reply.md')
+                    # Read the attempt's own reply file. Legacy jobs without
+                    # per-attempt evidence keep their original reply.md. Recovery
+                    # only reads: it never quarantines or rewrites the reply.
+                    name = (job.get('delivery') or {}).get('reply_name') or 'reply.md'
+                    if not re.fullmatch(r'reply-[a-f0-9]{12}\.md|reply\.md', str(name)):
+                        raise ValueError('unsupported reply file name in job delivery evidence')
+                    reply = read_contribution(directory / name, label='chat reply')
                 except (ValueError, OSError) as error:
-                    raise ValueError('Coordinator report reply is missing, empty or invalid (maximum 40000 bytes).') from error
+                    raise ValueError(f'Reply recovery failed for job {job_id}: {error}') from error
                 self.update_job(job_id, state='answered', result=reply, result_format='markdown',
-                                previous_error=job.get('error', ''), error='', recovered_at=now())
+                                previous_error=job.get('error', ''), error='', recovered_at=now(),
+                                delivery=dict(job.get('delivery') or {}, stage='reply_verified',
+                                              recovered=True, bytes=len(reply.encode('utf-8'))))
                 return 'recovered'
             if runs:
                 if runs[-1]['state'] != 'persona_sent':
@@ -819,4 +827,16 @@ class OrganizationStore:
                 self.update_job(job_id, state='delivered')
         except Exception as exc:
             # Timeouts/errors can occur after input was sent. Do not retry the job.
-            self.update_job(job_id, state='needs_attention', error=str(exc)[:500] + ' Inspect SSH before retrying; terminal input may have been sent.')
+            detail = str(exc)[:500]
+            if job['kind'] == 'chat':
+                # Diagnostics must never replace the original failure with their own.
+                try:
+                    with self.lock, closing(self.connect()) as db:
+                        current = self.get(db, 'jobs', job_id)
+                    stage = (current.get('delivery') or {}).get('stage', 'not_submitted')
+                except Exception:
+                    stage = 'unknown'
+                detail += f' Delivery stage: {stage}. Inspect Org chart → Chat before retrying; terminal input may have been sent.'
+            else:
+                detail += ' Inspect SSH before retrying; terminal input may have been sent.'
+            self.update_job(job_id, state='needs_attention', error=detail)

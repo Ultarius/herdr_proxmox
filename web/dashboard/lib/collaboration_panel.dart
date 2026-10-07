@@ -6,6 +6,23 @@ import 'artifact_export.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 
+/// Delivery stages are evidence, not proof of a completed turn. The labels keep
+/// an acknowledged CLI return distinct from a verified reply file.
+const deliveryStages = <String, String>{
+  'submitting': 'Submitting the prompt',
+  'command_returned': 'CLI returned (acknowledgment only)',
+  'session_idle_reply_pending': 'Waiting for the reply file',
+  'reply_verified': 'Reply verified',
+  'not_submitted': 'Not submitted',
+  'unknown': 'Unknown',
+};
+
+String deliveryLabel(Object? stage) {
+  final value = '${stage ?? ''}';
+  if (value.isEmpty) return 'No delivery evidence';
+  return deliveryStages[value] ?? value;
+}
+
 class CollaborationPanel extends StatefulWidget {
   const CollaborationPanel({
     super.key,
@@ -159,6 +176,39 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
   Future<void> export(Map<String, dynamic> job, {bool download = false}) =>
       exportDiscussionArtifact(context, job, download: download);
 
+  /// Delivery evidence for an uncertain or failed chat turn. It states what was
+  /// observed, never that the agent acknowledged or completed the request.
+  Widget delivery(Map<String, dynamic> job) {
+    final evidence = Map<String, dynamic>.from(job['delivery'] as Map);
+    final timestamps = <String>[
+      for (final field in const [
+        'started_at',
+        'returned_at',
+        'checked_at',
+        'verified_at',
+      ])
+        if ('${evidence[field] ?? ''}'.isNotEmpty)
+          '${field.replaceAll('_', ' ')}: ${evidence[field]}',
+    ];
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Delivery: ${deliveryLabel(evidence['stage'])}'),
+          if ('${evidence['reply_name'] ?? ''}'.isNotEmpty)
+            Text('Reply file: ${evidence['reply_name']}'),
+          if (evidence['recovered'] == true)
+            const Text(
+              'Recovered from a saved reply; no terminal input was sent.',
+            ),
+          for (final line in timestamps) Text(line),
+          Text('Job ${job['id']}'),
+        ],
+      ),
+    );
+  }
+
   Widget record(Map<String, dynamic> job) => Card(
     child: Padding(
       padding: const EdgeInsets.all(16),
@@ -172,6 +222,7 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
           if (job['progress'] != null) Text('${job['progress']}'),
           if ((job['error'] as String? ?? '').isNotEmpty)
             Text('${job['error']}'),
+          if (job['delivery'] is Map) delivery(job),
           if ((job['result'] as String? ?? '').isNotEmpty) ...[
             Text(
               job['kind'] == 'chat'
