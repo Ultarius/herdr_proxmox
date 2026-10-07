@@ -8,79 +8,99 @@ import 'package:herdr_dashboard/integration_board.dart';
 import 'package:herdr_dashboard/project_git_panel.dart';
 
 void main() {
-  testWidgets(
-    'phone recovery requires inspection and submits validation only',
-    (tester) async {
-      tester.view.physicalSize = const Size(390, 844);
-      tester.view.devicePixelRatio = 1;
-      addTearDown(tester.view.resetPhysicalSize);
-      addTearDown(tester.view.resetDevicePixelRatio);
-      final calls = <Map>[];
-      final connection = DashboardBloc(
-        client: MockClient((request) async {
-          if (request.url.path.endsWith('/integration/recover')) {
-            calls.add(jsonDecode(request.body) as Map);
-            return http.Response('{}', 200);
-          }
-          if (request.url.path.endsWith('/integration')) {
-            return http.Response(
-              jsonEncode({
-                'coordination': {
-                  'configurations': [],
-                  'events': [
-                    {
-                      'id': 'event',
-                      'repository': 'repo',
-                      'name': 'Max',
-                      'state': 'needs_attention',
-                      'path': 'repo/worker',
-                      'target': 'abc',
-                      'job_id': 'interrupted-job',
-                    },
-                  ],
-                },
-              }),
-              200,
-            );
-          }
-          return http.Response('{"workspaces":[],"agents":[]}', 200);
-        }),
-      );
-      BlocScope.register<DashboardBloc>(() => connection);
-      connection.connect('token');
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: SingleChildScrollView(
-              child: IntegrationBoard(repository: 'repo'),
+  for (final refused in [false, true]) {
+    testWidgets(
+      'phone recovery requires inspection; refusal remains visible: $refused',
+      (tester) async {
+        tester.view.physicalSize = const Size(390, 844);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        final calls = <Map>[];
+        final connection = DashboardBloc(
+          client: MockClient((request) async {
+            if (request.url.path.endsWith('/integration/recover')) {
+              calls.add(jsonDecode(request.body) as Map);
+              if (refused) {
+                return http.Response(
+                  '{"error":"Original session changed"}',
+                  409,
+                );
+              }
+              return http.Response('{}', 200);
+            }
+            if (request.url.path.endsWith('/integration')) {
+              return http.Response(
+                jsonEncode({
+                  'coordination': {
+                    'configurations': [],
+                    'events': [
+                      {
+                        'id': 'event',
+                        'repository': 'repo',
+                        'name': 'Max',
+                        'state': 'needs_attention',
+                        'path': 'repo/worker',
+                        'target': 'abc',
+                        'job_id': 'interrupted-job',
+                      },
+                    ],
+                  },
+                }),
+                200,
+              );
+            }
+            return http.Response('{"workspaces":[],"agents":[]}', 200);
+          }),
+        );
+        BlocScope.register<DashboardBloc>(() => connection);
+        connection.connect('token');
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SingleChildScrollView(
+                child: IntegrationBoard(repository: 'repo'),
+              ),
             ),
           ),
-        ),
-      );
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Integration coordinator'));
-      await tester.pumpAndSettle();
-      await tester.ensureVisible(find.text('Max · needs_attention'));
-      await tester.tap(find.text('Max · needs_attention'));
-      await tester.pumpAndSettle();
-      expect(find.text('Recover saved result'), findsOneWidget);
-      await tester.tap(find.text('Continue validation only'));
-      await tester.pumpAndSettle();
-      expect(calls, isEmpty);
-      await tester.tap(find.text('I inspected the conversation'));
-      await tester.pumpAndSettle();
-      expect(calls.single, {
-        'id': 'event',
-        'job_id': 'interrupted-job',
-        'mode': 'validate',
-        'inspected': true,
-      });
-      expect(tester.takeException(), isNull);
-      await tester.pumpWidget(const SizedBox.shrink());
-      await connection.disconnect();
-      await BlocScope.reset();
-    },
-  );
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Integration coordinator'));
+        await tester.pumpAndSettle();
+        await tester.ensureVisible(find.text('Max · needs_attention'));
+        await tester.tap(find.text('Max · needs_attention'));
+        await tester.pumpAndSettle();
+        expect(find.text('Recover saved result'), findsOneWidget);
+        await tester.tap(find.text('Continue validation only'));
+        await tester.pumpAndSettle();
+        expect(calls, isEmpty);
+        await tester.tap(find.text('I inspected the conversation'));
+        await tester.pumpAndSettle();
+        expect(calls.single, {
+          'id': 'event',
+          'job_id': 'interrupted-job',
+          'mode': 'validate',
+          'inspected': true,
+        });
+        expect(tester.takeException(), isNull);
+        if (refused) {
+          expect(
+            find.textContaining('Original session changed'),
+            findsOneWidget,
+          );
+          await tester.pump(const Duration(seconds: 16));
+          await tester.pumpAndSettle();
+          expect(
+            find.textContaining('Original session changed'),
+            findsOneWidget,
+          );
+        }
+        await tester.pumpWidget(const SizedBox.shrink());
+        await connection.disconnect();
+        await BlocScope.reset();
+      },
+    );
+  }
 
   testWidgets(
     'base update requires exact target review and exposes audit recovery',
@@ -158,6 +178,7 @@ void main() {
       expect(updates.single['target'], target);
       expect(updates.single['head'], head);
       expect(updates.single['request_id'], isNotEmpty);
+      expect(updates.single['request_id'], matches(RegExp(r'^\d+-\d+$')));
       await tester.ensureVisible(find.text('Base update audit & recovery'));
       await tester.tap(find.text('Base update audit & recovery'));
       await tester.pumpAndSettle();

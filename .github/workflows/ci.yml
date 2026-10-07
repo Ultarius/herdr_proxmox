@@ -59,6 +59,11 @@ jobs:
           restore-keys: dart-linux-${{ runner.arch }}-3.44.8-
       - name: Analyze, test and build both web applications
         run: bash scripts/build-web.sh
+      - name: Verify request IDs in compiled JavaScript
+        working-directory: web/dashboard
+        run: |
+          dart compile js test/request_id_web_check.dart -O2 -o "$RUNNER_TEMP/request-id-check.js"
+          node -e 'globalThis.self=globalThis; globalThis.crypto=require("node:crypto").webcrypto; require(process.argv[1])' "$RUNNER_TEMP/request-id-check.js"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: web-assets

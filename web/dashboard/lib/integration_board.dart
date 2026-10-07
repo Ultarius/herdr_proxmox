@@ -18,6 +18,7 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
   Map<String, dynamic> sdk = const {};
   Map<String, dynamic> validation = const {};
   String? error;
+  String? actionFailure;
   bool busy = false;
   bool refreshing = false;
   String? checked;
@@ -399,13 +400,16 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
     setState(() {
       busy = true;
       error = null;
+      actionFailure = null;
     });
     try {
       await connection.request(endpoint, body);
       if (!mounted || epoch != connection.generation) return;
       await connection.request('organizations/directory');
     } catch (e) {
-      if (mounted) setState(() => error = e.toString());
+      if (mounted && epoch == connection.generation) {
+        setState(() => actionFailure = e.toString());
+      }
     } finally {
       if (mounted) {
         setState(() => busy = false);
@@ -660,6 +664,13 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
               ),
           ],
           if (busy) const LinearProgressIndicator(),
+          // Polling may clear transport errors, but operator-action failures
+          // remain visible until another action is attempted.
+          if (actionFailure != null)
+            Text(
+              actionFailure!,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
           if (error != null)
             Text(
               error!,

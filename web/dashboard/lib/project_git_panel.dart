@@ -1,9 +1,9 @@
-import 'dart:math';
 import 'package:juice/juice.dart';
 import 'clipboard_copy.dart';
 import 'dashboard_bloc.dart';
 import 'integration.dart';
 import 'integration_board.dart';
+import 'request_id.dart';
 
 class ProjectGitPanel extends StatefulWidget {
   const ProjectGitPanel({super.key, required this.path, required this.onOpen});
@@ -144,8 +144,7 @@ class _ProjectGitPanelState extends State<ProjectGitPanel> {
       );
       if (confirmed != true || !mounted || epoch != connection.generation)
         return;
-      final requestId =
-          '${DateTime.now().microsecondsSinceEpoch}-${Random.secure().nextInt(1 << 32)}';
+      final requestId = newRequestId();
       final result = await connection.request('projects/git', {
         ...Map<String, dynamic>.from(plan),
         'action': 'update_base',
