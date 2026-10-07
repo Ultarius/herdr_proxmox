@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:juice/juice.dart';
 
@@ -226,7 +227,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
     return data;
   }
 
-  Future<String> text(String path) async {
+  Future<Uint8List> bytes(String path) async {
     final requestGeneration = generation;
     final response = await client
         .get(
@@ -246,8 +247,10 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
       } catch (_) {}
       throw Exception(message);
     }
-    return response.body;
+    return response.bodyBytes;
   }
+
+  Future<String> text(String path) async => utf8.decode(await bytes(path));
 
   @override
   void dispose() {

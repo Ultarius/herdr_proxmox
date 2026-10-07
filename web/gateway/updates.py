@@ -33,6 +33,49 @@ class Updates:
         self.retry_after = 0
         self.check_error = None
 
+    def _status(self):
+        try:
+            status = json.loads(self.state.read_text()) if self.state.exists() else {'state': 'idle'}
+        except (OSError, ValueError):
+            status = {'state': 'idle'}
+        return status if isinstance(status, dict) else {'state': 'idle'}
+
+    def _busy(self, status):
+        return (self.queue / 'request.json').exists() or status.get('state') in ('queued', 'running')
+
+    def _request(self, payload):
+        temporary = self.queue / 'request.tmp'
+        temporary.write_text(json.dumps(payload))
+        temporary.replace(self.queue / 'request.json')
+
+    def promote(self, manifest, archive, actor='dashboard'):
+        """Queue an approved local build; downloads alone never authorize this."""
+        with self.lock:
+            if not self.queue.is_dir():
+                raise ValueError('Install the updater service as root first.')
+            if self._busy(self._status()):
+                raise ValueError('A deployment is already running.')
+            if (not isinstance(manifest, dict) or manifest.get('deployment_mode') != 'local'
+                    or not re.fullmatch(r'[a-f0-9]{32}', str(manifest.get('build_id', '')))
+                    or not re.fullmatch(r'[a-f0-9]{64}', str(manifest.get('sha256', '')))):
+                raise ValueError('Select a retained local deployment package.')
+            self._request(dict(mode='local', build_id=manifest['build_id'],
+                               sha256=manifest['sha256'], path=str(archive),
+                               actor=str(actor)[:80]))
+            return {'state': 'queued', 'mode': 'local', 'build_id': manifest['build_id']}
+
+    def rollback(self, actor='dashboard'):
+        with self.lock:
+            if not self.queue.is_dir():
+                raise ValueError('Install the updater service as root first.')
+            status = self._status()
+            if self._busy(status):
+                raise ValueError('A deployment is already running.')
+            if not status.get('backup'):
+                raise ValueError('No completed deployment backup is available to restore.')
+            self._request(dict(mode='rollback', actor=str(actor)[:80]))
+            return {'state': 'queued', 'mode': 'rollback'}
+
     def snapshot(self, force=False):
         with self.lock:
             now = time.monotonic()
@@ -59,20 +102,32 @@ class Updates:
             finally:
                 with self.lock:
                     self.refreshing = False
-        if cached is None:
-            raise ValueError(error or 'Release check is in progress. Try again shortly.')
         with self.lock:
-            latest = cached['tag_name']
+            latest = cached['tag_name'] if cached else None
             version = self.root / 'VERSION'
             installed = version.read_text().strip() if version.exists() else 'unknown'
-            status = json.loads(self.state.read_text()) if self.state.exists() else {'state': 'idle'}
+            raw = self._status()
+            status = dict(raw)
             if (self.queue / 'request.json').exists():
-                status = {'state': 'queued'}
-            newer = installed == 'unknown' or (bool(re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', installed))
+                status = {'state': 'queued', 'backup': raw.get('backup')}
+            newer = bool(latest) and (installed == 'unknown' or (bool(re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', installed))
                 and tuple(map(int, latest[1:].split('.'))) > tuple(map(int, installed[1:].split('.'))))
+            )
+            identity_path = self.root / 'BUILD.json'
+            local_mode = False
+            if identity_path.exists():
+                try:
+                    local_mode = json.loads(identity_path.read_text()).get('deployment_mode') == 'local'
+                except (OSError, ValueError, AttributeError):
+                    local_mode = True  # Unknown identity must not be silently overwritten.
             return dict(installed=installed, latest=latest, available=newer,
-                        supported=self.queue.is_dir(), release_url=cached['html_url'],
-                        notes=cached.get('body', '')[:12000], **status)
+                        supported=self.queue.is_dir() and not local_mode,
+                        local_supported=self.queue.is_dir(),
+                        rollback_available=bool(raw.get('backup')),
+                        deployment_mode='local' if local_mode else 'release',
+                        release_url=cached['html_url'] if cached else None,
+                        check_error=error,
+                        notes=cached.get('body', '')[:12000] if cached else '', **status)
 
     def install(self, body):
         info = self.snapshot()
@@ -80,6 +135,8 @@ class Updates:
             if not isinstance(body, dict) or body.get('version') != info['latest']:
                 raise ValueError('Check updates again before installing.')
             if not info['supported']:
+                if info.get('deployment_mode') == 'local':
+                    raise ValueError('Release installation is disabled for a local deployment.')
                 raise ValueError('Install the updater service as root first.')
             if not info['available'] or info['state'] in ('queued', 'running'):
                 raise ValueError('No update available, or an update is already running.')

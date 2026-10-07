@@ -314,7 +314,13 @@ class _OrgChartState extends State<OrgChart> {
                                               ),
                                             ),
                                             Text(
-                                              '${profile['role']}',
+                                              profile['coordination_binding'] ==
+                                                      'used'
+                                                  ? 'Used by coordination'
+                                                  : profile['coordination_binding'] ==
+                                                        'inactive'
+                                                  ? 'Inactive coordinator profile'
+                                                  : '${profile['role']}',
                                               maxLines: 1,
                                               overflow: TextOverflow.ellipsis,
                                               style: TextStyle(

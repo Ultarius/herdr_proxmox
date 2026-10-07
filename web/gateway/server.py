@@ -161,6 +161,31 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def validation_artifact(self, run_id, kind='static'):
+        try:
+            archive, manifest = self.server.validation.artifact(run_id, kind)
+            stream = archive.open('rb')
+        except (ValueError, OSError) as exc:
+            self.reply(400, {'error': str(exc)[:500]})
+            return
+        with stream:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/gzip')
+            self.send_header('Content-Disposition', f'attachment; filename="{kind}-{run_id}.tar.gz"')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Content-Length', str(manifest['bytes']))
+            self.end_headers()
+            while chunk := stream.read(65536):
+                self.wfile.write(chunk)
+
+    def organization_snapshot(self, directory=False):
+        data = self.server.organizations.snapshot(directory=directory)
+        watcher = getattr(self.server, 'integration', None)
+        # Minimal gateways used for setup can serve organization storage before
+        # the background integration watcher is attached.
+        return watcher.annotate_profiles(data) if watcher else data
+
     def session_key(self):
         cookies = SimpleCookie()
         try:
@@ -238,6 +263,14 @@ class Handler(BaseHTTPRequestHandler):
                 query = parse_qs(urlsplit(self.path).query)
                 self.validation_log((query.get('id') or [''])[0])
                 return
+            if self.path.startswith('/api/validation/artifact?'):
+                query = parse_qs(urlsplit(self.path).query)
+                self.validation_artifact((query.get('id') or [''])[0], (query.get('kind') or ['static'])[0])
+                return
+            if self.path == '/api/build':
+                from build_identity import snapshot as build_snapshot
+                self.reply(200, build_snapshot())
+                return
             if self.path == '/api/resources':
                 self.reply(200, resources.snapshot())
                 return
@@ -286,10 +319,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.reply(200, self.server.organizations.state_snapshot())
                     return
                 if self.path == '/api/organizations/directory':
-                    self.reply(200, self.server.organizations.snapshot(directory=True))
+                    self.reply(200, self.organization_snapshot(directory=True))
                     return
                 if self.path == '/api/organizations':
-                    self.reply(200, self.server.organizations.snapshot())
+                    self.reply(200, self.organization_snapshot())
                     return
                 agents = listing(command('agent', 'list'), 'agents')
                 if getattr(self.server, 'organizations', None) is not None:
@@ -386,7 +419,7 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'remove_agent', 'remove_group')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/updates/promote', '/api/updates/rollback', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -428,7 +461,7 @@ class Handler(BaseHTTPRequestHandler):
                     from base_updates import update
                     self.reply(200, update(PROJECTS, body, actor, role, self.server.organizations.checkout_in_use))
                 else:
-                    self.reply(200, project_git.inspect(PROJECTS, body))
+                    self.reply(200, self.server.integration.annotate_worktrees(project_git.inspect(PROJECTS, body)))
                 if body.get('action') in ('fetch', 'update_base'):
                     self.server.integration.wake()
             elif self.path == '/api/projects/browse':
@@ -441,6 +474,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, self.server.updates.snapshot(force=True))
             elif self.path == '/api/updates/install':
                 self.reply(200, self.server.updates.install(body))
+            elif self.path == '/api/updates/promote':
+                if role != 'admin':
+                    raise ValueError('Only an administrator can deploy a build.')
+                run_id = body.get('run_id') if isinstance(body, dict) else None
+                archive, manifest = self.server.validation.artifact(run_id, 'deployment')
+                self.reply(200, self.server.updates.promote(manifest, archive, actor))
+            elif self.path == '/api/updates/rollback':
+                if role != 'admin':
+                    raise ValueError('Only an administrator can roll back a deployment.')
+                self.reply(200, self.server.updates.rollback(actor))
             elif self.path == '/api/herdr-server/start':
                 self.reply(200, self.server.herdr_server.start(body))
             elif self.path == '/api/dashboard-access':

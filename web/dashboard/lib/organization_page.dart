@@ -460,6 +460,12 @@ class _OrganizationPageState extends State<OrganizationPage> {
                                       context,
                                     ).textTheme.titleMedium,
                                   ),
+                                  if (profile['coordination_binding'] != null)
+                                    Text(
+                                      profile['coordination_binding'] == 'used'
+                                          ? 'Used by coordination: ${(profile['coordination_repositories'] as List).join(', ')}'
+                                          : 'Inactive coordinator profile · no repository binding',
+                                    ),
                                   const SizedBox(height: 8),
                                   Text(
                                     'Model: ${savedModelLabel(profile)}',

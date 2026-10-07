@@ -108,12 +108,18 @@ class _UpdateCardState extends State<UpdateCard> {
               'Installed: ${info!['installed']} · Latest: ${info!['latest']}',
             ),
             Text('Status: ${info!['state']}'),
+            if (info!['check_error'] != null)
+              Text('Release lookup unavailable: ${info!['check_error']}'),
             if (info!['state'] == 'complete')
               const Text(
                 'Update complete. Reload this page to use the new dashboard.',
               ),
             if (info!['error'] != null) Text('${info!['error']}'),
-            if (info!['supported'] != true)
+            if (info!['deployment_mode'] == 'local')
+              const Text(
+                'Release installation is disabled while a local build is deployed.',
+              )
+            else if (info!['supported'] != true)
               const Text(
                 'Install the updater service in this container before using dashboard updates.',
               ),

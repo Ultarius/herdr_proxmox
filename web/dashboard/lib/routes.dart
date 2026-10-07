@@ -7,6 +7,18 @@ import 'logs_page.dart';
 import 'app_shell.dart';
 import 'group_page.dart';
 import 'project_explorer_page.dart';
+import 'builds_page.dart';
+
+class BuildsRoute extends AppRoute {
+  @override
+  Uri toUri() => Uri.parse('/builds');
+  @override
+  Widget build(AppCoordinator coordinator, BuildContext context) => AppShell(
+    coordinator: coordinator,
+    section: 'builds',
+    child: const BuildsPage(),
+  );
+}
 
 class GroupRoute extends AppRoute {
   GroupRoute(this.id);
@@ -128,6 +140,7 @@ class AppCoordinator extends Coordinator<AppRoute> {
       '/agents' => AgentsRoute(),
       '/organization' => OrganizationRoute(),
       '/configuration' => CliSetupRoute(),
+      '/builds' => BuildsRoute(),
       '/logs' => LogsRoute(),
       '/explorer' => ExplorerRoute(uri.queryParameters['path'] ?? ''),
       _ => NotFoundRoute(uri),

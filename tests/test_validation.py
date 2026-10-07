@@ -126,6 +126,67 @@ class ValidationRunTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'not found'):
             self.runs.log('d' * 32)
 
+    @unittest.skipUnless(BASH, 'a POSIX bash is unavailable')
+    def test_success_retains_exact_build_artifact_after_checkout_cleanup(self):
+        import tarfile
+        (self.repository / 'scripts/build-web.sh').write_text(
+            '#!/bin/sh\nmkdir -p web/public\necho built > web/public/index.html\n')
+        self.target = commit(self.repository, 'static output')
+        with patch.object(validation, 'BASH', BASH):
+            run = self.submit_and_wait()
+        self.assertEqual(run['state'], 'complete')
+        self.assertEqual(run['artifact']['target'], self.target)
+        self.assertFalse(run['artifact']['deployment_authorized'])
+        folder = self.runs.root / run['id']
+        self.assertFalse((folder / 'tree').exists())
+        with tarfile.open(folder / 'artifact.tar.gz') as archive:
+            self.assertEqual(archive.extractfile('index.html').read(), b'built\n')
+        self.assertEqual(json.loads((folder / 'manifest.json').read_text()), run['artifact'])
+        archive, manifest = self.runs.artifact(run['id'])
+        self.assertEqual(manifest['target'], self.target)
+        archive.write_bytes(b'tampered')
+        with self.assertRaisesRegex(ValueError, 'size mismatch'):
+            self.runs.artifact(run['id'])
+
+    def test_artifact_download_requires_retained_complete_build(self):
+        with self.assertRaisesRegex(ValueError, 'Invalid'):
+            self.runs.artifact('../escape')
+        with self.assertRaisesRegex(ValueError, 'No retained'):
+            self.runs.artifact('d' * 32)
+
+    def test_artifact_size_limit_rejects_before_packaging(self):
+        tree = Path(self.temp.name) / 'output'
+        source = tree / 'web/public'
+        source.mkdir(parents=True)
+        (source / 'index.html').write_text('too large')
+        with patch.object(validation, 'ARTIFACT_LIMIT', 1):
+            with self.assertRaisesRegex(ValueError, 'retention limit'):
+                self.runs._retain_artifact(tree, tree, {})
+
+    @unittest.skipUnless(BASH, 'a POSIX bash is unavailable')
+    def test_retention_failure_keeps_the_passing_build_distinct(self):
+        (self.repository / 'scripts/build-web.sh').write_text(
+            '#!/bin/sh\nmkdir -p web/public\necho built > web/public/index.html\n')
+        self.target = commit(self.repository, 'static output')
+        with patch.object(validation, 'BASH', BASH), patch.object(validation, 'ARTIFACT_LIMIT', 1):
+            run = self.submit_and_wait()
+        self.assertEqual((run['state'], run['exit_code']), ('complete', 0))
+        self.assertNotIn('artifact', run)
+        self.assertIn('retention limit', run['artifact_error'])
+        _, content = self.runs.log(run['id'])
+        self.assertIn('Artifact retention failed', content)
+
+    @unittest.skipUnless(BASH and os.name != 'nt', 'a POSIX bash is unavailable')
+    def test_artifact_symlinks_are_rejected_after_a_passing_build(self):
+        (self.repository / 'scripts/build-web.sh').write_text(
+            '#!/bin/sh\nmkdir -p web/public\nln -s /etc web/public/escape\necho built > web/public/index.html\n')
+        self.target = commit(self.repository, 'linked output')
+        with patch.object(validation, 'BASH', BASH):
+            run = self.submit_and_wait()
+        self.assertEqual(run['state'], 'complete')
+        self.assertNotIn('artifact', run)
+        self.assertIn('symlinks', run['artifact_error'])
+
     def test_restart_marks_incomplete_runs_interrupted(self):
         folder = self.runs.root / ('c' * 32)
         folder.mkdir(parents=True)

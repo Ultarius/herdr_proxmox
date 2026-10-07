@@ -364,6 +364,7 @@ class _AppShellState extends State<AppShell> {
           ),
           nav('Terminal logs', Icons.subject, LogsRoute(), 'logs'),
           nav('CLI accounts', Icons.terminal, CliSetupRoute(), 'configuration'),
+          nav('Builds & deployments', Icons.build_outlined, BuildsRoute(), 'builds'),
           heading('AGENTS'),
           if (profiles.isEmpty)
             Padding(

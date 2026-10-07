@@ -453,26 +453,31 @@ class _ProjectGitPanelState extends State<ProjectGitPanel> {
           if ((tree['base_behind'] as int? ?? 0) > 0) ...[
             const SizedBox(height: 12),
             Text(
-              '${tree['base_behind']} commits behind ${tree['base']} — integrate when your work is ready.',
+              tree['checkout_role'] == 'coordinator'
+                  ? '${tree['base_behind']} commits behind ${tree['base']}. Coordinator checkout — reporting is independent of its age.'
+                  : tree['checkout_role'] == 'shared'
+                  ? 'Main behind · ${tree['base_behind']} commits. Update base branch when ready.'
+                  : '${tree['base_behind']} commits behind ${tree['base']} — worker needs to incorporate changes when ready.',
               style: const TextStyle(color: Color(0xfff1c75b)),
             ),
-            TextButton.icon(
-              onPressed: () async {
-                final message = await copyTextOrDownload(
-                  noticeFor(tree).instructions,
-                  'merge-instructions.md',
-                  copied: 'Merge instructions copied.',
-                  downloaded:
-                      'Clipboard unavailable over HTTP; merge instructions downloaded instead.',
-                );
-                if (context.mounted)
-                  ScaffoldMessenger.of(
-                    context,
-                  ).showSnackBar(SnackBar(content: Text(message)));
-              },
-              icon: const Icon(Icons.copy_outlined),
-              label: const Text('Copy merge instructions'),
-            ),
+            if (tree['checkout_role'] != 'coordinator')
+              TextButton.icon(
+                onPressed: () async {
+                  final message = await copyTextOrDownload(
+                    noticeFor(tree).instructions,
+                    'merge-instructions.md',
+                    copied: 'Merge instructions copied.',
+                    downloaded:
+                        'Clipboard unavailable over HTTP; merge instructions downloaded instead.',
+                  );
+                  if (context.mounted)
+                    ScaffoldMessenger.of(
+                      context,
+                    ).showSnackBar(SnackBar(content: Text(message)));
+                },
+                icon: const Icon(Icons.copy_outlined),
+                label: const Text('Copy merge instructions'),
+              ),
           ],
           if ((tree['conflicts'] as int? ?? 0) > 0)
             Text(
@@ -488,7 +493,8 @@ class _ProjectGitPanelState extends State<ProjectGitPanel> {
                 'Agent: ${agent['display_name'] ?? agent['name']} · ${agent['agent_status'] ?? 'unknown'}',
               ),
             ),
-          if ((tree['base_behind'] as int? ?? 0) > 0)
+          if ((tree['base_behind'] as int? ?? 0) > 0 &&
+              tree['checkout_role'] != 'coordinator')
             for (final agent in connection.state.agents.where(
               (a) => a['cwd'] == tree['cwd'] && a['profile_id'] != null,
             ))

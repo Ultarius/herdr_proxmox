@@ -9,14 +9,18 @@ the run finishes.
 """
 from datetime import datetime, timezone
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
 import secrets
 import signal
+import stat
 import shutil
 import subprocess
 import threading
+import time
+import tarfile
 
 import project_git
 from project_files import project_directory
@@ -29,6 +33,7 @@ TARGET = re.compile(r'(?:[a-f0-9]{40}|[a-f0-9]{64})')
 TIMEOUT_SECONDS = 1800
 OUTPUT_LIMIT = 200_000
 HISTORY = 20
+ARTIFACT_LIMIT = 256 * 1024 * 1024
 
 
 def stamp():
@@ -93,6 +98,34 @@ class ValidationRuns:
             content = 'No log was recorded for this run.\n'
         return run, content
 
+    def artifact(self, run_id, kind='static'):
+        if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+            raise ValueError('Invalid validation run ID.')
+        folder = self.root / run_id
+        if kind not in ('static', 'deployment'):
+            raise ValueError('Invalid artifact kind.')
+        archive = folder / ('artifact.tar.gz' if kind == 'static' else 'deployment.tar.gz')
+        if folder.is_symlink() or archive.is_symlink():
+            raise ValueError('Invalid artifact path.')
+        run = self._read(folder)
+        manifest = run.get('artifact' if kind == 'static' else 'deployment_package') if isinstance(run, dict) else None
+        if not isinstance(manifest, dict) or run.get('state') != 'complete':
+            raise ValueError('No retained artifact is available.')
+        if manifest.get('build_id') != run_id or manifest.get('target', manifest.get('source_sha')) != run.get('target'):
+            raise ValueError('Artifact identity mismatch.')
+        try:
+            if archive.stat().st_size != manifest.get('bytes') or archive.stat().st_size > ARTIFACT_LIMIT + 1_000_000:
+                raise ValueError('Artifact size mismatch.')
+            digest = hashlib.sha256()
+            with archive.open('rb') as stream:
+                for chunk in iter(lambda: stream.read(65536), b''):
+                    digest.update(chunk)
+            if digest.hexdigest() != manifest.get('sha256'):
+                raise ValueError('Artifact checksum mismatch.')
+        except OSError as error:
+            raise ValueError('Retained artifact is unavailable.') from error
+        return archive, manifest
+
     def submit(self, body, actor='dashboard_operator'):
         if not isinstance(body, dict) or not EVENT_ID.fullmatch(str(body.get('id', ''))):
             raise ValueError('Select an integration event to validate.')
@@ -135,6 +168,7 @@ class ValidationRuns:
                                        stderr=subprocess.STDOUT, start_new_session=os.name != 'nt',
                                        env=dict(os.environ, CI='1', GIT_TERMINAL_PROMPT='0'))
             tail = bytearray()
+            published = [0.0]
             def collect():
                 while True:
                     chunk = process.stdout.read(4096)
@@ -143,6 +177,19 @@ class ValidationRuns:
                     tail.extend(chunk)
                     if len(tail) > OUTPUT_LIMIT:
                         del tail[:-OUTPUT_LIMIT]
+                    # Publish a bounded live tail at most once per second; never
+                    # buffer the entire build or rewrite the log per chunk.
+                    now = time.monotonic()
+                    if now - published[0] < 1.0:
+                        continue
+                    published[0] = now
+                    temporary_log = folder / 'log.tmp'
+                    try:
+                        temporary_log.write_bytes(tail)
+                        temporary_log.replace(log_path)
+                    except OSError:
+                        # Keep draining stdout even when log storage fails.
+                        pass
             reader = threading.Thread(target=collect, daemon=True)
             reader.start()
             try:
@@ -164,6 +211,19 @@ class ValidationRuns:
             state = 'complete' if exit_code == 0 else 'failed'
             lines.extend((bytes(tail).decode('utf-8', errors='replace'),
                           f"\n\nValidation exited with status {exit_code}.\n"))
+            if exit_code == 0:
+                try:
+                    run['artifact'] = self._retain_artifact(worktree, folder, run)
+                except (ValueError, OSError) as error:
+                    # The build passed; only retention failed. Keep that distinct
+                    # from a validation failure and without deployable evidence.
+                    run['artifact_error'] = str(error)[:500]
+                    lines.append(f'Artifact retention failed: {error}\n')
+                try:
+                    from deployment_package import retain
+                    run['deployment_package'] = retain(worktree, folder, dict(run, exit_code=exit_code))
+                except (ValueError, OSError) as error:
+                    run['deployment_package_error'] = str(error)[:500]
         except subprocess.TimeoutExpired:
             lines.append(bytes(tail).decode('utf-8', errors='replace'))
             state = 'error'
@@ -192,6 +252,52 @@ class ValidationRuns:
         if not path.is_absolute():
             path = Path(self.projects) / path
         return project_directory(self.projects, path)
+
+    def _retain_artifact(self, worktree, folder, run):
+        """Retain static output only; this is evidence, not deployment authority."""
+        source = worktree / 'web/public'
+        if not source.is_dir():
+            return None
+        if source.is_symlink() or source.parent.is_symlink():
+            raise ValueError('Build artifact must not use symlinks.')
+        files, total = [], 0
+        # followlinks=False keeps a linked directory from being traversed or
+        # looped before the symlink itself is rejected.
+        for current, directories, names in os.walk(source, followlinks=False):
+            current = Path(current)
+            directories.sort()
+            for name in directories:
+                if (current / name).is_symlink():
+                    raise ValueError('Build artifact must not use symlinks.')
+            for name in sorted(names):
+                path = current / name
+                if path.is_symlink():
+                    raise ValueError('Build artifact must not use symlinks.')
+                metadata = path.lstat()
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError('Build artifact requires regular files.')
+                total += metadata.st_size
+                if total > ARTIFACT_LIMIT:
+                    raise ValueError('Build artifact exceeds the retention limit.')
+                files.append(path)
+                if len(files) > 20000:
+                    raise ValueError('Build artifact exceeds the file count limit.')
+        temporary = folder / 'artifact.tmp'
+        with tarfile.open(temporary, 'w:gz') as archive:
+            for path in files:
+                archive.add(path, arcname=path.relative_to(source).as_posix(), recursive=False)
+        digest = hashlib.sha256()
+        with temporary.open('rb') as artifact:
+            for chunk in iter(lambda: artifact.read(65536), b''):
+                digest.update(chunk)
+        manifest = dict(build_id=run['id'], target=run['target'], command=run['command'],
+                        repository=run['repository'], created_at=stamp(),
+                        sha256=digest.hexdigest(), bytes=temporary.stat().st_size,
+                        file_count=len(files), validation_exit_code=0,
+                        deployment_authorized=False)
+        temporary.replace(folder / 'artifact.tar.gz')
+        (folder / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+        return manifest
 
     def _worktree(self, checkout, worktree, target):
         project_git.git(checkout, 'worktree', 'add', '--detach', str(worktree), target, timeout=max(self.timeout, 60))

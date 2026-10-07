@@ -123,6 +123,41 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(watcher.refresh(), [])
         self.assertEqual(watcher.snapshot()['alerts'], [])
 
+    def test_coordinator_drift_is_status_only_and_workers_remain_actionable(self):
+        from unittest.mock import Mock
+        self.advance_main()
+        watcher = self.watcher([('summary', 'r1', 'Coordinator', str(self.repo)),
+                                ('worker', 'r2', 'Max', str(self.repo))])
+        watcher.coordinator = Mock()
+        watcher.coordinator.snapshot.return_value = {'configurations': [
+            {'profile_id': 'summary', 'coordinator_path': str(self.repo)}]}
+        watcher.coordinator.tick.return_value = False
+        notices = watcher.refresh()
+        self.assertEqual([n['profile_id'] for n in notices], ['worker'])
+        watcher.coordinator.observe.assert_called_once_with(notices)
+        self.assertEqual(watcher.snapshot()['alerts'], notices)
+        data = watcher.annotate_worktrees({'repository_path': 'repo', 'worktrees': [
+            {'path': 'repo', 'cwd': str(self.repo)},
+            {'path': 'other', 'cwd': str(self.root / 'other')}]})
+        self.assertEqual([t['checkout_role'] for t in data['worktrees']], ['coordinator', 'worker'])
+        watcher.coordinator.snapshot.return_value = {'configurations': []}
+        self.assertEqual(watcher.annotate_worktrees(data)['worktrees'][0]['checkout_role'], 'shared')
+
+    def test_coordinator_labels_use_profile_binding_not_duplicate_name(self):
+        from unittest.mock import Mock
+        watcher = self.watcher([])
+        watcher.coordinator = Mock()
+        watcher.coordinator.snapshot.return_value = {'configurations': [{'profile_id': 'used', 'repository': 'repo'}]}
+        result = watcher.annotate_profiles({'profiles': [
+            {'id': 'used', 'name': 'Same name', 'role': 'Integration coordinator'},
+            {'id': 'other', 'name': 'Same name', 'role': 'Integration coordinator'},
+            {'id': 'worker', 'name': 'Same name', 'role': 'Developer'},
+        ]})['profiles']
+        self.assertEqual(result[0]['coordination_binding'], 'used')
+        self.assertEqual(result[0]['coordination_repositories'], ['repo'])
+        self.assertEqual(result[1]['coordination_binding'], 'inactive')
+        self.assertNotIn('coordination_binding', result[2])
+
     def test_unmerged_conflicts_and_in_progress_merge_are_reported(self):
         self.run_git('checkout', '-b', 'feature')
         (self.repo / 'file.txt').write_text('feature\n')

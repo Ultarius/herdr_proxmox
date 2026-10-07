@@ -77,6 +77,8 @@ class IntegrationWatcher:
     def refresh(self):
         found = []
         measured = {}
+        configs = self.coordinator.snapshot()['configurations'] if self.coordinator else []
+        coordinator_ids = {c.get('profile_id') for c in configs}
         for profile_id, run_id, name, path in self.checkouts()[:LIMIT]:
             try:
                 key = str(Path(path).resolve())
@@ -87,7 +89,10 @@ class IntegrationWatcher:
                 found.append(dict(profile_id=profile_id, run_id=run_id, name=name,
                                   path=str(path), error=str(error)))
         # Only actionable drift is kept; clean checkouts produce no notice.
+        for notice in found:
+            notice['checkout_role'] = 'coordinator' if notice['profile_id'] in coordinator_ids else 'worker'
         notices = [n for n in found
+                   if n['checkout_role'] != 'coordinator'
                    if n.get('behind') or n.get('conflicts') or n.get('merging') or n.get('error')]
         with self.lock:
             now = time.monotonic()
@@ -99,6 +104,32 @@ class IntegrationWatcher:
             if self.coordinator.tick():
                 self.wake()
         return notices
+
+    def annotate_worktrees(self, data):
+        """Checkout age is status, not an integration request for a summary agent."""
+        configs = self.coordinator.snapshot()['configurations'] if self.coordinator else []
+        paths = {str(Path(c['coordinator_path']).resolve()) for c in configs if c.get('coordinator_path')}
+        for tree in data.get('worktrees', []):
+            cwd = tree.get('cwd')
+            tree['checkout_role'] = ('coordinator' if cwd and str(Path(cwd).resolve()) in paths
+                                     else 'shared' if tree.get('path') == data.get('repository_path')
+                                     else 'worker')
+        return data
+
+    def annotate_profiles(self, data):
+        """Expose binding by profile ID; duplicate display names are harmless."""
+        configs = self.coordinator.snapshot()['configurations'] if self.coordinator else []
+        bindings = {}
+        for config in configs:
+            bindings.setdefault(config.get('profile_id'), []).append(config.get('repository'))
+        for profile in data.get('profiles', []):
+            repositories = bindings.get(profile.get('id'), [])
+            profile['coordination_repositories'] = repositories
+            if repositories:
+                profile['coordination_binding'] = 'used'
+            elif str(profile.get('role') or '').lower() == 'integration coordinator':
+                profile['coordination_binding'] = 'inactive'
+        return data
 
     def notice(self, profile_id, run_id, name, path):
         directory = Path(path).resolve()
