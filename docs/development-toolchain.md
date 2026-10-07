@@ -38,9 +38,16 @@ or opt into the existing automatic SDK policy; the root worker executes it.
 
 ## What an agent does with a missing tool
 
-The worker instructions (`skills/herdr-worktree-integration/SKILL.md`) describe
-the procedure in full. Development task launches also receive that section;
-integration merge/retry prompts receive the full skill. In short: install it yourself, pinned and
+The worker bundle (`web/gateway/skills/herdr-worktree-integration/`) has a small
+`SKILL.md` routing entry and full references for merge, tools, validation and
+reporting. `.agents/skills/herdr-worktree-integration/SKILL.md` is the project
+discovery entry linking to that canonical bundle, without duplicated procedures.
+Integration prompts include the routing entry with absolute deployed reference
+paths, so older worktrees need not contain the new project skill. Task launches
+receive only the tool-reference location. Detail is loaded when needed, not
+flattened into the 8,000-character chat request. CLI discovery and file access
+depend on the runtime and profile permissions; report unreadable resources
+rather than bypassing permissions. In short: install it yourself, pinned and
 integrity-verified, inside a task-specific cache or environment; run the check for real;
 report the commands, their real exit status, and the version and location you
 installed. A check that could not run is `not_run`, never `passed`.

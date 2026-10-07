@@ -19,7 +19,16 @@ APPROVAL_TTL_SECONDS = 24 * 60 * 60
 def merge_skill():
     # Deliver the bundled procedure even when the worker's older checkout lacks
     # project-local skills. It grants no extra OpenCode permissions.
-    return (Path(__file__).parent / 'skills/herdr-worktree-integration/SKILL.md').read_text(encoding='utf-8')
+    directory = Path(__file__).parent / 'skills/herdr-worktree-integration'
+    entry = (directory / 'SKILL.md').read_text(encoding='utf-8')
+    # An existing worker may have an older checkout without these files.
+    # Anchor references to the deployed bundle; never flatten them into chat.
+    for name in ('merge.md', 'tools.md', 'validation.md', 'report.md'):
+        resource = directory / 'references' / name
+        if resource.is_symlink() or not resource.is_file():
+            raise ValueError('Worker skill reference is missing or unsafe: ' + name)
+        entry = entry.replace('(references/' + name + ')', '(' + resource.resolve().as_posix() + ')')
+    return entry
 
 
 def merge_mode(checkout, target):

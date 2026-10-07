@@ -33,16 +33,16 @@ REQUEST = re.compile(r'[A-Za-z0-9_-]{1,64}')
 def task_tool_guidance():
     """Share tool acquisition policy without issuing a merge request to a task.
 
-    The policy lives once, in the worker skill; this extracts just the section a
-    development task needs. A missing section is an inconsistent installation and
-    must say so, not surface as an index error during a launch.
+    The detailed policy lives once in a reference file. Pass its location, not
+    its contents, so development tasks load it only when a tool is missing.
     """
-    skill = (Path(__file__).parent / 'skills/herdr-worktree-integration/SKILL.md').read_text(encoding='utf-8')
-    marker = '## Missing tools and validation failures\n'
-    if marker not in skill:
-        raise ValueError('Worker skill is missing its tool policy section; reinstall the dashboard release.')
-    section = skill.split(marker, 1)[1]
-    return section.split('\n## Validation failures and permission requests', 1)[0].strip()
+    resource = Path(__file__).parent / 'skills/herdr-worktree-integration/references/tools.md'
+    if resource.is_symlink() or not resource.is_file():
+        raise ValueError('Worker skill tool reference is missing or unsafe; reinstall the dashboard release.')
+    return ('Before obtaining missing task tools, read ' + resource.resolve().as_posix() + '. '
+            'Pin and verify tools within existing permissions in task-specific environments; '
+            'agents share the herdr account. Report actual checks and installation failures. '
+            'If the reference cannot be read, report its exact path; do not broaden permissions.')
 
 # A background status poll must never hold a task long, and must never wait
 # long enough to delay validation feedback delivery.

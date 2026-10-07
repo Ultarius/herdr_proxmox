@@ -36,6 +36,10 @@ class Store:
             raise ValueError('Busy')
 
     def action(self, name, body):
+        # Mirror the real chat boundary; a permissive double hid oversized
+        # bundled instructions and left live retries queued indefinitely.
+        if len(body.get('prompt', '')) > 8000:
+            raise ValueError('Invalid prompt (maximum 8000 characters).')
         if body['request_id'] in self.requests:
             return self.requests[body['request_id']]
         self.calls.append(body)
@@ -277,8 +281,10 @@ class CoordinatorTests(unittest.TestCase):
         self.service.tick()
         merge = self.store.calls[-1]
         self.assertEqual(merge['profile_id'], 'worker')
-        self.assertIn('git merge --no-edit <target>', merge['prompt'])
-        self.assertIn('Missing required suites/toolchains', merge['prompt'])
+        reference = Path(__file__).parents[1] / 'web/gateway/skills/herdr-worktree-integration/references/merge.md'
+        self.assertIn(reference.resolve().as_posix(), merge['prompt'])
+        self.assertIn('git merge --no-edit <target>', reference.read_text(encoding='utf-8'))
+        self.assertIn('Missing required suites/toolchains', reference.read_text(encoding='utf-8'))
         self.store.jobs[self.event()['job_id']].update(state='answered', result=json.dumps({
             'outcome': 'integrated', 'tests': {'status': 'passed', 'summary': 'unit tests passed'}}))
         with patch('integration_coordinator.project_git.git', return_value='0'), patch(
@@ -466,7 +472,9 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIn('Do not merge again', prompt)
         self.assertIn('Do not edit tests', prompt)
         self.assertIn('Report test isolation defects', prompt)
-        self.assertIn('Do not request broad access such as `/etc/*`', prompt)
+        reference = Path(__file__).parents[1] / 'web/gateway/skills/herdr-worktree-integration/references/validation.md'
+        self.assertIn(reference.resolve().as_posix(), prompt)
+        self.assertIn('Do not request broad access such as `/etc/*`', reference.read_text(encoding='utf-8'))
         self.assertEqual(self.store.calls[-1]['profile_id'], 'worker')
         self.store.jobs[self.event()['job_id']].update(state='answered', result=json.dumps({
             'outcome': 'integrated', 'tests': {'status': 'passed', 'summary': 'All required checks passed'}}))

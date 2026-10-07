@@ -171,9 +171,10 @@ class ContributionTests(unittest.TestCase):
         self.assertEqual(arguments['worktree_branch'], self.task['branch'])
         prompt = arguments['task_prompt']
         self.assertIn('Task-local tool acquisition policy:', prompt)
-        self.assertIn('Pin the version required by the repository', prompt)
-        self.assertIn('Agents currently share the', prompt)
-        self.assertIn('A check that never ran remains `not_run`', prompt)
+        resource = Path(contributions.__file__).parent / 'skills/herdr-worktree-integration/references/tools.md'
+        self.assertIn(resource.resolve().as_posix(), prompt)
+        self.assertTrue(resource.is_file())
+        self.assertNotIn(resource.read_text(encoding='utf-8').strip(), prompt)
         self.assertNotIn('## Merge procedure', prompt)
         self.assertIn('Never push', arguments['task_prompt'])
         self.assertEqual(project_git.configured_base(self.repo), self.task['base_ref'])
@@ -190,8 +191,8 @@ class ContributionTests(unittest.TestCase):
         self.assertGreater(cap, 8000 + len(contributions.task_tool_guidance()) + 500)
 
     def test_tool_policy_extraction_reports_an_inconsistent_installation(self):
-        with patch.object(contributions.Path, 'read_text', return_value='# incomplete skill'):
-            with self.assertRaisesRegex(ValueError, 'missing its tool policy section'):
+        with patch.object(contributions.Path, 'is_file', return_value=False):
+            with self.assertRaisesRegex(ValueError, 'tool reference is missing'):
                 contributions.task_tool_guidance()
 
     def test_candidate_preserves_main_and_blocks_dirty_or_changed_checkout(self):
