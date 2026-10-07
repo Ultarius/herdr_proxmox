@@ -9,6 +9,14 @@ import build_identity
 
 
 class BuildIdentityTests(unittest.TestCase):
+    def test_legacy_version_is_exposed_without_inventing_source_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'VERSION').write_text('v0.0.23')
+            data = build_identity.snapshot(root)
+            self.assertEqual(data['build_id'], 'v0.0.23')
+            self.assertIsNone(data['source_sha'])
+
     def test_identity_is_deployment_metadata_not_repository_head(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

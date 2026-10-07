@@ -270,12 +270,31 @@ and removed when the process exits normally; no real agent is launched.
 For an existing CT, copy `web/public`, the complete `web/gateway` directory,
 `install/web-install.sh`, `install/dashboard-update.py`, `install/sdk-install.py`,
 `install/operator-admin.py`, `install/dev-tools-install.sh`,
-`install/flutter-release.py`, and the release's `VERSION` file into the same
-layout under `/opt/herdr-web`, then run:
+`install/flutter-release.py`, `install/build-install.sh`, and the release's
+`VERSION` file into the same layout under `/opt/herdr-web`, then run:
 
 ```bash
 bash /opt/herdr-web/install/web-install.sh
 ```
+
+The optional durable build service is a separate explicit root step. It requires
+the pinned SDK and delegated CPU/memory cgroups, and refuses to enable itself
+without them:
+
+```bash
+bash /opt/herdr-web/install/build-install.sh
+```
+
+It runs one exact-commit build at a time as `herdr` under CPU, memory, task and
+I/O budgets, and records per-check evidence in each build manifest. Dashboard
+builds fall back to the in-process runner when it is not installed.
+
+After enabling the service, an administrator can enable **Build incorporated
+commits automatically** under **Git changes → Integration coordinator** for a
+repository. This setting is off by default and requires enabled coordination
+and gateway-confirmed incorporation. Full queues wait visibly; failed builds
+require an explicit retry. Results appear in **Builds & deployments** without
+an open browser. Deployment remains a separate administrator action.
 
 After installing this version once, **CLI configuration → Dashboard updates**
 checks GitHub for stable `vMAJOR.MINOR.PATCH` releases with both packaged assets.

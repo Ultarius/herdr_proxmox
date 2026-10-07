@@ -61,7 +61,10 @@ def retain(tree, folder, run):
             digest.update(chunk)
     manifest = dict(identity, sha256=digest.hexdigest(), bytes=temporary.stat().st_size,
                     file_count=len(files) + 2, validation_exit_code=run['exit_code'] if 'exit_code' in run else 0,
-                    deployment_authorized=False, required_checks_verified=False)
+                    deployment_authorized=False, checks=run.get('checks', []),
+                    toolchain_pin=run.get('toolchain_pin'),
+                    task_id=run.get('task_id'), validation_waiver=run.get('validation_waiver'),
+                    required_checks_verified=run.get('required_checks_verified', False))
     temporary.replace(folder / 'deployment.tar.gz')
     (folder / 'deployment-manifest.json').write_text(json.dumps(manifest, indent=2))
     return manifest

@@ -147,7 +147,7 @@ class IntegrationTests(unittest.TestCase):
         from unittest.mock import Mock
         watcher = self.watcher([])
         watcher.coordinator = Mock()
-        watcher.coordinator.snapshot.return_value = {'configurations': [{'profile_id': 'used', 'repository': 'repo'}]}
+        watcher.coordinator.configuration_records.return_value = [{'profile_id': 'used', 'repository': 'repo'}]
         result = watcher.annotate_profiles({'profiles': [
             {'id': 'used', 'name': 'Same name', 'role': 'Integration coordinator'},
             {'id': 'other', 'name': 'Same name', 'role': 'Integration coordinator'},
@@ -157,6 +157,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(result[0]['coordination_repositories'], ['repo'])
         self.assertEqual(result[1]['coordination_binding'], 'inactive')
         self.assertNotIn('coordination_binding', result[2])
+        watcher.coordinator.snapshot.assert_not_called()
 
     def test_unmerged_conflicts_and_in_progress_merge_are_reported(self):
         self.run_git('checkout', '-b', 'feature')

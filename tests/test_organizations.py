@@ -8,6 +8,7 @@ import unittest
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 import uuid
+from types import SimpleNamespace
 
 spec = importlib.util.spec_from_file_location('organization_gateway', Path(__file__).parents[1] / 'web/gateway/server.py')
 gateway = importlib.util.module_from_spec(spec)
@@ -392,6 +393,18 @@ class OrganizationTests(unittest.TestCase):
             snapshot = json.load(urlopen(Request(base, headers=headers)))
             self.assertEqual(snapshot['profiles'][0]['name'], 'Maya')
             self.assertEqual(self.calls, [])
+            from integration import IntegrationWatcher
+            watcher = object.__new__(IntegrationWatcher)
+            watcher.coordinator = SimpleNamespace(configuration_records=lambda: [
+                {'profile_id': snapshot['profiles'][0]['id'], 'repository': 'repo'}])
+            server.integration = watcher
+            # The roster polls the compact state endpoint, not the full snapshot.
+            # Both must expose the same binding without embedding coordination.
+            for endpoint in (base, base + '/state'):
+                labelled = json.load(urlopen(Request(endpoint, headers=headers)))
+                self.assertEqual(labelled['profiles'][0]['coordination_binding'], 'used')
+                self.assertEqual(labelled['profiles'][0]['coordination_repositories'], ['repo'])
+                self.assertNotIn('integration', labelled)
             with self.assertRaises(HTTPError) as error:
                 urlopen(Request(base + '/save', headers={**headers, 'Origin': 'https://other.example'}, data=json.dumps(body).encode()))
             self.assertEqual(error.exception.code, 403)

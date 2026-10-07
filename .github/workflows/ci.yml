@@ -93,6 +93,7 @@ jobs:
           cp -R ct install "$RUNNER_TEMP/package/herdr-proxmox/"
           cp README.md "$RUNNER_TEMP/package/herdr-proxmox/"
           printf '%s\n' '${{ github.ref_name }}' > "$RUNNER_TEMP/package/herdr-proxmox/VERSION"
+          python3 -c 'import json,os,sys; from pathlib import Path; Path(sys.argv[1]).write_text(json.dumps(dict(build_id=os.environ["GITHUB_REF_NAME"], source_sha=os.environ["GITHUB_SHA"], package_version=os.environ["GITHUB_REF_NAME"], deployment_mode="release")))' "$RUNNER_TEMP/package/herdr-proxmox/BUILD.json"
           cp -R web/gateway web/public "$RUNNER_TEMP/package/herdr-proxmox/web/"
           tar -czf herdr-proxmox.tar.gz -C "$RUNNER_TEMP/package" herdr-proxmox
           sha256sum herdr-proxmox.tar.gz > herdr-proxmox.tar.gz.sha256

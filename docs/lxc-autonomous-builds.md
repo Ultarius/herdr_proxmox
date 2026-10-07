@@ -2,6 +2,51 @@
 
 Research and live verification: 7 October 2026.
 
+## Evidence and queue implementation
+
+The runner executes discovered scripts independently under one total timeout.
+Each script has runner-observed duration/exit evidence. HERDR_CHECK_REPORT adds
+bounded JSONL records attributed to the script, not to an independent verifier.
+build-web.sh now reports its individual checks and planned checks it did not run.
+Passed, failed, unavailable, not_run, skipped and waived remain distinct; only
+required passing checks with exit zero satisfy required_checks_verified.
+Both artifact manifests and coordinator feedback retain checks[]. The dashboard
+shows check results and warns about non-passing evidence before manual promotion.
+
+The optional build_queue stores requests in SQLite, deduplicates repository/SHA/
+policy/toolchain, bounds pending plus active jobs to one, records attempts and
+keeps event subscribers. Restarted running jobs become interrupted. An explicit
+retry creates a new attempt; repeated requests for queued/running attempts return
+the same job. The worker runs without a browser and gateway polls publish durable
+result feedback to each linked integration event without rerunning the build.
+
+install/build-install.sh is explicit root bootstrap, not repository code executed
+by the build worker. It configures an unprivileged systemd service with CPUQuota,
+MemoryHigh/Max, TasksMax, IOWeight, nice and a disk-space precondition. Bootstrap
+refuses unavailable CPU/memory controllers instead of claiming unenforced limits.
+Limits are initial budgets and have not been measured on the LXC. Gateway fallback
+remains available when the service is not configured. No service was installed
+or enabled during local development.
+
+The admin-only auto_build repository setting is off by default. Enabled
+coordination schedules only terminal incorporated events with gateway evidence
+(zero conflicts and no operation active), through the service queue. Multiple
+worker events share repository/SHA builds. Full queues and absent services remain
+visible on the integration board and are reassessed; failed attempts do not
+automatically retry. Pausing stops new submissions, not in-flight builds.
+The watcher polls active build results every five seconds without a browser.
+Runner-owned post-build checks verify unchanged HEAD and tracked source before
+retention. Script evidence remains distinctly attributed; this is not a sandbox.
+Task/job linkage and event waivers are retained in build/package manifests.
+Service restart cleans validated temporary worktrees and records interrupted;
+unexpected request errors are terminal rather than restart retry loops.
+
+Still pending: approved SDK retry orchestration,
+load-based deferral, RSS fallback, retention pruning, isolated preview and the
+independent maintenance service. Unattended builds require the service to be
+installed and auto_build to be enabled; they are one stage of product delivery. No
+automatic promotion policy is enabled.
+
 ## Verified live behavior
 
 The dashboard's base update completed a fast-forward from a135f61 to a8cf7c2,
@@ -19,12 +64,14 @@ Max's next integration; this latest worker job was still running during review.
 - ValidationRuns accepts an integration event, creates a detached exact-commit
   worktree, runs scripts/validate.sh and/or scripts/build-web.sh, records an exit
   status, retains bounded static artifacts and removes the worktree. It rejects
-  a second running gateway validation globally; this is not a durable service queue.
+  a second running gateway validation globally. The optional service uses a durable
+  queue with one pending or active job.
 - scripts/build-web.sh analyzes/tests Flutter and builds Flutter plus the Jaspr
   shell into web/public. Flutter release assets are static files; the browser
   does not compile the application.
 - The updater installs fixed GitHub release packages with a checksum, backup,
-  restart, and startup check. It does not install locally generated artifacts.
+  restart, and authenticated startup checks. It also accepts manifest-backed local
+  packages through explicit administrator promotion.
 
 ## Recommended workflow
 
@@ -34,26 +81,27 @@ SHA, never re-resolve a moving branch. This consistency is not implemented yet.
 
 The current runner rejects a second running validation globally under its
 submission lock and collects a bounded output tail. These are existing code
-protections, not a durable service queue or cgroup resource limits. Logs now
+protections; the optional service adds a durable queue and cgroup budgets. Logs now
 publish that capped tail during execution. Successful runs retain web/public in
 artifact.tar.gz plus manifest.json before cleanup, capped at 256 MiB of input.
 The manifest records build ID, exact SHA, command, archive hash and exit status.
-It does not yet certify the SDK version, individual checks or deployability.
+It also records individual checks and the expected toolchain pin. The pin alone
+does not certify the actual SDK version or deployability.
 Browser preview remains to be built; artifact download is now available.
 
 Implementation progress: Builds & deployments now lists validation history,
 downloads logs/manifests and checksum-verified static or matched gateway/UI
 packages, and hosts release-update controls. Downloadable manifests remain
-deployment_authorized=false and required_checks_verified=false: an explicit
+deployment_authorized=false and the actual required_checks_verified result: an explicit
 administrator action approves manual deployment, but never creates passing
 per-check evidence. GET /api/build reports installed identity;
 unknown legacy installations remain unknown instead of borrowing main's SHA.
 Both gateway and root updater refuse release installation in local mode.
 Coordinator profiles are annotated by binding ID as used or inactive.
 
-Still pending: isolated preview, manifest-bound retention pruning, per-check
-runner evidence and SDK identity, configured base, durable service queue,
-resource limits and the independent maintenance rollback service. None of these should be inferred
+Still pending: isolated preview, manifest-bound retention pruning, verified SDK
+identity, configured base, measured service budgets
+and the independent maintenance rollback service. None of these should be inferred
 from the presence of a downloadable full package.
 
 The first end-to-end milestone is manual build, artifact download, isolated
@@ -190,5 +238,7 @@ before relying on per-service limits.
   https://github.com/systemd/systemd/blob/main/man/systemd.resource-control.xml
 
 Role-aware drift, matched package retention, local promotion with authenticated
-readiness, and rollback are implemented. No autonomous fetch, build service,
-structured check evidence, preview or automatic promotion is enabled yet.
+readiness, rollback, structured check evidence and an optional durable build
+service and opt-in automatic build scheduling are implemented. Autonomous fetch,
+preview and automatic promotion are not enabled yet. Live queue/service limits
+still require LXC verification.

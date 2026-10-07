@@ -15,6 +15,8 @@ class _BuildsPageState extends State<BuildsPage> {
   List<Map<String, dynamic>> runs = [];
   Map<String, dynamic>? identity;
   Map<String, dynamic>? deployment;
+  String executor = 'gateway';
+  int queued = 0;
   String? error;
   String? actionError;
   bool acting = false;
@@ -49,6 +51,8 @@ class _BuildsPageState extends State<BuildsPage> {
       if (mounted && epoch == connection.generation)
         setState(() {
           runs = List<Map<String, dynamic>>.from(result['runs'] ?? []);
+          executor = '${result['executor'] ?? 'gateway'}';
+          queued = result['queued'] as int? ?? 0;
           identity = Map<String, dynamic>.from(deployed);
           deployment = status;
           error = null;
@@ -73,8 +77,9 @@ class _BuildsPageState extends State<BuildsPage> {
           'Your administrator approval is recorded. Files and configuration are backed up; '
           'the gateway restarts and must report this build ID before the deployment is complete. '
           'Downloading a package alone never authorizes deployment.\n\n'
-          'Individual required checks are not yet independently verified in the package manifest. '
-          'Review the validation log and any skipped, unavailable or waived checks before approving.',
+          'Required checks not passed: ${(manifest['checks'] as List? ?? []).where((c) => c is Map && c['required'] != false && c['status'] != 'passed').map((c) => c['id']).join(', ')}\n'
+          'Evidence complete: ${manifest['required_checks_verified'] == true}. '
+          'Review the log; administrator approval never changes an underlying check result.',
           // The package records only a script-set exit status today; do not
           // imply that administrator approval creates per-check evidence.
         ),
@@ -203,6 +208,7 @@ class _BuildsPageState extends State<BuildsPage> {
         ],
       ),
       const SizedBox(height: 12),
+      Text('Build executor: $executor · $queued queued'),
       const Text(
         'Build exact integration commits from Git changes. Static artifacts and full gateway/UI packages are separate. Downloading a package does not authorize deployment.',
       ),
@@ -275,7 +281,26 @@ class _BuildsPageState extends State<BuildsPage> {
                   style: Theme.of(context).textTheme.titleMedium,
                 ),
                 SelectableText('Source: ${run['target']}\nBuild: ${run['id']}'),
+                if (run['task_id'] != null)
+                  SelectableText('Task/job: ${run['task_id']}'),
+                if (run['event_ids'] is List)
+                  SelectableText(
+                    'Integration events: ${(run['event_ids'] as List).join(', ')}',
+                  ),
+                if (run['validation_waiver'] != null)
+                  const Text(
+                    'The originating integration event has a validation waiver. Build checks retain their actual results.',
+                  ),
                 Text('${run['command'] ?? 'Preparing validation'}'),
+                if (run['checks'] is List)
+                  for (final check in run['checks'] as List)
+                    if (check is Map)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Text(
+                          '${check['name'] ?? check['id']} · ${check['status']} · ${check['duration_ms'] ?? 0} ms · exit ${check['exit_code'] ?? 'not run'}\n${check['summary'] ?? ''}',
+                        ),
+                      ),
                 if (run['artifact_error'] != null)
                   Text(
                     'Build output could not be retained: ${run['artifact_error']}',

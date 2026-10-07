@@ -19,6 +19,10 @@ def snapshot(root=None):
         version = None
     sha = data.get('source_sha')
     build_id = data.get('build_id')
+    # Legacy packages had VERSION only. Expose their release identity without
+    # inventing source provenance from a mutable repository checkout.
+    if not (root / 'BUILD.json').exists() and isinstance(version, str) and re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', version):
+        build_id = version
     return dict(build_id=build_id if isinstance(build_id, str) and re.fullmatch(r'[A-Za-z0-9._-]{1,120}', build_id) else None,
                 source_sha=sha if isinstance(sha, str) and re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', sha) else None,
                 gateway_version=version, package_version=version,

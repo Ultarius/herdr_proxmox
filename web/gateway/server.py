@@ -40,6 +40,7 @@ PROJECTS = Path(os.environ.get('HERDR_PROJECTS', '/home/herdr/projects')).resolv
 BIN = os.environ.get('HERDR_BIN', '/home/herdr/.local/bin/herdr')
 TOKEN_FILE = Path(os.environ.get('HERDR_WEB_TOKEN_FILE', '/home/herdr/.config/herdr-web/token'))
 DATABASE = Path(os.environ.get('HERDR_ORGANIZATION_DB', '/home/herdr/.config/herdr-web/organizations.sqlite3'))
+BUILD_SERVICE_CONFIG = Path('/etc/herdr/build-service.json')
 
 
 def command(*args, timeout=10):
@@ -179,8 +180,9 @@ class Handler(BaseHTTPRequestHandler):
             while chunk := stream.read(65536):
                 self.wfile.write(chunk)
 
-    def organization_snapshot(self, directory=False):
-        data = self.server.organizations.snapshot(directory=directory)
+    def organization_snapshot(self, directory=False, state=False):
+        data = (self.server.organizations.state_snapshot() if state
+                else self.server.organizations.snapshot(directory=directory))
         watcher = getattr(self.server, 'integration', None)
         # Minimal gateways used for setup can serve organization storage before
         # the background integration watcher is attached.
@@ -316,7 +318,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.reply(200, self.server.cli_setup.snapshot())
                     return
                 if self.path == '/api/organizations/state':
-                    self.reply(200, self.server.organizations.state_snapshot())
+                    self.reply(200, self.organization_snapshot(state=True))
                     return
                 if self.path == '/api/organizations/directory':
                     self.reply(200, self.organization_snapshot(directory=True))
@@ -551,9 +553,22 @@ def main():
     projects = ProjectJobs(PROJECTS, DATABASE.with_name('projects.sqlite3'))
     coordinator = IntegrationCoordinator(DATABASE.with_name('integration.sqlite3'), organizations,
                                          sdk_request=lambda: sdk_install.install({}))
-    validation = ValidationRuns(PROJECTS, coordinator.event, record=coordinator.record_validation_run)
+    build_queue = None
+    minimum_build_space = 0
+    build_config = BUILD_SERVICE_CONFIG
+    if build_config.is_file():
+        from build_queue import BuildQueue
+        configuration = json.loads(build_config.read_text())
+        if Path(configuration['projects']).resolve() != Path(PROJECTS).resolve():
+            raise ValueError('Build service projects do not match the gateway.')
+        build_queue = BuildQueue(configuration['queue'])
+        minimum_build_space = configuration.get('minimum_free_bytes', 2 * 1024**3)
+    validation = ValidationRuns(PROJECTS, coordinator.event, record=coordinator.record_validation_run, queue=build_queue, minimum_free_bytes=minimum_build_space)
     integration = IntegrationWatcher(PROJECTS, organizations.active_checkouts, coordinator=coordinator,
                                      wake_event=organizations.jobs_changed)
+    # Durable queue results reach their integration events even without a browser.
+    integration.build_results = validation.snapshot
+    integration.schedule_builds = lambda: coordinator.schedule_builds(validation)
     integration.wake()
     try:
         serve_gateway(bind, 8787, policy, token, {'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator, 'operators': operators, 'sdk_install': sdk_install, 'validation': validation}, cookie_secure=secure_setting == '1')

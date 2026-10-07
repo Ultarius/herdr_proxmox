@@ -30,6 +30,9 @@ class IntegrationWatcher:
         self.alerts = []
         self.checked = None
         self.bases = {}
+        self.build_results = None
+        self.schedule_builds = None
+        self.build_active = False
         self.stopped = threading.Event()
         self.wake_event = wake_event if wake_event is not None else threading.Event()
         self.thread = threading.Thread(target=self._loop, daemon=True)
@@ -64,7 +67,7 @@ class IntegrationWatcher:
 
     def _loop(self):
         while not self.stopped.is_set():
-            self.wake_event.wait(self.interval)
+            self.wake_event.wait(min(self.interval, 5) if self.build_active else self.interval)
             self.wake_event.clear()
             if self.stopped.is_set():
                 break
@@ -75,6 +78,9 @@ class IntegrationWatcher:
                 continue
 
     def refresh(self):
+        if self.build_results is not None:
+            builds = self.build_results()
+            self.build_active = bool(builds.get('running') or builds.get('queued'))
         found = []
         measured = {}
         configs = self.coordinator.snapshot()['configurations'] if self.coordinator else []
@@ -103,6 +109,11 @@ class IntegrationWatcher:
             self.coordinator.observe(notices)
             if self.coordinator.tick():
                 self.wake()
+            if self.schedule_builds is not None:
+                self.schedule_builds()
+                # Poll promptly after submission, including without a browser.
+                builds = self.build_results() if self.build_results else {}
+                self.build_active = bool(builds.get('running') or builds.get('queued'))
         return notices
 
     def annotate_worktrees(self, data):
@@ -118,7 +129,7 @@ class IntegrationWatcher:
 
     def annotate_profiles(self, data):
         """Expose binding by profile ID; duplicate display names are harmless."""
-        configs = self.coordinator.snapshot()['configurations'] if self.coordinator else []
+        configs = self.coordinator.configuration_records() if self.coordinator else []
         bindings = {}
         for config in configs:
             bindings.setdefault(config.get('profile_id'), []).append(config.get('repository'))

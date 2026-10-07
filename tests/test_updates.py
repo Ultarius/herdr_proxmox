@@ -22,6 +22,20 @@ worker_spec.loader.exec_module(worker)
 
 
 class UpdateTests(unittest.TestCase):
+    def test_release_source_provenance_is_preserved_and_mismatches_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            self.assertIsNone(worker.release_identity(source, 'v0.0.24')['source_sha'])
+            metadata = dict(build_id='v0.0.24', source_sha='c' * 40, deployment_mode='release')
+            (source / 'BUILD.json').write_text(json.dumps(metadata))
+            self.assertEqual(worker.release_identity(source, 'v0.0.24')['source_sha'], 'c' * 40)
+            with self.assertRaisesRegex(ValueError, 'does not match'):
+                worker.release_identity(source, 'v0.0.25')
+            metadata['source_sha'] = 'invalid'
+            (source / 'BUILD.json').write_text(json.dumps(metadata))
+            with self.assertRaisesRegex(ValueError, 'does not match'):
+                worker.release_identity(source, 'v0.0.24')
+
     def test_offline_release_lookup_keeps_local_recovery_status(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

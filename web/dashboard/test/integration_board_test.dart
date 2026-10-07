@@ -332,7 +332,12 @@ void main() {
         final endpoint = request.url.path;
         calls.add(request.url.toString());
         if (endpoint.endsWith('/integration/configure')) {
-          expect(jsonDecode(request.body)['auto_sdk'], isTrue);
+          final body = jsonDecode(request.body);
+          expect(
+            body['auto_sdk'] == true || body['auto_build'] == true,
+            isTrue,
+          );
+          expect(body['repository'], 'repo');
           return http.Response('{}', 200);
         }
         if (endpoint.endsWith('/sdk/install')) {
@@ -443,6 +448,15 @@ void main() {
       calls.where((c) => c.endsWith('/api/integration/configure')),
       hasLength(1),
     );
+    await tester.ensureVisible(
+      find.text('Build incorporated commits automatically'),
+    );
+    await tester.tap(find.text('Build incorporated commits automatically'));
+    await tester.pumpAndSettle();
+    expect(
+      calls.where((c) => c.endsWith('/api/integration/configure')),
+      hasLength(2),
+    );
     await tester.ensureVisible(find.byTooltip('Download validation log'));
     await tester.tap(find.byTooltip('Download validation log'));
     await tester.pumpAndSettle();
@@ -486,7 +500,20 @@ void main() {
             200,
           );
         if (endpoint.endsWith('/integration'))
-          return http.Response(jsonEncode({'coordination': {}}), 200);
+          return http.Response(
+            jsonEncode({
+              'coordination': {
+                'configurations': [
+                  {
+                    'repository': 'repo',
+                    'enabled': true,
+                    'profile_id': 'coord',
+                  },
+                ],
+              },
+            }),
+            200,
+          );
         return http.Response('{"workspaces":[],"agents":[]}', 200);
       }),
     );
@@ -505,6 +532,17 @@ void main() {
     await tester.tap(find.text('Integration coordinator'));
     await tester.pumpAndSettle();
     expect(find.text('Signed in: kit · operator'), findsOneWidget);
+    expect(
+      tester
+          .widget<SwitchListTile>(
+            find.widgetWithText(
+              SwitchListTile,
+              'Build incorporated commits automatically',
+            ),
+          )
+          .onChanged,
+      isNull,
+    );
     expect(
       find.text('Only an administrator can request the SDK installation.'),
       findsOneWidget,

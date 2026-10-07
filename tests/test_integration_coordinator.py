@@ -4,8 +4,10 @@ from contextlib import closing
 from pathlib import Path
 import sys
 import tempfile
+import subprocess
+import shutil
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'web/gateway'))
 from integration_coordinator import IntegrationCoordinator, report_digest
@@ -70,6 +72,107 @@ class CoordinatorTests(unittest.TestCase):
         event = self.event()
         self.store.jobs[event['job_id']].update(state='answered', result=json.dumps(decision))
         self.service.tick()
+
+    def test_auto_build_requires_admin_boolean_and_verified_incorporation(self):
+        with self.assertRaisesRegex(ValueError, 'administrator'):
+            self.service.configure({'auto_build': True}, role='operator')
+        with patch('integration_coordinator.project_git.inspect', return_value={'repository': True, 'repository_path': 'repo'}):
+            with self.assertRaisesRegex(ValueError, 'boolean'):
+                self.service.configure(dict(repository='repo', auto_build='yes'))
+            self.service.configure(dict(repository='repo', profile_id='coordinator', auto_build=True))
+        self.service.observe([self.notice])
+        event = self.event()
+        builds = Mock(queue=object())
+        builds.submit.return_value = {'id': 'c' * 32}
+        self.service.schedule_builds(builds)
+        builds.submit.assert_not_called()
+        with closing(self.service.connect()) as db, db:
+            event.update(state='completed')
+            self.service.save(db, event)
+        self.service.schedule_builds(builds)
+        builds.submit.assert_not_called()  # A worker outcome alone is insufficient.
+        with closing(self.service.connect()) as db, db:
+            event.update(verification=dict(target_incorporated=True, conflicts=0, merging=False))
+            self.service.save(db, event)
+        self.service.schedule_builds(builds)
+        self.service.schedule_builds(builds)
+        builds.submit.assert_called_once_with({'id': event['id']}, actor='automatic_build')
+        self.assertEqual(self.event()['automatic_build_id'], 'c' * 32)
+
+    def test_auto_build_queue_backpressure_is_visible_and_retried_without_audit_spam(self):
+        with patch('integration_coordinator.project_git.inspect', return_value={'repository': True, 'repository_path': 'repo'}):
+            self.service.configure(dict(repository='repo', profile_id='coordinator', auto_build=True))
+        self.service.observe([self.notice])
+        event = self.event()
+        with closing(self.service.connect()) as db, db:
+            event.update(state='validation_waived', verification=dict(target_incorporated=True, conflicts=0, merging=False))
+            self.service.save(db, event)
+        builds = Mock(queue=None)
+        self.service.schedule_builds(builds)
+        self.assertIn('require', self.event()['automatic_build_error'])
+        builds.queue = object()
+        builds.submit.side_effect = ValueError('Build queue is full.')
+        self.service.schedule_builds(builds)
+        count = len(self.service.snapshot()['audit'])
+        self.service.schedule_builds(builds)
+        self.assertEqual(len(self.service.snapshot()['audit']), count)
+        self.assertIn('full', self.event()['automatic_build_error'])
+        builds.submit.side_effect = None
+        builds.submit.return_value = {'id': 'c' * 32}
+        self.service.schedule_builds(builds)
+        self.assertEqual(self.event()['automatic_build_error'], '')
+        self.assertEqual(self.event()['state'], 'validation_waived')
+
+    @unittest.skipUnless(shutil.which('git'), 'Git required')
+    def test_automatic_build_deduplicates_real_worker_events_and_delivers_results_without_browser(self):
+        from test_check_evidence import BASH
+        if not BASH:
+            self.skipTest('Bash required')
+        from build_queue import BuildQueue
+        from build_worker import execute_next
+        from validation import ValidationRuns
+        from integration import IntegrationWatcher
+        repo = self.root / 'repo'
+        (repo / 'scripts').mkdir(parents=True)
+        (repo / 'scripts/build-web.sh').write_text('#!/bin/sh\necho automatic-build\n')
+        def git(*arguments):
+            return subprocess.run(['git', '-C', str(repo), *arguments], check=True, capture_output=True).stdout.decode().strip()
+        git('init', '-b', 'main')
+        git('config', 'user.name', 'Test')
+        git('config', 'user.email', 'test@example.test')
+        git('add', '.')
+        git('commit', '-m', 'build fixture')
+        target = git('rev-parse', 'HEAD')
+        with patch('integration_coordinator.project_git.inspect', return_value={'repository': True, 'repository_path': 'repo'}):
+            self.service.configure(dict(repository='repo', profile_id='coordinator', auto_build=True))
+        self.service.observe([dict(self.notice, target=target), dict(self.notice, target=target, run_id='second-run')])
+        with closing(self.service.connect()) as db, db:
+            for row in db.execute('SELECT data FROM events').fetchall():
+                event = json.loads(row[0])
+                event.update(state='completed', verification=dict(target_incorporated=True, conflicts=0, merging=False))
+                self.service.save(db, event)
+        queue = BuildQueue(self.root / 'queue')
+        facade = ValidationRuns(self.root, self.service.event, queue=queue, root=self.root / 'runs',
+                                record=self.service.record_validation_run)
+        with patch.object(IntegrationWatcher, '_loop', return_value=None):
+            watcher = IntegrationWatcher(self.root, lambda: [], coordinator=self.service)
+        self.addCleanup(watcher.close)
+        watcher.build_results = facade.snapshot
+        watcher.schedule_builds = lambda: self.service.schedule_builds(facade)
+        watcher.refresh()
+        self.assertTrue(watcher.build_active)
+        builds = facade.snapshot()['runs']
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(len(queue.get(builds[0]['id'])['event_ids']), 2)
+        worker = ValidationRuns(self.root, lambda _: None, external=True, root=facade.root)
+        with patch('validation.BASH', BASH):
+            self.assertTrue(execute_next(queue, worker))
+        watcher.refresh()
+        self.assertFalse(watcher.build_active)
+        for event in self.service.snapshot()['events']:
+            self.assertEqual(event['validation_run']['state'], 'complete')
+            self.assertTrue(event['validation_run']['required_checks_verified'])
+        self.assertFalse(execute_next(queue, worker))
 
     def test_busy_agent_stays_queued_and_duplicate_events_are_suppressed(self):
         self.store.busy.add('worker')

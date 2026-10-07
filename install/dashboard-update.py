@@ -117,6 +117,20 @@ def extract(archive, staging):
     return source
 
 
+def release_identity(source, version):
+    identity = dict(build_id=version, source_sha=None,
+                    package_version=version, deployment_mode='release')
+    identity_file = source / 'BUILD.json'
+    if identity_file.is_file():
+        supplied = json.loads(identity_file.read_text())
+        if (not isinstance(supplied, dict) or supplied.get('build_id') != version
+                or supplied.get('deployment_mode') != 'release'
+                or not SOURCE.fullmatch(str(supplied.get('source_sha', '')))):
+            raise ValueError('Release build identity does not match the package.')
+        identity['source_sha'] = supplied['source_sha']
+    return identity
+
+
 def wait_for_ready(expected=None):
     """Authenticated readiness: the running gateway proves auth and build identity."""
     try:
@@ -284,8 +298,7 @@ def main():
                 source = extract(archive, staging)
                 if (source / 'VERSION').read_text().strip() != request['version']:
                     raise ValueError('Release version does not match package.')
-                build_identity = dict(build_id=request['version'], source_sha=None,
-                                      package_version=request['version'], deployment_mode='release')
+                build_identity = release_identity(source, request['version'])
             else:
                 # Verify and extract the same root-owned copy. The retained
                 # build file belongs to herdr and may change after approval.

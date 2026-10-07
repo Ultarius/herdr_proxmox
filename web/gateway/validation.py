@@ -14,13 +14,11 @@ import os
 from pathlib import Path
 import re
 import secrets
-import signal
 import stat
 import shutil
-import subprocess
 import threading
-import time
 import tarfile
+import time
 
 import project_git
 from project_files import project_directory
@@ -41,16 +39,19 @@ def stamp():
 
 
 class ValidationRuns:
-    def __init__(self, projects, lookup, record=None, root=None, timeout=TIMEOUT_SECONDS):
+    def __init__(self, projects, lookup, record=None, root=None, timeout=TIMEOUT_SECONDS, queue=None, external=False, minimum_free_bytes=0):
         self.projects = Path(projects)
         self.lookup = lookup
         self.record = record
         self.root = Path(root) if root else self.projects.parent / 'herdr-validation'
         self.timeout = timeout
         self.lock = threading.Lock()
+        self.queue = queue
+        self.external = external or queue is not None
+        self.minimum_free_bytes = minimum_free_bytes
         # Durable runs cannot remain "running" after the gateway process exits.
         for run in self._history():
-            if run.get('state') == 'running':
+            if run.get('state') == 'running' and not self.external:
                 folder = self.root / run['id']
                 run.update(state='interrupted', finished_at=stamp(), note='Gateway restarted; inspect retained logs before retrying.')
                 self._write(folder, run)
@@ -73,6 +74,16 @@ class ValidationRuns:
             return []
         runs = [self._read(folder) for folder in folders]
         runs = [run for run in runs if isinstance(run, dict) and RUN_ID.fullmatch(str(run.get('id', '')))]
+        if self.queue is not None:
+            for index, run in enumerate(runs):
+                queued = self.queue.get(run['id'])
+                if queued:
+                    # The queue is authoritative if the service claimed a job
+                    # before the submitting gateway published its run file.
+                    if queued['state'] in ('queued', 'running'):
+                        run['state'] = queued['state']
+                    else:
+                        runs[index] = queued
         return sorted(runs, key=lambda run: str(run.get('started_at', '')), reverse=True)
 
     def running(self):
@@ -80,7 +91,29 @@ class ValidationRuns:
 
     def snapshot(self):
         runs = self._history()
+        if self.queue is not None and self.record is not None:
+            # Watcher and dashboard polls can overlap; one lock prevents a
+            # result from being audited twice before its marker is written.
+            with self.lock:
+                for run in runs:
+                    if run.get('state') not in ('complete', 'failed', 'error', 'interrupted', 'cancelled'):
+                        continue
+                    queued = self.queue.get(run['id']) or run
+                    for event_id in queued.get('event_ids', [run['event_id']]):
+                        folder = self.root / run['id']
+                        delivered = folder / ('feedback-' + hashlib.sha256(str(event_id).encode()).hexdigest())
+                        if delivered.exists():
+                            continue
+                        try:
+                            self._record_result(event_id, run)
+                            delivered.write_text(stamp())
+                        except (ValueError, OSError):
+                            # Retry delivery after transient storage failures; never
+                            # redispatch a build just because its feedback was lost.
+                            continue
         return {'runs': runs[:HISTORY], 'running': sum(run['state'] == 'running' for run in runs),
+                'executor': 'service' if self.queue is not None else 'gateway',
+                'queued': sum(run['state'] == 'queued' for run in runs),
                 'commands': list(COMMANDS), 'timeout_seconds': self.timeout}
 
     def log(self, run_id):
@@ -135,16 +168,30 @@ class ValidationRuns:
         target = event.get('target')
         if not isinstance(target, str) or not TARGET.fullmatch(target):
             raise ValueError('This event has no exact commit to validate.')
+        if type(body.get('retry', False)) is not bool:
+            raise ValueError('Retry must be a boolean.')
         with self.lock:
-            if self.running():
+            if self.running() and self.queue is None:
                 raise ValueError('Validation is already running. Wait for it to finish.')
             run = dict(id=secrets.token_hex(16), event_id=event['id'], repository=event.get('repository'),
                        target=target, path=event.get('path'), actor=actor, state='running',
                        started_at=stamp(), finished_at=None, exit_code=None, command=None, note='')
+            run['task_id'] = event.get('task_id') or event.get('job_id')
+            # Preserve provenance without turning an event waiver into a pass.
+            if event.get('state') == 'validation_waived':
+                run['validation_waiver'] = dict(event_id=event['id'], approval=event.get('operator_approval'),
+                                               reason=event.get('reason'))
+            if self.queue is not None:
+                if shutil.disk_usage(self.projects).free < self.minimum_free_bytes:
+                    raise ValueError('Insufficient free disk space to queue a build.')
+                run, created = self.queue.enqueue(run, retry=body.get('retry', False))
+                if not created:
+                    return run
             folder = self.root / run['id']
             folder.mkdir(parents=True, exist_ok=True)
             self._write(folder, run)
-        threading.Thread(target=self._execute, args=(run, folder), daemon=True).start()
+        if self.queue is None:
+            threading.Thread(target=self._execute, args=(run, folder), daemon=True).start()
         return dict(run)
 
     def _execute(self, run, folder):
@@ -163,54 +210,20 @@ class ValidationRuns:
                 raise ValueError('No validation script found (looked for ' + ', '.join(COMMANDS) + ').')
             run['command'] = command
             lines.append(f"Validating {run['target']} in an isolated worktree with {command}.\n\n")
-            arguments = [BASH, commands[0]] if len(commands) == 1 else [BASH, '-c', ' && '.join('bash ' + item for item in commands)]
-            process = subprocess.Popen(arguments, cwd=worktree, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, start_new_session=os.name != 'nt',
-                                       env=dict(os.environ, CI='1', GIT_TERMINAL_PROMPT='0'))
-            tail = bytearray()
-            published = [0.0]
-            def collect():
-                while True:
-                    chunk = process.stdout.read(4096)
-                    if not chunk:
-                        break
-                    tail.extend(chunk)
-                    if len(tail) > OUTPUT_LIMIT:
-                        del tail[:-OUTPUT_LIMIT]
-                    # Publish a bounded live tail at most once per second; never
-                    # buffer the entire build or rewrite the log per chunk.
-                    now = time.monotonic()
-                    if now - published[0] < 1.0:
-                        continue
-                    published[0] = now
-                    temporary_log = folder / 'log.tmp'
-                    try:
-                        temporary_log.write_bytes(tail)
-                        temporary_log.replace(log_path)
-                    except OSError:
-                        # Keep draining stdout even when log storage fails.
-                        pass
-            reader = threading.Thread(target=collect, daemon=True)
-            reader.start()
-            try:
-                exit_code = process.wait(timeout=self.timeout)
-            finally:
-                # Kill the entire Linux validation group, including descendants
-                # still holding stdout or writing in the temporary worktree.
-                if os.name != 'nt':
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                elif process.poll() is None:
-                    process.kill()
-                process.wait()
-                reader.join(5)
-                if not reader.is_alive():
-                    process.stdout.close()
-            state = 'complete' if exit_code == 0 else 'failed'
-            lines.extend((bytes(tail).decode('utf-8', errors='replace'),
-                          f"\n\nValidation exited with status {exit_code}.\n"))
+            from check_runner import run_scripts, required_passed
+            def evidence(checks):
+                run['checks'] = checks
+                self._write(folder, run)
+            checks, exit_code, timed_out = run_scripts(worktree, commands, folder,
+                self.timeout, BASH, OUTPUT_LIMIT, changed=evidence)
+            # Repository scripts can report subchecks, but cannot certify that
+            # they left the requested commit and tracked source unchanged.
+            checks.extend(self._integrity_checks(worktree, run['target']))
+            if not required_passed(checks) and exit_code == 0:
+                exit_code = 1
+            run.update(checks=checks, required_checks_verified=required_passed(checks))
+            state = 'error' if timed_out else 'complete' if exit_code == 0 else 'failed'
+            lines.append(log_path.read_text(errors='replace'))
             if exit_code == 0:
                 try:
                     run['artifact'] = self._retain_artifact(worktree, folder, run)
@@ -224,10 +237,6 @@ class ValidationRuns:
                     run['deployment_package'] = retain(worktree, folder, dict(run, exit_code=exit_code))
                 except (ValueError, OSError) as error:
                     run['deployment_package_error'] = str(error)[:500]
-        except subprocess.TimeoutExpired:
-            lines.append(bytes(tail).decode('utf-8', errors='replace'))
-            state = 'error'
-            lines.append(f'Validation exceeded the {self.timeout} second limit.\n')
         except (ValueError, OSError) as error:
             lines.append(f'Validation could not run: {error}\n')
         finally:
@@ -235,17 +244,38 @@ class ValidationRuns:
             run.update(state=state, exit_code=exit_code, finished_at=stamp())
             content = ''.join(lines)[-OUTPUT_LIMIT:]
             try:
-                log_path.write_text(content)
+                log_path.write_bytes(content.encode('utf-8')[-OUTPUT_LIMIT:])
                 self._write(folder, run)
             except OSError:
                 pass
             if self.record is not None:
                 try:
-                    self.record(run['event_id'], dict(run_id=run['id'], state=run['state'], target=run['target'],
-                                                      command=run['command'], exit_code=run['exit_code'],
-                                                      finished_at=run['finished_at'], actor=run['actor']))
+                    self._record_result(run['event_id'], run)
                 except (ValueError, OSError):
                     pass
+
+    def _record_result(self, event_id, run):
+        self.record(event_id, dict(run_id=run['id'], state=run['state'], target=run['target'],
+            command=run.get('command'), exit_code=run.get('exit_code'), checks=run.get('checks', []),
+            required_checks_verified=run.get('required_checks_verified', False),
+            finished_at=run.get('finished_at'), actor=run.get('actor')))
+
+    def _integrity_checks(self, worktree, target):
+        results = []
+        for identifier, arguments, expected in (
+                ('exact-commit', ('rev-parse', 'HEAD'), target),
+                ('worktree-clean', ('status', '--porcelain=v1', '--untracked-files=no'), '')):
+            started = time.monotonic()
+            try:
+                actual = project_git.git(worktree, *arguments).strip()
+                passed, detail = actual == expected, actual[:500]
+            except (ValueError, OSError) as error:
+                passed, detail = False, str(error)[:500]
+            results.append(dict(id='runner:' + identifier, name=identifier, source='runner', required=True,
+                                command='git ' + ' '.join(arguments), duration_ms=int((time.monotonic() - started) * 1000),
+                                status='passed' if passed else 'failed', exit_code=0 if passed else 1,
+                                summary='Requested source preserved.' if passed else detail))
+        return results
 
     def _checkout(self, value):
         path = Path(str(value))
@@ -294,6 +324,9 @@ class ValidationRuns:
                         repository=run['repository'], created_at=stamp(),
                         sha256=digest.hexdigest(), bytes=temporary.stat().st_size,
                         file_count=len(files), validation_exit_code=0,
+                        checks=run.get('checks', []), required_checks_verified=run.get('required_checks_verified', False),
+                        toolchain_pin=run.get('toolchain_pin'),
+                        task_id=run.get('task_id'), validation_waiver=run.get('validation_waiver'),
                         deployment_authorized=False)
         temporary.replace(folder / 'artifact.tar.gz')
         (folder / 'manifest.json').write_text(json.dumps(manifest, indent=2))

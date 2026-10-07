@@ -111,6 +111,8 @@ class IntegrationCoordinator:
             raise ValueError('Expected a JSON object.')
         if 'auto_sdk' in body and role != 'admin':
             raise ValueError('Only an administrator can change automatic SDK installation.')
+        if 'auto_build' in body and role != 'admin':
+            raise ValueError('Only an administrator can change automatic builds.')
         repository = body.get('repository')
         if not isinstance(repository, str):
             raise ValueError('Select a repository.')
@@ -124,6 +126,9 @@ class IntegrationCoordinator:
         auto_sdk = body.get('auto_sdk')
         if auto_sdk is not None and type(auto_sdk) is not bool:
             raise ValueError('Automatic SDK installation must be a boolean.')
+        auto_build = body.get('auto_build')
+        if 'auto_build' in body and type(auto_build) is not bool:
+            raise ValueError('Automatic builds must be a boolean.')
         org_id = body.get('organization_id')
         profile_id = body.get('profile_id')
         with self.lock, closing(self.connect()) as db, db:
@@ -149,9 +154,12 @@ class IntegrationCoordinator:
                               profile_id=profile_id, organization_id=profile['organization_id'])
             if auto_sdk is not None:
                 config['auto_sdk'] = auto_sdk
+            if auto_build is not None:
+                config['auto_build'] = auto_build
             db.execute('INSERT OR REPLACE INTO settings VALUES (?, ?)', (repository, json.dumps(config)))
             self.audit(db, dict(action='configuration', repository=repository, enabled=enabled,
-                                profile_id=config.get('profile_id'), actor=actor or 'dashboard_operator'))
+                                profile_id=config.get('profile_id'), auto_build=config.get('auto_build', False),
+                                actor=actor or 'dashboard_operator'))
         return config
 
     def observe(self, notices):
@@ -670,6 +678,49 @@ class IntegrationCoordinator:
                     db.execute('UPDATE settings SET data=? WHERE repository=?', (json.dumps(config), repository))
 
             return advance_pending
+
+    def configuration_records(self):
+        """Small binding read for organization polls; no jobs, events or audit."""
+        with closing(self.connect()) as db:
+            return [json.loads(row[0]) for row in db.execute('SELECT data FROM settings')]
+
+    def schedule_builds(self, validation):
+        """Opt-in service delivery outside the coordinator's transaction/lock.
+
+        Worker claims alone do not authorize a build. Require gateway Git
+        incorporation evidence; queue deduplication links multiple worker events.
+        Failed attempts remain attached until an operator explicitly retries.
+        """
+        with closing(self.connect()) as db:
+            settings = {row[0]: json.loads(row[1]) for row in db.execute('SELECT * FROM settings')}
+            events = [json.loads(row[0]) for row in db.execute('SELECT data FROM events ORDER BY rowid')]
+        for event in events:
+            config = settings.get(event['repository'], {})
+            verified = event.get('verification') or {}
+            if (not config.get('enabled') or not config.get('auto_build')
+                    or event.get('state') not in ('completed', 'validation_pending', 'validation_failed', 'validation_waived')
+                    or verified.get('target_incorporated') is not True
+                    or verified.get('conflicts') != 0 or verified.get('merging') is not False
+                    or event.get('validation_run') or event.get('automatic_build_id')):
+                continue
+            try:
+                if validation.queue is None:
+                    raise ValueError('Automatic builds require the installed build service.')
+                run = validation.submit({'id': event['id']}, actor='automatic_build')
+                result = dict(automatic_build_id=run['id'], automatic_build_error='')
+            except (ValueError, OSError) as error:
+                result = dict(automatic_build_error=str(error)[:500])
+            with self.lock, closing(self.connect()) as db, db:
+                row = db.execute('SELECT data FROM events WHERE id=?', (event['id'],)).fetchone()
+                if not row:
+                    continue
+                current = json.loads(row[0])
+                if all(current.get(key) == value for key, value in result.items()):
+                    continue
+                current.update(result)
+                self.save(db, current)
+                self.audit(db, dict(action='automatic_build', event_id=event['id'],
+                                    repository=event['repository'], **result))
 
     def snapshot(self):
         # A reader must not wait for dispatch/network work holding the writer lock.

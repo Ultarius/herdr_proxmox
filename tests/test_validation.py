@@ -98,6 +98,32 @@ class ValidationRunTests(unittest.TestCase):
         self.assertIn('broken', content)
         self.assertIn('status 3', content)
 
+    @unittest.skipUnless(BASH, 'a POSIX bash is unavailable')
+    def test_required_scripts_run_independently_and_retain_failure_evidence(self):
+        (self.repository / 'scripts/validate.sh').write_text('#!/bin/sh\necho backend-failed\nexit 3\n')
+        (self.repository / 'scripts/build-web.sh').write_text('#!/bin/sh\necho frontend-still-ran\n')
+        self.target = commit(self.repository, 'independent checks')
+        with patch.object(validation, 'BASH', BASH):
+            run = self.submit_and_wait()
+        self.assertEqual(run['state'], 'failed')
+        self.assertEqual([c['status'] for c in run['checks']], ['failed', 'passed', 'passed', 'passed'])
+        self.assertFalse(run['required_checks_verified'])
+        self.assertIn('frontend-still-ran', self.runs.log(run['id'])[1])
+        self.assertEqual(self.records[0][1]['checks'], run['checks'])
+
+    @unittest.skipUnless(BASH, 'a POSIX bash is unavailable')
+    def test_waived_subcheck_does_not_turn_a_zero_exit_into_verified_checks(self):
+        (self.repository / 'scripts/build-web.sh').write_text(
+            '#!/bin/sh\nprintf \'%s\\n\' \'{"id":"lint","status":"waived","exit_code":null,"duration_ms":0}\' > "$HERDR_CHECK_REPORT"\n')
+        self.target = commit(self.repository, 'reported waiver')
+        with patch.object(validation, 'BASH', BASH):
+            run = self.submit_and_wait()
+        self.assertEqual(run['checks'][0]['status'], 'passed')
+        self.assertEqual(run['checks'][1]['status'], 'waived')
+        self.assertFalse(run['required_checks_verified'])
+        self.assertEqual(run['state'], 'failed')
+        self.assertNotIn('artifact', run)
+
     def test_a_missing_script_is_an_error_not_a_failed_validation(self):
         (self.repository / 'scripts').rename(self.repository / 'scripts-away')
         self.target = commit(self.repository, 'remove the script')
@@ -119,6 +145,26 @@ class ValidationRunTests(unittest.TestCase):
                                                      'started_at': '2026-01-01T00:00:00+00:00'}))
         with self.assertRaisesRegex(ValueError, 'already running'):
             self.runs.submit({'id': 'a' * 64})
+
+    @unittest.skipUnless(BASH, 'a POSIX bash is unavailable')
+    def test_service_queue_executes_without_browser_and_publishes_results_once(self):
+        from build_queue import BuildQueue
+        from build_worker import execute_next
+        queue = BuildQueue(Path(self.temp.name) / 'queue')
+        facade = ValidationRuns(self.projects, self.lookup, root=self.runs.root, queue=queue,
+            record=lambda event, summary: self.records.append((event, summary)))
+        submitted = facade.submit({'id': 'a' * 64})
+        self.assertEqual(submitted['state'], 'queued')
+        worker = ValidationRuns(self.projects, self.lookup, root=self.runs.root, external=True)
+        with patch.object(validation, 'BASH', BASH):
+            self.assertTrue(execute_next(queue, worker))
+        self.assertEqual(facade.snapshot()['runs'][0]['state'], 'complete')
+        self.assertEqual(self.records[0][1]['run_id'], submitted['id'])
+        facade.snapshot()
+        self.assertEqual(len(self.records), 1)
+        duplicate = facade.submit({'id': 'a' * 64})
+        self.assertEqual(duplicate['id'], submitted['id'])
+        self.assertFalse(execute_next(queue, worker))
 
     def test_logs_reject_unknown_or_invalid_runs(self):
         with self.assertRaisesRegex(ValueError, 'Invalid validation run ID'):
@@ -186,6 +232,64 @@ class ValidationRunTests(unittest.TestCase):
         self.assertEqual(run['state'], 'complete')
         self.assertNotIn('artifact', run)
         self.assertIn('symlinks', run['artifact_error'])
+
+    def test_service_restart_cleans_detached_worktree_and_requires_explicit_retry(self):
+        from build_queue import BuildQueue
+        from build_worker import recover_interrupted
+        queue = BuildQueue(Path(self.temp.name) / 'queue')
+        facade = ValidationRuns(self.projects, self.lookup, root=self.runs.root, queue=queue)
+        submitted = facade.submit({'id': 'a' * 64})
+        claimed = queue.claim()
+        tree = self.runs.root / submitted['id'] / 'tree'
+        self.runs._worktree(self.repository, tree, self.target)
+        recover_interrupted(queue, self.runs)
+        self.assertFalse(tree.exists())
+        self.assertNotIn(str(tree).replace('\\', '/'), git(self.repository, 'worktree', 'list', '--porcelain').stdout.decode())
+        self.assertEqual(queue.get(claimed['id'])['state'], 'interrupted')
+        self.assertEqual(facade.submit({'id': 'a' * 64})['state'], 'interrupted')
+        retried = facade.submit({'id': 'a' * 64, 'retry': True})
+        self.assertEqual(retried['attempt'], 2)
+        self.assertNotEqual(retried['id'], submitted['id'])
+
+    @unittest.skipUnless(BASH, 'a POSIX bash is unavailable')
+    def test_passing_script_cannot_package_modified_tracked_source(self):
+        (self.repository / 'scripts/build-web.sh').write_text(
+            '#!/bin/sh\necho changed >> scripts/build-web.sh\nmkdir -p web/public\necho built > web/public/index.html\n')
+        self.target = commit(self.repository, 'self modifying build')
+        with patch.object(validation, 'BASH', BASH):
+            run = self.submit_and_wait()
+        self.assertEqual(run['state'], 'failed')
+        checks = {check['id']: check for check in run['checks']}
+        self.assertEqual(checks['runner:worktree-clean']['status'], 'failed')
+        self.assertEqual(checks['runner:exact-commit']['status'], 'passed')
+        self.assertFalse(run['required_checks_verified'])
+        self.assertNotIn('artifact', run)
+
+    def test_unexpected_worker_exception_is_terminal_not_a_restart_retry(self):
+        from build_queue import BuildQueue
+        from build_worker import execute_next
+        queue = BuildQueue(Path(self.temp.name) / 'queue')
+        facade = ValidationRuns(self.projects, self.lookup, root=self.runs.root, queue=queue)
+        submitted = facade.submit({'id': 'a' * 64})
+        with patch.object(self.runs, '_execute', side_effect=RuntimeError('poison request')), self.assertLogs(level='ERROR'):
+            self.assertTrue(execute_next(queue, self.runs))
+        self.assertEqual(queue.get(submitted['id'])['state'], 'error')
+        self.assertIn('poison request', queue.get(submitted['id'])['note'])
+        self.assertFalse(execute_next(queue, self.runs))
+
+    @unittest.skipUnless(BASH, 'a POSIX bash is unavailable')
+    def test_artifact_keeps_task_and_waiver_provenance_without_rewriting_event(self):
+        (self.repository / 'scripts/build-web.sh').write_text(
+            '#!/bin/sh\nmkdir -p web/public\necho built > web/public/index.html\n')
+        self.target = commit(self.repository, 'waiver provenance')
+        event = dict(self.lookup('a' * 64), state='validation_waived', job_id='task-job',
+                     operator_approval={'actor': 'admin', 'reason': 'Earlier tools unavailable'}, reason='Validation waived')
+        with patch.object(self.runs, 'lookup', return_value=event), patch.object(validation, 'BASH', BASH):
+            run = self.submit_and_wait()
+        self.assertEqual(run['state'], 'complete')
+        self.assertEqual(run['artifact']['task_id'], 'task-job')
+        self.assertEqual(run['artifact']['validation_waiver']['approval']['actor'], 'admin')
+        self.assertEqual(event['state'], 'validation_waived')
 
     def test_restart_marks_incomplete_runs_interrupted(self):
         folder = self.runs.root / ('c' * 32)

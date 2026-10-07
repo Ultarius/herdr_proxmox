@@ -510,7 +510,7 @@ class _AppShellState extends State<AppShell> {
                         'explorer' => 1,
                         'agents' => 2,
                         'organization' => 3,
-                        'configuration' => 4,
+                        'configuration' || 'builds' => 4,
                         _ => 0,
                       },
                       onDestinationSelected: (index) => navigate(

@@ -183,7 +183,7 @@ else
 fi
 if ((web)); then
   archive=$(mktemp)
-  tar -C "$repo" -czf "$archive" web/public web/gateway install/web-install.sh install/dashboard-update.py install/sdk-install.py install/operator-admin.py install/dev-tools-install.sh install/flutter-release.py
+  tar -C "$repo" -czf "$archive" web/public web/gateway install/web-install.sh install/dashboard-update.py install/sdk-install.py install/operator-admin.py install/dev-tools-install.sh install/flutter-release.py install/build-install.sh
   pct push "$ctid" "$archive" /root/herdr-web.tar.gz --perms 0600
   pct exec "$ctid" -- mkdir -p /opt/herdr-web
   pct exec "$ctid" -- tar -xzf /root/herdr-web.tar.gz -C /opt/herdr-web

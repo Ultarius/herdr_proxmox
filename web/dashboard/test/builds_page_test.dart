@@ -138,6 +138,8 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.textContaining('Deployment: idle'), findsOneWidget);
       await tester.ensureVisible(find.text('Deploy this build'));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('Deploy this build'));
       await tester.tap(find.text('Deploy this build'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Approve and deploy'));

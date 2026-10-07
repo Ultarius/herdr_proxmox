@@ -597,6 +597,30 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
                       'auto_sdk': value,
                     }),
             ),
+          if (config?['enabled'] == true)
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Build incorporated commits automatically'),
+              subtitle: const Text(
+                'Requires the build service. Queue the exact commit after gateway Git verification; failed builds need an explicit retry. Deployment remains an administrator action.',
+              ),
+              value: config?['auto_build'] == true,
+              onChanged: busy || connection.operator.value['role'] != 'admin'
+                  ? null
+                  : (value) => action('integration/configure', {
+                      'repository': widget.repository,
+                      'profile_id': config?['profile_id'],
+                      'enabled': true,
+                      'auto_build': value,
+                    }),
+            ),
+          for (final event in events)
+            if ('${event['automatic_build_error'] ?? ''}'.isNotEmpty)
+              ListTile(
+                leading: const Icon(Icons.warning_amber_outlined),
+                title: Text('Automatic build waiting · ${event['name']}'),
+                subtitle: Text('${event['automatic_build_error']}'),
+              ),
           if (sdk['state'] == 'unavailable')
             ListTile(
               contentPadding: EdgeInsets.zero,
