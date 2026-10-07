@@ -476,7 +476,9 @@ class OrganizationStore:
                                     or not profile.get('use_worktree', True)):
                                 raise ValueError('Invalid task branch or starting commit.')
                             item.update(task_id=task_id, worktree_branch=body['worktree_branch'],
-                                        start_sha=body['start_sha'], task_prompt=text(body, 'task_prompt', 10000))
+                                        # A task description is allowed 8000 characters and the
+                                        # launch adds instructions plus the shared tool policy.
+                                        start_sha=body['start_sha'], task_prompt=text(body, 'task_prompt', 16000))
                         self.project(profile['project'])
                     else:
                         sender = self.get(db, 'profiles', text(body, 'sender_id', 40), org_id)

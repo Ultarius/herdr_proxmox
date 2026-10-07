@@ -33,6 +33,27 @@ class FlutterReleaseTests(unittest.TestCase):
         self.assertIn('v=="3.44.8"', build)
         self.assertLess(installer.index('sha256sum --check'), installer.index('tar --no-same-owner'))
 
+    def test_the_product_build_requires_only_its_own_pinned_toolchain(self):
+        # Tools an agent may install for its own task. The product must never make
+        # one of them a build or provisioning requirement: the gateway validates
+        # every worker merge by running the repository's own scripts, so a required
+        # task tool would stall the integration loop whenever it is not installed.
+        task_tools = ('actionlint', 'shellcheck', 'golangci')
+        product_toolchain = ('scripts/build-web.sh', 'install/dev-tools-install.sh',
+                             'web/gateway/sdk_install.py', 'web/gateway/validation.py')
+
+        root = Path(__file__).parents[1]
+        for name in product_toolchain:
+            path = root / name
+            self.assertTrue(path.is_file(), name)
+            # Comments explain the rule and must not trip it; only real code counts.
+            code = [line for line in path.read_text().splitlines()
+                    if not line.lstrip().startswith('#')]
+            for line in code:
+                for tool in task_tools:
+                    self.assertNotRegex(line, r'\b' + tool + r'\b',
+                                        f'{name} must not require a task tool: {line.strip()}')
+
     def test_installer_uses_release_bucket_not_engine_artifact_prefix(self):
         installer = (Path(__file__).parents[1] / 'install/dev-tools-install.sh').read_text()
         self.assertIn('origin=https://storage.googleapis.com/flutter_infra_release/releases\n', installer)

@@ -27,6 +27,19 @@ spec.loader.exec_module(script)
 
 
 class CheckEvidenceTests(unittest.TestCase):
+    def test_successful_web_check_cannot_hide_a_missing_or_failed_check(self):
+        # Protocol rule, independent of which checks a repository chooses:
+        # a passing check must never mask a required check that did not pass.
+        for command, expected in ((['herdr-nonexistent-linter'], 'unavailable'),
+                                  ([sys.executable, '-c', 'raise SystemExit(1)'], 'failed')):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                report = Path(directory) / 'checks.jsonl'
+                self.assertEqual(script.execute('flutter-release', [sys.executable, '-c', 'pass'], report), 0)
+                self.assertNotEqual(script.execute('extra-lint', command, report), 0)
+                checks = read_report(report, 'build')
+                self.assertEqual(checks[-1]['status'], expected)
+                self.assertFalse(required_passed(checks))
+
     def test_only_actual_passes_satisfy_required_checks(self):
         self.assertFalse(required_passed([]))
         self.assertTrue(required_passed([dict(status='passed', exit_code=0)]))

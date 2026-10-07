@@ -23,4 +23,9 @@ check shell-analyze dart analyze
 # Jaspr mounts a client-rendered DOM shell; no server rendering or CLI generator needed.
 check shell-compile dart compile js lib/main.dart -O2 -o ../public/main.dart.js
 cp web/index.html ../public/index.html
+# Only the project's own pinned build toolchain belongs here. This script is
+# what the gateway runs to validate every worker merge, so requiring a
+# separately provisioned tool would stall the integration loop whenever that
+# provisioning has not run. A task-specific tool belongs to the agent, who
+# installs it in its own checkout and reports the real result.
 printf '\nBuilt web/public. Copy the repository to your Proxmox host to install.\n'

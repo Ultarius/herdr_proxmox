@@ -56,6 +56,8 @@ assert len(checks) == 10, checks
 assert len({check['id'] for check in checks}) == 10, checks
 assert all(check['status'] == 'passed' and check['exit_code'] == 0 for check in checks), checks
 PY
+# The tool-ownership guard for this script lives in one place:
+# tests/test_flutter_release.py::test_the_product_build_requires_only_its_own_pinned_toolchain
 # The fix must still enforce the pinned version and stop before building.
 : >"$HERDR_BUILD_TEST_LOG"
 export HERDR_CHECK_REPORT="$tmp/version-mismatch-checks.jsonl"

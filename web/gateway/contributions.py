@@ -28,6 +28,22 @@ from repository_lock import repository_lock
 SHA = re.compile(r'[a-f0-9]{40}|[a-f0-9]{64}')
 BRANCH = re.compile(r'herdr/task-[a-f0-9]{12}')
 REQUEST = re.compile(r'[A-Za-z0-9_-]{1,64}')
+
+
+def task_tool_guidance():
+    """Share tool acquisition policy without issuing a merge request to a task.
+
+    The policy lives once, in the worker skill; this extracts just the section a
+    development task needs. A missing section is an inconsistent installation and
+    must say so, not surface as an index error during a launch.
+    """
+    skill = (Path(__file__).parent / 'skills/herdr-worktree-integration/SKILL.md').read_text(encoding='utf-8')
+    marker = '## Missing tools and validation failures\n'
+    if marker not in skill:
+        raise ValueError('Worker skill is missing its tool policy section; reinstall the dashboard release.')
+    section = skill.split(marker, 1)[1]
+    return section.split('\n## Validation failures and permission requests', 1)[0].strip()
+
 # A background status poll must never hold a task long, and must never wait
 # long enough to delay validation feedback delivery.
 POLL_WAIT_SECONDS = 5
@@ -397,7 +413,8 @@ class Contributions:
                 task_prompt='Task: ' + task['title'] + '\n' + task['description'] +
                     '\nWork only in your assigned task branch. Implement, run required checks, and commit your changes. '
                     'Never push, open a pull request, update the shared checkout or deploy. '
-                    'Report commands and actual results; missing checks are not passes. Publishing is a dashboard administrator action.'))
+                    'Report commands and actual results; missing checks are not passes. Publishing is a dashboard administrator action.\n\n'
+                    'Task-local tool acquisition policy:\n' + task_tool_guidance()))
             task.update(run_id=run['id'], worktree=str((self.projects / '.herdr-worktrees' / run['id']).resolve()),
                         state='implementing')
         elif action == 'candidate':

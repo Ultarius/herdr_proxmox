@@ -2,6 +2,7 @@ import json
 from contextlib import closing, contextmanager
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -168,11 +169,30 @@ class ContributionTests(unittest.TestCase):
         arguments = self.store.action.call_args.args[1]
         self.assertEqual(arguments['start_sha'], self.base)
         self.assertEqual(arguments['worktree_branch'], self.task['branch'])
+        prompt = arguments['task_prompt']
+        self.assertIn('Task-local tool acquisition policy:', prompt)
+        self.assertIn('Pin the version required by the repository', prompt)
+        self.assertIn('Agents currently share the', prompt)
+        self.assertIn('A check that never ran remains `not_run`', prompt)
+        self.assertNotIn('## Merge procedure', prompt)
         self.assertIn('Never push', arguments['task_prompt'])
         self.assertEqual(project_git.configured_base(self.repo), self.task['base_ref'])
         self.assertEqual(launched['state'], 'implementing')
         self.service.action('launch', dict(request_id='again', task_id=self.task['id']), 'admin', 'admin')
         self.assertEqual(self.store.action.call_count, 1)
+
+    def test_task_prompt_budget_accommodates_the_shared_tool_policy(self):
+        # The launch channel caps task_prompt. A maximum-length description plus
+        # the shared policy must fit, or a task could be created and never launch.
+        root = Path(__file__).parents[1]
+        source = (root / 'web/gateway/organizations.py').read_text()
+        cap = int(re.search(r"task_prompt', (\d+)", source).group(1))
+        self.assertGreater(cap, 8000 + len(contributions.task_tool_guidance()) + 500)
+
+    def test_tool_policy_extraction_reports_an_inconsistent_installation(self):
+        with patch.object(contributions.Path, 'read_text', return_value='# incomplete skill'):
+            with self.assertRaisesRegex(ValueError, 'missing its tool policy section'):
+                contributions.task_tool_guidance()
 
     def test_candidate_preserves_main_and_blocks_dirty_or_changed_checkout(self):
         task = self.candidate()
