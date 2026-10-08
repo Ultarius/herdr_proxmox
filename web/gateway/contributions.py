@@ -411,7 +411,72 @@ class Contributions:
     def detail(self, task_id):
         if not isinstance(task_id, str) or not re.fullmatch(r'[a-f0-9]{32}', task_id):
             raise ValueError('Select a valid task.')
-        return self.get(task_id)
+        task = self.get(task_id)
+        with closing(self.connect()) as db:
+            task['audit'] = list(reversed([json.loads(row[0]) for row in db.execute(
+                'SELECT data FROM audit WHERE task_id=? ORDER BY rowid DESC LIMIT 500', (task_id,))]))
+        jobs = self.store.snapshot(live_status=False).get('jobs', [])
+        sessions = [j for j in jobs if j.get('task_id') == task_id or j.get('id') == task.get('run_id')]
+        participants = list(task.get('participants', []))
+        known = {p.get('run_id') for p in participants}
+        for job in sessions:
+            if job.get('kind', 'launch') != 'launch':
+                continue
+            if job['id'] not in known:
+                profile = job.get('profile', {})
+                participants.append(dict(profile_id=job.get('profile_id'), run_id=job['id'],
+                    name=profile.get('name', 'Agent identity unavailable'), role=profile.get('role', ''),
+                    runtime=profile.get('runtime', ''), model=profile.get('model'), provider=profile.get('provider'), assigned_at=job.get('created_at'),
+                    provenance='launch_record'))
+                known.add(job['id'])
+        task['participants'] = participants
+        task['sessions'] = [{k: j.get(k) for k in ('id', 'kind', 'state', 'profile_id', 'created_at',
+                            'updated_at', 'error', 'pane_id', 'alias', 'session_closed_at')} |
+                            dict(history=[{k: h.get(k) for k in ('alias', 'pane_id', 'session_closed_at')}
+                                          for h in j.get('session_history', [])]) for j in sessions]
+        # History is a read-only view of immutable commits, never candidate recapture.
+        if task.get('head_sha'):
+            try:
+                repository = self.path_for(task)
+                with repository_lock(repository):
+                    task['commit_graph'] = self.commit_history(repository, task['base_sha'], task['head_sha'])
+            except (ValueError, OSError) as error:
+                task['history_error'] = str(error)[:500]
+                task['commit_graph'] = []
+        return task
+
+    @staticmethod
+    def commit_history(repository, base, head):
+        if not SHA.fullmatch(str(base)) or not SHA.fullmatch(str(head)):
+            raise ValueError('Commit history requires recorded full commit identities.')
+        log_format = '%H%x1f%P%x1f%s%x1f%an%x1f%aI%x1f%D'
+        rows = project_git.git(repository, 'log', '--topo-order', '--max-count=30',
+                               '--format=' + log_format, base + '..' + head, '--').splitlines()
+        result = []
+        for row in rows:
+            sha, parents, subject, author, date, refs = row.split('\x1f', 5)
+            result.append(dict(sha=sha, parents=parents.split(), subject=subject[:300],
+                               author=author[:120], date=date, refs=refs[:200]))
+        if not any(n['sha'] == base for n in result):
+            row = project_git.git(repository, 'show', '-s', '--format=' + log_format, base, '--').strip()
+            sha, parents, subject, author, date, refs = row.split('\x1f', 5)
+            result.append(dict(sha=sha, parents=parents.split(), subject=subject[:300],
+                               author=author[:120], date=date, refs=refs[:200]))
+        return result
+
+    def commit_detail(self, task_id, sha):
+        task = self.detail(task_id)
+        if not SHA.fullmatch(str(sha)) or sha not in {n['sha'] for n in task.get('commit_graph', [])}:
+            raise ValueError('Select a commit from this task history.')
+        repository = self.path_for(task)
+        with repository_lock(repository):
+            parents = next(n['parents'] for n in task['commit_graph'] if n['sha'] == sha)
+            if parents:
+                diff = project_git.git(repository, 'diff', '--no-ext-diff', '--no-textconv', parents[0], sha, '--')
+            else:
+                diff = project_git.git(repository, 'show', '--format=', '--root', '--no-ext-diff', '--no-textconv', sha, '--')
+        return dict(sha=sha, diff=diff[:65536], diff_truncated=len(diff) > 65536,
+                    comparison='first parent' if parents else 'empty tree', build=task.get('builds', {}).get(sha))
 
     def path_for(self, task):
         return project_directory(self.projects, str(self.projects / task['repository']))
@@ -510,7 +575,8 @@ class Contributions:
                         repository=repository.relative_to(self.projects).as_posix(), github_repository=remote,
                         base_ref=base, base_sha=sha, branch='herdr/task-' + task_id[:12],
                         profile_id=profile['id'], organization_id=profile['organization_id'], state='draft',
-                        created_at=stamp(), checks=[], audit=[], auto_validate=False)
+                        created_at=stamp(), checks=[], audit=[], auto_validate=False,
+                        assigned_agent={k: profile.get(k) for k in ('id', 'name', 'role', 'runtime')}, participants=[])
             return self.save(task, 'create', actor)
         task = self.get(task_id)
         had_error = task.pop('error', None) is not None
@@ -534,6 +600,10 @@ class Contributions:
                     'When complete, write JSON to {{HERDR_TASK_RECEIPT}} with outcome=complete, commit=the full HEAD SHA, run_id={{HERDR_TASK_RUN}}, token={{HERDR_TASK_TOKEN}}, and tests as an array of actual check results. Write it last after committing. '
                     'Report commands and actual results; missing checks are not passes. Publishing is a dashboard administrator action.\n\n'
                     'Task-local tool acquisition policy:\n' + task_tool_guidance()))
+            profile = next((p for p in self.store.snapshot(live_status=False)['profiles'] if p['id'] == task['profile_id']), {})
+            task.setdefault('participants', []).append(dict(profile_id=task['profile_id'], run_id=run['id'],
+                name=profile.get('name', 'Agent identity unavailable'), role=profile.get('role', ''),
+                runtime=profile.get('runtime', ''), model=profile.get('model'), provider=profile.get('provider'), assigned_at=stamp(), provenance='task_launch'))
             task.update(run_id=run['id'], worktree=str((self.projects / '.herdr-worktrees' / run['id']).resolve()),
                         state='implementing')
         elif action == 'policy':
@@ -649,7 +719,12 @@ class Contributions:
                 db.execute('INSERT OR IGNORE INTO build_events VALUES (?,?)', (event_id, json.dumps(event)))
             previous = task.get('builds', {}).get(target)
             run = self.validation.submit(dict(id=event_id, retry=bool(previous and previous.get('state') in ('failed', 'interrupted'))), actor=actor)
-            task.setdefault('builds', {})[target] = dict(run_id=run['id'], state=run['state'], target=target, checks=run.get('checks', []))
+            if previous and previous.get('run_id') == run['id']:
+                # The durable queue deduplicated to the existing run; keep its
+                # full evidence instead of replacing it with the queue record.
+                task.setdefault('builds', {})[target] = dict(previous, state=run['state'])
+            else:
+                task.setdefault('builds', {})[target] = dict(run_id=run['id'], state=run['state'], target=target, checks=run.get('checks', []))
         elif action == 'refresh':
             previous = task.get('pull'), task.get('state'), task.get('merge_sha')
             if not task.get('pull'):

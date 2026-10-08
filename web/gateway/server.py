@@ -282,6 +282,15 @@ class Handler(BaseHTTPRequestHandler):
                 except (ValueError, OSError) as error:
                     self.reply(400, {'error': str(error)[:500]})
                 return
+            if self.path.startswith('/api/tasks/commit?'):
+                query = parse_qs(urlsplit(self.path).query)
+                try:
+                    self.reply(200, self.server.contributions.commit_detail(query.get('id', [''])[0], query.get('sha', [''])[0]))
+                except sqlite3.Error:
+                    self.reply(503, {'error': 'Task storage is unavailable.'})
+                except (ValueError, OSError) as error:
+                    self.reply(400, {'error': str(error)[:500]})
+                return
             if self.path.startswith('/api/tasks/detail?'):
                 query = parse_qs(urlsplit(self.path).query)
                 try:

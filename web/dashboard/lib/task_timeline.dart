@@ -1,21 +1,45 @@
 import 'package:flutter/material.dart';
 
-/// Real parent edges for the bounded captured history; no implied publication.
+/// A read-only vertical Git graph. Build evidence belongs to its exact commit.
 class TaskTimeline extends StatelessWidget {
-  const TaskTimeline({super.key, required this.task});
+  const TaskTimeline({
+    super.key,
+    required this.task,
+    this.onSelect,
+    this.onRefresh,
+  });
   final Map task;
+  final ValueChanged<String>? onSelect;
+  final VoidCallback? onRefresh;
+
+  static String shortSha(Map node) {
+    final sha = '${node['sha']}';
+    return sha.substring(0, sha.length.clamp(0, 8));
+  }
+
   @override
   Widget build(BuildContext context) {
-    final nodes = <Map>[
-      for (final node in task['commit_graph'] as List? ?? [])
-        if (node is Map) node,
+    final nodes = [
+      for (final n in task['commit_graph'] as List? ?? [])
+        if (n is Map) n,
     ];
-    final head = '${task['head_sha'] ?? ''}';
-    final graphMissing = head.isNotEmpty && !nodes.any((n) => n['sha'] == head);
-    if (graphMissing) nodes.insert(0, {'sha': head, 'parents': []});
-    final base = '${task['base_sha'] ?? ''}';
-    if (base.isNotEmpty && !nodes.any((n) => n['sha'] == base))
-      nodes.add({'sha': base, 'parents': []});
+    if (nodes.isEmpty || !nodes.any((n) => n['sha'] == task['head_sha'])) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Commit history unavailable'),
+          Text(
+            '${task['history_error'] ?? 'Refresh to load recorded commit history. Viewing history does not capture a new candidate.'}',
+          ),
+          if (onRefresh != null)
+            TextButton.icon(
+              onPressed: onRefresh,
+              icon: const Icon(Icons.refresh),
+              label: const Text('Refresh history'),
+            ),
+        ],
+      );
+    }
     final lanes = <String>[];
     final laneBySha = <String, int>{};
     for (final node in nodes) {
@@ -34,130 +58,174 @@ class TaskTimeline extends StatelessWidget {
         if (!lanes.contains(parent)) lanes.add(parent);
       }
     }
-    final ordered = nodes.reversed.toList();
     final positions = <String, Offset>{};
-    for (var i = 0; i < ordered.length; i++) {
-      positions['${ordered[i]['sha']}'] = Offset(
-        50 + i * 130,
-        32 + (laneBySha['${ordered[i]['sha']}'] ?? 0) * 32,
+    // Bound the lane gutter so a merge-heavy history cannot squeeze the text.
+    final gutter = (lanes.length.clamp(1, 6) * 16 + 16).toDouble();
+    for (var i = 0; i < nodes.length; i++) {
+      positions['${nodes[i]['sha']}'] = Offset(
+        12 + (laneBySha['${nodes[i]['sha']}'] ?? 0).clamp(0, 5) * 16,
+        i * 124 + 22,
       );
     }
-    final height = 105.0 + lanes.length * 32;
     final builds = task['builds'] as Map? ?? {};
-    final colors = <String, Color>{};
-    for (final node in ordered) {
-      final build = builds[node['sha']] as Map?;
-      colors['${node['sha']}'] =
-          build?['state'] == 'failed' || build?['state'] == 'error'
-          ? Theme.of(context).colorScheme.error
-          : build?['state'] == 'complete' &&
-                build?['required_checks_verified'] == true
-          ? Colors.green
-          : Theme.of(context).colorScheme.primary;
-    }
+    final scheme = Theme.of(context).colorScheme;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text('Git timeline · recorded commit parents'),
-        if (graphMissing)
-          const Text('Capture the candidate again to load its parent edges.'),
-        SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: SizedBox(
-            width: (ordered.length * 130 + 40).toDouble(),
-            height: height,
-            child: Stack(
-              children: [
-                Positioned.fill(
-                  child: CustomPaint(
-                    painter: _Edges(
-                      ordered,
-                      positions,
-                      Theme.of(context).colorScheme.outline,
-                    ),
-                  ),
-                ),
-                for (final node in ordered)
-                  Positioned(
-                    left: positions['${node['sha']}']!.dx - 38,
-                    top: positions['${node['sha']}']!.dy - 12,
-                    child: Tooltip(
-                      message:
-                          '${node['sha']}\n${node['sha'] == base
-                              ? 'Recorded base'
-                              : node['sha'] == task['head_sha']
-                              ? 'Current candidate'
-                              : 'Ancestor'}',
-                      child: Column(
-                        children: [
-                          Icon(
-                            Icons.circle_outlined,
-                            color: colors['${node['sha']}'],
-                            size: 24,
+        const Text('Recent commits \u00b7 newest first'),
+        const SizedBox(height: 8),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: gutter,
+              height: nodes.length * 124.0,
+              child: CustomPaint(
+                painter: _GitEdges(nodes, positions, scheme.primary),
+              ),
+            ),
+            Expanded(
+              child: Column(
+                children: [
+                  for (final node in nodes)
+                    SizedBox(
+                      height: 124,
+                      child: InkWell(
+                        onTap: onSelect == null
+                            ? null
+                            : () => onSelect!('${node['sha']}'),
+                        child: Padding(
+                          padding: const EdgeInsets.only(
+                            left: 8,
+                            right: 4,
+                            bottom: 8,
                           ),
-                          Text(
-                            '${node['sha']}'.substring(
-                              0,
-                              '${node['sha']}'.length.clamp(0, 8),
+                          child: Align(
+                            alignment: Alignment.topLeft,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  '${node['subject'] ?? 'Commit'}',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: Theme.of(context).textTheme.titleSmall,
+                                ),
+                                Tooltip(
+                                  message: '${node['sha']}',
+                                  child: Text(
+                                    '${node['author'] ?? 'Unknown author'} \u00b7 ${shortSha(node)}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                                if ('${node['refs'] ?? ''}'.isNotEmpty)
+                                  Text(
+                                    '${node['refs']}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: Theme.of(context).textTheme.bodySmall,
+                                  ),
+                                Wrap(
+                                  spacing: 8,
+                                  children: [
+                                    if (node['sha'] == task['base_sha'])
+                                      const Text('Base'),
+                                    if (node['sha'] == task['head_sha'])
+                                      const Text('Candidate'),
+                                    if (builds[node['sha']] is Map)
+                                      _BuildBadge(
+                                        evidence: builds[node['sha']],
+                                      ),
+                                  ],
+                                ),
+                              ],
                             ),
                           ),
-                          if (node['sha'] == base) const Text('Base'),
-                          if (node['sha'] == task['head_sha'])
-                            const Text('Candidate'),
-                        ],
+                        ),
                       ),
                     ),
-                  ),
-              ],
+                ],
+              ),
             ),
-          ),
+          ],
         ),
         const Text(
-          'Green: verified build · red: failed build · other nodes: no verified pass. Up to 12 commits; absent parent edges are outside this view.',
-        ),
-        Text(
-          'Completion receipt: ${task['completion_receipt'] == null ? 'not verified' : 'verified for ${task['completion_receipt']['commit']}'}',
+          'Only recorded parent edges are shown. Older parents can be outside this bounded history.',
         ),
         if (task['already_upstream'] == true)
           const Text(
-            'Candidate tree matches the last fetched configured base. No additional file changes need a PR; this is not deployment verification.',
+            'Candidate files match the last fetched base. Deployment is separate.',
           ),
       ],
     );
   }
 }
 
-class _Edges extends CustomPainter {
-  _Edges(this.nodes, this.positions, this.color);
+class _BuildBadge extends StatelessWidget {
+  const _BuildBadge({required this.evidence});
+  final Map evidence;
+  @override
+  Widget build(BuildContext context) {
+    final verified =
+        evidence['state'] == 'complete' &&
+        evidence['required_checks_verified'] == true;
+    final failed = ['failed', 'error'].contains(evidence['state']);
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    return Text(
+      verified
+          ? 'Checks verified'
+          : failed
+          ? 'Checks failed'
+          : 'Checks not verified',
+      style: TextStyle(
+        color: verified
+            ? (dark ? Colors.green.shade400 : Colors.green.shade800)
+            : failed
+            ? Theme.of(context).colorScheme.error
+            : null,
+      ),
+    );
+  }
+}
+
+class _GitEdges extends CustomPainter {
+  _GitEdges(this.nodes, this.positions, this.color);
   final List<Map> nodes;
   final Map<String, Offset> positions;
   final Color color;
   @override
   void paint(Canvas canvas, Size size) {
-    final paint = Paint()
+    final pen = Paint()
       ..color = color
       ..strokeWidth = 2
       ..style = PaintingStyle.stroke;
     for (final node in nodes) {
-      final child = positions['${node['sha']}']!;
+      final start = positions['${node['sha']}']!;
       for (final parent in node['parents'] as List? ?? []) {
-        final start = positions['$parent'];
-        if (start == null) continue;
-        final path = Path()
-          ..moveTo(start.dx, start.dy)
-          ..cubicTo(
-            (start.dx + child.dx) / 2,
-            start.dy,
-            (start.dx + child.dx) / 2,
-            child.dy,
-            child.dx,
-            child.dy,
-          );
-        canvas.drawPath(path, paint);
+        final end = positions['$parent'];
+        if (end == null) continue;
+        canvas.drawPath(
+          Path()
+            ..moveTo(start.dx, start.dy)
+            ..cubicTo(
+              start.dx,
+              (start.dy + end.dy) / 2,
+              end.dx,
+              (start.dy + end.dy) / 2,
+              end.dx,
+              end.dy,
+            ),
+          pen,
+        );
       }
+    }
+    for (final position in positions.values) {
+      canvas.drawCircle(position, 5, pen);
     }
   }
 
   @override
-  bool shouldRepaint(covariant _Edges old) => true;
+  bool shouldRepaint(covariant _GitEdges old) =>
+      old.nodes != nodes || old.color != color;
 }

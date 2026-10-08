@@ -17,7 +17,22 @@ class TasksRoute extends AppRoute {
   Widget build(AppCoordinator coordinator, BuildContext context) => AppShell(
     coordinator: coordinator,
     section: 'tasks',
-    child: const TasksPage(),
+    child: TasksPage(coordinator: coordinator),
+  );
+}
+
+class TaskDetailRoute extends AppRoute {
+  TaskDetailRoute(this.id);
+  final String id;
+  @override
+  List<Object?> get props => [id];
+  @override
+  Uri toUri() => Uri(path: '/tasks/$id');
+  @override
+  Widget build(AppCoordinator coordinator, BuildContext context) => AppShell(
+    coordinator: coordinator,
+    section: 'tasks',
+    child: TasksPage(key: ValueKey(id), taskId: id, coordinator: coordinator),
   );
 }
 
@@ -147,6 +162,8 @@ class AppCoordinator extends Coordinator<AppRoute> {
   AppRoute parseRouteFromUri(Uri uri) {
     if (uri.pathSegments.length == 2 && uri.pathSegments.first == 'groups')
       return GroupRoute(uri.pathSegments[1]);
+    if (uri.pathSegments.length == 2 && uri.pathSegments.first == 'tasks')
+      return TaskDetailRoute(uri.pathSegments[1]);
     return switch (uri.path) {
       '/' || '' => DashboardRoute(),
       '/agents' => AgentsRoute(),

@@ -236,6 +236,54 @@ class ContributionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'durable build service'):
             self.service.action('policy', dict(request_id='policy-guard', task_id=task['id'], auto_validate=True), 'admin', 'admin')
 
+    def test_detail_loads_legacy_history_without_recapture_or_write(self):
+        task = self.candidate()
+        task.pop('commit_graph', None)
+        self.service.save(task, 'legacy', 'admin')
+        before = self.service.get(task['id'])
+        self.store.snapshot.return_value['jobs'][0].update(kind='launch', profile_id='worker',
+            profile=dict(name='Maya at launch', role='Frontend developer', runtime='opencode'),
+            completion_token='private-token', session_history=[dict(alias='old-session', pane_id='w1:p1', session_closed_at='yesterday', secret='hidden')])
+        self.profile['name'] = 'Renamed current profile'
+        detail = self.service.detail(task['id'])
+        self.assertEqual(detail['participants'][0]['name'], 'Maya at launch')
+        self.assertEqual(detail['commit_graph'][0]['sha'], task['head_sha'])
+        self.assertEqual(detail['commit_graph'][0]['parents'], [self.base])
+        self.assertEqual(detail['commit_graph'][0]['subject'], 'implementation')
+        self.assertEqual(detail['commit_graph'][-1]['sha'], self.base)
+        self.assertNotIn('completion_token', detail['sessions'][0])
+        self.assertNotIn('secret', detail['sessions'][0]['history'][0])
+        self.assertEqual(self.service.get(task['id']), before)
+        change = self.service.commit_detail(task['id'], task['head_sha'])
+        self.assertIn('+implementation', change['diff'])
+        self.assertEqual(change['comparison'], 'first parent')
+        with self.assertRaisesRegex(ValueError, 'task history'):
+            self.service.commit_detail(task['id'], 'f' * 40)
+        self.assertEqual(self.service.get(task['id']), before)
+
+    def test_detail_history_preserves_both_merge_parents(self):
+        task = self.candidate()
+        (self.repo / 'upstream').write_text('upstream changes')
+        self.git('add', '.')
+        self.git('commit', '-m', 'upstream update')
+        upstream = self.git('rev-parse', 'HEAD').strip()
+        self.git('merge', '--no-ff', 'main', '-m', 'merge upstream', path=task['worktree'])
+        merged = self.service.action('candidate', dict(request_id='merged-candidate', task_id=task['id']), 'admin', 'admin')
+        history = self.service.detail(task['id'])['commit_graph']
+        self.assertEqual(history[0]['sha'], merged['head_sha'])
+        self.assertEqual(history[0]['parents'], [task['head_sha'], upstream])
+        self.assertEqual(history[0]['subject'], 'merge upstream')
+        self.assertEqual(self.service.commit_detail(task['id'], merged['head_sha'])['comparison'], 'first parent')
+
+    def test_detail_keeps_persisted_participation_when_profile_changes(self):
+        task = self.candidate()
+        task['participants'] = [dict(run_id='run', profile_id='worker', name='Original Maya', role='Frontend', provenance='task_launch')]
+        self.service.save(task, 'participation', 'admin')
+        self.store.snapshot.return_value['jobs'][0].update(profile=dict(name='New name'))
+        detail = self.service.detail(task['id'])
+        self.assertEqual(len(detail['participants']), 1)
+        self.assertEqual(detail['participants'][0]['name'], 'Original Maya')
+
     def pull_data(self, task, **changes):
         result = dict(number=7, state='open', draft=True, head=dict(ref=task['branch'], sha=task['head_sha'],
                       repo=dict(full_name='owner/repo')), base=dict(ref='main'), mergeable=None)
@@ -388,6 +436,25 @@ class ContributionTests(unittest.TestCase):
         mismatched = self.service.get(task['id'])
         self.assertIn('does not match', mismatched['error'])
         self.assertNotIn(task['head_sha'], mismatched['builds'])
+
+    def test_revalidating_a_deduplicated_build_keeps_its_evidence(self):
+        task = self.candidate()
+        self.service.validation = MagicMock()
+        self.service.validation.submit.return_value = dict(id='build-1', state='queued', checks=[])
+        self.service.action('build', dict(request_id='build-1', task_id=task['id'], target=task['head_sha']), 'admin', 'admin')
+        stored = self.service.get(task['id'])
+        stored['builds'][task['head_sha']] = dict(run_id='build-1', target=task['head_sha'], state='complete',
+                                                  required_checks_verified=True, exit_code=0,
+                                                  checks=[dict(id='test', status='passed')])
+        self.service.save(stored, 'build_result', 'runner')
+        # The durable queue deduplicates to the existing run; the recorded
+        # evidence must survive instead of being replaced by the queue record.
+        self.service.validation.submit.return_value = dict(id='build-1', state='complete', checks=[])
+        self.service.action('build', dict(request_id='build-2', task_id=task['id'], target=task['head_sha']), 'admin', 'admin')
+        again = self.service.get(task['id'])['builds'][task['head_sha']]
+        self.assertTrue(again['required_checks_verified'])
+        self.assertEqual(again['exit_code'], 0)
+        self.assertEqual(again['checks'], [dict(id='test', status='passed')])
 
     def test_background_poll_survives_storage_faults_and_never_publishes(self):
         task = self.candidate()
@@ -610,6 +677,7 @@ class ContributionTests(unittest.TestCase):
         self.assertIn('denied', saved['error'])
 
     def test_gateway_routes_authenticate_and_enforce_administrator(self):
+        task = self.candidate()
         gateway = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
         gateway.token = 'a' * 48
         gateway.github = self.api
@@ -632,12 +700,23 @@ class ContributionTests(unittest.TestCase):
             self.assertEqual(visible['github'], {'configured': True})
             detail = json.load(urlopen(Request(base + '/api/tasks/detail?id=' + self.task['id'], headers=operator_headers)))
             self.assertEqual(detail['title'], self.task['title'])
+            commit_path = '/api/tasks/commit?id=' + task['id'] + '&sha=' + task['head_sha']
+            with self.assertRaises(HTTPError) as unauthenticated:
+                urlopen(base + commit_path)
+            self.assertEqual(unauthenticated.exception.code, 401)
+            commit = json.load(urlopen(Request(base + commit_path, headers=operator_headers)))
+            self.assertEqual(commit['sha'], task['head_sha'])
+            self.assertIn('+implementation', commit['diff'])
+            with self.assertRaises(HTTPError) as unrelated:
+                urlopen(Request(base + '/api/tasks/commit?id=' + task['id'] + '&sha=' + 'f' * 40, headers=operator_headers))
+            self.assertEqual(unrelated.exception.code, 400)
+
             with self.assertRaises(HTTPError) as denied:
                 urlopen(Request(base + '/api/github', headers=operator_headers))
             self.assertEqual(denied.exception.code, 403)
             configured = json.load(urlopen(Request(base + '/api/github', headers={'Authorization': 'Bearer ' + gateway.token})))
             self.assertEqual(configured['login'], 'publisher')
-            for endpoint, method in (('/api/tasks', 'snapshot'), ('/api/tasks/detail?id=' + self.task['id'], 'detail')):
+            for endpoint, method in (('/api/tasks', 'snapshot'), ('/api/tasks/detail?id=' + self.task['id'], 'detail'), (commit_path, 'commit_detail')):
                 with patch.object(self.service, method, side_effect=sqlite3.OperationalError('database is locked')):
                     with self.assertRaises(HTTPError) as unavailable:
                         urlopen(Request(base + endpoint, headers=operator_headers))

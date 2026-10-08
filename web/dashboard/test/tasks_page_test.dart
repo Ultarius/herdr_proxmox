@@ -109,7 +109,7 @@ void main() {
         await tester.pumpWidget(
           MaterialApp(
             theme: ThemeData(brightness: brightness),
-            home: const Scaffold(body: TasksPage()),
+            home: const Scaffold(body: TasksPage(taskId: 'task-1')),
           ),
         );
         await tester.pumpAndSettle();
@@ -185,6 +185,7 @@ void main() {
     };
     final merged = {
       ...base,
+      'id': 'task-2',
       'state': 'merged',
       'merge_sha': merge,
       'pull': {
@@ -200,10 +201,16 @@ void main() {
     final connection = DashboardBloc(
       client: MockClient(
         (request) async => http.Response(
-          jsonEncode({
-            'tasks': [conflicting, merged],
-            'github': {'configured': true, 'login': 'owner'},
-          }),
+          jsonEncode(
+            request.url.path.endsWith('/tasks/detail')
+                ? request.url.queryParameters['id'] == 'task-2'
+                      ? merged
+                      : conflicting
+                : {
+                    'tasks': [conflicting, merged],
+                    'github': {'configured': true, 'login': 'owner'},
+                  },
+          ),
           200,
         ),
       ),
@@ -212,28 +219,44 @@ void main() {
     connection.connect('token');
     connection.operator.value = {'name': 'admin', 'role': 'admin'};
     await tester.pumpWidget(
-      const MaterialApp(home: Scaffold(body: TasksPage())),
+      const MaterialApp(
+        home: Scaffold(body: TasksPage(taskId: 'task-1')),
+      ),
     );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Changes'));
     await tester.pumpAndSettle();
     // Conflicts are only reported for a pull request that can still merge.
     expect(find.textContaining('PR #7 · Open for review'), findsOneWidget);
     expect(find.textContaining('conflicts'), findsOneWidget);
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: TasksPage(key: ValueKey('merged'), taskId: 'task-2'),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Changes'));
+    await tester.pumpAndSettle();
     // A merged pull request is never presented as awaiting review.
     expect(find.textContaining('PR #8 · Merged'), findsOneWidget);
     expect(find.text('Merged · repo'), findsOneWidget);
     expect(find.textContaining('Merged result: $merge'), findsOneWidget);
     expect(find.text('Build merged result'), findsOneWidget);
+    await tester.tap(find.text('Checks & builds'));
+    await tester.pumpAndSettle();
     await tester.ensureVisible(find.textContaining('Previous candidate build'));
     await tester.pumpAndSettle();
     await tester.tap(find.textContaining('Previous candidate build'));
     await tester.pumpAndSettle();
-    expect(find.text('Does not validate the current candidate.'), findsOneWidget);
     expect(
-      find.textContaining('required checks not verified'),
-      findsNWidgets(2),
+      find.text('Does not validate the current candidate.'),
+      findsOneWidget,
     );
-    expect(find.textContaining('not evidence of a pass'), findsNWidgets(2));
-    expect(find.text('unit: failed'), findsNWidgets(2));
+    expect(find.textContaining('required checks not verified'), findsOneWidget);
+    expect(find.textContaining('not evidence of a pass'), findsOneWidget);
+    expect(find.text('unit: failed'), findsOneWidget);
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
     await connection.disconnect();
@@ -261,13 +284,17 @@ void main() {
       final connection = DashboardBloc(
         client: MockClient(
           (request) async => http.Response(
-            jsonEncode({
-              'tasks': [task],
-              'github': {
-                'configured': false,
-                'error': 'GitHub credential file must have mode 0600.',
-              },
-            }),
+            jsonEncode(
+              request.url.path.endsWith('/tasks/detail')
+                  ? task
+                  : {
+                      'tasks': [task],
+                      'github': {
+                        'configured': false,
+                        'error': 'GitHub credential file must have mode 0600.',
+                      },
+                    },
+            ),
             200,
           ),
         ),
@@ -280,6 +307,8 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(find.textContaining('mode 0600'), findsOneWidget);
+      await tester.tap(find.text('Open task'));
+      await tester.pumpAndSettle();
       // Publishing actions stay disabled rather than failing after the click.
       expect(
         tester
