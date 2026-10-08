@@ -1,9 +1,12 @@
 """Put release-matched guidance inside an ignored worker checkout directory."""
 import hashlib
-import uuid
-from repository_lock import repository_lock
+import os
 from pathlib import Path
+import tempfile
+import uuid
+
 import project_git
+from repository_lock import repository_lock
 
 
 def local_bundle(checkout, recover=False):
@@ -38,8 +41,17 @@ def _local_bundle(checkout, recover):
     existing = exclude.read_bytes() if exclude.exists() else b''
     pattern = b'/.ci-cache/herdr-guidance/'
     if pattern not in existing.splitlines():
-        with exclude.open('ab') as stream:
-            stream.write((b'\n' if existing and not existing.endswith(b'\n') else b'') + pattern + b'\n')
+        descriptor, temporary = tempfile.mkstemp(prefix='.herdr-exclude-', dir=exclude.parent)
+        try:
+            with os.fdopen(descriptor, 'wb') as stream:
+                stream.write(existing + (b'\n' if existing and not existing.endswith(b'\n') else b'') + pattern + b'\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+            if exclude.exists():
+                os.chmod(temporary, exclude.stat().st_mode & 0o777)
+            os.replace(temporary, exclude)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
     project_git.git(checkout, 'check-ignore', '--no-index', relative + '/SKILL.md')
     destination = checkout / relative
     for parent in (checkout / '.ci-cache', checkout / '.ci-cache/herdr-guidance', destination, destination / 'references'):

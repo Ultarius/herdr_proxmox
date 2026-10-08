@@ -258,19 +258,40 @@ class AgentPanel extends StatefulWidget {
 
 class _AgentPanelState extends State<AgentPanel> {
   String filter = 'All';
+  final search = TextEditingController();
+
+  @override
+  void dispose() {
+    search.dispose();
+    super.dispose();
+  }
+
+  /// Status chips and the search box compose: an agent must satisfy both.
+  bool matches(Map<String, dynamic> agent) {
+    final status = agentStatus(agent);
+    final statusMatches =
+        filter == 'All' ||
+        (filter == 'Working'
+            ? isWorking(agent)
+            : ['idle', 'done', 'waiting'].contains(status));
+    if (!statusMatches) return false;
+    final needle = search.text.trim().toLowerCase();
+    if (needle.isEmpty) return true;
+    return agentName(agent).toLowerCase().contains(needle) ||
+        workspaceFor(agent).toLowerCase().contains(needle);
+  }
+
+  void clearSearch() {
+    search.clear();
+    setState(() {});
+  }
+
   @override
   Widget build(BuildContext context) => LayoutBuilder(
     builder: (context, size) {
       final desktop = size.maxWidth >= 650;
-      final agents = widget.agents
-          .where(
-            (agent) =>
-                filter == 'All' ||
-                (filter == 'Working'
-                    ? isWorking(agent)
-                    : ['idle', 'done', 'waiting'].contains(agentStatus(agent))),
-          )
-          .toList();
+      final agents = widget.agents.where(matches).toList();
+      final query = search.text.trim();
       return Card(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -285,16 +306,42 @@ class _AgentPanelState extends State<AgentPanel> {
             ),
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
-              child: Wrap(
-                spacing: 8,
-                runSpacing: 8,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  for (final value in ['All', 'Working', 'Idle'])
-                    ChoiceChip(
-                      label: Text(value),
-                      selected: filter == value,
-                      onSelected: (_) => setState(() => filter = value),
+                  TextField(
+                    controller: search,
+                    onChanged: (_) => setState(() {}),
+                    textInputAction: TextInputAction.search,
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    decoration: InputDecoration(
+                      labelText: 'Search agents',
+                      hintText: 'Name or workspace',
+                      prefixIcon: const Icon(Icons.search),
+                      suffixIcon: search.text.isEmpty
+                          ? null
+                          : IconButton(
+                              tooltip: 'Clear search',
+                              icon: const Icon(Icons.clear),
+                              onPressed: clearSearch,
+                            ),
+                      isDense: true,
                     ),
+                  ),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final value in ['All', 'Working', 'Idle'])
+                        ChoiceChip(
+                          label: Text(value),
+                          selected: filter == value,
+                          onSelected: (_) => setState(() => filter = value),
+                        ),
+                    ],
+                  ),
                 ],
               ),
             ),
@@ -314,9 +361,32 @@ class _AgentPanelState extends State<AgentPanel> {
                 ),
               ),
             if (agents.isEmpty)
-              const Padding(
-                padding: EdgeInsets.all(24),
-                child: Text('No agents match this view.'),
+              Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  children: [
+                    Icon(
+                      query.isEmpty
+                          ? Icons.smart_toy_outlined
+                          : Icons.search_off,
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      query.isEmpty
+                          ? 'No agents match this view.'
+                          : 'No agents match "$query".',
+                      textAlign: TextAlign.center,
+                    ),
+                    if (query.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      TextButton(
+                        onPressed: clearSearch,
+                        child: const Text('Clear search'),
+                      ),
+                    ],
+                  ],
+                ),
               ),
             for (final agent in agents) ...[
               const Divider(height: 1),

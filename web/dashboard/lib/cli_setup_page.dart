@@ -1,3 +1,6 @@
+import 'clipboard_copy.dart';
+import 'setup_links.dart';
+import 'external_link.dart';
 import 'package:juice/juice.dart';
 import 'package:xterm/xterm.dart';
 import 'dashboard_bloc.dart';
@@ -109,6 +112,26 @@ class _CliSetupPageState extends State<CliSetupPage> {
         'rows': terminal.viewHeight.clamp(5, 150),
       });
       await poll();
+    } catch (e) {
+      showError(e);
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> verify(String cli) async {
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    final epoch = ++generation;
+    try {
+      final data = await connection.request('cli-setup/verify', {'cli': cli});
+      if (!mounted || epoch != generation || !connection.state.connected) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${data['detail'] ?? 'Account verified.'}')),
+      );
+      await refresh();
     } catch (e) {
       showError(e);
     } finally {
@@ -260,6 +283,17 @@ class _CliSetupPageState extends State<CliSetupPage> {
                     : 'Connect account',
               ),
             ),
+            if (cli['id'] == 'claude' && cli['installed'] == true)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: OutlinedButton.icon(
+                  onPressed: busy || session != null
+                      ? null
+                      : () => verify(cli['id'] as String),
+                  icon: const Icon(Icons.play_arrow_outlined, size: 18),
+                  label: const Text('Test account'),
+                ),
+              ),
             if (session != null && !active)
               const Padding(
                 padding: EdgeInsets.only(top: 8),
@@ -273,6 +307,35 @@ class _CliSetupPageState extends State<CliSetupPage> {
       ),
     );
   }
+
+  Future<void> copySetupText(String value) async {
+    final message = copySetupClipboard(value)
+        ? 'Copied.'
+        : await copyTextOrDownload(value, 'cli-setup.txt');
+    if (mounted)
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> selectableOutput() => showDialog<void>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Terminal text'),
+      content: SizedBox(
+        width: 700,
+        child: SingleChildScrollView(
+          child: SelectableText(terminal.buffer.getText()),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+      ],
+    ),
+  );
 
   @override
   Widget build(BuildContext context) => JuiceBuilder<DashboardBloc>(
@@ -354,6 +417,54 @@ class _CliSetupPageState extends State<CliSetupPage> {
                     'Open the sign-in link shown below in your browser. Use the menu controls or click the terminal to type.',
                   ),
                   const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      TextButton.icon(
+                        onPressed: () =>
+                            copySetupText(terminal.buffer.getText()),
+                        icon: const Icon(Icons.copy),
+                        label: const Text('Copy terminal text'),
+                      ),
+                      TextButton(
+                        onPressed: selectableOutput,
+                        child: const Text('Select terminal text'),
+                      ),
+                    ],
+                  ),
+                  for (final link in setupLinks(terminal.buffer.getText()))
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          SelectableText(link.toString()),
+                          Wrap(
+                            spacing: 8,
+                            children: [
+                              TextButton.icon(
+                                onPressed: () {
+                                  try {
+                                    openExternalLink(link);
+                                  } catch (exception) {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(content: Text('$exception')),
+                                    );
+                                  }
+                                },
+                                icon: const Icon(Icons.open_in_new),
+                                label: Text('Open link · ${link.host}'),
+                              ),
+                              TextButton.icon(
+                                onPressed: () => copySetupText(link.toString()),
+                                icon: const Icon(Icons.copy),
+                                label: const Text('Copy link'),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
                   Container(
                     clipBehavior: Clip.antiAlias,
                     decoration: BoxDecoration(

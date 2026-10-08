@@ -75,7 +75,7 @@ void main() {
           return http.Response(
             jsonEncode({
               'output': body['cursor'] == 0
-                  ? 'Enter authorization code:\r\n'
+                  ? 'Open https://example.com/oauth?state=test&code_challenge=abc\r\nEnter authorization code:\r\n'
                   : '',
               'cursor': 1,
               'truncated': false,
@@ -104,8 +104,22 @@ void main() {
     coordinator.navigate(CliSetupRoute());
     await tester.pumpAndSettle();
     expect(find.text('Codex'), findsOneWidget);
-    expect(tester.widget<FilledButton>(find.widgetWithText(FilledButton, 'Connect account')).onPressed, isNotNull);
-    expect(tester.widget<FilledButton>(find.widgetWithText(FilledButton, 'CLI not installed')).onPressed, isNull);
+    expect(
+      tester
+          .widget<FilledButton>(
+            find.widgetWithText(FilledButton, 'Connect account'),
+          )
+          .onPressed,
+      isNotNull,
+    );
+    expect(
+      tester
+          .widget<FilledButton>(
+            find.widgetWithText(FilledButton, 'CLI not installed'),
+          )
+          .onPressed,
+      isNull,
+    );
     await tester.tap(find.text('Connect account'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 100));
@@ -114,6 +128,22 @@ void main() {
       view.terminal.buffer.getText(),
       contains('Enter authorization code:'),
     );
+    expect(find.text('Open link · example.com'), findsOneWidget);
+    expect(find.text('Copy link'), findsOneWidget);
+    await tester.ensureVisible(find.text('Select terminal text'));
+    await tester.tap(find.text('Select terminal text'));
+    await tester.pumpAndSettle();
+    expect(find.byType(AlertDialog), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.byType(SelectableText),
+      ),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Close'));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('↓ Down'));
     await tester.tap(find.text('↓ Down'));
     await tester.pump();
     expect(inputs, contains('\x1b[B'));
@@ -164,6 +194,72 @@ void main() {
     await tester.pumpAndSettle();
     expect(mutations, contains('/api/dashboard-access'));
     expect(find.byType(TerminalView), findsNothing);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+    await connection.disconnect();
+    coordinator.dispose();
+    await BlocScope.reset();
+  });
+
+  testWidgets('Claude account test confirms a real reply', (tester) async {
+    tester.view.physicalSize = const Size(1200, 1600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final verifications = <Map<String, dynamic>>[];
+    final connection = DashboardBloc(
+      client: MockClient((request) async {
+        if (request.url.path == '/api/snapshot') {
+          return http.Response('{"workspaces":[],"agents":[]}', 200);
+        }
+        if (request.url.path == '/api/cli-setup/verify') {
+          verifications.add(jsonDecode(request.body) as Map<String, dynamic>);
+          return http.Response(
+            '{"cli":"claude","verified":true,"detail":"Claude Code answered: hello"}',
+            200,
+          );
+        }
+        if (request.url.path == '/api/cli-setup') {
+          return http.Response(
+            jsonEncode({
+              'clis': [
+                {
+                  'id': 'claude',
+                  'name': 'Claude Code',
+                  'installed': true,
+                  'status': 'configured',
+                  'detail': 'Signed in via claude.ai; run Test account.',
+                },
+              ],
+            }),
+            200,
+          );
+        }
+        return http.Response('{}', 200);
+      }),
+    );
+    BlocScope.register<DashboardBloc>(
+      () => connection,
+      lifecycle: BlocLifecycle.permanent,
+    );
+    final loaded = connection.stream.firstWhere(
+      (_) => connection.state.refreshed != null,
+    );
+    connection.connect('token');
+    await loaded;
+    final coordinator = AppCoordinator();
+    await tester.pumpWidget(MaterialApp.router(routerConfig: coordinator));
+    coordinator.navigate(CliSetupRoute());
+    await tester.pumpAndSettle();
+    expect(find.text('Claude Code'), findsOneWidget);
+    await tester.ensureVisible(find.text('Test account'));
+    await tester.tap(find.text('Test account'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(verifications, [
+      {'cli': 'claude'},
+    ]);
+    expect(find.text('Claude Code answered: hello'), findsOneWidget);
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
     await connection.disconnect();

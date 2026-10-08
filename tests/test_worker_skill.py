@@ -99,6 +99,22 @@ class WorkerSkillTests(unittest.TestCase):
                 store.repair_guidance('worker', path)
             self.assertEqual(bundle.call_count, 1)
 
+    def test_failed_atomic_exclude_replace_preserves_original_and_cleans_temp(self):
+        from worker_guidance import local_bundle
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory)
+            subprocess.run(['git', 'init', str(checkout)], check=True, capture_output=True)
+            exclude = checkout / '.git/info/exclude'
+            original = b'# preserve this\nexisting-rule\n'
+            exclude.write_bytes(original)
+            with patch('worker_guidance.os.replace', side_effect=OSError('interrupted replace')):
+                with self.assertRaisesRegex(OSError, 'interrupted'):
+                    local_bundle(checkout)
+            self.assertEqual(exclude.read_bytes(), original)
+            self.assertEqual(list(exclude.parent.glob('.herdr-exclude-*')), [])
+            local_bundle(checkout)
+            self.assertTrue(exclude.read_bytes().startswith(original))
+
     def test_project_discovery_entries_resolve_to_the_canonical_bundle(self):
         root = Path(__file__).parents[1]
         canonical = (root / 'web/gateway/skills/herdr-worktree-integration/SKILL.md').resolve()

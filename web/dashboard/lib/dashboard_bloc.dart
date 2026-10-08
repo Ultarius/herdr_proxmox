@@ -177,6 +177,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
                 seconds:
                     path.startsWith('tasks/') ||
                         path == 'github/configure' ||
+                        path == 'cli-setup/verify' ||
                         path == 'projects/clone' ||
                         (path == 'projects/git' &&
                             ['fetch', 'update_base'].contains(body?['action']))

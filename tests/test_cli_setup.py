@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -67,6 +68,48 @@ class CliSetupTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.manager.action('input', {'id': key, 'data': 'hello'})
 
+    def test_claude_status_accepts_documented_auth_method(self):
+        # `claude auth status` documents authMethod; loggedIn is not guaranteed.
+        with patch('cli_setup.os.access', return_value=True), patch('cli_setup.subprocess.run') as run:
+            run.return_value = Mock(stdout='{"authMethod":"claude.ai"}', stderr='', returncode=0)
+            result = self.manager.status('claude')
+            self.assertEqual(result['status'], 'configured')
+            self.assertEqual(result['auth_method'], 'claude.ai')
+            self.assertIn('claude.ai', result['detail'])
+            run.return_value = Mock(stdout='{"authMethod":"none"}', stderr='', returncode=1)
+            self.assertEqual(self.manager.status('claude')['status'], 'not_configured')
+            run.return_value = Mock(stdout='{"loggedIn":true,"authMethod":"api_key"}', stderr='', returncode=0)
+            self.assertEqual(self.manager.status('claude')['status'], 'configured')
+            run.return_value = Mock(stdout='not json', stderr='', returncode=0)
+            self.assertEqual(self.manager.status('claude')['status'], 'unknown')
+
+    def test_claude_verification_runs_a_bounded_hello_probe(self):
+        # A stored credential is not proof: confirm a real answer.
+        with patch('cli_setup.os.access', return_value=True), patch('cli_setup.subprocess.run') as run:
+            run.return_value = Mock(
+                stdout='{"type":"result","subtype":"success","is_error":false,"result":"hello"}',
+                stderr='', returncode=0)
+            verified = self.manager.action('verify', {'cli': 'claude'})
+            self.assertTrue(verified['verified'])
+            self.assertIn('hello', verified['detail'])
+            command = run.call_args.args[0]
+            self.assertEqual(command[1:4], ['--print', 'Respond with hello.', '--output-format'])
+            self.assertEqual(run.call_args.kwargs['timeout'], 90)
+            run.return_value = Mock(stdout='{"is_error":true,"result":"Invalid API key"}', stderr='', returncode=1)
+            with self.assertRaisesRegex(ValueError, 'Invalid API key'):
+                self.manager.verify('claude')
+            run.side_effect = subprocess.TimeoutExpired('claude', 90)
+            with self.assertRaisesRegex(ValueError, 'did not answer'):
+                self.manager.verify('claude')
+            run.side_effect = None
+            run.return_value = Mock(stdout='not json', stderr='', returncode=0)
+            with self.assertRaisesRegex(ValueError, 'JSON result'):
+                self.manager.verify('claude')
+            with self.assertRaisesRegex(ValueError, 'Claude Code only'):
+                self.manager.verify('codex')
+            with self.assertRaises(ValueError):
+                self.manager.action('verify', {'cli': '/bin/sh'})
+
     def test_setup_endpoints_require_auth_and_same_origin(self):
         server = gateway.ThreadingHTTPServer(('127.0.0.1', 0), gateway.Handler)
         server.token = 'a' * 48
@@ -75,7 +118,8 @@ class CliSetupTests(unittest.TestCase):
         thread.start()
         base = f'http://127.0.0.1:{server.server_port}'
         try:
-            for path, body in [('/api/cli-setup', None), ('/api/cli-setup/start', b'{"cli":"codex"}')]:
+            for path, body in [('/api/cli-setup', None), ('/api/cli-setup/start', b'{"cli":"codex"}'),
+                               ('/api/cli-setup/verify', b'{"cli":"claude"}')]:
                 with self.assertRaises(HTTPError) as error:
                     urlopen(Request(base + path, data=body))
                 self.assertEqual(error.exception.code, 401)
