@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -18,6 +19,22 @@ void main() {
     addTearDown(tester.view.resetDevicePixelRatio);
     final mutations = <String>[];
     final inputs = <String>[];
+    const signInUrl =
+        'https://example.com/authorize?state=test&challenge=whole-url';
+    String? copied;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') copied = call.arguments['text'];
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
     final connection = DashboardBloc(
       client: MockClient((request) async {
         expect(request.headers['Authorization'], 'Bearer token');
@@ -75,7 +92,7 @@ void main() {
           return http.Response(
             jsonEncode({
               'output': body['cursor'] == 0
-                  ? 'Enter authorization code:\r\n'
+                  ? 'Visit: $signInUrl\r\nEnter authorization code:\r\n'
                   : '',
               'cursor': 1,
               'truncated': false,
@@ -104,8 +121,22 @@ void main() {
     coordinator.navigate(CliSetupRoute());
     await tester.pumpAndSettle();
     expect(find.text('Codex'), findsOneWidget);
-    expect(tester.widget<FilledButton>(find.widgetWithText(FilledButton, 'Connect account')).onPressed, isNotNull);
-    expect(tester.widget<FilledButton>(find.widgetWithText(FilledButton, 'CLI not installed')).onPressed, isNull);
+    expect(
+      tester
+          .widget<FilledButton>(
+            find.widgetWithText(FilledButton, 'Connect account'),
+          )
+          .onPressed,
+      isNotNull,
+    );
+    expect(
+      tester
+          .widget<FilledButton>(
+            find.widgetWithText(FilledButton, 'CLI not installed'),
+          )
+          .onPressed,
+      isNull,
+    );
     await tester.tap(find.text('Connect account'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 100));
@@ -114,6 +145,12 @@ void main() {
       view.terminal.buffer.getText(),
       contains('Enter authorization code:'),
     );
+    expect(find.widgetWithText(SelectableText, signInUrl), findsOneWidget);
+    await tester.ensureVisible(find.text('Copy sign-in URL'));
+    await tester.tap(find.text('Copy sign-in URL'));
+    await tester.pump();
+    expect(copied, signInUrl);
+    await tester.ensureVisible(find.text('↓ Down'));
     await tester.tap(find.text('↓ Down'));
     await tester.pump();
     expect(inputs, contains('\x1b[B'));
@@ -132,6 +169,7 @@ void main() {
     await tester.tap(find.text('Close terminal'));
     await tester.pump();
     expect(mutations, contains('/api/cli-setup/close'));
+    expect(find.text(signInUrl), findsNothing);
     final sshInput = find.widgetWithText(TextField, 'SSH public key (.pub)');
     await tester.ensureVisible(sshInput);
     await tester.enterText(sshInput, 'ssh-ed25519 example-public-key');

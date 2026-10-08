@@ -101,12 +101,12 @@ class CliSetupTests(unittest.TestCase):
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(.02)
             self.assertIn('TTY=True', session.poll(0)['output'])
-            session.input('test-code\r')
+            session.input('one-time-code#test-state\r')
             while session.poll(0)['running']:
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(.02)
             result = session.poll(0)
-            self.assertIn('Received test-code', result['output'])
+            self.assertIn('Received one-time-code#test-state', result['output'])
             self.assertEqual(result['exit_code'], 0)
             self.assertEqual(session.poll(result['cursor'])['output'], '')
         finally:

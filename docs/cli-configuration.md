@@ -6,12 +6,23 @@ Select **Configure** to launch the selected CLI as the LXC's `herdr` user in a
 real Linux pseudoterminal. The Flutter terminal renders ANSI output and supports
 interactive menus, keyboard input, resizing, copy/paste and Ctrl+C.
 
-Open the authorization URL printed by the CLI in your local browser, complete
+Use **Copy sign-in URL** or **Open sign-in URL** above the terminal to open the
+complete authorization URL in your local browser. The URL is also selectable
+for manual copying; copying supports plain-HTTP LAN dashboards. Complete
 the provider's sign-in, and return to the terminal. Where the CLI asks for a
 code or API key, use the masked paste field and **Send to terminal**, or type
 directly into the terminal. The CLI controls whether input is echoed. Closing
 the terminal or leaving the page stops the setup process; refresh configuration
 after completing login. An exited command is not itself proof of successful login.
+
+For Claude Code, paste the entire authorization code, including `#state`, from
+the current attempt. The paste field removes surrounding/copied line whitespace,
+checks that the state matches the current authorization URL, and submits one
+line. It rejects incomplete codes or codes from a different attempt before
+sending them to the CLI. If the CLI exits with an error, use **Restart sign-in**,
+open the new URL and obtain a fresh code. Codes are single-use; a provider HTTP
+400 can also originate in Claude Code or the provider, so local input validation
+does not guarantee that the provider will accept a code.
 
 | CLI | Setup command | Status detection |
 | --- | --- | --- |

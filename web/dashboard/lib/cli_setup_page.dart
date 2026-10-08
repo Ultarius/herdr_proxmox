@@ -1,5 +1,7 @@
 import 'package:juice/juice.dart';
 import 'package:xterm/xterm.dart';
+import 'cli_setup_auth.dart';
+import 'cli_setup_browser.dart';
 import 'dashboard_bloc.dart';
 import 'routes.dart';
 import 'ssh_access_card.dart';
@@ -15,10 +17,12 @@ class _CliSetupPageState extends State<CliSetupPage> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
   final terminal = Terminal(maxLines: 2000);
   final paste = TextEditingController();
+  final links = CliSetupLinks();
   List<Map<String, dynamic>> clis = [];
   String? session;
   String? selected;
   String? error;
+  String? inputError;
   bool busy = false;
   bool running = false;
   bool polling = false;
@@ -88,6 +92,7 @@ class _CliSetupPageState extends State<CliSetupPage> {
     setState(() {
       busy = true;
       error = null;
+      inputError = null;
     });
     final epoch = ++generation;
     try {
@@ -97,6 +102,7 @@ class _CliSetupPageState extends State<CliSetupPage> {
         return;
       }
       clearTerminal();
+      paste.clear();
       setState(() {
         session = data['id'];
         selected = cli;
@@ -131,9 +137,12 @@ class _CliSetupPageState extends State<CliSetupPage> {
       });
       if (!mounted || session != id || !connection.state.connected) return;
       if (data['truncated'] == true) {
+        links.clear();
         terminal.write('\x1b[2J\x1b[H[Earlier output expired]\r\n');
       }
-      terminal.write(data['output'] as String);
+      final output = data['output'] as String;
+      terminal.write(output);
+      if (output.isNotEmpty) setState(() => links.add(output));
       cursor = data['cursor'] as int;
       if (data['running'] == false) {
         terminal.write('\r\n[Setup command exited: ${data['exit_code']}]\r\n');
@@ -162,6 +171,7 @@ class _CliSetupPageState extends State<CliSetupPage> {
         session = null;
         running = false;
         selected = null;
+        inputError = null;
       });
     if (id != null) {
       try {
@@ -174,9 +184,48 @@ class _CliSetupPageState extends State<CliSetupPage> {
   }
 
   void clearTerminal() {
+    links.clear();
     terminal.mainBuffer.clear();
     terminal.altBuffer.clear();
     terminal.write('\x1b[?1049l\x1b[2J\x1b[H');
+  }
+
+  void submitCode() {
+    if (!running || session == null) return;
+    try {
+      final input = setupSubmission(
+        paste.text,
+        claude: selected == 'claude',
+        state: links.claudeState,
+      );
+      setState(() => inputError = null);
+      sendInput(input);
+      paste.clear();
+    } on FormatException catch (e) {
+      setState(() => inputError = e.message);
+    }
+  }
+
+  Future<void> copyLink(String url) async {
+    try {
+      await copySetupUrl(url);
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Sign-in URL copied.')));
+      }
+    } catch (_) {
+      showError(
+        'Copy unavailable. Select the sign-in URL and use your browser\'s Copy command.',
+      );
+    }
+  }
+
+  Future<void> restart() async {
+    final cli = selected;
+    if (cli == null || busy) return;
+    await stop();
+    if (mounted && connection.state.connected) await start(cli);
   }
 
   @override
@@ -347,6 +396,11 @@ class _CliSetupPageState extends State<CliSetupPage> {
                         onPressed: stop,
                         child: const Text('Close terminal'),
                       ),
+                      if (!running)
+                        TextButton(
+                          onPressed: busy ? null : restart,
+                          child: const Text('Restart sign-in'),
+                        ),
                     ],
                   ),
                   const SizedBox(height: 8),
@@ -354,6 +408,29 @@ class _CliSetupPageState extends State<CliSetupPage> {
                     'Open the sign-in link shown below in your browser. Use the menu controls or click the terminal to type.',
                   ),
                   const SizedBox(height: 12),
+                  for (final url in links.urls) ...[
+                    SelectableText(url),
+                    Wrap(
+                      spacing: 8,
+                      children: [
+                        OutlinedButton.icon(
+                          onPressed: running ? () => copyLink(url) : null,
+                          icon: const Icon(Icons.copy),
+                          label: const Text('Copy sign-in URL'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: running ? () => openSetupUrl(url) : null,
+                          icon: const Icon(Icons.open_in_new),
+                          label: const Text('Open sign-in URL'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+                  if (!running)
+                    const Text(
+                      'Setup has ended. If sign-in failed, restart sign-in and authorize using the new URL. Previous codes cannot be reused.',
+                    ),
                   Container(
                     clipBehavior: Clip.antiAlias,
                     decoration: BoxDecoration(
@@ -394,23 +471,26 @@ class _CliSetupPageState extends State<CliSetupPage> {
                   const SizedBox(height: 12),
                   TextField(
                     controller: paste,
+                    enabled: running,
                     obscureText: true,
-                    decoration: const InputDecoration(
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    onSubmitted: (_) => submitCode(),
+                    decoration: InputDecoration(
+                      errorText: inputError,
+                      errorMaxLines: 3,
                       labelText: 'Authorization code or API key',
-                      helperText:
-                          'Input is hidden here. Send it only when the terminal asks.',
-                      border: OutlineInputBorder(),
+                      helperText: selected == 'claude'
+                          ? 'Paste the full code from this sign-in attempt, including # and everything after it.'
+                          : 'Input is hidden here. Send it only when the terminal asks.',
+                      helperMaxLines: 3,
+                      border: const OutlineInputBorder(),
                     ),
                   ),
                   Align(
                     alignment: Alignment.centerLeft,
                     child: FilledButton(
-                      onPressed: running
-                          ? () {
-                              sendInput('${paste.text}\r');
-                              paste.clear();
-                            }
-                          : null,
+                      onPressed: running ? submitCode : null,
                       child: const Text('Send to terminal'),
                     ),
                   ),
