@@ -2,6 +2,7 @@ import 'permission_options.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'organization_bloc.dart';
+import 'request_id.dart';
 import 'routes.dart';
 import 'org_chart.dart';
 import 'collaboration_panel.dart';
@@ -21,6 +22,10 @@ class _OrganizationPageState extends State<OrganizationPage> {
   late final OrganizationBloc bloc = OrganizationBloc(connection);
   Timer? timer;
   String view = 'chart';
+  bool cleaningSessions = false;
+  // Keep the exact request across lost responses so a retried restart or close
+  // reconciles instead of repeating the pane operation.
+  final Map<String, String> sessionRequests = {};
   ModelCatalog catalog = const ModelCatalog({});
   String? get selected => connection.selectedOrganization.value;
   set selected(String? value) => connection.selectedOrganization.value = value;
@@ -129,13 +134,164 @@ class _OrganizationPageState extends State<OrganizationPage> {
     if (values != null && mounted) await submit('delegate', values);
   }
 
+  Future<void> cleanupSessions(Iterable<Map<String, dynamic>> jobs) async {
+    final obsolete = jobs
+        .where(
+          (j) =>
+              j['kind'] == 'launch' &&
+              j['state'] == 'released' &&
+              j['session_closed_at'] == null,
+        )
+        .toList();
+    final chosen = <String>{};
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, update) => AlertDialog(
+          title: const Text('Review obsolete sessions'),
+          content: SizedBox(
+            width: 600,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'Only selected released sessions are considered. Busy, blocked, changed or unidentified sessions are skipped. Repository files remain intact.',
+                  ),
+                  for (final job in obsolete)
+                    CheckboxListTile(
+                      title: Text(
+                        '${job['profile']?['name'] ?? job['profile_id']}',
+                      ),
+                      subtitle: Text('${job['alias']} · ${job['pane_id']}'),
+                      value: chosen.contains(job['id']),
+                      onChanged: (value) => update(() {
+                        if (value == true) {
+                          chosen.add(job['id']);
+                        } else {
+                          chosen.remove(job['id']);
+                        }
+                      }),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: chosen.isEmpty
+                  ? null
+                  : () => Navigator.pop(context, true),
+              child: const Text('Close selected idle sessions'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => cleaningSessions = true);
+    try {
+      final result = await OrganizationCommand('session', {
+        'organization_id': selected,
+        'mode': 'cleanup',
+        'job_ids': chosen.toList(),
+        'inspected': true,
+      }).execute(connection);
+      if (!mounted) return;
+      final names = {
+        for (final job in obsolete)
+          job['id']: '${job['profile']?['name'] ?? job['profile_id']}',
+      };
+      await showDialog<void>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Session cleanup results'),
+          content: SingleChildScrollView(
+            child: Text(
+              (result['results'] as List)
+                  .map(
+                    (r) =>
+                        '${names[r['id']] ?? r['id']}: ${r['state']}${r['reason'] == null ? '' : ' · ${r['reason']}'}',
+                  )
+                  .join('\n'),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+      bloc.send(OrganizationCommand('refresh'));
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('$error')));
+    } finally {
+      if (mounted) setState(() => cleaningSessions = false);
+    }
+  }
+
+  Future<void> manageSession(Map<String, dynamic> job, String mode) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(
+          mode == 'restart'
+              ? 'Restart agent session?'
+              : 'Close obsolete session?',
+        ),
+        content: Text(
+          '${job['profile']?['name'] ?? job['profile_id']}\nAlias: ${job['alias']}\nPane: ${job['pane_id']}\nThe gateway verifies the original session is idle and unchanged. Checkout files, branches and history are preserved. Restart adopts the current profile and waits for instructions; it does not repeat the task.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('I inspected the idle session'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final selection = 'session:${job['id']}:$mode';
+    final request = sessionRequests.putIfAbsent(selection, newRequestId);
+    try {
+      await connection.request('organizations/session', {
+        'organization_id': job['organization_id'],
+        'job_id': job['id'],
+        'mode': mode,
+        'inspected': true,
+        'request_id': request,
+      });
+      sessionRequests.remove(selection);
+      if (!mounted) return;
+      bloc.send(OrganizationCommand('refresh'));
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('$error')));
+    }
+  }
+
   Future<void> release(Map<String, dynamic> job) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Release run binding?'),
         content: const Text(
-          'This allows another launch. It leaves the terminal and process running. Inspect and stop the old agent over SSH first to avoid duplicate work.',
+          'This allows another launch. It leaves the terminal and process running. Use Close session pane to stop an idle session and avoid duplicate work.',
         ),
         actions: [
           TextButton(
@@ -564,6 +720,13 @@ class _OrganizationPageState extends State<OrganizationPage> {
                         const SizedBox(height: 24),
                       ],
                       if (view == 'runs') ...[
+                        if (connection.operator.value['role'] == 'admin')
+                          TextButton(
+                            onPressed: state.busy || cleaningSessions
+                                ? null
+                                : () => cleanupSessions(jobs),
+                            child: const Text('Clean up obsolete panes'),
+                          ),
                         Text(
                           'Runs and delegation history',
                           style: Theme.of(context).textTheme.titleLarge,
@@ -622,6 +785,39 @@ class _OrganizationPageState extends State<OrganizationPage> {
                                   if ((job['result'] ?? '') != '')
                                     Text(
                                       'Operator completion report: ${job['result']}',
+                                    ),
+                                  if (job['kind'] == 'launch' &&
+                                      [
+                                        'persona_sent',
+                                        'released',
+                                      ].contains(job['state']) &&
+                                      job['session_closed_at'] == null &&
+                                      connection.operator.value['role'] ==
+                                          'admin')
+                                    Wrap(
+                                      children: [
+                                        TextButton(
+                                          onPressed: state.busy
+                                              ? null
+                                              : () =>
+                                                    manageSession(job, 'close'),
+                                          child: const Text(
+                                            'Close session pane',
+                                          ),
+                                        ),
+                                        if (job['state'] == 'persona_sent')
+                                          TextButton(
+                                            onPressed: state.busy
+                                                ? null
+                                                : () => manageSession(
+                                                    job,
+                                                    'restart',
+                                                  ),
+                                            child: const Text(
+                                              'Restart in assigned checkout',
+                                            ),
+                                          ),
+                                      ],
                                     ),
                                   if (![
                                         'queued',

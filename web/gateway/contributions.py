@@ -17,7 +17,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 from urllib.parse import quote
 import uuid
 
@@ -186,14 +185,84 @@ class Contributions:
             self.thread.join(timeout=2)
 
     def poll(self):
-        while not self.stopped.wait(60):
+        cycles = 0
+        while not self.stopped.wait(10):
             try:
-                self.poll_once()
+                self.advance_automatic()
+                cycles += 1
+                if cycles % 6 == 0:
+                    self.poll_once()
             except (ValueError, OSError, sqlite3.Error):
                 # A transient storage or API failure must never end the poller;
                 # the next cycle reconciles again. Never redispatch a push or a
                 # pull request creation from here.
                 continue
+
+    def automatic_tasks(self):
+        """Ids and states only, so a ten-second reconcile never parses stored diffs."""
+        with closing(self.connect()) as db:
+            return [dict(id=row[0], state=row[1]) for row in db.execute(
+                "SELECT json_extract(data, '$.id'), json_extract(data, '$.state') FROM tasks "
+                "WHERE json_extract(data, '$.auto_validate')=1 LIMIT 100")]
+
+    def advance_automatic(self):
+        tasks = [t for t in self.automatic_tasks() if t.get('state') in ('implementing', 'review_ready')]
+        if not tasks:
+            return
+        if not self.validation or self.validation.snapshot().get('executor') != 'service':
+            return
+        runs = self.store.snapshot(live_status=False)['jobs']
+        for listed in tasks:
+            try:
+                with self.operation('task:' + listed['id'], timeout=0):
+                    task = self.get(listed['id'])
+                    path = self.tree_for(task)
+                    run = next((j for j in runs if j['id'] == task.get('run_id')), None)
+                    if not run or run['state'] != 'persona_sent':
+                        raise ValueError('Awaiting the original task session.')
+                    from collaboration import current_run
+                    current_run(self.store, run)
+                    if any(j['state'] in ('queued', 'running') and task['profile_id'] in
+                           j.get('participants', [j.get('profile_id')]) for j in runs):
+                        raise ValueError('Awaiting queued or running agent work.')
+                    with repository_lock(path):
+                        if project_git.git(path, 'symbolic-ref', '--short', 'HEAD').strip() != task['branch']:
+                            raise ValueError('Task branch changed; inspect before continuing.')
+                        head = project_git.git(path, 'rev-parse', 'HEAD').strip()
+                        if head != task.get('head_sha') or task['state'] == 'implementing':
+                            receipt_path = path / '.ci-cache/herdr-guidance' / ('task-' + task['id']) / 'receipt.json'
+                            if any(parent.is_symlink() for parent in (receipt_path.parent, receipt_path.parent.parent, path / '.ci-cache')):
+                                raise ValueError('Completion receipt directories must not be symlinks.')
+                            from collaboration import read_contribution
+                            receipt = json.loads(read_contribution(receipt_path, label='task completion receipt'))
+                            if (not isinstance(receipt, dict) or receipt.get('outcome') != 'complete' or
+                                    receipt.get('commit') != head or not run.get('completion_token') or receipt.get('token') != run.get('completion_token') or
+                                    receipt.get('run_id') != task.get('run_id') or not isinstance(receipt.get('tests'), list)):
+                                raise ValueError('Completion receipt does not match this task, session and commit.')
+                            self.perform('candidate', {}, task['id'], 'automatic_task_policy')
+                            task = self.get(task['id'])
+                            if task.get('head_sha') != head:
+                                raise ValueError('Task advanced during capture; awaiting its new completion receipt.')
+                            task['completion_receipt'] = dict(commit=head, tests=receipt['tests'], verified_at=stamp())
+                            self.save(task, 'completion_verified', 'automatic_task_policy')
+                    # Do not automatically retry failures. One durable identity per task+SHA.
+                    if head not in task.get('builds', {}):
+                        self.perform('build', {'target': head}, task['id'], 'automatic_task_policy')
+                    task = self.get(task['id'])
+                    if task.pop('automation_error', None) is not None:
+                        self.save(task, 'automation_resumed', 'automatic_task_policy')
+            except Busy:
+                continue
+            except (ValueError, OSError, sqlite3.Error) as error:
+                try:
+                    with self.operation('task:' + listed['id'], timeout=0):
+                        task = self.get(listed['id'])
+                        message = str(error)[:500]
+                        if task.get('automation_error') != message:
+                            task['automation_error'] = message
+                            self.save(task, 'automation_waiting', 'automatic_task_policy')
+                except (ValueError, OSError, sqlite3.Error):
+                    continue
 
     def poll_once(self):
         """Refresh the pull requests of open tasks once. Safe to call directly."""
@@ -335,7 +404,9 @@ class Contributions:
             # Operators can inspect task/repository evidence, as elsewhere in
             # the dashboard. Publishing account configuration is admin-only.
             github = dict(configured=bool(github.get('configured')))
-        return dict(tasks=tasks, github=github)
+        executor = ('unavailable' if self.validation is None
+                    else 'service' if self.validation.queue is not None else 'gateway')
+        return dict(tasks=tasks, github=github, executor=executor)
 
     def detail(self, task_id):
         if not isinstance(task_id, str) or not re.fullmatch(r'[a-f0-9]{32}', task_id):
@@ -439,7 +510,7 @@ class Contributions:
                         repository=repository.relative_to(self.projects).as_posix(), github_repository=remote,
                         base_ref=base, base_sha=sha, branch='herdr/task-' + task_id[:12],
                         profile_id=profile['id'], organization_id=profile['organization_id'], state='draft',
-                        created_at=stamp(), checks=[], audit=[])
+                        created_at=stamp(), checks=[], audit=[], auto_validate=False)
             return self.save(task, 'create', actor)
         task = self.get(task_id)
         had_error = task.pop('error', None) is not None
@@ -460,25 +531,52 @@ class Contributions:
                     '\nWork only in your assigned task branch. Implement, run required checks, and commit your changes. '
                     'Commit using git -c user.name=Herdr-Agent -c user.email=agent@herdr.local commit. Never infer the operator identity or change global Git config. '
                     'Never push, open a pull request, update the shared checkout or deploy. '
+                    'When complete, write JSON to {{HERDR_TASK_RECEIPT}} with outcome=complete, commit=the full HEAD SHA, run_id={{HERDR_TASK_RUN}}, token={{HERDR_TASK_TOKEN}}, and tests as an array of actual check results. Write it last after committing. '
                     'Report commands and actual results; missing checks are not passes. Publishing is a dashboard administrator action.\n\n'
                     'Task-local tool acquisition policy:\n' + task_tool_guidance()))
             task.update(run_id=run['id'], worktree=str((self.projects / '.herdr-worktrees' / run['id']).resolve()),
                         state='implementing')
+        elif action == 'policy':
+            if not isinstance(body.get('auto_validate'), bool):
+                raise ValueError('Choose whether automatic capture and validation is enabled.')
+            if body['auto_validate'] and (not self.validation or self.validation.snapshot().get('executor') != 'service'):
+                raise ValueError('Install the durable build service before enabling automatic task validation.')
+            task['auto_validate'] = body['auto_validate']
         elif action == 'candidate':
             path = self.tree_for(task)
             run = next((j for j in self.store.snapshot(live_status=False)['jobs'] if j['id'] == task.get('run_id')), None)
             if not run or run['state'] != 'persona_sent':
                 raise ValueError('Task agent launch is not ready; inspect its job.')
+            if run.get('alias'):
+                from collaboration import current_run
+                current_run(self.store, run)
             # Capturing a candidate is explicit operator review, not a claim the
             # worker passed validation. The immutable SHA remains the evidence.
             with repository_lock(path):
                 if project_git.merge_state(path) or project_git.git(path, 'status', '--porcelain=v1', '--untracked-files=all').strip():
                     raise ValueError('Commit task changes and resolve operations before reviewing.')
                 head = project_git.git(path, 'rev-parse', 'HEAD').strip()
+                if project_git.git(path, 'symbolic-ref', '--short', 'HEAD').strip() != task['branch']:
+                    raise ValueError('Task checkout branch changed; inspect before capturing.')
                 if head == task['base_sha']:
                     raise ValueError('The task has no committed changes to review.')
                 project_git.git(path, 'merge-base', '--is-ancestor', task['base_sha'], head)
                 diff = project_git.git(path, 'diff', '--no-ext-diff', '--no-textconv', task['base_sha'], head, '--')
+                graph = []
+                for line in project_git.git(path, 'log', '--topo-order', '--max-count=12', '--format=%H %P', task['base_sha'] + '..' + head, '--').splitlines():
+                    fields = line.split()
+                    graph.append(dict(sha=fields[0], parents=fields[1:]))
+                task['commit_graph'] = graph
+                try:
+                    upstream = project_git.git(repository, 'rev-parse', '--verify', task['base_ref'] + '^{commit}').strip()
+                    task['current_upstream_sha'] = upstream
+                    task['already_upstream'] = (
+                        project_git.git(path, 'rev-parse', head + '^{tree}').strip() ==
+                        project_git.git(path, 'rev-parse', upstream + '^{tree}').strip())
+                except ValueError:
+                    # A pruned or renamed base ref is not a capture failure.
+                    task['current_upstream_sha'] = None
+                    task['already_upstream'] = None
                 task.update(head_sha=head, diff=diff[:65536], diff_truncated=len(diff) > 65536,
                             diff_stat=project_git.git(path, 'diff', '--stat', task['base_sha'], head, '--')[:12000],
                             state='review_ready', candidate_changed=bool(task.get('pull') and task['pull']['head_sha'] != head))

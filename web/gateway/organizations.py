@@ -544,6 +544,83 @@ class OrganizationStore:
             self.jobs_changed.set()
         return job
 
+    def manage_session(self, body, actor):
+        if body.get('mode') == 'cleanup':
+            ids = body.get('job_ids')
+            if body.get('inspected') is not True or not isinstance(ids, list) or not 1 <= len(ids) <= 100 or not all(isinstance(i, str) for i in ids):
+                raise ValueError('Review and select obsolete sessions first.')
+            results = []
+            for job_id in dict.fromkeys(ids):
+                try:
+                    with self.lock, closing(self.connect()) as db:
+                        old = self.get(db, 'jobs', job_id, text(body, 'organization_id', 40))
+                    if old['kind'] != 'launch' or old['state'] != 'released':
+                        raise ValueError('Only released sessions are eligible for bulk cleanup.')
+                    self.manage_session(dict(body, job_id=job_id, mode='close'), actor)
+                    results.append(dict(id=job_id, state='closed'))
+                except (ValueError, OSError) as error:
+                    results.append(dict(id=job_id, state='skipped', reason=str(error)))
+            return {'results': results}
+        mode = body.get('mode')
+        if mode not in ('close', 'restart') or body.get('inspected') is not True:
+            raise ValueError('Inspect the session and choose close or restart.')
+        request_id = body.get('request_id')
+        if request_id is not None and (not isinstance(request_id, str) or not 1 <= len(request_id) <= 64):
+            raise ValueError('Invalid session request ID.')
+        with self.lock, closing(self.connect()) as db:
+            run = self.get(db, 'jobs', text(body, 'job_id', 40), text(body, 'organization_id', 40))
+            lock = self.agent_locks.setdefault(run.get('profile_id'), threading.RLock())
+        if not lock.acquire(blocking=False):
+            raise ValueError('Agent is executing work. Wait before changing its session.')
+        try:
+            with self.lock, closing(self.connect()) as db:
+                run = self.get(db, 'jobs', run['id'])
+                if request_id and run.get('session_request_id') == request_id:
+                    if run.get('session_request_mode') != mode:
+                        raise ValueError('Session request ID already used for another action.')
+                    return {'id': run['id']}
+                if run['kind'] != 'launch' or run['state'] not in ('persona_sent', 'released'):
+                    raise ValueError('Select a completed launch binding.')
+                if mode == 'restart' and run['state'] == 'released':
+                    raise ValueError('Restart only the currently bound session.')
+                if any(j['state'] in ('queued', 'running') and run['profile_id'] in
+                       j.get('participants', [j.get('profile_id')]) for j in self.job_records()):
+                    raise ValueError('Wait for queued or running agent work.')
+                if run.get('session_closed_at') and mode == 'close':
+                    return {'id': run['id']}
+            response = self.command('agent', 'list')
+            live = response if isinstance(response, list) else response.get('agents')
+            if not isinstance(live, list):
+                raise ValueError('Cannot verify live sessions.')
+            agent = next((a for a in live if a.get('name') == run['alias']), None)
+            if agent is None:
+                raise ValueError('Original agent is absent; the pane cannot be safely identified for closure.')
+            if not run.get('agent_session'):
+                raise ValueError('Session identity is missing; inspect manually.')
+            self.identity(run, agent=agent)  # Refuses busy, blocked or changed sessions.
+            self.identity(run)  # Recheck immediately before pane mutation.
+            self.command('pane', 'close', run['pane_id'], timeout=10)
+            closed = now()
+            run = self.update_job(run['id'], state='released', session_closed_at=closed,
+                                  session_closed_by=actor, session_request_id=request_id, session_request_mode=mode)
+            if mode == 'restart':
+                with self.lock, closing(self.connect()) as db:
+                    profile = self.get(db, 'profiles', run['profile_id'], run['organization_id'])
+                profile = dict(profile, project=run.get('source_project') or run['profile']['project'])
+                history = list(run.get('session_history', []))[-20:]
+                history.append({k: run.get(k) for k in ('alias', 'pane_id', 'agent_session', 'session_closed_at')})
+                self.update_job(run['id'], state='queued', reuse_checkout=True,
+                                profile=profile, alias='hire_' + uuid.uuid4().hex[:20],
+                                agent_session=None, session_closed_at=None, session_history=history,
+                                task_prompt='', error='', restarted_by=actor)
+                with self.lock:
+                    future = self.worker.submit(self.execute, run['id'])
+                    self.futures.add(future)
+                    future.add_done_callback(self._finished)
+            return {'id': run['id']}
+        finally:
+            lock.release()
+
     def recover_chat(self, body, actor):
         if not isinstance(body, dict) or body.get('inspected') is not True:
             raise ValueError('Inspect the idle conversation before recovering a reply.')
@@ -778,7 +855,16 @@ class OrganizationStore:
                 project = self.project(profile['project'])
                 source = Path(project)
                 repository = any((parent / '.git').exists() for parent in (source, *source.parents))
-                if profile.get('use_worktree', True) and repository:
+                if job.get('reuse_checkout'):
+                    checkout = Path(job.get('worktree_path') or job.get('source_project', project)).resolve()
+                    if not checkout.is_relative_to(self.projects) or not checkout.is_dir():
+                        raise ValueError('Assigned checkout is missing or outside managed projects.')
+                    if job.get('worktree_branch'):
+                        import project_git
+                        if project_git.git(checkout, 'symbolic-ref', '--short', 'HEAD').strip() != job['worktree_branch']:
+                            raise ValueError('Assigned checkout branch changed; inspect before restarting.')
+                    created = self.command('workspace', 'create', '--cwd', str(checkout), '--label', profile['name'], '--no-focus')
+                elif profile.get('use_worktree', True) and repository:
                     root = (self.projects / '.herdr-worktrees').resolve()
                     if not root.is_relative_to(self.projects):
                         raise ValueError('Worktree directory must remain inside the projects directory.')
@@ -815,7 +901,7 @@ class OrganizationStore:
                 pane, workspace = self.created_pane(created, job.get('worktree_path', project))
                 job = self.update_job(job_id, pane_id=pane, workspace_id=workspace)
                 self.wait_for_shell(pane)
-                if job.get('task_prompt'):
+                if job.get('task_prompt') or job.get('task_id'):
                     from worker_guidance import local_bundle
                     guidance = local_bundle(job.get('worktree_path', project))
                 arguments = launch_arguments(profile) + prepare_permissions(profile, self.path.parent)
@@ -825,6 +911,8 @@ class OrganizationStore:
                 self.command('agent', 'start', job['alias'], '--kind', profile['runtime'], '--pane', pane, '--timeout', '60000', *(['--', *arguments] if arguments else []), timeout=70)
                 agent = self.identity(job)
                 job = self.update_job(job_id, agent_session=agent.get('agent_session'))
+                if job.get('task_id'):
+                    job = self.update_job(job_id, completion_token=uuid.uuid4().hex)
                 org = job['organization']
                 prompt = (f"Organization: {org['name']}\nPurpose: {org['purpose']}\nShared instructions:\n{org['instructions']}\n\n"
                           f"You are {profile['name']}, our {profile['role']}. Persona (version {profile['version']}):\n{profile['persona']}\n\n"
@@ -832,9 +920,21 @@ class OrganizationStore:
                           'Acknowledge readiness and wait for an assigned task. Use Herdr agent commands for explicit delegation; '
                           'do not interpret a delivered prompt or idle status as proof of completed work.')
                 prompt += '\nNever push branches or create pull requests without explicit publication authorization. Dashboard task publishing is administrator-controlled.'
+                if job.get('task_id'):
+                    receipt_directory = guidance.parent / ('task-' + job['task_id'])
+                    if receipt_directory.is_symlink():
+                        raise ValueError('Task receipt directory must not be a symlink.')
+                    receipt_directory.mkdir(exist_ok=True)
+                    prompt += ('\nTask completion protocol for this session: after authorized work is committed, write JSON to ' +
+                               (receipt_directory / 'receipt.json').as_posix() +
+                               ' with outcome=complete, commit=full HEAD SHA, run_id=' + job['id'] +
+                               ', token=' + job['completion_token'] + ', and tests as an array of actual check results. '
+                               'This protocol does not authorize replaying an old task.')
                 if job.get('task_prompt'):
                     deployed = (Path(__file__).parent / 'skills/herdr-worktree-integration').resolve().as_posix()
                     task_prompt = job['task_prompt'].replace(deployed, guidance.as_posix())
+                    if job.get('task_id'):
+                        task_prompt = task_prompt.replace('{{HERDR_TASK_RECEIPT}}', (receipt_directory / 'receipt.json').as_posix()).replace('{{HERDR_TASK_RUN}}', job['id']).replace('{{HERDR_TASK_TOKEN}}', job['completion_token'])
                     prompt += '\n\nAssigned task (start now in this checkout):\n' + task_prompt
                 if profile.get('group_id'):
                     # Do not deliver an imperative group description as the startup task.

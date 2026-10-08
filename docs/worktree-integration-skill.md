@@ -171,3 +171,24 @@ Deployment of this update is needed before using it on existing timed-out jobs.
 New task instructions specify `Herdr-Agent <agent@herdr.local>` using per-command
 Git identity options. Agents must not infer operator attribution or alter global
 Git configuration. Existing commits retain their original attribution.
+
+
+### Session cleanup and restart
+
+Org chart → Runs exposes administrator-only **Close session pane**, **Restart in
+assigned checkout**, and checkbox-reviewed **Clean up obsolete panes**. Bulk
+cleanup considers only released launch bindings and reports each closed/skipped
+result. Closure requires matching saved alias, pane, runtime and conversation,
+with idle/done status; missing identities, blocked/busy sessions and queued work
+are refused. Unknown unmanaged panes are never closed automatically.
+
+Closing records the operator and timestamp; profiles, worktrees, branches and
+job history remain. Restart preserves the task run ID and assigned checkout,
+retains prior session identity in history, applies current profile/model settings,
+and sends only the persona. It does not replay the task prompt or reset files.
+Original conversation replies cannot be recovered into a replacement session.
+Repeated restart HTTP requests with the same request ID are no-ops.
+
+Herdr's runtime still performs the pane operation; this removes the need to use
+its terminal UI, not the dependency on its CLI. Session conversation history may
+no longer be available in the closed pane; inspect/recover pending replies first.

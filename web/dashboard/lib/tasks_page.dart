@@ -1,3 +1,4 @@
+import 'task_timeline.dart';
 import 'artifact_download.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
@@ -63,6 +64,7 @@ class _TasksPageState extends State<TasksPage> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
   List<Map<String, dynamic>> tasks = [];
   Map<String, dynamic> github = {};
+  String executor = 'unavailable';
   String? error;
   // A failed list read must not erase an action failure, and vice versa.
   String? readError;
@@ -137,6 +139,7 @@ class _TasksPageState extends State<TasksPage> {
         setState(() {
           tasks = List<Map<String, dynamic>>.from(data['tasks'] ?? []);
           github = Map<String, dynamic>.from(data['github'] ?? {});
+          executor = '${data['executor'] ?? 'unavailable'}';
           readError = null; // A successful read clears an earlier failure.
         });
       }
@@ -598,10 +601,54 @@ class _TasksPageState extends State<TasksPage> {
                   if (task['last_sync'] != null)
                     Text('Pull request status last read ${task['last_sync']}.'),
                 ],
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Automatically capture and validate'),
+                  subtitle: const Text(
+                    'Requires the durable build service and a matching completion receipt. Publishing, merging and deployment remain separate.',
+                  ),
+                  value: task['auto_validate'] == true,
+                  onChanged:
+                      admin &&
+                          !busy &&
+                          !['merged', 'closed'].contains(task['state']) &&
+                          (task['auto_validate'] == true ||
+                              executor == 'service')
+                      ? (value) => act('policy', {
+                          'task_id': task['id'],
+                          'auto_validate': value,
+                        })
+                      : null,
+                ),
+                if (task['automation_error'] != null)
+                  Text('Automation waiting: ${task['automation_error']}'),
+                if (task['head_sha'] != null) ...[
+                  ExpansionTile(
+                    title: const Text('Git timeline'),
+                    children: [TaskTimeline(task: task)],
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    'Current candidate validation: ${(task['builds'] as Map?)?[task['merge_sha'] ?? task['head_sha']] == null ? 'not run' : (task['builds'] as Map)[task['merge_sha'] ?? task['head_sha']]['state']}',
+                  ),
+                ],
                 if (task['builds'] is Map) ...[
                   for (final entry in (task['builds'] as Map).entries)
                     if (entry.value is Map)
-                      _buildEvidence('${entry.key}', entry.value as Map),
+                      if (entry.key == (task['merge_sha'] ?? task['head_sha']))
+                        _buildEvidence('${entry.key}', entry.value as Map)
+                      else
+                        ExpansionTile(
+                          title: Text(
+                            'Previous candidate build · ${entry.key}',
+                          ),
+                          subtitle: const Text(
+                            'Does not validate the current candidate.',
+                          ),
+                          children: [
+                            _buildEvidence('${entry.key}', entry.value as Map),
+                          ],
+                        ),
                 ],
                 if (task['checks'] is List) ...[
                   for (final check in task['checks'])
@@ -739,7 +786,9 @@ class _TasksPageState extends State<TasksPage> {
                     for (final entry in (task['audit'] as List? ?? []))
                       if (entry is Map)
                         ListTile(
-                          title: Text('${entry['action']} · ${entry['actor']}'),
+                          title: Text(
+                            '${entry['action']} · ${entry['actor']}',
+                          ),
                           subtitle: Text(
                             '${entry['at']}'
                             '${entry['state'] != null ? ' · ${entry['state']}' : ''}'

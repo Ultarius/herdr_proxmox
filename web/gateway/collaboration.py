@@ -188,6 +188,9 @@ def action(store, db, name, body, org):
 def current_run(store, run, ready=True):
     with store.lock, closing(store.connect()) as db:
         current = store.get(db, 'jobs', run['id'], run['organization_id'])
+    if (run.get('alias') != current.get('alias') or
+            (run.get('agent_session') and run.get('agent_session') != current.get('agent_session'))):
+        raise ValueError('Original conversation was replaced; this reply cannot be recovered into the new session.')
     if current['state'] != 'persona_sent':
         raise ValueError('Run binding was released. Launch and select an agent again.')
     try:

@@ -48,6 +48,59 @@ class OrganizationTests(unittest.TestCase):
             return {'agent': self.agents[args[2]]}
         return {}
 
+    def test_session_cleanup_and_restart_preserve_assignment_without_repeating_task(self):
+        subprocess.run(['git', 'init', str(self.projects)], check=True, capture_output=True)
+        (self.projects / 'tracked.txt').write_text('base')
+        subprocess.run(['git', '-C', str(self.projects), 'add', '.'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.projects), '-c', 'user.name=Test',
+                        '-c', 'user.email=test@example.test', 'commit', '-m', 'base'], check=True, capture_output=True)
+        org = self.organization()
+        profile = self.hire(org, use_worktree=False)
+        run_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        run = next(j for j in self.store.job_records() if j['id'] == run_id)
+        old_alias = run['alias']
+        body = dict(job_id=run_id, organization_id=org, mode='restart', inspected=True, request_id='restart-test')
+        self.store.update_job(run_id, task_prompt='Do not replay this task', task_id='task-marker')
+        before = len(self.calls)
+        self.store.manage_session(body, 'admin')
+        self.drain()
+        restarted = next(j for j in self.store.job_records() if j['id'] == run_id)
+        self.assertNotEqual(restarted['alias'], old_alias)
+        self.assertEqual(restarted['id'], run_id)
+        self.assertEqual(restarted['source_project'], run['source_project'])
+        self.assertEqual(restarted['task_id'], 'task-marker')
+        self.assertEqual(restarted['task_prompt'], '')
+        self.assertTrue(restarted.get('completion_token'))
+        prompts = [str(args) for args, _ in self.calls[before:] if args[:2] == ('pane', 'send')]
+        self.assertFalse(any('Do not replay this task' in prompt for prompt in prompts))
+        self.assertTrue(any(args[:2] == ('pane', 'close') for args, _ in self.calls[before:]))
+        count = len(self.calls)
+        self.store.manage_session(body, 'admin')
+        self.assertEqual(len(self.calls), count)
+        with self.assertRaisesRegex(ValueError, 'request ID'):
+            self.store.manage_session(dict(body, request_id='x' * 65), 'admin')
+        self.action('release', organization_id=org, job_id=run_id)
+        result = self.store.manage_session(dict(organization_id=org, mode='cleanup', inspected=True, job_ids=[run_id]), 'admin')
+        self.assertEqual(result['results'][0]['state'], 'closed')
+
+    def test_cleanup_skips_busy_and_changed_sessions(self):
+        org = self.organization()
+        profile = self.hire(org)
+        run_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        run = next(j for j in self.store.job_records() if j['id'] == run_id)
+        self.action('release', organization_id=org, job_id=run_id)
+        self.agents[run['alias']]['agent_status'] = 'working'
+        body = dict(organization_id=org, mode='cleanup', inspected=True, job_ids=[run_id])
+        result = self.store.manage_session(body, 'admin')
+        self.assertEqual(result['results'][0]['state'], 'skipped')
+        self.agents[run['alias']]['agent_status'] = 'idle'
+        self.agents[run['alias']]['agent_session'] = {'value': 'replacement'}
+        result = self.store.manage_session(body, 'admin')
+        self.assertEqual(result['results'][0]['state'], 'skipped')
+        self.assertFalse(any(args[:2] == ('pane', 'close') for args, _ in self.calls))
+
     def test_created_pane_recovers_from_authoritative_checkout_records(self):
         def command(*args, **kwargs):
             if args == ('workspace', 'list'):

@@ -167,6 +167,75 @@ class ContributionTests(unittest.TestCase):
         self.store.snapshot.return_value['jobs'] = [dict(id='run', state='persona_sent')]
         return self.service.action('candidate', dict(request_id='candidate-1', task_id=self.task['id']), 'admin', 'admin')
 
+    def test_automatic_receipt_capture_and_build_are_exact_and_deduplicated(self):
+        task = self.candidate()
+        task.update(state='implementing', auto_validate=True)
+        task.pop('head_sha')
+        self.service.save(task, 'policy', 'admin')
+        run = self.store.snapshot.return_value['jobs'][0]
+        run.update(profile_id='worker', completion_token='fresh-token')
+        tree = Path(task['worktree'])
+        # Put the receipt exclusion in Git metadata, keeping the worktree clean.
+        exclude = self.repo / '.git/info/exclude'
+        exclude.write_text('/.ci-cache/\n')
+        receipt = tree / '.ci-cache/herdr-guidance' / ('task-' + task['id']) / 'receipt.json'
+        receipt.parent.mkdir(parents=True)
+        head = self.git('rev-parse', 'HEAD', path=tree).strip()
+        receipt.write_text(json.dumps(dict(outcome='complete', commit=head, run_id='run', token='fresh-token', tests=[])))
+        self.service.validation = MagicMock()
+        self.service.validation.snapshot.return_value = {'executor': 'service'}
+        self.service.validation.submit.return_value = dict(id='build1', state='queued', checks=[])
+        with patch('collaboration.current_run'):
+            self.service.advance_automatic()
+            self.service.advance_automatic()
+        captured = self.service.get(task['id'])
+        self.assertEqual(captured['head_sha'], head)
+        self.assertEqual(captured['completion_receipt']['commit'], head)
+        self.assertEqual(captured['builds'][head]['state'], 'queued')
+        self.assertEqual(self.service.validation.submit.call_count, 1)
+        self.assertTrue(captured['commit_graph'])
+        # A failed result does not produce an automatic retry.
+        captured['builds'][head]['state'] = 'failed'
+        self.service.save(captured, 'build_result', 'runner')
+        with patch('collaboration.current_run'):
+            self.service.advance_automatic()
+        self.assertEqual(self.service.validation.submit.call_count, 1)
+
+    def test_automatic_receipt_rejects_stale_token_and_missing_service(self):
+        task = self.candidate()
+        task.update(auto_validate=True, state='implementing')
+        task.pop('head_sha')
+        self.service.save(task, 'policy', 'admin')
+        run = self.store.snapshot.return_value['jobs'][0]
+        run.update(profile_id='worker', completion_token='new-session')
+        tree = Path(task['worktree'])
+        (self.repo / '.git/info/exclude').write_text('/.ci-cache/\n')
+        receipt = tree / '.ci-cache/herdr-guidance' / ('task-' + task['id']) / 'receipt.json'
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(json.dumps(dict(outcome='complete', commit=self.git('rev-parse', 'HEAD', path=tree).strip(), run_id='run', token='old-session', tests=[])))
+        self.service.validation = MagicMock()
+        self.service.validation.snapshot.return_value = {'executor': 'service'}
+        with patch('collaboration.current_run'):
+            self.service.advance_automatic()
+        self.assertIn('does not match', self.service.get(task['id'])['automation_error'])
+        self.service.validation.submit.assert_not_called()
+        # A receipt from the right session still cannot validate another SHA.
+        receipt.write_text(json.dumps(dict(outcome='complete', commit=self.base, run_id='run', token='new-session', tests=[])))
+        with patch('collaboration.current_run'):
+            self.service.advance_automatic()
+        self.assertIn('does not match', self.service.get(task['id'])['automation_error'])
+        self.service.validation.submit.assert_not_called()
+        # Matching completion does not override an uncommitted worktree.
+        receipt.write_text(json.dumps(dict(outcome='complete', commit=self.git('rev-parse', 'HEAD', path=tree).strip(), run_id='run', token='new-session', tests=[])))
+        (tree / 'file').write_text('uncommitted')
+        with patch('collaboration.current_run'):
+            self.service.advance_automatic()
+        self.assertNotIn('head_sha', self.service.get(task['id']))
+        self.service.validation.submit.assert_not_called()
+        self.service.validation.snapshot.return_value = {'executor': 'gateway'}
+        with self.assertRaisesRegex(ValueError, 'durable build service'):
+            self.service.action('policy', dict(request_id='policy-guard', task_id=task['id'], auto_validate=True), 'admin', 'admin')
+
     def pull_data(self, task, **changes):
         result = dict(number=7, state='open', draft=True, head=dict(ref=task['branch'], sha=task['head_sha'],
                       repo=dict(full_name='owner/repo')), base=dict(ref='main'), mergeable=None)
