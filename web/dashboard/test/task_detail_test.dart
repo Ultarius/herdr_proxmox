@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard/task_activity.dart';
 import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -8,6 +9,36 @@ import 'package:herdr_dashboard/tasks_page.dart';
 import 'package:herdr_dashboard/routes.dart';
 
 void main() {
+  test('legacy JSON participant identity uses a typed lookup', () {
+    final task =
+        jsonDecode('{"participants":[{"name":"Maya at launch"}]}') as Map;
+    expect(taskAgentName(task), 'Maya at launch');
+    expect(
+      taskAgentName({'participants': []}),
+      'Assigned agent identity unavailable',
+    );
+    expect(
+      taskAgentName({
+        'participants': [
+          null,
+          {'name': ''},
+          {'name': 'Olaf'},
+        ],
+      }),
+      'Olaf',
+    );
+    expect(
+      taskAgentName({'participants': 'invalid'}),
+      'Assigned agent identity unavailable',
+    );
+    expect(
+      taskAgentName({
+        'assigned_agent': {'name': 'Assigned'},
+        ...task,
+      }),
+      'Assigned',
+    );
+  });
   test('task detail route round trips and keeps Tasks selected', () {
     final route = TaskDetailRoute('a' * 32);
     final parsed = AppCoordinator().parseRouteFromUri(route.toUri());
@@ -37,7 +68,6 @@ void main() {
           'branch': 'herdr/task-abcdefabcdef',
           'base_ref': 'refs/remotes/origin/main',
           'run_id': 'run',
-          'assigned_agent': {'name': 'Maya'},
           'participants': [
             {
               'run_id': 'run',
@@ -272,10 +302,7 @@ void main() {
     await tester.tap(find.text('Changes'));
     await tester.pumpAndSettle();
     expect(find.text('Commit history unavailable'), findsOneWidget);
-    expect(
-      find.textContaining('temporarily unavailable'),
-      findsOneWidget,
-    );
+    expect(find.textContaining('temporarily unavailable'), findsOneWidget);
     final before = details;
     await tester.ensureVisible(find.text('Refresh history'));
     await tester.pumpAndSettle();

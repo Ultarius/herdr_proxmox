@@ -686,9 +686,7 @@ class _TasksPageState extends State<TasksPage> {
             style: Theme.of(context).textTheme.titleLarge,
           ),
           Text('${taskState(task)} \u00b7 ${task['repository']}'),
-          Text(
-            '${task['assigned_agent']?['name'] ?? task['participants']?.firstOrNull?['name'] ?? 'Assigned agent identity unavailable'}',
-          ),
+          Text('${taskAgentName(task)}'),
           Text(taskNextStep(task)),
           if (task['updated_at'] != null)
             Text('Last activity ${task['updated_at']}'),
@@ -759,7 +757,8 @@ class _TasksPageState extends State<TasksPage> {
       return const SizedBox.shrink();
     if (evidence?['state'] == 'complete') {
       final verified = evidence?['required_checks_verified'] == true;
-      if (verified && !['merged', 'published', 'pr_open'].contains(task['state'])) {
+      if (verified &&
+          !['merged', 'published', 'pr_open'].contains(task['state'])) {
         return FilledButton.icon(
           onPressed: admin && !busy && github['configured'] == true
               ? () => review(task)
@@ -858,7 +857,7 @@ class _TasksPageState extends State<TasksPage> {
             ),
             const SizedBox(height: 12),
             Text(
-              'Assigned agent: ${task['assigned_agent']?['name'] ?? task['participants']?.firstOrNull?['name'] ?? 'Identity unavailable'}',
+              'Assigned agent: ${taskAgentName(task, fallback: 'Identity unavailable')}',
             ),
             if (task['error'] != null) Text('Task issue: ${task['error']}'),
             if (task['automation_error'] != null)

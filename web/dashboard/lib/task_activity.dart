@@ -1,5 +1,29 @@
 import 'package:flutter/material.dart';
 
+/// JSON collections are dynamic: extension getters must not be dispatched on them.
+String taskAgentName(
+  Map task, {
+  String fallback = 'Assigned agent identity unavailable',
+}) {
+  final assigned = task['assigned_agent'];
+  if (assigned is Map &&
+      assigned['name'] is String &&
+      (assigned['name'] as String).trim().isNotEmpty) {
+    return assigned['name'] as String;
+  }
+  final participants = task['participants'];
+  if (participants is List) {
+    for (final participant in participants) {
+      if (participant is Map &&
+          participant['name'] is String &&
+          (participant['name'] as String).trim().isNotEmpty) {
+        return participant['name'] as String;
+      }
+    }
+  }
+  return fallback;
+}
+
 String taskNextStep(Map task) {
   if (task['automation_error'] != null)
     return 'Automation needs attention: ${task['automation_error']}';
