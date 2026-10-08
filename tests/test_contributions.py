@@ -284,6 +284,120 @@ class ContributionTests(unittest.TestCase):
         self.assertEqual(len(detail['participants']), 1)
         self.assertEqual(detail['participants'][0]['name'], 'Original Maya')
 
+    def test_reviewed_completion_is_explicit_pinned_and_does_not_claim_validation(self):
+        task = self.candidate()
+        body = dict(request_id='complete-1', task_id=task['id'], head_sha=task['head_sha'], upstream_sha=self.base,
+                    outcome='incorporated_elsewhere', reason='Reviewed task changes already included by other upstream work.', inspected=True)
+        with self.assertRaisesRegex(ValueError, 'Review the exact'):
+            self.service.action('complete', dict(body, request_id='no-inspection', inspected=False), 'admin', 'admin')
+        with self.assertRaisesRegex(ValueError, 'Fetched base changed'):
+            self.service.action('complete', dict(body, request_id='stale-base', upstream_sha='f' * 40), 'admin', 'admin')
+        with self.assertRaisesRegex(ValueError, 'administrator'):
+            self.service.action('complete', body, 'viewer', 'operator')
+        completed = self.service.action('complete', body, 'admin', 'admin')
+        self.assertEqual(completed['state'], 'completed')
+        self.assertEqual(completed['completion']['validation'], 'not_verified')
+        self.assertEqual(completed['completion']['candidate'], task['head_sha'])
+        self.assertEqual(self.service.action('complete', body, 'admin', 'admin')['state'], 'completed')
+        with self.assertRaisesRegex(ValueError, 'closed'):
+            self.service.action('publish', dict(request_id='after-done', task_id=task['id'], head_sha=task['head_sha']), 'admin', 'admin')
+
+    def test_automatic_completion_requires_exact_tree_and_verified_checks(self):
+        task = self.candidate()
+        head = task['head_sha']
+        task['builds'] = {head: dict(target=head, state='complete', required_checks_verified=False)}
+        self.service.save(task, 'build_result', 'runner')
+        self.git('update-ref', 'refs/remotes/origin/main', head)
+        self.service.reconcile_completed()
+        self.assertEqual(self.service.get(task['id'])['state'], 'review_ready')
+        task['builds'][head]['required_checks_verified'] = True
+        self.service.save(task, 'build_result', 'runner')
+        self.git('update-ref', 'refs/remotes/origin/main', self.base)
+        self.service.reconcile_completed()
+        self.assertEqual(self.service.get(task['id'])['state'], 'review_ready')
+        self.git('update-ref', 'refs/remotes/origin/main', head)
+        self.service.reconcile_completed()
+        completed = self.service.get(task['id'])
+        self.assertEqual(completed['state'], 'completed')
+        self.assertEqual(completed['completion']['validation'], 'verified')
+        before = completed['audit']
+        self.service.reconcile_completed()
+        self.assertEqual(self.service.get(task['id'])['audit'], before)
+
+    def test_group_review_produces_deduplicated_draft_proposals_without_launch(self):
+        task = self.candidate()
+        group = dict(id='group', organization_id='org', name='Project Review')
+        self.store.snapshot.return_value['groups'] = [group]
+        self.store.action.return_value = dict(id='meeting', state='queued')
+        body = dict(task_id=task['id'], request_id='review-1', group_id='group')
+        reviewed = self.service.action('discuss', body, 'admin', 'admin')
+        prompt = self.store.action.call_args.args[1]['prompt']
+        self.assertIn('task_proposals', prompt)
+        self.assertIn('Read-only discussion', prompt)
+        self.assertEqual(reviewed['meetings'][0]['job_id'], 'meeting')
+        task = self.service.get(task['id'])
+        task.update(auto_review=True, review_group_id='group')
+        self.service.save(task, 'review_policy', 'admin')
+        count = self.store.action.call_count
+        self.service.advance_reviews()
+        self.assertEqual(self.store.action.call_count, count)  # Manual review already covered this state.
+        job = dict(id='meeting', organization_id='org', task_id=task['id'], kind='discussion', state='artifact_ready',
+                   result='```json\n' + json.dumps({'task_proposals': [dict(title='Add status coverage', description='Add a regression check. Acceptance: filters compose. Run widget tests.', profile_id='worker')]}) + '\n```')
+        self.store.snapshot.return_value['jobs'].append(job)
+        proposal = self.service.detail(task['id'])['meeting_results'][0]['proposals'][0]
+        created = self.service.action('proposal', dict(task_id=task['id'], request_id='approve-proposal', meeting_id='meeting', proposal_key=proposal['key']), 'admin', 'admin')
+        follow_id = created['follow_up_tasks'][proposal['key']]
+        self.assertEqual(self.service.get(follow_id)['state'], 'draft')
+        self.assertEqual(self.service.get(follow_id)['source']['meeting_id'], 'meeting')
+        self.service.action('proposal', dict(task_id=task['id'], request_id='approve-proposal-again', meeting_id='meeting', proposal_key=proposal['key']), 'admin', 'admin')
+        self.assertEqual(len(self.service.snapshot()['tasks']), 2)
+        self.assertEqual(self.store.action.call_count, count)
+        job['state'] = 'running'
+        with self.assertRaisesRegex(ValueError, 'finalized'):
+            self.service.action('proposal', dict(task_id=task['id'], request_id='unfinished-proposal', meeting_id='meeting', proposal_key=proposal['key']), 'admin', 'admin')
+
+    def test_automatic_group_review_is_opt_in_and_deduplicated(self):
+        task = self.candidate()
+        self.store.snapshot.return_value['groups'] = [dict(id='group', organization_id='org', name='Review')]
+        self.store.action.return_value = dict(id='auto-meeting', state='queued')
+        self.service.advance_reviews()
+        self.store.action.assert_not_called()
+        self.service.action('review_policy', dict(task_id=task['id'], request_id='enable-review', group_id='group', auto_review=True), 'admin', 'admin')
+        self.service.advance_reviews()
+        self.service.advance_reviews()
+        self.assertEqual(self.store.action.call_count, 1)
+        self.assertEqual(self.service.get(task['id'])['meetings'][0]['job_id'], 'auto-meeting')
+        with self.assertRaisesRegex(ValueError, 'active group'):
+            self.service.action('review_policy', dict(task_id=task['id'], request_id='wrong-group', group_id='other', auto_review=True), 'admin', 'admin')
+
+    def test_auto_review_without_a_group_is_recorded_not_fatal(self):
+        task = self.candidate()
+        task.update(auto_review=True, state='review_ready')
+        self.service.save(task, 'review_policy', 'admin')
+        # A missing group must be a recorded waiting reason, never a poller crash.
+        self.service.advance_reviews()
+        self.assertIn('active review group', self.service.get(task['id'])['review_error'])
+
+    def test_auto_review_ignores_transient_build_states_but_not_evidence(self):
+        task = self.candidate()
+        task['builds'] = {task['head_sha']: dict(state='queued')}
+        self.service.save(task, 'build', 'admin')
+        self.store.snapshot.return_value['groups'] = [dict(id='group', organization_id='org', name='Review')]
+        self.store.action.return_value = dict(id='auto-meeting', state='queued')
+        self.service.action('review_policy', dict(task_id=task['id'], request_id='review-1', group_id='group', auto_review=True), 'admin', 'admin')
+        self.service.advance_reviews()
+        count = self.store.action.call_count
+        stored = self.service.get(task['id'])
+        stored['builds'][stored['head_sha']]['state'] = 'running'
+        self.service.save(stored, 'build', 'runner')
+        self.service.advance_reviews()
+        self.assertEqual(self.store.action.call_count, count)  # queued and running collapse.
+        stored = self.service.get(task['id'])
+        stored['builds'][stored['head_sha']].update(state='complete', required_checks_verified=False)
+        self.service.save(stored, 'build_result', 'runner')
+        self.service.advance_reviews()
+        self.assertEqual(self.store.action.call_count, count + 1)  # Changed evidence reviews again.
+
     def pull_data(self, task, **changes):
         result = dict(number=7, state='open', draft=True, head=dict(ref=task['branch'], sha=task['head_sha'],
                       repo=dict(full_name='owner/repo')), base=dict(ref='main'), mergeable=None)

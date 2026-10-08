@@ -44,6 +44,8 @@ class OrganizationTests(unittest.TestCase):
             return {'agent': self.agents[args[2]]}
         if args[:2] == ('agent', 'list'):
             return {'agents': list(self.agents.values())}
+        if args[:2] == ('agent', 'read'):
+            return {'output': 'Saved terminal context: completed work, next steps and checks.'}
         if args[:2] == ('agent', 'get'):
             return {'agent': self.agents[args[2]]}
         return {}
@@ -99,6 +101,80 @@ class OrganizationTests(unittest.TestCase):
         self.agents[run['alias']]['agent_session'] = {'value': 'replacement'}
         result = self.store.manage_session(body, 'admin')
         self.assertEqual(result['results'][0]['state'], 'skipped')
+        self.assertFalse(any(args[:2] == ('pane', 'close') for args, _ in self.calls))
+
+    def test_archive_is_saved_before_close_and_continue_is_idempotent(self):
+        org = self.organization()
+        profile = self.hire(org)
+        run_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        run = next(j for j in self.store.job_records() if j['id'] == run_id)
+        original = self.store.command
+        def command(*args, **kwargs):
+            if args[:2] == ('pane', 'close'):
+                archives = self.store.manage_session(dict(mode='archives', organization_id=org), 'admin')
+                self.assertTrue(archives['archives'])
+            return original(*args, **kwargs)
+        self.store.command = command
+        closed = self.store.manage_session(dict(job_id=run_id, organization_id=org, mode='close', inspected=True, request_id='archive-close'), 'admin')
+        saved = self.store.manage_session(dict(mode='view_archive', organization_id=org, archive_id=closed['archive_id']), 'admin')
+        self.assertIn('Saved terminal context', saved['terminal'])
+        self.assertFalse(saved['terminal_is_complete_transcript'])
+        self.assertFalse(saved['native_resume_available'])
+        self.assertNotIn('agent_session', saved)
+        other = self.organization('Other org')
+        with self.assertRaisesRegex(ValueError, 'not found'):
+            self.store.manage_session(dict(mode='view_archive', organization_id=other, archive_id=saved['id']), 'admin')
+        body = dict(mode='continue', organization_id=org, job_id=run_id, archive_id=saved['id'], inspected=True, request_id='continue-once')
+        self.store.manage_session(body, 'admin')
+        self.drain()
+        continued = next(j for j in self.store.job_records() if j['id'] == run_id)
+        self.assertNotEqual(continued['alias'], run['alias'])
+        self.assertEqual(continued['source_project'], run['source_project'])
+        self.assertEqual(continued['continuation_archive_id'], saved['id'])
+        prompts = [str(args) for args, _ in self.calls if args[:2] == ('agent', 'prompt')]
+        self.assertTrue(any('Archived session context' in p and 'Wait for a new task' in p for p in prompts))
+        count = len(self.calls)
+        self.store.manage_session(body, 'admin')
+        self.assertEqual(len(self.calls), count)
+
+    def test_failed_archive_capture_does_not_close_pane(self):
+        org = self.organization()
+        profile = self.hire(org)
+        run_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        original = self.store.command
+        self.store.command = lambda *args, **kwargs: {'output': ''} if args[:2] == ('agent', 'read') else original(*args, **kwargs)
+        with self.assertRaisesRegex(ValueError, 'preservation failed'):
+            self.store.manage_session(dict(job_id=run_id, organization_id=org, mode='close', inspected=True), 'admin')
+        self.assertFalse(any(args[:2] == ('pane', 'close') for args, _ in self.calls))
+        self.assertEqual(self.store.manage_session(dict(mode='archives', organization_id=org), 'admin')['archives'], [])
+
+    def test_absent_agent_requires_absent_pane_before_reconciliation(self):
+        org = self.organization()
+        profile = self.hire(org)
+        run_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        run = next(j for j in self.store.job_records() if j['id'] == run_id)
+        self.agents.clear()
+        original = self.store.command
+        present = True
+        def command(*args, **kwargs):
+            if args[:2] == ('workspace', 'list'):
+                return {'workspaces': [dict(workspace_id='w1')]}
+            if args[:2] == ('pane', 'list'):
+                return {'panes': [dict(pane_id=run['pane_id'])] if present else []}
+            return original(*args, **kwargs)
+        self.store.command = command
+        body = dict(job_id=run_id, organization_id=org, mode='close', inspected=True)
+        with self.assertRaisesRegex(ValueError, 'pane is present'):
+            self.store.manage_session(body, 'admin')
+        present = False
+        closed = self.store.manage_session(body, 'admin')
+        self.assertEqual(closed['status'], 'already_closed')
+        saved = self.store.manage_session(dict(mode='view_archive', organization_id=org, archive_id=closed['archive_id']), 'admin')
+        self.assertIsNone(saved['terminal'])
+        self.assertIn('already absent', saved['terminal_unavailable'])
         self.assertFalse(any(args[:2] == ('pane', 'close') for args, _ in self.calls))
 
     def test_created_pane_recovers_from_authoritative_checkout_records(self):

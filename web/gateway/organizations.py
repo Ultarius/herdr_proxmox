@@ -92,6 +92,7 @@ class OrganizationStore:
                 CREATE INDEX IF NOT EXISTS jobs_by_organization ON jobs(organization_id);
                 CREATE INDEX IF NOT EXISTS discussion_by_group ON jobs(organization_id, json_extract(data, '$.group_id'), json_extract(data, '$.kind'));
                 CREATE TABLE IF NOT EXISTS requests (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, response TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS session_archives (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, data TEXT NOT NULL);
             ''')
             # A crash may have occurred after terminal input. Never replay automatically.
             for row in db.execute('SELECT id, data FROM jobs').fetchall():
@@ -545,6 +546,13 @@ class OrganizationStore:
         return job
 
     def manage_session(self, body, actor):
+        if body.get('mode') in ('archives', 'view_archive'):
+            from session_archives import listing, read
+            org_id = text(body, 'organization_id', 40)
+            with closing(self.connect()) as db:
+                self.get(db, 'organizations', org_id)
+            return ({'archives': listing(self, org_id)} if body['mode'] == 'archives'
+                    else read(self, org_id, text(body, 'archive_id', 40)))
         if body.get('mode') == 'cleanup':
             ids = body.get('job_ids')
             if body.get('inspected') is not True or not isinstance(ids, list) or not 1 <= len(ids) <= 100 or not all(isinstance(i, str) for i in ids):
@@ -556,13 +564,13 @@ class OrganizationStore:
                         old = self.get(db, 'jobs', job_id, text(body, 'organization_id', 40))
                     if old['kind'] != 'launch' or old['state'] != 'released':
                         raise ValueError('Only released sessions are eligible for bulk cleanup.')
-                    self.manage_session(dict(body, job_id=job_id, mode='close'), actor)
-                    results.append(dict(id=job_id, state='closed'))
+                    closed = self.manage_session(dict(body, job_id=job_id, mode='close'), actor)
+                    results.append(dict(id=job_id, state=closed.get('status', 'closed'), archive_id=closed.get('archive_id')))
                 except (ValueError, OSError) as error:
                     results.append(dict(id=job_id, state='skipped', reason=str(error)))
             return {'results': results}
         mode = body.get('mode')
-        if mode not in ('close', 'restart') or body.get('inspected') is not True:
+        if mode not in ('close', 'restart', 'continue') or body.get('inspected') is not True:
             raise ValueError('Inspect the session and choose close or restart.')
         request_id = body.get('request_id')
         if request_id is not None and (not isinstance(request_id, str) or not 1 <= len(request_id) <= 64):
@@ -588,36 +596,73 @@ class OrganizationStore:
                     raise ValueError('Wait for queued or running agent work.')
                 if run.get('session_closed_at') and mode == 'close':
                     return {'id': run['id']}
-            response = self.command('agent', 'list')
-            live = response if isinstance(response, list) else response.get('agents')
-            if not isinstance(live, list):
-                raise ValueError('Cannot verify live sessions.')
-            agent = next((a for a in live if a.get('name') == run['alias']), None)
-            if agent is None:
-                raise ValueError('Original agent is absent; the pane cannot be safely identified for closure.')
-            if not run.get('agent_session'):
-                raise ValueError('Session identity is missing; inspect manually.')
-            self.identity(run, agent=agent)  # Refuses busy, blocked or changed sessions.
-            self.identity(run)  # Recheck immediately before pane mutation.
-            self.command('pane', 'close', run['pane_id'], timeout=10)
-            closed = now()
-            run = self.update_job(run['id'], state='released', session_closed_at=closed,
-                                  session_closed_by=actor, session_request_id=request_id, session_request_mode=mode)
-            if mode == 'restart':
+            from session_archives import archive, read, context
+            saved = None
+            status = 'closed'
+            if mode == 'continue':
+                if not run.get('session_closed_at'):
+                    raise ValueError('Archive and close this session before continuing from saved context.')
+                saved = read(self, run['organization_id'], text(body, 'archive_id', 40))
+                if saved['run_id'] != run['id']:
+                    raise ValueError('Archive does not belong to this run.')
+                if any(j['kind'] == 'launch' and j['id'] != run['id'] and j.get('profile_id') == run['profile_id'] and j['state'] != 'released' for j in self.job_records()):
+                    raise ValueError('Release the current agent binding before continuing an archived session.')
+            else:
+                response = self.command('agent', 'list')
+                live = response if isinstance(response, list) else response.get('agents')
+                if not isinstance(live, list):
+                    raise ValueError('Cannot verify live sessions.')
+                agent = next((a for a in live if a.get('name') == run['alias']), None)
+                if agent is None:
+                    # Require a valid inventory; an absent agent alone cannot identify a pane.
+                    inventory = self.command('workspace', 'list')
+                    workspaces = inventory if isinstance(inventory, list) else inventory.get('workspaces')
+                    if not isinstance(workspaces, list):
+                        raise ValueError('Cannot verify workspace inventory.')
+                    found = False
+                    for workspace in workspaces:
+                        workspace_id = workspace.get('workspace_id') or workspace.get('id')
+                        if not isinstance(workspace_id, str):
+                            raise ValueError('Cannot identify a workspace in the live inventory.')
+                        response = self.command('pane', 'list', '--workspace', workspace_id)
+                        panes = response if isinstance(response, list) else response.get('panes')
+                        if not isinstance(panes, list):
+                            raise ValueError('Cannot verify pane inventory.')
+                        found = found or any(p.get('pane_id') == run.get('pane_id') for p in panes)
+                    if found or not run.get('pane_id'):
+                        raise ValueError('Original agent is absent but its pane is present or unidentified; inspect ownership before closure.')
+                    saved = archive(self, run, actor, unavailable='Agent and recorded pane were already absent. Terminal history cannot be recovered from them.')
+                    status = 'already_closed'
+                else:
+                    if not run.get('agent_session'):
+                        raise ValueError('Session identity is missing; inspect manually.')
+                    self.identity(run, agent=agent)
+                    output = self.command('agent', 'read', run['alias'], '--source', 'recent-unwrapped', '--lines', '2000', timeout=10)
+                    terminal = output.get('output') if isinstance(output, dict) else None
+                    if not isinstance(terminal, str) or not terminal.strip():
+                        raise ValueError('Terminal preservation failed or returned empty output; the pane was not closed.')
+                    saved = archive(self, run, actor, terminal=terminal[-40000:])
+                    self.identity(run)  # Recheck after archive capture and immediately before closure.
+                    self.command('pane', 'close', run['pane_id'], timeout=10)
+                run = self.update_job(run['id'], state='released', session_closed_at=now(),
+                    session_closed_by=actor, session_archive_id=saved['id'], session_close_status=status,
+                    session_request_id=request_id, session_request_mode=mode)
+            if mode in ('restart', 'continue'):
                 with self.lock, closing(self.connect()) as db:
                     profile = self.get(db, 'profiles', run['profile_id'], run['organization_id'])
                 profile = dict(profile, project=run.get('source_project') or run['profile']['project'])
                 history = list(run.get('session_history', []))[-20:]
-                history.append({k: run.get(k) for k in ('alias', 'pane_id', 'agent_session', 'session_closed_at')})
+                history.append({k: run.get(k) for k in ('alias', 'pane_id', 'agent_session', 'session_closed_at', 'session_archive_id')})
                 self.update_job(run['id'], state='queued', reuse_checkout=True,
-                                profile=profile, alias='hire_' + uuid.uuid4().hex[:20],
-                                agent_session=None, session_closed_at=None, session_history=history,
-                                task_prompt='', error='', restarted_by=actor)
+                    profile=profile, alias='hire_' + uuid.uuid4().hex[:20], agent_session=None,
+                    session_closed_at=None, session_history=history, task_prompt='', error='', restarted_by=actor,
+                    continuation_context=context(saved) if mode == 'continue' else '', continuation_archive_id=saved['id'] if mode == 'continue' else None,
+                    session_request_id=request_id, session_request_mode=mode)
                 with self.lock:
                     future = self.worker.submit(self.execute, run['id'])
                     self.futures.add(future)
                     future.add_done_callback(self._finished)
-            return {'id': run['id']}
+            return {'id': run['id'], 'status': status, 'archive_id': saved['id']}
         finally:
             lock.release()
 
@@ -953,9 +998,13 @@ class OrganizationStore:
                     # publication boundary instead of losing it here.
                     prompt += ('\nNever push branches or create pull requests without explicit '
                                'publication authorization. Dashboard task publishing is administrator-controlled.')
+                    if job.get('continuation_context'):
+                        prompt += '\n\n' + job['continuation_context']
                     self.command('agent', 'prompt', job['alias'], prompt, '--wait', '--timeout', '180000', timeout=190)
                     self.identity(job)
                 else:
+                    if job.get('continuation_context'):
+                        prompt += '\n\n' + job['continuation_context']
                     self.command('agent', 'prompt', job['alias'], prompt)
                 self.update_job(job_id, state='persona_sent')
             else:

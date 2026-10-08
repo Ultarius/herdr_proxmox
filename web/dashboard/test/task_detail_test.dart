@@ -301,6 +301,12 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('Changes'));
     await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.text('Commit history unavailable'),
+      200,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.pumpAndSettle();
     expect(find.text('Commit history unavailable'), findsOneWidget);
     expect(find.textContaining('temporarily unavailable'), findsOneWidget);
     final before = details;

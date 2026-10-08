@@ -8,6 +8,23 @@ import 'package:herdr_dashboard/tasks_page.dart';
 import 'package:herdr_dashboard/routes.dart';
 
 void main() {
+  test(
+    'repository choices are relative, distinct, sorted and bounded to projects',
+    () {
+      expect(
+        taskRepositories([
+          {'project': '/home/herdr/projects/zeta'},
+          {'project': '/home/herdr/projects/team/alpha'},
+          {'project': '/home/herdr/projects/zeta'},
+          {'project': '/outside/repo'},
+          {'project': '../escape'},
+          {'project': null},
+        ], '/home/herdr/projects'),
+        ['team/alpha', 'zeta'],
+      );
+    },
+  );
+
   testWidgets(
     'GitHub authentication failure preserves the browser dashboard session',
     (tester) async {
@@ -308,6 +325,12 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.textContaining('mode 0600'), findsOneWidget);
       await tester.tap(find.text('Open task'));
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(
+        find.text('Open draft PR'),
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
       await tester.pumpAndSettle();
       // Publishing actions stay disabled rather than failing after the click.
       expect(

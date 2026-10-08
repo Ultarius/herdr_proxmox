@@ -191,6 +191,8 @@ class Contributions:
                 self.advance_automatic()
                 cycles += 1
                 if cycles % 6 == 0:
+                    self.reconcile_completed()
+                    self.advance_reviews()
                     self.poll_once()
             except (ValueError, OSError, sqlite3.Error):
                 # A transient storage or API failure must never end the poller;
@@ -263,6 +265,115 @@ class Contributions:
                             self.save(task, 'automation_waiting', 'automatic_task_policy')
                 except (ValueError, OSError, sqlite3.Error):
                     continue
+
+    def reconcile_completed(self):
+        with closing(self.connect()) as db:
+            ids = [r[0] for r in db.execute("SELECT id FROM tasks WHERE json_extract(data, '$.state')='review_ready' LIMIT 100")]
+        for task_id in ids:
+            try:
+                with self.operation('task:' + task_id, timeout=0):
+                    task = self.get(task_id)
+                    if task.get('pull') or task.get('publish'):
+                        continue
+                    head = task.get('head_sha')
+                    evidence = task.get('builds', {}).get(head, {})
+                    if evidence.get('target') != head or evidence.get('state') != 'complete' or evidence.get('required_checks_verified') is not True:
+                        continue
+                    jobs = self.store.snapshot(live_status=False).get('jobs', [])
+                    if any(j.get('state') in ('queued', 'running') and task['profile_id'] in j.get('participants', [j.get('profile_id')]) for j in jobs):
+                        continue
+                    run = next((j for j in jobs if j.get('id') == task.get('run_id')), None)
+                    if run and run.get('alias'):
+                        from collaboration import current_run
+                        current_run(self.store, run)
+                    repository = self.path_for(task)
+                    with repository_lock(repository):
+                        path = self.tree_for(task)
+                        if (project_git.git(path, 'rev-parse', 'HEAD').strip() != head or project_git.merge_state(path)
+                                or project_git.git(path, 'status', '--porcelain=v1', '--untracked-files=all').strip()):
+                            continue
+                        upstream = project_git.git(repository, 'rev-parse', '--verify', task['base_ref'] + '^{commit}').strip()
+                        if project_git.git(repository, 'rev-parse', head + '^{tree}').strip() != project_git.git(repository, 'rev-parse', upstream + '^{tree}').strip():
+                            continue
+                    task.update(state='completed', auto_validate=False, completion=dict(
+                        outcome='incorporated_upstream', candidate=head, upstream=upstream, validation='verified',
+                        reason='Exact candidate file tree matches the fetched configured base and required checks passed.',
+                        actor='task_reconciler', at=stamp()))
+                    self.save(task, 'complete', 'task_reconciler')
+            except (ValueError, OSError, sqlite3.Error):
+                continue
+
+    @staticmethod
+    def review_signature(task):
+        """Evidence identity for automatic reviews; transient states collapse."""
+        build = task.get('builds', {}).get(task.get('head_sha'), {})
+        state = build.get('state') if build.get('state') in ('complete', 'failed', 'error', 'interrupted') else 'pending'
+        return hashlib.sha256(json.dumps([task.get('head_sha'), task.get('state'),
+                                          task.get('automation_error'), state,
+                                          bool(build.get('required_checks_verified'))]).encode()).hexdigest()[:20]
+
+    def advance_reviews(self):
+        with closing(self.connect()) as db:
+            ids = [r[0] for r in db.execute("SELECT id FROM tasks WHERE json_extract(data, '$.auto_review')=1 LIMIT 100")]
+        for task_id in ids:
+            try:
+                with self.operation('task:' + task_id, timeout=0):
+                    task = self.get(task_id)
+                    if task['state'] not in ('implementing', 'review_ready'):
+                        continue
+                    group_id = task.get('review_group_id')
+                    if not group_id:
+                        raise ValueError('Automatic review needs an active review group.')
+                    head = task.get('head_sha')
+                    build = task.get('builds', {}).get(head, {})
+                    if not (task.get('automation_error') or build.get('state') in ('failed', 'error') or task['state'] == 'review_ready'):
+                        continue
+                    signature = self.review_signature(task)
+                    if task.get('review_signature') == signature:
+                        continue
+                    jobs = self.store.snapshot(live_status=False).get('jobs', [])
+                    if any(j.get('task_id') == task_id and j.get('review_signature') == signature for j in jobs):
+                        # A meeting for this exact evidence already exists (for
+                        # example after a restart between creation and save).
+                        task['review_signature'] = signature
+                        task.pop('review_error', None)
+                        self.save(task, 'review_linked', 'task_review_policy')
+                        continue
+                    self.perform('discuss', dict(group_id=group_id, signature=signature), task_id, 'task_review_policy')
+            except (ValueError, OSError, sqlite3.Error) as error:
+                try:
+                    with self.operation('task:' + task_id, timeout=0):
+                        task = self.get(task_id)
+                        if task.get('review_error') != str(error)[:500]:
+                            task['review_error'] = str(error)[:500]
+                            self.save(task, 'review_waiting', 'task_review_policy')
+                except (ValueError, OSError, sqlite3.Error):
+                    continue
+
+    @staticmethod
+    def discussion_proposals(job):
+        if job.get('state') != 'artifact_ready':
+            return []
+        result = job.get('result')
+        if not isinstance(result, str) or not result:
+            return []
+        match = re.search(r'```json\s*(.*?)\s*```', result, re.DOTALL)
+        try:
+            data = json.loads(match[1] if match else result)
+        except (ValueError, TypeError):
+            return []
+        proposals = data.get('task_proposals', []) if isinstance(data, dict) else []
+        if not isinstance(proposals, list) or len(proposals) > 10:
+            return []
+        valid = []
+        for proposal in proposals:
+            if (not isinstance(proposal, dict) or not isinstance(proposal.get('title'), str) or not 1 <= len(proposal['title'].strip()) <= 120
+                    or not isinstance(proposal.get('description'), str) or not 1 <= len(proposal['description'].strip()) <= 7000
+                    or not isinstance(proposal.get('profile_id'), str)):
+                continue
+            key = hashlib.sha256(json.dumps(proposal, sort_keys=True).encode()).hexdigest()[:24]
+            valid.append(dict(proposal, key=key))
+        return valid
 
     def poll_once(self):
         """Refresh the pull requests of open tasks once. Safe to call directly."""
@@ -415,7 +526,9 @@ class Contributions:
         with closing(self.connect()) as db:
             task['audit'] = list(reversed([json.loads(row[0]) for row in db.execute(
                 'SELECT data FROM audit WHERE task_id=? ORDER BY rowid DESC LIMIT 500', (task_id,))]))
-        jobs = self.store.snapshot(live_status=False).get('jobs', [])
+        snapshot = self.store.snapshot(live_status=False)
+        jobs = snapshot.get('jobs', [])
+        names = {p.get('id'): p.get('name', '') for p in snapshot.get('profiles', [])}
         sessions = [j for j in jobs if j.get('task_id') == task_id or j.get('id') == task.get('run_id')]
         participants = list(task.get('participants', []))
         known = {p.get('run_id') for p in participants}
@@ -429,11 +542,30 @@ class Contributions:
                     runtime=profile.get('runtime', ''), model=profile.get('model'), provider=profile.get('provider'), assigned_at=job.get('created_at'),
                     provenance='launch_record'))
                 known.add(job['id'])
+        meetings = []
+        for reference in task.get('meetings', []):
+            job = next((j for j in jobs if j.get('id') == reference['job_id']), None)
+            if job:
+                proposals = [dict(p, assignee=names.get(p['profile_id'], 'Agent identity unavailable'))
+                             for p in self.discussion_proposals(job)]
+                meetings.append(dict(reference, state=job['state'], result=job.get('result', ''),
+                    error=job.get('error', ''), proposals=proposals))
+            else:
+                meetings.append(dict(reference, state='unavailable', proposals=[]))
+        task['meeting_results'] = meetings
         task['participants'] = participants
         task['sessions'] = [{k: j.get(k) for k in ('id', 'kind', 'state', 'profile_id', 'created_at',
                             'updated_at', 'error', 'pane_id', 'alias', 'session_closed_at')} |
                             dict(history=[{k: h.get(k) for k in ('alias', 'pane_id', 'session_closed_at')}
                                           for h in j.get('session_history', [])]) for j in sessions]
+        try:
+            task['current_upstream_sha'] = project_git.git(self.path_for(task), 'rev-parse', '--verify', task['base_ref'] + '^{commit}').strip()
+            if task.get('head_sha'):
+                repository = self.path_for(task)
+                task['already_upstream'] = (project_git.git(repository, 'rev-parse', task['head_sha'] + '^{tree}').strip() == project_git.git(repository, 'rev-parse', task['current_upstream_sha'] + '^{tree}').strip())
+        except (ValueError, OSError):
+            task['current_upstream_sha'] = None
+            task['already_upstream'] = None
         # History is a read-only view of immutable commits, never candidate recapture.
         if task.get('head_sha'):
             try:
@@ -582,7 +714,7 @@ class Contributions:
         had_error = task.pop('error', None) is not None
         # An unchanged background refresh must not rewrite the task or its audit.
         unchanged = self.comparable(task) if action == 'refresh' else None
-        if task['state'] in ('merged', 'closed') and action not in ('refresh', 'build'):
+        if task['state'] in ('merged', 'closed', 'completed') and action not in ('refresh', 'build', 'discuss', 'review_policy', 'proposal', 'complete'):
             raise ValueError('This task pull request is closed. Create a new task for further changes.')
         repository = self.path_for(task)
         if remote_info(repository) != task['github_repository']:
@@ -606,6 +738,88 @@ class Contributions:
                 runtime=profile.get('runtime', ''), model=profile.get('model'), provider=profile.get('provider'), assigned_at=stamp(), provenance='task_launch'))
             task.update(run_id=run['id'], worktree=str((self.projects / '.herdr-worktrees' / run['id']).resolve()),
                         state='implementing')
+        elif action == 'complete':
+            if task['state'] == 'completed':
+                saved = task.get('completion', {})
+                if body.get('head_sha') == saved.get('candidate') and body.get('reason', '').strip() == saved.get('reason') and body.get('outcome') == saved.get('outcome'):
+                    return task
+                raise ValueError('This task is already completed; its completion record is immutable.')
+            head = body.get('head_sha')
+            reason = body.get('reason')
+            if body.get('inspected') is not True or head != task.get('head_sha') or not SHA.fullmatch(str(head)):
+                raise ValueError('Review the exact current candidate before marking the task done.')
+            if not isinstance(reason, str) or not 10 <= len(reason.strip()) <= 2000:
+                raise ValueError('Record how this task was satisfied or superseded.')
+            outcome = body.get('outcome')
+            if outcome not in ('incorporated_elsewhere', 'superseded'):
+                raise ValueError('Choose a completion outcome.')
+            if task.get('pull') and task['pull'].get('state') == 'open':
+                raise ValueError('Resolve the open pull request before completing this task.')
+            path = self.tree_for(task)
+            with repository_lock(repository):
+                if (project_git.git(path, 'rev-parse', 'HEAD').strip() != head or project_git.merge_state(path)
+                        or project_git.git(path, 'status', '--porcelain=v1', '--untracked-files=all').strip()):
+                    raise ValueError('Candidate changed or checkout is not clean; inspect it again.')
+                upstream = project_git.git(repository, 'rev-parse', '--verify', task['base_ref'] + '^{commit}').strip()
+                if body.get('upstream_sha') != upstream:
+                    raise ValueError('Fetched base changed; refresh before confirming completion.')
+            evidence = task.get('builds', {}).get(head, {})
+            task.update(state='completed', auto_validate=False, auto_review=False, completion=dict(
+                outcome=outcome, candidate=head, upstream=upstream,
+                validation='verified' if evidence.get('state') == 'complete' and evidence.get('target') == head and evidence.get('required_checks_verified') is True else 'not_verified',
+                reason=reason.strip(), actor=actor, at=stamp()))
+        elif action in ('discuss', 'review_policy'):
+            groups = self.store.snapshot(live_status=False).get('groups', [])
+            group = next((g for g in groups if g['id'] == body.get('group_id') and g['organization_id'] == task['organization_id'] and not g.get('removed_at')), None)
+            if not group:
+                raise ValueError('Choose an active group in this task organization.')
+            if action == 'review_policy':
+                if not isinstance(body.get('auto_review'), bool):
+                    raise ValueError('Choose whether group reviews are automatic.')
+                task.update(review_group_id=group['id'], auto_review=body['auto_review'])
+            else:
+                with closing(self.connect()) as db:
+                    open_tasks = [json.loads(r[0]) for r in db.execute("SELECT data FROM tasks WHERE json_extract(data, '$.organization_id')=? AND json_extract(data, '$.state') NOT IN ('completed','closed','merged') LIMIT 10", (task['organization_id'],))]
+                # The instruction comes first: bounded context may be truncated,
+                # never the required proposal contract.
+                instruction = ('Discuss remaining acceptance criteria, blockers, review evidence and possible duplicate/superseded work. '
+                    'Read-only discussion; do not edit, commit, push or deploy. '
+                    'Do not treat missing validation as passed. Propose only necessary follow-up work; do not recreate existing tasks. '
+                    'In the final action-plan artifact include one fenced json object with task_proposals: an array (at most 10) of {title, description, profile_id}. '
+                    'Each description must include acceptance criteria and required checks. Use an existing individual repository worker profile ID from the group roster. '
+                    'An empty proposal array is valid. These are drafts for operator review, not authorization to launch work.')
+                context = ('Review task ' + task['id'] + ': ' + task['title'] + '\n' + task['description'][:2000] +
+                    '\nCandidate: ' + str(task.get('head_sha')) + '\nIssue: ' + str(task.get('automation_error', task.get('error', '')))[:500] +
+                    '\nOther open work:\n' + '\n'.join(t['id'] + ' ' + t['title'][:120] + ' [' + t['state'] + ']' for t in open_tasks))
+                topic = (instruction + '\n\n' + context)[:8000]
+                signature = body.get('signature') or hashlib.sha256(str(body.get('request_id', uuid.uuid4().hex)).encode()).hexdigest()[:20]
+                if not re.fullmatch(r'[a-f0-9]{20}', signature):
+                    raise ValueError('Invalid discussion identity.')
+                job = self.store.action('discuss', dict(request_id='task-review-' + task_id + '-' + signature,
+                    organization_id=task['organization_id'], group_id=group['id'], prompt=topic))
+                self.store.update_job(job['id'], task_id=task_id, review_signature=signature)
+                task.setdefault('meetings', []).append(dict(job_id=job['id'], group_id=group['id'], group_name=group['name'], at=stamp(), signature=signature))
+                task['meetings'] = task['meetings'][-30:]
+                task['review_signature'] = self.review_signature(task)
+                task.pop('review_error', None)
+        elif action == 'proposal':
+            reference = next((m for m in task.get('meetings', []) if m['job_id'] == body.get('meeting_id')), None)
+            if not reference:
+                raise ValueError('Select a discussion linked to this task.')
+            jobs = self.store.snapshot(live_status=False).get('jobs', [])
+            job = next((j for j in jobs if j['id'] == reference['job_id'] and j.get('organization_id') == task['organization_id']), None)
+            proposal = next((p for p in self.discussion_proposals(job or {}) if p['key'] == body.get('proposal_key')), None)
+            if not proposal:
+                raise ValueError('Select a finalized discussion proposal.')
+            profile = next((p for p in self.store.snapshot(live_status=False)['profiles'] if p['id'] == proposal['profile_id']), None)
+            if not profile or profile.get('organization_id') != task['organization_id']:
+                raise ValueError('Proposal assignee belongs to a different organization.')
+            new_id = uuid.uuid5(uuid.NAMESPACE_URL, 'herdr:' + task_id + ':' + reference['job_id'] + ':' + proposal['key']).hex
+            created = self.perform('create', dict(title=proposal['title'], description=proposal['description'],
+                repository=task['repository'], base_ref=task['base_ref'], profile_id=proposal['profile_id']), new_id, actor)
+            created['source'] = dict(task_id=task_id, meeting_id=reference['job_id'], group_id=reference['group_id'], proposal_key=proposal['key'])
+            self.save(created, 'proposal_accepted', actor)
+            task.setdefault('follow_up_tasks', {})[proposal['key']] = new_id
         elif action == 'policy':
             if not isinstance(body.get('auto_validate'), bool):
                 raise ValueError('Choose whether automatic capture and validation is enabled.')

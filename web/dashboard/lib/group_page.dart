@@ -781,6 +781,16 @@ class _GroupPageState extends State<GroupPage> {
                         Wrap(
                           spacing: 12,
                           children: [
+                            if (job['task_id'] != null)
+                              TextButton.icon(
+                                onPressed: () => widget.coordinator.push(
+                                  TaskDetailRoute('${job['task_id']}'),
+                                ),
+                                icon: const Icon(Icons.task_alt),
+                                label: const Text(
+                                  'Review task and follow-up proposals',
+                                ),
+                              ),
                             TextButton(
                               onPressed: () => export(job, false),
                               child: const Text('Copy Markdown'),

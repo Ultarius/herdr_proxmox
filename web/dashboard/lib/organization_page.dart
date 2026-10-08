@@ -1,3 +1,5 @@
+import 'dart:convert';
+import 'artifact_download.dart';
 import 'permission_options.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
@@ -161,9 +163,11 @@ class _OrganizationPageState extends State<OrganizationPage> {
                   for (final job in obsolete)
                     CheckboxListTile(
                       title: Text(
-                        '${job['profile']?['name'] ?? job['profile_id']}',
+                        '${job['profile']?['name'] ?? bloc.state.profiles.where((p) => p['id'] == job['profile_id']).map((p) => p['name']).firstOrNull ?? job['profile_id']}',
                       ),
-                      subtitle: Text('${job['alias']} · ${job['pane_id']}'),
+                      subtitle: Text(
+                        '${job['alias']} · ${job['pane_id'] ?? 'Pane identity missing'}\nStarted ${job['created_at'] ?? 'at an unknown time'}',
+                      ),
                       value: chosen.contains(job['id']),
                       onChanged: (value) => update(() {
                         if (value == true) {
@@ -186,7 +190,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
               onPressed: chosen.isEmpty
                   ? null
                   : () => Navigator.pop(context, true),
-              child: const Text('Close selected idle sessions'),
+              child: const Text('Archive and close selected sessions'),
             ),
           ],
         ),
@@ -204,7 +208,8 @@ class _OrganizationPageState extends State<OrganizationPage> {
       if (!mounted) return;
       final names = {
         for (final job in obsolete)
-          job['id']: '${job['profile']?['name'] ?? job['profile_id']}',
+          job['id']:
+              '${job['profile']?['name'] ?? bloc.state.profiles.where((p) => p['id'] == job['profile_id']).map((p) => p['name']).firstOrNull ?? job['profile_id']}',
       };
       await showDialog<void>(
         context: context,
@@ -239,6 +244,131 @@ class _OrganizationPageState extends State<OrganizationPage> {
     }
   }
 
+  Future<void> showArchives() async {
+    final epoch = connection.generation;
+    final organizationId = selected;
+    bool current() =>
+        mounted && epoch == connection.generation && selected == organizationId;
+    try {
+      final response = await connection.request('organizations/session', {
+        'mode': 'archives',
+        'organization_id': organizationId,
+      });
+      if (!current()) return;
+      final archives = [
+        for (final entry in response['archives'] as List? ?? [])
+          if (entry is Map) entry,
+      ];
+      final chosen = await showDialog<Map>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Archived sessions'),
+          content: SizedBox(
+            width: 720,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (archives.isEmpty)
+                    const Text(
+                      'No session archives yet. Archive and close a verified idle session first.',
+                    ),
+                  for (final archive in archives)
+                    ListTile(
+                      title: Text(
+                        '${archive['identity']?['name'] ?? 'Historical agent'}',
+                      ),
+                      subtitle: Text(
+                        '${archive['alias']}\nArchived ${archive['archived_at']}${archive['terminal_unavailable'] != null ? '\nTerminal history unavailable; saved records only.' : ''}',
+                      ),
+                      trailing: TextButton(
+                        onPressed: () => Navigator.pop(context, archive),
+                        child: const Text('View history'),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+      if (chosen == null || !current()) return;
+      final data = await connection.request('organizations/session', {
+        'mode': 'view_archive',
+        'organization_id': organizationId,
+        'archive_id': chosen['id'],
+      });
+      if (!current()) return;
+      final continueSession = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text(
+            'Archived conversation: ${data['identity']?['name'] ?? 'agent'}',
+          ),
+          content: SizedBox(
+            width: 800,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'Bounded historical evidence, not a complete provider transcript. Continuing creates a fresh conversation and waits for instructions.',
+                  ),
+                  SelectableText(
+                    'Checkout: ${data['worktree_path'] ?? data['source_project']}\nBranch: ${data['worktree_branch']}\nTask: ${data['task_id']}',
+                  ),
+                  SelectableText(
+                    '${data['terminal'] ?? data['terminal_unavailable'] ?? 'Terminal unavailable.'}',
+                  ),
+                  for (final message in data['messages'] as List? ?? [])
+                    SelectableText('$message'),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => downloadArtifact(
+                jsonEncode(data),
+                'session-${data['id']}.json',
+              ),
+              child: const Text('Download archive'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Close'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Continue with saved context'),
+            ),
+          ],
+        ),
+      );
+      if (continueSession == true && current())
+        await manageSession({
+          'id': data['run_id'],
+          'organization_id': organizationId,
+          'archive_id': data['id'],
+          'alias': data['alias'],
+          'pane_id': data['pane_id'],
+          'profile': data['identity'],
+        }, 'continue');
+    } catch (error) {
+      if (current())
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('$error')));
+    }
+  }
+
   Future<void> manageSession(Map<String, dynamic> job, String mode) async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -246,10 +376,17 @@ class _OrganizationPageState extends State<OrganizationPage> {
         title: Text(
           mode == 'restart'
               ? 'Restart agent session?'
-              : 'Close obsolete session?',
+              : mode == 'continue'
+              ? 'Continue archived context?'
+              : 'Archive and close session?',
         ),
         content: Text(
-          '${job['profile']?['name'] ?? job['profile_id']}\nAlias: ${job['alias']}\nPane: ${job['pane_id']}\nThe gateway verifies the original session is idle and unchanged. Checkout files, branches and history are preserved. Restart adopts the current profile and waits for instructions; it does not repeat the task.',
+          '${job['profile']?['name'] ?? job['profile_id']}\nAlias: ${job['alias']}\nPane: ${job['pane_id']}\n'
+          '${mode == 'restart'
+              ? 'Restarts a fresh session in the retained checkout with the current agent profile. It waits for instructions and does not replay the task.'
+              : mode == 'continue'
+              ? 'Starts a fresh session in the retained checkout with the archived evidence and the current agent profile. It does not resume the provider conversation or replay the task.'
+              : 'Preserves available evidence before closing a verified idle session. If capture fails, the pane stays open.'}',
         ),
         actions: [
           TextButton(
@@ -273,6 +410,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
         'mode': mode,
         'inspected': true,
         'request_id': request,
+        if (job['archive_id'] != null) 'archive_id': job['archive_id'],
       });
       sessionRequests.remove(selection);
       if (!mounted) return;
@@ -291,7 +429,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
       builder: (context) => AlertDialog(
         title: const Text('Release run binding?'),
         content: const Text(
-          'This allows another launch. It leaves the terminal and process running. Use Close session pane to stop an idle session and avoid duplicate work.',
+          'This allows another launch. It leaves the terminal and process running. Use Archive and close session to stop an idle session and avoid duplicate work.',
         ),
         actions: [
           TextButton(
@@ -727,6 +865,11 @@ class _OrganizationPageState extends State<OrganizationPage> {
                                 : () => cleanupSessions(jobs),
                             child: const Text('Clean up obsolete panes'),
                           ),
+                        if (connection.operator.value['role'] == 'admin')
+                          TextButton(
+                            onPressed: state.busy ? null : showArchives,
+                            child: const Text('Archived sessions'),
+                          ),
                         Text(
                           'Runs and delegation history',
                           style: Theme.of(context).textTheme.titleLarge,
@@ -802,7 +945,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
                                               : () =>
                                                     manageSession(job, 'close'),
                                           child: const Text(
-                                            'Close session pane',
+                                            'Archive and close session',
                                           ),
                                         ),
                                         if (job['state'] == 'persona_sent')

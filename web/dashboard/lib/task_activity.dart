@@ -24,9 +24,24 @@ String taskAgentName(
   return fallback;
 }
 
+String completionOutcome(Map task) {
+  final completion = task['completion'];
+  final outcome = completion is Map ? '${completion['outcome']}' : '';
+  switch (outcome) {
+    case 'superseded':
+      return 'superseded by other work';
+    case 'incorporated_upstream':
+      return 'already incorporated upstream';
+    default:
+      return 'incorporated elsewhere';
+  }
+}
+
 String taskNextStep(Map task) {
   if (task['automation_error'] != null)
     return 'Automation needs attention: ${task['automation_error']}';
+  if (task['state'] == 'completed')
+    return 'Done: ${completionOutcome(task)}. Validation and deployment remain separate.';
   if (task['state'] == 'draft') return 'Ready to launch the assigned agent.';
   if (task['state'] == 'implementing')
     return 'Implementation in progress; awaiting a committed candidate.';
@@ -53,6 +68,11 @@ String taskNextStep(Map task) {
 }
 
 const activityLabels = {
+  'complete': 'Task marked done',
+  'discuss': 'Group review requested',
+  'review_policy': 'Automatic group review policy changed',
+  'proposal': 'Follow-up draft created',
+  'proposal_accepted': 'Discussion proposal accepted',
   'create': 'Task created',
   'launch': 'Implementation started',
   'candidate': 'Candidate captured',

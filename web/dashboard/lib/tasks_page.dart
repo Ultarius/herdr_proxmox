@@ -10,6 +10,7 @@ import 'request_id.dart';
 /// Task lifecycle labels. The gateway owns these states; an unknown value is
 /// shown verbatim rather than guessed.
 const taskStates = <String, String>{
+  'completed': 'Done',
   'draft': 'Draft',
   'implementing': 'Implementing',
   'review_ready': 'Review ready',
@@ -56,6 +57,32 @@ String buildSummary(String target, Map<dynamic, dynamic> build) {
       '${state == 'complete' && !verified ? ' · required checks not verified' : ''}';
 }
 
+/// Task repositories come from managed agent assignments, relative to projects.
+List<String> taskRepositories(
+  List<Map<String, dynamic>> profiles,
+  String root,
+) {
+  final prefix =
+      '${root.replaceAll('\\', '/').replaceAll(RegExp(r'/+$'), '')}/';
+  return (profiles
+      .map((p) {
+        final project = '${p['project'] ?? ''}'.replaceAll('\\', '/');
+        return project.startsWith(prefix)
+            ? project.substring(prefix.length)
+            : project;
+      })
+      .where(
+        (path) =>
+            path.isNotEmpty &&
+            !path.startsWith('/') &&
+            !path.contains(':') &&
+            !path.split('/').contains('..'),
+      )
+      .toSet()
+      .toList()
+    ..sort());
+}
+
 class TasksPage extends StatefulWidget {
   const TasksPage({super.key, this.taskId, this.coordinator});
   final String? taskId;
@@ -70,6 +97,7 @@ class _TasksPageState extends State<TasksPage> {
   Map<String, dynamic> github = {};
   String executor = 'unavailable';
   String section = 'Overview';
+  final Set<String> expandedMeetings = {};
   String? localTaskId;
   String? get selectedId => widget.taskId ?? localTaskId;
   String? error;
@@ -103,6 +131,7 @@ class _TasksPageState extends State<TasksPage> {
           error = null;
           readError = null;
           requests.clear();
+          expandedMeetings.clear();
         });
         // A read begun before reconnect is not valid for the new connection.
         refresh(force: true);
@@ -325,7 +354,19 @@ class _TasksPageState extends State<TasksPage> {
         throw StateError('Hire a worktree agent before creating a task.');
       final title = TextEditingController();
       final description = TextEditingController();
-      final repository = TextEditingController(text: 'herdr_proxmox');
+      final projects = await connection.request('projects/browse', {
+        'path': '',
+      });
+      if (!mounted || epoch != connection.generation) return;
+      final repositories = taskRepositories(
+        profiles,
+        '${projects['root'] ?? ''}',
+      );
+      if (repositories.isEmpty)
+        throw StateError(
+          'No managed repository is assigned to a worktree agent.',
+        );
+      final repository = TextEditingController(text: repositories.first);
       final base = TextEditingController(text: 'refs/remotes/origin/main');
       var profile = '${profiles.first['id']}';
       Map<String, dynamic>? body;
@@ -358,11 +399,20 @@ class _TasksPageState extends State<TasksPage> {
                               'Change, acceptance criteria and required checks',
                         ),
                       ),
-                      TextField(
-                        controller: repository,
+                      DropdownButtonFormField<String>(
+                        initialValue: repository.text,
+                        isExpanded: true,
                         decoration: const InputDecoration(
-                          labelText: 'Repository inside projects',
+                          labelText: 'Repository',
                         ),
+                        items: [
+                          for (final path in repositories)
+                            DropdownMenuItem(value: path, child: Text(path)),
+                        ],
+                        onChanged: (value) {
+                          if (value != null)
+                            update(() => repository.text = value);
+                        },
                       ),
                       TextField(
                         controller: base,
@@ -373,7 +423,7 @@ class _TasksPageState extends State<TasksPage> {
                       ValueListenableBuilder<TextEditingValue>(
                         valueListenable: repository,
                         builder: (context, value, _) {
-                          // Only an agent already assigned to the typed
+                          // Only an agent already assigned to the selected
                           // repository can own its task branch.
                           final wanted = value.text.trim().replaceAll(
                             '\\',
@@ -388,19 +438,9 @@ class _TasksPageState extends State<TasksPage> {
                                 project == wanted ||
                                 project.endsWith('/$wanted');
                           }).toList();
-                          if (matches.isEmpty)
-                            return const InputDecorator(
-                              decoration: InputDecoration(
-                                labelText: 'Assigned agent',
-                                errorText:
-                                    'No worktree agent is assigned to this repository.',
-                              ),
-                              child: Text(
-                                'Hire a worktree agent for it in Organization first.',
-                              ),
-                            );
-                          final selected =
-                              matches.any((p) => '${p['id']}' == profile)
+                          final selected = matches.isEmpty
+                              ? null
+                              : matches.any((p) => '${p['id']}' == profile)
                               ? profile
                               : '${matches.first['id']}';
                           return DropdownButtonFormField<String>(
@@ -409,8 +449,14 @@ class _TasksPageState extends State<TasksPage> {
                             ),
                             initialValue: selected,
                             isExpanded: true,
-                            decoration: const InputDecoration(
+                            hint: const Text('No eligible agents'),
+                            decoration: InputDecoration(
                               labelText: 'Assigned agent',
+                              helperText: matches.isEmpty
+                                  ? wanted.isEmpty
+                                        ? 'Enter the repository inside projects first.'
+                                        : 'Hire a worktree agent for this repository in Organization first.'
+                                  : null,
                             ),
                             items: [
                               for (final p in matches)
@@ -419,9 +465,12 @@ class _TasksPageState extends State<TasksPage> {
                                   child: Text('${p['name']}'),
                                 ),
                             ],
-                            onChanged: (value) {
-                              if (value != null) update(() => profile = value);
-                            },
+                            onChanged: matches.isEmpty
+                                ? null
+                                : (value) {
+                                    if (value != null)
+                                      update(() => profile = value);
+                                  },
                           );
                         },
                       ),
@@ -437,15 +486,34 @@ class _TasksPageState extends State<TasksPage> {
                   onPressed: () => Navigator.pop(context),
                   child: const Text('Cancel'),
                 ),
-                FilledButton(
-                  onPressed: () => Navigator.pop(context, {
-                    'title': title.text,
-                    'description': description.text,
-                    'repository': repository.text.trim(),
-                    'base_ref': base.text.trim(),
-                    'profile_id': profile,
-                  }),
-                  child: const Text('Create task'),
+                ValueListenableBuilder<TextEditingValue>(
+                  valueListenable: repository,
+                  builder: (context, value, _) {
+                    final wanted = value.text.trim().replaceAll('\\', '/');
+                    final eligible = profiles.where((p) {
+                      final project = '${p['project']}'.replaceAll('\\', '/');
+                      return wanted.isNotEmpty &&
+                          (project == wanted || project.endsWith('/$wanted'));
+                    }).toList();
+                    return FilledButton(
+                      onPressed: eligible.isEmpty
+                          ? null
+                          : () {
+                              final assigned =
+                                  eligible.any((p) => '${p['id']}' == profile)
+                                  ? profile
+                                  : '${eligible.first['id']}';
+                              Navigator.pop(context, {
+                                'title': title.text,
+                                'description': description.text,
+                                'repository': repository.text.trim(),
+                                'base_ref': base.text.trim(),
+                                'profile_id': assigned,
+                              });
+                            },
+                      child: const Text('Create task'),
+                    );
+                  },
                 ),
               ],
             ),
@@ -742,6 +810,186 @@ class _TasksPageState extends State<TasksPage> {
     }
   }
 
+  Future<void> completeTask(Map<String, dynamic> task) async {
+    var reason = '';
+    var outcome = 'incorporated_elsewhere';
+    var inspected = false;
+    Map<String, dynamic>? body;
+    body = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, update) => AlertDialog(
+          title: const Text('Mark task done'),
+          content: SizedBox(
+            width: 560,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'Record why no implementation remains. This does not claim validation passed or deploy anything.',
+                  ),
+                  SelectableText(
+                    'Candidate: ${task['head_sha']}\nFetched base: ${task['current_upstream_sha']}',
+                  ),
+                  DropdownButtonFormField<String>(
+                    initialValue: outcome,
+                    isExpanded: true,
+                    items: const [
+                      DropdownMenuItem(
+                        value: 'incorporated_elsewhere',
+                        child: Text('Changes incorporated elsewhere'),
+                      ),
+                      DropdownMenuItem(
+                        value: 'superseded',
+                        child: Text('Superseded by other work'),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value != null) update(() => outcome = value);
+                    },
+                  ),
+                  TextField(
+                    onChanged: (value) => update(() => reason = value),
+                    maxLength: 2000,
+                    minLines: 2,
+                    maxLines: 5,
+                    decoration: const InputDecoration(
+                      labelText: 'Reviewed evidence and completion reason',
+                    ),
+                  ),
+                  if (reason.trim().isNotEmpty && reason.trim().length < 10)
+                    const Text(
+                      'Record at least a short sentence explaining this decision.',
+                    ),
+                  if (task['current_upstream_sha'] == null)
+                    const Text(
+                      'Refresh the task to load the fetched base before confirming.',
+                    ),
+                  CheckboxListTile(
+                    value: inspected,
+                    onChanged: (value) =>
+                        update(() => inspected = value == true),
+                    title: const Text(
+                      'I reviewed this candidate and the upstream work.',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed:
+                  inspected &&
+                      reason.trim().length >= 10 &&
+                      task['current_upstream_sha'] != null
+                  ? () => Navigator.pop(context, {
+                      'task_id': task['id'],
+                      'head_sha': task['head_sha'],
+                      'upstream_sha': task['current_upstream_sha'],
+                      'outcome': outcome,
+                      'reason': reason,
+                      'inspected': true,
+                    })
+                  : null,
+              child: const Text('Confirm completion'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (body != null && mounted) await act('complete', body);
+  }
+
+  Future<void> discussTask(Map<String, dynamic> task) async {
+    try {
+      final data = await connection.request('organizations/directory');
+      if (!mounted) return;
+      final groups = [
+        for (final g in data['groups'] as List? ?? [])
+          if (g is Map &&
+              g['organization_id'] == task['organization_id'] &&
+              g['removed_at'] == null)
+            g,
+      ];
+      if (groups.isEmpty)
+        throw StateError(
+          'Create an active group in this task organization first.',
+        );
+      var group = '${groups.first['id']}';
+      var automatic = task['auto_review'] == true;
+      final selected = await showDialog<Map<String, dynamic>>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+          builder: (context, update) => AlertDialog(
+            title: const Text('Review work with a group'),
+            content: SizedBox(
+              width: 520,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'Discuss this task, blockers and other open work. Recommendations become draft proposals; agents do not start new work.',
+                  ),
+                  DropdownButtonFormField<String>(
+                    initialValue: group,
+                    isExpanded: true,
+                    items: [
+                      for (final g in groups)
+                        DropdownMenuItem(
+                          value: '${g['id']}',
+                          child: Text('${g['name']}'),
+                        ),
+                    ],
+                    onChanged: (value) => update(() => group = value!),
+                  ),
+                  CheckboxListTile(
+                    value: automatic,
+                    onChanged: (value) =>
+                        update(() => automatic = value == true),
+                    title: const Text(
+                      'Automatically request a review when task evidence changes',
+                    ),
+                    subtitle: const Text(
+                      'One discussion per changed candidate, blocker or validation state. Draft proposals only.',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, {
+                  'group_id': group,
+                  'auto_review': automatic,
+                }),
+                child: const Text('Start group review'),
+              ),
+            ],
+          ),
+        ),
+      );
+      if (selected != null && mounted) {
+        await act('review_policy', {'task_id': task['id'], ...selected});
+        await act('discuss', {
+          'task_id': task['id'],
+          'group_id': selected['group_id'],
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => error = '$e');
+    }
+  }
+
   Widget _nextAction(Map<String, dynamic> task) {
     final target = task['merge_sha'] ?? task['head_sha'];
     final evidence = (task['builds'] as Map?)?[target] as Map?;
@@ -753,7 +1001,7 @@ class _TasksPageState extends State<TasksPage> {
         icon: const Icon(Icons.play_arrow),
         label: const Text('Start implementation'),
       );
-    if (target == null || task['state'] == 'closed')
+    if (target == null || ['closed', 'completed'].contains(task['state']))
       return const SizedBox.shrink();
     if (evidence?['state'] == 'complete') {
       final verified = evidence?['required_checks_verified'] == true;
@@ -827,6 +1075,50 @@ class _TasksPageState extends State<TasksPage> {
             ),
           ),
           Align(alignment: Alignment.centerLeft, child: _nextAction(task)),
+          Wrap(
+            spacing: 8,
+            children: [
+              if (task['head_sha'] != null &&
+                  !['completed', 'closed', 'merged'].contains(task['state']))
+                OutlinedButton(
+                  onPressed: admin && !busy ? () => completeTask(task) : null,
+                  child: const Text('Mark task done'),
+                ),
+              OutlinedButton.icon(
+                onPressed: admin && !busy ? () => discussTask(task) : null,
+                icon: const Icon(Icons.groups),
+                label: const Text('Discuss with group'),
+              ),
+            ],
+          ),
+          if (task['completion'] is Map) ...[
+            Text(
+              'Done: ${completionOutcome(task)}',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            Text('Reason: ${task['completion']['reason']}'),
+            SelectableText(
+              'Candidate: ${task['completion']['candidate']}\nUpstream at completion: ${task['completion']['upstream']}',
+            ),
+            Text(
+              task['completion']['validation'] == 'verified'
+                  ? 'Required checks passed for this candidate. Deployment remains separate.'
+                  : 'No verified required checks for this candidate at completion. Done is not validation.',
+            ),
+            Text(
+              'Recorded by ${task['completion']['actor']} at ${task['completion']['at']}',
+            ),
+          ],
+          if (task['follow_up_tasks'] is Map)
+            for (final id in (task['follow_up_tasks'] as Map).values)
+              TextButton.icon(
+                onPressed: () => openTask('$id'),
+                icon: const Icon(Icons.task_alt),
+                label: const Text('Open follow-up draft'),
+              ),
+          if (task['review_error'] != null)
+            Text('Group review waiting: ${task['review_error']}'),
+
           if (github['configured'] != true)
             const Text(
               'GitHub publishing is not configured. Local implementation and validation remain available.',
@@ -851,6 +1143,15 @@ class _TasksPageState extends State<TasksPage> {
           ),
           const SizedBox(height: 20),
           if (section == 'Overview') ...[
+            if (task['source'] is Map) ...[
+              Text(
+                'Follow-up proposed by group ${task['source']['group_id']} in meeting ${task['source']['meeting_id']}',
+              ),
+              TextButton(
+                onPressed: () => openTask('${task['source']['task_id']}'),
+                child: const Text('Open originating task'),
+              ),
+            ],
             const Text('Task description & acceptance criteria'),
             SelectableText(
               '${task['description'] ?? 'No description recorded.'}',
@@ -880,7 +1181,11 @@ class _TasksPageState extends State<TasksPage> {
                   onChanged:
                       admin &&
                           !busy &&
-                          !['merged', 'closed'].contains(task['state']) &&
+                          ![
+                            'merged',
+                            'closed',
+                            'completed',
+                          ].contains(task['state']) &&
                           (task['auto_validate'] == true ||
                               executor == 'service')
                       ? (value) => act('policy', {
@@ -899,6 +1204,70 @@ class _TasksPageState extends State<TasksPage> {
               task: task,
               onOpen: (value) => setState(() => section = value),
             ),
+          if (section == 'Activity & agents')
+            for (final meeting in task['meeting_results'] as List? ?? [])
+              if (meeting is Map)
+                Card(
+                  key: ValueKey('meeting-${meeting['job_id']}'),
+                  child: ExpansionTile(
+                    initiallyExpanded: expandedMeetings.contains(
+                      '${meeting['job_id']}',
+                    ),
+                    onExpansionChanged: (value) {
+                      if (value)
+                        expandedMeetings.add('${meeting['job_id']}');
+                      else
+                        expandedMeetings.remove('${meeting['job_id']}');
+                    },
+                    title: Text('${meeting['group_name']} review'),
+                    subtitle: Text('${meeting['state']}'),
+                    children: [
+                      if (widget.coordinator != null)
+                        TextButton(
+                          onPressed: () => widget.coordinator!.push(
+                            GroupRoute('${meeting['group_id']}'),
+                          ),
+                          child: const Text('Open group discussion'),
+                        ),
+                      if (meeting['error'] != null &&
+                          '${meeting['error']}'.isNotEmpty)
+                        Text('${meeting['error']}'),
+                      SelectableText(
+                        '${meeting['result'] ?? 'Waiting for discussion output.'}',
+                      ),
+                      for (final proposal
+                          in meeting['proposals'] as List? ?? [])
+                        if (proposal is Map)
+                          ListTile(
+                            title: Text('${proposal['title']}'),
+                            subtitle: Text(
+                              'Assigned: ${proposal['assignee'] ?? proposal['profile_id']}\n${proposal['description']}',
+                            ),
+                            trailing: TextButton(
+                              onPressed:
+                                  admin &&
+                                      !busy &&
+                                      (task['follow_up_tasks']
+                                              as Map?)?[proposal['key']] ==
+                                          null
+                                  ? () => act('proposal', {
+                                      'task_id': task['id'],
+                                      'meeting_id': meeting['job_id'],
+                                      'proposal_key': proposal['key'],
+                                    })
+                                  : null,
+                              child: Text(
+                                (task['follow_up_tasks']
+                                            as Map?)?[proposal['key']] ==
+                                        null
+                                    ? 'Create draft'
+                                    : 'Draft created',
+                              ),
+                            ),
+                          ),
+                    ],
+                  ),
+                ),
           if (section == 'Changes') ...[
             SelectableText(
               'Branch: ${task['branch']}\nBase: ${task['base_ref']} \u00b7 ${task['base_sha']}\nCandidate: ${task['head_sha'] ?? 'Not captured'}',
@@ -908,7 +1277,7 @@ class _TasksPageState extends State<TasksPage> {
                 'PR #${task['pull']['number']} \u00b7 ${pullStatus(task)}\n${task['pull']['url']}',
               ),
               if (task['pull']['mergeable'] == false &&
-                  !['merged', 'closed'].contains(task['state']))
+                  !['merged', 'closed', 'completed'].contains(task['state']))
                 const Text('GitHub reports merge conflicts.'),
             ],
             if (task['merge_sha'] != null)
@@ -992,7 +1361,7 @@ class _TasksPageState extends State<TasksPage> {
           child: const Text('Launch task agent'),
         ),
       if (task['run_id'] != null &&
-          !['merged', 'closed'].contains(task['state']))
+          !['merged', 'closed', 'completed'].contains(task['state']))
         OutlinedButton(
           onPressed: admin && !busy
               ? () => act('candidate', {'task_id': task['id']})
@@ -1033,7 +1402,7 @@ class _TasksPageState extends State<TasksPage> {
           child: const Text('Download candidate patch'),
         ),
       if (task['head_sha'] != null &&
-          !['merged', 'closed'].contains(task['state']))
+          !['merged', 'closed', 'completed'].contains(task['state']))
         OutlinedButton(
           onPressed: admin && !busy && github['configured'] == true
               ? () => review(task)
