@@ -32,6 +32,8 @@ String completionOutcome(Map task) {
       return 'superseded by other work';
     case 'incorporated_upstream':
       return 'already incorporated upstream';
+    case 'no_changes':
+      return 'no changes needed';
     default:
       return 'incorporated elsewhere';
   }
@@ -42,7 +44,15 @@ String taskNextStep(Map task) {
     return 'Automation needs attention: ${task['automation_error']}';
   if (task['state'] == 'completed')
     return 'Done: ${completionOutcome(task)}. Validation and deployment remain separate.';
-  if (task['state'] == 'draft') return 'Ready to launch the assigned agent.';
+  if (task['assignment_error'] != null)
+    return 'Queued task needs attention: ${task['assignment_error']}';
+  if (task['state'] == 'draft') {
+    if ((task['assignment'] as Map?)?['state'] == 'queued')
+      return 'Queued for the assigned agent; the scheduler starts it when the agent is free.';
+    if (task['blocking_execution'] is Map)
+      return 'The assigned agent is finishing other work. Hand off when its evidence is complete, or queue this task.';
+    return 'Ready to launch the assigned agent.';
+  }
   if (task['state'] == 'implementing')
     return 'Implementation in progress; awaiting a committed candidate.';
   if (task['state'] == 'merged')
@@ -89,6 +99,11 @@ const activityLabels = {
   'build_evidence_mismatch': 'Build evidence did not match the commit',
   'release': 'Run binding released',
   'recover': 'Reply recovered',
+  'handoff_started': 'Execution handoff started',
+  'handoff_closed': 'Previous execution archived and finished',
+  'finish_execution': 'Execution finished',
+  'assignment_queued': 'Task queued for its agent',
+  'assignment_waiting': 'Queued task waiting for its agent',
 };
 
 String activityLabel(Object? action) {
@@ -101,6 +116,11 @@ String activitySection(Object? action) {
   switch ('${action ?? ''}') {
     case 'launch':
     case 'release':
+    case 'handoff_started':
+    case 'handoff_closed':
+    case 'finish_execution':
+    case 'assignment_queued':
+    case 'assignment_waiting':
       return 'Activity & agents';
     case 'candidate':
     case 'completion_verified':

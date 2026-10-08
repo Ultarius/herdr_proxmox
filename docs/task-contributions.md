@@ -7,11 +7,16 @@ merges a pull request or deploys a build.
 ## Administrator workflow
 
 1. Fetch the repository through Project explorer. Hire an individual worker with
-   its project set to that repository and Use a Git worktree enabled. Inspect and
-   release a previous run before launching a new task; a task cannot silently take
-   over an existing conversation.
-2. Open Tasks, create a task with acceptance criteria and required checks, select
-   the worker and an explicit base such as `refs/remotes/origin/main`. The task
+   its project set to that repository and Use a Git worktree enabled. Starting a
+   task for a busy worker verifies the previous execution's evidence, archives and
+   finishes that session, then starts the new task; a task whose agent is busy can
+   instead be queued and starts when the agent is free. A task never silently takes
+   over an existing conversation. See [agent-scheduling.md](agent-scheduling.md).
+2. Open Tasks, create a task with acceptance criteria and required checks and select
+   the worker. The base is optional: leaving it empty uses the repository's configured
+   base, then origin's recorded default branch, then main or master only when exactly
+   one exists; otherwise the gateway asks for an explicit branch. An explicit base
+   such as `refs/remotes/origin/main` is also accepted. The task
    records the current remote-tracking commit, not a moving branch name. The first
    task sets the repository base in its common Git directory's `herdr-base.json`.
    Subsequent tasks, inspection, watcher and base updates use that same base;
@@ -21,7 +26,9 @@ merges a pull request or deploys a build.
    repository. The gateway then pins only this newly created, clean checkout to the
    recorded start SHA, under the repository lock, and verifies HEAD reached it before
    any agent starts. Existing branches and checkouts are never reset or reused
-   automatically, so a live or released task branch is left untouched.
+   automatically, so a live or released task branch is left untouched. When the
+   assigned agent is busy, launch first runs the verified handoff described in
+   [agent-scheduling.md](agent-scheduling.md), or the task is queued instead.
 4. The agent implements, tests and commits locally. Inspect its conversation via
    Organization/agent activity. Capture candidate requires a clean task checkout,
    the expected branch and an actual commit descended from the recorded base.
@@ -82,8 +89,9 @@ than as a pass.
 
 ## Durability and current limits
 
-`tasks.sqlite3` contains task records, immutable build-event selections and durable
-request fingerprints. Mutating task operations require administrator identity and
+`tasks.sqlite3` contains task records, queued assignments, immutable build-event
+selections and durable request fingerprints. Mutating task operations require
+administrator identity and
 a stable request ID; reusing an ID for different content is rejected. Pending push
 requests reconcile remote head before redispatch; PR creation finds before creating.
 Background polling never pushes, creates a PR or merges. Gateway restarts do not

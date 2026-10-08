@@ -44,7 +44,7 @@ def launch_group(store, db, group, org):
     profile = facilitator(store, db, group)
     existing = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs')]
     run = next((j for j in reversed(existing) if j['kind'] == 'launch' and
-                j['profile_id'] == profile['id'] and j['state'] != 'released'), None)
+                j['profile_id'] == profile['id'] and j['state'] not in ('released', 'finished')), None)
     if run:
         return run
     run = dict(id=uuid.uuid4().hex, organization_id=org['id'], kind='launch', profile_id=profile['id'],

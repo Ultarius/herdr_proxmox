@@ -23,6 +23,35 @@ import project_git
 import server
 
 
+class TaskBaseTests(unittest.TestCase):
+    @patch('project_git.configured_base', return_value=None)
+    @patch('project_git.git')
+    def test_origin_default_is_resolved_to_explicit_branch(self, git, configured):
+        git.side_effect = ['refs/remotes/origin/develop', '', 'a' * 40]
+        self.assertEqual(contributions.task_base(Path('/repo'), ''), ('refs/remotes/origin/develop', 'a' * 40))
+
+    @patch('project_git.git')
+    def test_missing_explicit_base_has_actionable_error(self, git):
+        git.side_effect = ['', ValueError('Git information unavailable')]
+        with self.assertRaisesRegex(ValueError, 'Fetch remote updates'):
+            contributions.task_base(Path('/repo'), 'refs/remotes/origin/main')
+
+    @patch('project_git.configured_base', return_value='refs/remotes/origin/trunk')
+    @patch('project_git.git')
+    def test_configured_base_precedes_the_origin_default(self, git, configured):
+        git.side_effect = ['', 'b' * 40]
+        self.assertEqual(contributions.task_base(Path('/repo'), ' '),
+                         ('refs/remotes/origin/trunk', 'b' * 40))
+
+    @patch('project_git.configured_base', return_value=None)
+    @patch('project_git.git')
+    def test_ambiguous_default_branches_require_an_explicit_choice(self, git, configured):
+        # origin/HEAD is unset and both main and master exist: do not guess.
+        git.side_effect = [ValueError('no origin head'), '', '']
+        with self.assertRaisesRegex(ValueError, 'explicit origin base branch'):
+            contributions.task_base(Path('/repo'), '')
+
+
 class PatchExportTests(unittest.TestCase):
     def test_binary_patch_is_exact_and_applies_without_modifying_source(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -872,3 +901,280 @@ class ContributionTests(unittest.TestCase):
             self.assertNotIn('token=', ' '.join(args))
             if 'push' in args:
                 self.assertEqual(env['GIT_CONFIG_GLOBAL'], os.devnull)
+
+    def _receipt(self, task, outcome='complete', commit=None, token='handoff-token', run_id='run', **extra):
+        tree = Path(task['worktree'])
+        (self.repo / '.git/info/exclude').write_text('/.ci-cache/\n')
+        receipt = tree / '.ci-cache/herdr-guidance' / ('task-' + task['id']) / 'receipt.json'
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        head = commit or self.git('rev-parse', 'HEAD', path=tree).strip()
+        receipt.write_text(json.dumps(dict(outcome=outcome, commit=head, run_id=run_id, token=token,
+                                           tests=[], **extra)))
+        return head
+
+    def test_launch_hands_off_a_verified_finished_execution(self):
+        task = self.candidate()
+        run = self.store.snapshot.return_value['jobs'][0]
+        run.update(kind='launch', profile_id='worker', task_id=task['id'], completion_token='handoff-token')
+        self._receipt(task)
+        successor = self.service.action('create', dict(self.body, request_id='create-2', title='Next task'), 'admin', 'admin')
+        self.store.action.reset_mock()
+        self.store.action.return_value = dict(id='run2')
+        with patch('collaboration.current_run'):
+            launched = self.service.action('launch', dict(request_id='launch-next', task_id=successor['id']), 'admin', 'admin')
+        self.assertEqual(launched['run_id'], 'run2')
+        self.assertEqual(launched['state'], 'implementing')
+        self.assertIsNone(launched.get('handoff'))
+        self.store.manage_session.assert_called_once()
+        request = self.store.manage_session.call_args[0][0]
+        self.assertEqual((request['mode'], request['job_id'], request['inspected']), ('finish', 'run', True))
+        # The predecessor keeps its evidence and state; only its session finished.
+        self.assertEqual(self.service.get(task['id'])['state'], 'review_ready')
+
+    def test_launch_refuses_handoff_without_verified_evidence(self):
+        task = self.candidate()
+        self.store.snapshot.return_value['jobs'][0].update(kind='launch', profile_id='worker', task_id=task['id'], completion_token='handoff-token')
+        successor = self.service.action('create', dict(self.body, request_id='create-2', title='Next task'), 'admin', 'admin')
+        with self.assertRaisesRegex(ValueError, 'busy with task'):
+            self.service.action('launch', dict(request_id='launch-next', task_id=successor['id']), 'admin', 'admin')
+        self.store.manage_session.assert_not_called()
+        self.store.action.assert_not_called()
+        self.assertIsNone(self.service.get(successor['id']).get('run_id'))
+        # A receipt from a different session token is also not evidence.
+        self._receipt(task, token='stale-token')
+        with self.assertRaisesRegex(ValueError, 'busy with task'):
+            self.service.action('launch', dict(request_id='launch-next-2', task_id=successor['id']), 'admin', 'admin')
+
+    def test_no_changes_receipt_completes_without_capture_or_build(self):
+        tree = self.root / 'tree'
+        self.git('worktree', 'add', '-b', self.task['branch'], str(tree), self.base)
+        self.task.update(worktree=str(tree), run_id='run', state='implementing', auto_validate=True)
+        self.service.save(self.task, 'launch', 'admin')
+        self.store.snapshot.return_value['jobs'] = [dict(id='run', state='persona_sent', profile_id='worker', completion_token='token')]
+        self._receipt(self.task, outcome='no_changes', commit=self.base, token='token',
+                      reason='The behavior is already covered by the existing code.')
+        self.service.validation = MagicMock()
+        self.service.validation.snapshot.return_value = {'executor': 'service'}
+        with patch('collaboration.current_run'):
+            self.service.advance_automatic()
+        completed = self.service.get(self.task['id'])
+        self.assertEqual(completed['state'], 'completed')
+        self.assertEqual(completed['completion']['outcome'], 'no_changes')
+        self.assertEqual(completed['completion']['validation'], 'not_applicable')
+        self.service.validation.submit.assert_not_called()
+        request = self.store.manage_session.call_args[0][0]
+        self.assertEqual((request['mode'], request['job_id']), ('finish', 'run'))
+
+    def test_assignment_queue_starts_in_order_when_the_agent_is_free(self):
+        successor = self.service.action('create', dict(self.body, request_id='create-2', title='Next task'), 'admin', 'admin')
+        queued = self.service.action('assignment', dict(request_id='queue-1', task_id=successor['id'], mode='queue'), 'admin', 'admin')
+        self.assertEqual(queued['assignment']['state'], 'queued')
+        self.assertEqual(queued['assignment']['position'], 1)
+        self.store.action.reset_mock()
+        self.store.action.return_value = dict(id='run2')
+        self.service.dispatch_assignments()
+        launched = self.service.get(successor['id'])
+        self.assertEqual(launched['run_id'], 'run2')
+        self.assertEqual(launched['state'], 'implementing')
+        self.assertIsNone(launched.get('assignment'))
+        self.assertEqual(self.service.queued_assignments(), [])
+
+    def test_queue_waits_for_a_busy_agent_and_surfaces_unverified_evidence(self):
+        blocker = self.service.action('create', dict(self.body, request_id='create-2', title='Blocker'), 'admin', 'admin')
+        successor = self.service.action('create', dict(self.body, request_id='create-3', title='Next'), 'admin', 'admin')
+        self.store.snapshot.return_value['jobs'] = [dict(id='run', kind='launch', state='persona_sent', profile_id='worker', task_id=blocker['id'])]
+        self.service.action('assignment', dict(request_id='queue-1', task_id=successor['id'], mode='queue'), 'admin', 'admin')
+        self.store.action.reset_mock()
+        self.service.dispatch_assignments()
+        self.store.action.assert_not_called()
+        self.assertEqual(self.service.get(successor['id'])['assignment']['state'], 'queued')
+        # A candidate without a verified receipt blocks the handoff with a precise reason.
+        blocker['state'] = 'review_ready'
+        self.service.save(blocker, 'candidate', 'admin')
+        self.service.dispatch_assignments()
+        waiting = self.service.get(successor['id'])
+        self.assertIn('busy with task', waiting['assignment_error'])
+        self.assertEqual(self.service.queued_assignments()[0]['task_id'], successor['id'])
+
+    def test_assignment_move_cancel_and_draft_only(self):
+        successor = self.service.action('create', dict(self.body, request_id='create-2', title='Next'), 'admin', 'admin')
+        self.service.action('assignment', dict(request_id='queue-1', task_id=successor['id'], mode='queue'), 'admin', 'admin')
+        moved = self.service.action('assignment', dict(request_id='move-1', task_id=successor['id'], mode='move', position=7), 'admin', 'admin')
+        self.assertEqual(moved['assignment']['position'], 7)
+        cancelled = self.service.action('assignment', dict(request_id='cancel-1', task_id=successor['id'], mode='cancel'), 'admin', 'admin')
+        self.assertIsNone(cancelled.get('assignment'))
+        self.assertEqual(self.service.queued_assignments(), [])
+        started = self.candidate()
+        with self.assertRaisesRegex(ValueError, 'not started'):
+            self.service.action('assignment', dict(request_id='queue-2', task_id=started['id'], mode='queue'), 'admin', 'admin')
+        with self.assertRaisesRegex(ValueError, 'position'):
+            self.service.action('assignment', dict(request_id='move-2', task_id=successor['id'], mode='move', position=-1), 'admin', 'admin')
+
+    def test_completed_task_cannot_handoff_after_head_changes(self):
+        task = self.candidate()
+        task.update(state='completed', completion={'candidate': task['head_sha']})
+        self.service.save(task, 'complete', 'admin')
+        run = dict(id='run', state='persona_sent')
+        self.git('commit', '--allow-empty', '-m', 'later work', path=task['worktree'])
+        with patch('collaboration.current_run') as current:
+            ready, reason = self.service.execution_finished(task, run)
+        self.assertFalse(ready)
+        self.assertIn('HEAD changed', reason)
+        current.assert_not_called()
+
+    def test_no_changes_receipt_does_not_complete_a_dirty_checkout(self):
+        tree = self.root / 'tree'
+        self.git('worktree', 'add', '-b', self.task['branch'], str(tree), self.base)
+        self.task.update(worktree=str(tree), run_id='run', state='implementing', auto_validate=True)
+        self.service.save(self.task, 'launch', 'admin')
+        self.store.snapshot.return_value['jobs'] = [dict(id='run', state='persona_sent', completion_token='token')]
+        self._receipt(self.task, outcome='no_changes', commit=self.base, token='token', reason='Already implemented.')
+        (tree / 'file').write_text('uncommitted work')
+        self.service.validation = MagicMock()
+        self.service.validation.snapshot.return_value = {'executor': 'service'}
+        with patch('collaboration.current_run'):
+            self.service.advance_automatic()
+        saved = self.service.get(self.task['id'])
+        self.assertEqual(saved['state'], 'implementing')
+        self.assertIn('clean checkout', saved['automation_error'])
+        self.store.manage_session.assert_not_called()
+
+    def test_finished_execution_still_allows_automatic_candidate_validation(self):
+        task = self.candidate()
+        task.update(auto_validate=True, completion_receipt={'commit': task['head_sha']})
+        self.service.save(task, 'policy', 'admin')
+        self.store.snapshot.return_value['jobs'][0]['state'] = 'finished'
+        self.service.validation = MagicMock()
+        self.service.validation.snapshot.return_value = {'executor': 'service'}
+        self.service.validation.submit.return_value = dict(id='build1', state='queued', checks=[])
+        with patch('collaboration.current_run') as live:
+            self.service.advance_automatic()
+        live.assert_not_called()
+        self.service.validation.submit.assert_called_once()
+        self.assertIn(task['head_sha'], self.service.get(task['id'])['builds'])
+
+    def test_manual_launch_counts_pending_and_uncertain_task_reservations(self):
+        self.store.snapshot.return_value['jobs'] = [
+            dict(id=str(i), kind='launch', task_id='other-' + str(i), profile_id='other-' + str(i), state=state)
+            for i, state in enumerate(('queued', 'running', 'needs_attention', 'error'))]
+        with self.assertRaisesRegex(ValueError, 'capacity is full'):
+            self.service.action('launch', dict(request_id='launch-at-limit', task_id=self.task['id']), 'admin', 'admin')
+        self.store.action.assert_not_called()
+        # Error launches still reserve the agent until explicitly reconciled.
+        self.assertEqual(self.service.active_execution('other-3')['state'], 'error')
+
+    def test_handoff_can_replace_a_task_execution_at_capacity(self):
+        task = self.candidate()
+        run = self.store.snapshot.return_value['jobs'][0]
+        run.update(kind='launch', profile_id='worker', task_id=task['id'], completion_token='handoff-token')
+        self._receipt(task)
+        self.store.snapshot.return_value['jobs'].extend([
+            dict(id=str(i), kind='launch', task_id='other-' + str(i), profile_id='other-' + str(i), state='queued')
+            for i in range(3)])
+        successor = self.service.action('create', dict(self.body, request_id='create-2'), 'admin', 'admin')
+        self.store.action.return_value = dict(id='run2')
+        with patch('collaboration.current_run'):
+            result = self.service.action('launch', dict(request_id='launch-at-limit', task_id=successor['id']), 'admin', 'admin')
+        self.assertEqual(result['run_id'], 'run2')
+        self.store.manage_session.assert_called_once()
+
+    def test_queue_record_and_task_update_roll_back_together(self):
+        with closing(self.service.connect()) as db, db:
+            db.execute("CREATE TRIGGER fail_task BEFORE INSERT ON tasks BEGIN SELECT RAISE(ABORT, 'simulated crash'); END")
+        with self.assertRaises(sqlite3.Error):
+            self.service.action('assignment', dict(request_id='queue-failure', task_id=self.task['id'], mode='queue'), 'admin', 'admin')
+        self.assertEqual(self.service.queued_assignments(), [])
+        self.assertNotIn('assignment', self.service.get(self.task['id']))
+
+    def test_queue_cancellation_does_not_need_the_repository(self):
+        self.service.action('assignment', dict(request_id='queue-1', task_id=self.task['id'], mode='queue'), 'admin', 'admin')
+        self.repo.rename(self.root / 'unavailable-repo')
+        cancelled = self.service.action('assignment', dict(request_id='cancel-1', task_id=self.task['id'], mode='cancel'), 'admin', 'admin')
+        self.assertNotIn('assignment', cancelled)
+        self.assertEqual(self.service.queued_assignments(), [])
+
+    def test_launch_reconciles_a_reserved_session_after_task_save_failure(self):
+        queued = self.service.action('assignment', dict(request_id='queue-1', task_id=self.task['id'], mode='queue'), 'admin', 'admin')
+        def reserve(*args):
+            job = dict(id='reserved-run', kind='launch', task_id=self.task['id'], profile_id='worker', state='queued')
+            self.store.snapshot.return_value['jobs'] = [job]
+            return {'id': job['id']}
+        self.store.action.side_effect = reserve
+        save = self.service.save
+        failed = False
+        def interrupted(task, action, actor):
+            nonlocal failed
+            if action == 'launch' and not failed:
+                failed = True
+                raise OSError('simulated crash after reservation')
+            return save(task, action, actor)
+        request = dict(request_id='launch-retry', task_id=self.task['id'])
+        with patch.object(self.service, 'save', side_effect=interrupted):
+            with self.assertRaises(OSError):
+                self.service.action('launch', request, 'admin', 'admin')
+        self.assertEqual(len(self.service.queued_assignments()), 1)
+        self.service.dispatch_assignments()
+        result = self.service.get(self.task['id'])
+        replay = self.service.action('launch', request, 'admin', 'admin')
+        self.assertEqual(replay['run_id'], 'reserved-run')
+        self.assertEqual(result['run_id'], 'reserved-run')
+        self.store.action.assert_called_once()
+        self.assertEqual(self.service.queued_assignments(), [])
+
+    def test_fifo_does_not_skip_a_failed_task_for_the_same_agent(self):
+        first = self.service.action('create', dict(self.body, request_id='create-2'), 'admin', 'admin')
+        second = self.service.action('create', dict(self.body, request_id='create-3'), 'admin', 'admin')
+        for task, request in ((first, 'queue-1'), (second, 'queue-2')):
+            self.service.action('assignment', dict(request_id=request, task_id=task['id'], mode='queue'), 'admin', 'admin')
+        with patch.object(self.service, 'perform', side_effect=ValueError('first launch blocked')) as dispatch:
+            self.service.dispatch_assignments()
+        self.assertEqual(dispatch.call_count, 1)
+        self.assertEqual(dispatch.call_args.args[2], first['id'])
+        self.assertEqual(len(self.service.queued_assignments()), 2)
+
+    def test_published_candidate_can_handoff_with_receipt(self):
+        task = self.candidate()
+        task['state'] = 'pr_open'
+        self.service.save(task, 'pull', 'admin')
+        run = dict(id='run', state='persona_sent', completion_token='handoff-token')
+        self._receipt(task)
+        with patch('collaboration.current_run'):
+            ready, reason = self.service.execution_finished(task, run)
+        self.assertTrue(ready, reason)
+
+    def test_long_busy_queue_does_not_starve_another_agent(self):
+        blocker = dict(self.task, state='implementing')
+        self.service.save(blocker, 'launch', 'admin')
+        self.store.snapshot.return_value['jobs'] = [dict(id='busy', kind='launch', profile_id='worker', task_id=blocker['id'], state='persona_sent')]
+        other = dict(self.profile, id='other-worker')
+        self.store.snapshot.return_value['profiles'].append(other)
+        for i in range(51):
+            task = dict(self.task, id=f'{i:032x}', profile_id='worker' if i < 50 else 'other-worker',
+                        audit=[], assignment=dict(state='queued', position=i + 1))
+            self.service.save(task, 'assignment', 'admin')
+        self.store.action.return_value = dict(id='free-run')
+        self.service.dispatch_assignments()
+        launched = self.service.get(f'{50:032x}')
+        self.assertEqual(launched['state'], 'implementing')
+        self.assertEqual(launched['run_id'], 'free-run')
+        self.store.action.assert_called_once()
+
+    def test_cancelled_assignment_does_not_regain_a_late_scheduler_error(self):
+        self.service.action('assignment', dict(request_id='queue-1', task_id=self.task['id'], mode='queue'), 'admin', 'admin')
+        perform = self.service.perform
+        def cancelled(*args):
+            perform('assignment', {'mode': 'cancel'}, self.task['id'], 'admin')
+            raise ValueError('late dispatch failure')
+        with patch.object(self.service, 'perform', side_effect=cancelled):
+            self.service.dispatch_assignments()
+        task = self.service.get(self.task['id'])
+        self.assertNotIn('assignment', task)
+        self.assertNotIn('assignment_error', task)
+
+    def test_terminal_reservation_blocks_relaunch_instead_of_attaching(self):
+        self.store.snapshot.return_value['jobs'] = [dict(id='dead-run', kind='launch', task_id=self.task['id'],
+                                                         profile_id='worker', state='finished')]
+        with self.assertRaisesRegex(ValueError, 'finished or released launch reservation'):
+            self.service.action('launch', dict(request_id='launch-dead', task_id=self.task['id']), 'admin', 'admin')
+        self.store.action.assert_not_called()
+        self.assertIsNone(self.service.get(self.task['id']).get('run_id'))

@@ -194,4 +194,175 @@ void main() {
       await BlocScope.reset();
     },
   );
+  testWidgets(
+    'queued assignment shows its position and cancels through the queue action',
+    (tester) async {
+      final task = <String, dynamic>{
+        'id': 'task',
+        'title': 'Next task',
+        'state': 'draft',
+        'repository': 'repo',
+        'organization_id': 'org',
+        'assignment': {
+          'state': 'queued',
+          'position': 2,
+          'profile_id': 'worker',
+        },
+      };
+      final posts = <Map<String, dynamic>>[];
+      final connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.method == 'POST') {
+            posts.add(Map<String, dynamic>.from(jsonDecode(request.body)));
+          }
+          return http.Response(
+            jsonEncode(
+              request.url.path.endsWith('/tasks')
+                  ? {
+                      'tasks': [task],
+                      'github': {},
+                    }
+                  : task,
+            ),
+            200,
+          );
+        }),
+      );
+      BlocScope.register<DashboardBloc>(() => connection);
+      connection.connect('token');
+      connection.operator.value = {'role': 'admin'};
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(body: TasksPage(taskId: 'task')),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Queued \u00b7 repo'), findsOneWidget);
+      expect(find.textContaining('Queued for this agent'), findsOneWidget);
+      expect(find.textContaining('order 2'), findsOneWidget);
+      await tester.tap(find.text('Change queue order'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Later'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Save queue order'));
+      await tester.pumpAndSettle();
+      expect(posts.single['mode'], 'move');
+      expect(posts.single['position'], 3);
+      await tester.tap(find.text('Cancel queued assignment'));
+      await tester.pumpAndSettle();
+      expect(posts.last['mode'], 'cancel');
+      expect(posts.last['task_id'], 'task');
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await connection.disconnect();
+      await BlocScope.reset();
+    },
+  );
+  testWidgets('a busy agent offers a precise blocker and the queue action', (
+    tester,
+  ) async {
+    final task = <String, dynamic>{
+      'id': 'task',
+      'title': 'Next task',
+      'state': 'draft',
+      'repository': 'repo',
+      'organization_id': 'org',
+      'blocking_execution': {
+        'run_id': 'run',
+        'task_id': 'other',
+        'task_title': 'Open work',
+        'handoff_ready': false,
+      },
+    };
+    final posts = <Map<String, dynamic>>[];
+    final connection = DashboardBloc(
+      client: MockClient((request) async {
+        if (request.method == 'POST') {
+          posts.add(Map<String, dynamic>.from(jsonDecode(request.body)));
+        }
+        return http.Response(
+          jsonEncode(
+            request.url.path.endsWith('/tasks')
+                ? {
+                    'tasks': [task],
+                    'github': {},
+                  }
+                : task,
+          ),
+          200,
+        );
+      }),
+    );
+    BlocScope.register<DashboardBloc>(() => connection);
+    connection.connect('token');
+    connection.operator.value = {'role': 'admin'};
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(body: TasksPage(taskId: 'task')),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Blocked by: Open work'), findsOneWidget);
+    expect(find.text('Start implementation'), findsNothing);
+    await tester.tap(find.text('Queue for this agent'));
+    await tester.pumpAndSettle();
+    expect(posts.single['mode'], 'queue');
+    expect(posts.single['task_id'], 'task');
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await connection.disconnect();
+    await BlocScope.reset();
+  });
+  testWidgets('a verified finished blocker offers hand off and start', (
+    tester,
+  ) async {
+    final task = <String, dynamic>{
+      'id': 'task',
+      'title': 'Next task',
+      'state': 'draft',
+      'repository': 'repo',
+      'organization_id': 'org',
+      'blocking_execution': {
+        'run_id': 'run',
+        'task_id': 'other',
+        'task_title': 'Open work',
+        'handoff_ready': true,
+      },
+    };
+    final posts = <String>[];
+    final connection = DashboardBloc(
+      client: MockClient((request) async {
+        if (request.method == 'POST') posts.add(request.url.path);
+        return http.Response(
+          jsonEncode(
+            request.url.path.endsWith('/tasks')
+                ? {
+                    'tasks': [task],
+                    'github': {},
+                  }
+                : task,
+          ),
+          200,
+        );
+      }),
+    );
+    BlocScope.register<DashboardBloc>(() => connection);
+    connection.connect('token');
+    connection.operator.value = {'role': 'admin'};
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(body: TasksPage(taskId: 'task')),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Verify handoff and start'), findsOneWidget);
+    expect(find.text('Queue instead'), findsOneWidget);
+    await tester.tap(find.text('Verify handoff and start'));
+    await tester.pumpAndSettle();
+    expect(posts.single, endsWith('/tasks/launch'));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await connection.disconnect();
+    await BlocScope.reset();
+  });
 }

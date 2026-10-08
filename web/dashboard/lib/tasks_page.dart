@@ -21,7 +21,9 @@ const taskStates = <String, String>{
 };
 
 String taskState(Map<String, dynamic> task) =>
-    taskStates['${task['state']}'] ?? '${task['state']}';
+    (task['assignment'] as Map?)?['state'] == 'queued'
+    ? 'Queued'
+    : taskStates['${task['state']}'] ?? '${task['state']}';
 
 /// A merged pull request is never presented as awaiting review, and a draft is
 /// never presented as ready.
@@ -367,7 +369,7 @@ class _TasksPageState extends State<TasksPage> {
           'No managed repository is assigned to a worktree agent.',
         );
       final repository = TextEditingController(text: repositories.first);
-      final base = TextEditingController(text: 'refs/remotes/origin/main');
+      final base = TextEditingController();
       var profile = '${profiles.first['id']}';
       Map<String, dynamic>? body;
       try {
@@ -417,7 +419,9 @@ class _TasksPageState extends State<TasksPage> {
                       TextField(
                         controller: base,
                         decoration: const InputDecoration(
-                          labelText: 'Explicit remote base ref',
+                          labelText: 'Base branch override (optional)',
+                          helperText:
+                              'Leave empty to use the repository base or origin default.',
                         ),
                       ),
                       ValueListenableBuilder<TextEditingValue>(
@@ -703,7 +707,7 @@ class _TasksPageState extends State<TasksPage> {
                 child: Text(
                   !connected
                       ? 'Not connected to the gateway.'
-                      : error != null || readError != null
+                      : readError != null
                       ? 'Task list unavailable.'
                       : refreshing
                       ? 'Loading tasks…'
@@ -990,17 +994,178 @@ class _TasksPageState extends State<TasksPage> {
     }
   }
 
+  Future<void> moveAssignment(Map<String, dynamic> task) async {
+    final epoch = connection.generation;
+    var position = (task['assignment'] as Map?)?['position'] as int? ?? 1;
+    final chosen = await showDialog<int>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, update) => AlertDialog(
+          title: const Text('Change queue order'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Lower order numbers run first. This does not interrupt active work.',
+              ),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  IconButton(
+                    tooltip: 'Earlier',
+                    onPressed: position > 0
+                        ? () => update(() => position--)
+                        : null,
+                    icon: const Icon(Icons.remove),
+                  ),
+                  Text('$position'),
+                  IconButton(
+                    tooltip: 'Later',
+                    onPressed: position < 10000
+                        ? () => update(() => position++)
+                        : null,
+                    icon: const Icon(Icons.add),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, position),
+              child: const Text('Save queue order'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (chosen != null && mounted && epoch == connection.generation)
+      await act('assignment', {
+        'task_id': task['id'],
+        'mode': 'move',
+        'position': chosen,
+      });
+  }
+
   Widget _nextAction(Map<String, dynamic> task) {
     final target = task['merge_sha'] ?? task['head_sha'];
     final evidence = (task['builds'] as Map?)?[target] as Map?;
-    if (task['state'] == 'draft')
-      return FilledButton.icon(
-        onPressed: admin && !busy
-            ? () => act('launch', {'task_id': task['id']})
-            : null,
-        icon: const Icon(Icons.play_arrow),
-        label: const Text('Start implementation'),
+    if (task['state'] == 'draft') {
+      final assignment = task['assignment'] as Map?;
+      final blocking = task['blocking_execution'] as Map?;
+      if (assignment?['state'] == 'queued') {
+        return Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            Chip(
+              avatar: const Icon(Icons.schedule, size: 18),
+              label: Text(
+                'Queued for this agent \u00b7 order ${assignment?['position']}',
+              ),
+            ),
+            OutlinedButton.icon(
+              onPressed: admin && !busy ? () => moveAssignment(task) : null,
+              icon: const Icon(Icons.reorder),
+              label: const Text('Change queue order'),
+            ),
+            OutlinedButton.icon(
+              onPressed: admin && !busy
+                  ? () => act('assignment', {
+                      'task_id': task['id'],
+                      'mode': 'cancel',
+                    })
+                  : null,
+              icon: const Icon(Icons.cancel_outlined),
+              label: const Text('Cancel queued assignment'),
+            ),
+          ],
+        );
+      }
+      if (blocking == null) {
+        return Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            FilledButton.icon(
+              onPressed: admin && !busy
+                  ? () => act('launch', {'task_id': task['id']})
+                  : null,
+              icon: const Icon(Icons.play_arrow),
+              label: const Text('Start implementation'),
+            ),
+            OutlinedButton.icon(
+              onPressed: admin && !busy
+                  ? () => act('assignment', {
+                      'task_id': task['id'],
+                      'mode': 'queue',
+                    })
+                  : null,
+              icon: const Icon(Icons.schedule),
+              label: const Text('Queue for this agent'),
+            ),
+          ],
+        );
+      }
+      final blockingTaskId = blocking['task_id'];
+      final title = '${blocking['task_title'] ?? ''}'.isNotEmpty
+          ? '${blocking['task_title']}'
+          : 'Existing agent session';
+      if (blocking['handoff_ready'] == true) {
+        return Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            FilledButton.icon(
+              onPressed: admin && !busy
+                  ? () => act('launch', {'task_id': task['id']})
+                  : null,
+              icon: const Icon(Icons.swap_horiz),
+              label: const Text('Verify handoff and start'),
+            ),
+            OutlinedButton.icon(
+              onPressed: admin && !busy
+                  ? () => act('assignment', {
+                      'task_id': task['id'],
+                      'mode': 'queue',
+                    })
+                  : null,
+              icon: const Icon(Icons.schedule),
+              label: const Text('Queue instead'),
+            ),
+          ],
+        );
+      }
+      return Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          OutlinedButton.icon(
+            onPressed: blockingTaskId != null
+                ? () => openTask('$blockingTaskId')
+                : widget.coordinator == null
+                ? null
+                : () => widget.coordinator!.navigate(OrganizationRoute()),
+            icon: const Icon(Icons.block),
+            label: Text('Blocked by: $title'),
+          ),
+          OutlinedButton.icon(
+            onPressed: admin && !busy
+                ? () => act('assignment', {
+                    'task_id': task['id'],
+                    'mode': 'queue',
+                  })
+                : null,
+            icon: const Icon(Icons.schedule),
+            label: const Text('Queue for this agent'),
+          ),
+        ],
       );
+    }
     if (target == null || ['closed', 'completed'].contains(task['state']))
       return const SizedBox.shrink();
     if (evidence?['state'] == 'complete') {
@@ -1101,7 +1266,9 @@ class _TasksPageState extends State<TasksPage> {
               'Candidate: ${task['completion']['candidate']}\nUpstream at completion: ${task['completion']['upstream']}',
             ),
             Text(
-              task['completion']['validation'] == 'verified'
+              task['completion']['validation'] == 'not_applicable'
+                  ? 'No changes were made; candidate validation is not applicable.'
+                  : task['completion']['validation'] == 'verified'
                   ? 'Required checks passed for this candidate. Deployment remains separate.'
                   : 'No verified required checks for this candidate at completion. Done is not validation.',
             ),
@@ -1243,26 +1410,56 @@ class _TasksPageState extends State<TasksPage> {
                             subtitle: Text(
                               'Assigned: ${proposal['assignee'] ?? proposal['profile_id']}\n${proposal['description']}',
                             ),
-                            trailing: TextButton(
-                              onPressed:
-                                  admin &&
-                                      !busy &&
-                                      (task['follow_up_tasks']
-                                              as Map?)?[proposal['key']] ==
-                                          null
-                                  ? () => act('proposal', {
-                                      'task_id': task['id'],
-                                      'meeting_id': meeting['job_id'],
-                                      'proposal_key': proposal['key'],
-                                    })
-                                  : null,
-                              child: Text(
-                                (task['follow_up_tasks']
-                                            as Map?)?[proposal['key']] ==
-                                        null
-                                    ? 'Create draft'
-                                    : 'Draft created',
-                              ),
+                            trailing: Wrap(
+                              spacing: 4,
+                              children: [
+                                TextButton(
+                                  onPressed:
+                                      admin &&
+                                          !busy &&
+                                          (task['follow_up_tasks']
+                                                  as Map?)?[proposal['key']] ==
+                                              null
+                                      ? () => act('proposal', {
+                                          'task_id': task['id'],
+                                          'meeting_id': meeting['job_id'],
+                                          'proposal_key': proposal['key'],
+                                        })
+                                      : null,
+                                  child: Text(
+                                    (task['follow_up_tasks']
+                                                as Map?)?[proposal['key']] ==
+                                            null
+                                        ? 'Create draft'
+                                        : 'Draft created',
+                                  ),
+                                ),
+                                if ((task['follow_up_tasks']
+                                        as Map?)?[proposal['key']] ==
+                                    null)
+                                  TextButton(
+                                    onPressed: admin && !busy
+                                        ? () => act('proposal', {
+                                            'task_id': task['id'],
+                                            'meeting_id': meeting['job_id'],
+                                            'proposal_key': proposal['key'],
+                                            'queue': true,
+                                          })
+                                        : null,
+                                    child: const Text('Create and queue'),
+                                  )
+                                else
+                                  TextButton(
+                                    onPressed: admin && !busy
+                                        ? () => act('assignment', {
+                                            'task_id':
+                                                '${(task['follow_up_tasks'] as Map?)?[proposal['key']]}',
+                                            'mode': 'queue',
+                                          })
+                                        : null,
+                                    child: const Text('Queue'),
+                                  ),
+                              ],
                             ),
                           ),
                     ],

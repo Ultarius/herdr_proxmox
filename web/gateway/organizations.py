@@ -178,7 +178,7 @@ class OrganizationStore:
                     live = {agent['name']: agent for agent in entries if isinstance(agent, dict) and isinstance(agent.get('name'), str)}
             except (ValueError, OSError, subprocess.TimeoutExpired):
                 pass
-        latest_runs = {j['profile_id']: j for j in data['jobs'] if j['kind'] == 'launch' and j['state'] != 'released'}
+        latest_runs = {j['profile_id']: j for j in data['jobs'] if j['kind'] == 'launch' and j['state'] not in ('released', 'finished')}
         for profile in data['profiles']:
             run = latest_runs.get(profile['id'])
             state = dict(active=False, status='off', run_id=run['id'] if run else None)
@@ -231,12 +231,12 @@ class OrganizationStore:
             value = run.get('worktree_path') or run.get('source_project') or profiles.get(run.get('profile_id'), {}).get('project')
             return value is not None and Path(value).resolve() == wanted
         for job in data['jobs']:
-            if job['kind'] == 'launch' and job['state'] != 'released' and matches(job):
+            if job['kind'] == 'launch' and job['state'] not in ('released', 'finished') and matches(job):
                 if job['state'] != 'persona_sent' or data['member_states'].get(job['profile_id'], {}).get('status') not in ('idle', 'done', 'off'):
                     return True
             if job['state'] in ('queued', 'running', 'uncertain', 'needs_attention'):
                 bindings = job.get('runs') or [r for r in runs.values()
-                                              if r.get('profile_id') == job.get('profile_id') and r['state'] != 'released']
+                                              if r.get('profile_id') == job.get('profile_id') and r['state'] not in ('released', 'finished')]
                 explicit_path = job['kind'] == 'launch' or job.get('worktree_path') or job.get('source_project')
                 if (explicit_path and matches(job)) or any(matches(runs.get(r.get('id'), r)) for r in bindings):
                     return True
@@ -358,7 +358,7 @@ class OrganizationStore:
                 (profile_id and profile_id in job.get('participants', [job.get('profile_id')]))) for job in jobs):
             raise ValueError('Wait for active work to finish before removing this entry.')
         runs = [job for job in jobs if profile_id and job['kind'] == 'launch' and
-                job.get('profile_id') == profile_id and job['state'] != 'released']
+                job.get('profile_id') == profile_id and job['state'] not in ('released', 'finished')]
         if runs:
             response = self.command('agent', 'list')
             live = response if isinstance(response, list) else response.get('agents')
@@ -465,7 +465,7 @@ class OrganizationStore:
                     profile = self.get(db, 'profiles', text(body, 'profile_id', 40), org_id)
                     jobs = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs WHERE organization_id=?', (org_id,))]
                     if action == 'launch':
-                        if any(j['kind'] == 'launch' and j['profile_id'] == profile['id'] and j['state'] != 'released' for j in jobs):
+                        if any(j['kind'] == 'launch' and j['profile_id'] == profile['id'] and j['state'] not in ('released', 'finished') for j in jobs):
                             raise ValueError('Inspect and release the previous run before launching again.')
                         item = dict(id=uuid.uuid4().hex, organization_id=org_id, kind='launch', profile_id=profile['id'],
                                     profile=profile, organization=org, alias='hire_' + uuid.uuid4().hex[:20])
@@ -570,7 +570,7 @@ class OrganizationStore:
                     results.append(dict(id=job_id, state='skipped', reason=str(error)))
             return {'results': results}
         mode = body.get('mode')
-        if mode not in ('close', 'restart', 'continue') or body.get('inspected') is not True:
+        if mode not in ('close', 'restart', 'continue', 'finish') or body.get('inspected') is not True:
             raise ValueError('Inspect the session and choose close or restart.')
         request_id = body.get('request_id')
         if request_id is not None and (not isinstance(request_id, str) or not 1 <= len(request_id) <= 64):
@@ -587,15 +587,15 @@ class OrganizationStore:
                     if run.get('session_request_mode') != mode:
                         raise ValueError('Session request ID already used for another action.')
                     return {'id': run['id']}
-                if run['kind'] != 'launch' or run['state'] not in ('persona_sent', 'released'):
+                if run['kind'] != 'launch' or run['state'] not in ('persona_sent', 'released', 'finished'):
                     raise ValueError('Select a completed launch binding.')
-                if mode == 'restart' and run['state'] == 'released':
+                if mode == 'restart' and run['state'] != 'persona_sent':
                     raise ValueError('Restart only the currently bound session.')
                 if any(j['state'] in ('queued', 'running') and run['profile_id'] in
                        j.get('participants', [j.get('profile_id')]) for j in self.job_records()):
                     raise ValueError('Wait for queued or running agent work.')
-                if run.get('session_closed_at') and mode == 'close':
-                    return {'id': run['id']}
+                if run.get('session_closed_at') and mode in ('close', 'finish'):
+                    return {'id': run['id'], 'status': 'already_closed', 'archive_id': run.get('session_archive_id')}
             from session_archives import archive, read, context
             saved = None
             status = 'closed'
@@ -605,7 +605,7 @@ class OrganizationStore:
                 saved = read(self, run['organization_id'], text(body, 'archive_id', 40))
                 if saved['run_id'] != run['id']:
                     raise ValueError('Archive does not belong to this run.')
-                if any(j['kind'] == 'launch' and j['id'] != run['id'] and j.get('profile_id') == run['profile_id'] and j['state'] != 'released' for j in self.job_records()):
+                if any(j['kind'] == 'launch' and j['id'] != run['id'] and j.get('profile_id') == run['profile_id'] and j['state'] not in ('released', 'finished') for j in self.job_records()):
                     raise ValueError('Release the current agent binding before continuing an archived session.')
             else:
                 response = self.command('agent', 'list')
@@ -644,9 +644,11 @@ class OrganizationStore:
                     saved = archive(self, run, actor, terminal=terminal[-40000:])
                     self.identity(run)  # Recheck after archive capture and immediately before closure.
                     self.command('pane', 'close', run['pane_id'], timeout=10)
-                run = self.update_job(run['id'], state='released', session_closed_at=now(),
+                terminal = 'finished' if mode == 'finish' else 'released'
+                run = self.update_job(run['id'], state=terminal, session_closed_at=now(),
                     session_closed_by=actor, session_archive_id=saved['id'], session_close_status=status,
-                    session_request_id=request_id, session_request_mode=mode)
+                    session_request_id=request_id, session_request_mode=mode,
+                    **({'finished_at': now(), 'finished_by': actor} if mode == 'finish' else {}))
             if mode in ('restart', 'continue'):
                 with self.lock, closing(self.connect()) as db:
                     profile = self.get(db, 'profiles', run['profile_id'], run['organization_id'])
@@ -769,7 +771,7 @@ class OrganizationStore:
                 if any(j['state'] in ('queued', 'running') and profile_id in
                        j.get('participants', [j.get('profile_id')]) for j in jobs):
                     raise ValueError('Wait for this agent\'s queued or running work before repairing.')
-                runs = [j for j in jobs if j['kind'] == 'launch' and j.get('profile_id') == profile_id and j['state'] != 'released']
+                runs = [j for j in jobs if j['kind'] == 'launch' and j.get('profile_id') == profile_id and j['state'] not in ('released', 'finished')]
             if mode == 'recover':
                 from collaboration import current_run, read_contribution
                 for binding in job.get('runs', []):

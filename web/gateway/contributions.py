@@ -47,6 +47,12 @@ def task_tool_guidance():
 # A background status poll must never hold a task long, and must never wait
 # long enough to delay validation feedback delivery.
 POLL_WAIT_SECONDS = 5
+# An execution occupies its agent only while it is genuinely active. `finished`
+# (evidence-verified) and `released` (manual recovery) hand the slot back.
+TERMINAL_EXECUTIONS = ('finished', 'released')
+HANDOFF_TASK_STATES = ('review_ready', 'published', 'pr_open', 'merged', 'closed', 'completed')
+# Independent of the build-service limit: sessions are launched concurrently.
+MAX_ACTIVE_EXECUTIONS = 4
 
 
 def stamp():
@@ -127,6 +133,35 @@ def push(repository, branch, sha, github):
                              'Refresh GitHub status; never force-push.' + push_detail(folder))
 
 
+def task_base(repository, requested):
+    """Use explicit configuration or origin's recorded default, without fetching."""
+    base = requested.strip()
+    if not base:
+        base = project_git.configured_base(repository)
+        if not base:
+            try:
+                base = project_git.git(repository, 'symbolic-ref', 'refs/remotes/origin/HEAD').strip()
+            except ValueError:
+                available = []
+                for candidate in ('refs/remotes/origin/main', 'refs/remotes/origin/master'):
+                    try:
+                        project_git.git(repository, 'rev-parse', '--verify', candidate + '^{commit}')
+                        available.append(candidate)
+                    except ValueError:
+                        pass
+                if len(available) != 1:
+                    raise ValueError('Choose an explicit origin base branch. Fetch remote updates if remote branches are missing.')
+                base = available[0]
+    if not base.startswith('refs/remotes/origin/') or base.endswith('/HEAD'):
+        raise ValueError('Select an explicit origin base branch, not origin/HEAD.')
+    project_git.git(repository, 'check-ref-format', base)
+    try:
+        sha = project_git.git(repository, 'rev-parse', '--verify', base + '^{commit}').strip()
+    except ValueError as error:
+        raise ValueError('Base branch ' + base + ' is unavailable. Fetch remote updates or select an existing origin branch.') from error
+    return base, sha
+
+
 class Busy(ValueError):
     """Another operation on the same task or request is still running."""
 
@@ -148,6 +183,7 @@ class Contributions:
             db.execute('CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS build_events (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS audit (task_id TEXT NOT NULL, data TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS assignments (task_id TEXT PRIMARY KEY, position INTEGER NOT NULL, data TEXT NOT NULL)')
 
     def connect(self):
         return sqlite3.connect(self.path, timeout=10)
@@ -189,6 +225,7 @@ class Contributions:
         while not self.stopped.wait(10):
             try:
                 self.advance_automatic()
+                self.dispatch_assignments()
                 cycles += 1
                 if cycles % 6 == 0:
                     self.reconcile_completed()
@@ -220,33 +257,48 @@ class Contributions:
                     task = self.get(listed['id'])
                     path = self.tree_for(task)
                     run = next((j for j in runs if j['id'] == task.get('run_id')), None)
-                    if not run or run['state'] != 'persona_sent':
+                    if not run or run['state'] not in ('persona_sent', 'finished'):
                         raise ValueError('Awaiting the original task session.')
-                    from collaboration import current_run
-                    current_run(self.store, run)
-                    if any(j['state'] in ('queued', 'running') and task['profile_id'] in
-                           j.get('participants', [j.get('profile_id')]) for j in runs):
-                        raise ValueError('Awaiting queued or running agent work.')
+                    if run['state'] == 'persona_sent':
+                        from collaboration import current_run
+                        current_run(self.store, run)
+                        if any(j['state'] in ('queued', 'running') and task['profile_id'] in
+                               j.get('participants', [j.get('profile_id')]) for j in runs):
+                            raise ValueError('Awaiting queued or running agent work.')
                     with repository_lock(path):
                         if project_git.git(path, 'symbolic-ref', '--short', 'HEAD').strip() != task['branch']:
                             raise ValueError('Task branch changed; inspect before continuing.')
                         head = project_git.git(path, 'rev-parse', 'HEAD').strip()
+                        no_changes = False
+                        if run['state'] == 'finished' and (task['state'] == 'implementing' or head != task.get('head_sha')
+                                or task.get('completion_receipt', {}).get('commit') != head):
+                            raise ValueError('Finished execution no longer matches its verified candidate.')
                         if head != task.get('head_sha') or task['state'] == 'implementing':
-                            receipt_path = path / '.ci-cache/herdr-guidance' / ('task-' + task['id']) / 'receipt.json'
-                            if any(parent.is_symlink() for parent in (receipt_path.parent, receipt_path.parent.parent, path / '.ci-cache')):
-                                raise ValueError('Completion receipt directories must not be symlinks.')
-                            from collaboration import read_contribution
-                            receipt = json.loads(read_contribution(receipt_path, label='task completion receipt'))
-                            if (not isinstance(receipt, dict) or receipt.get('outcome') != 'complete' or
-                                    receipt.get('commit') != head or not run.get('completion_token') or receipt.get('token') != run.get('completion_token') or
-                                    receipt.get('run_id') != task.get('run_id') or not isinstance(receipt.get('tests'), list)):
-                                raise ValueError('Completion receipt does not match this task, session and commit.')
-                            self.perform('candidate', {}, task['id'], 'automatic_task_policy')
-                            task = self.get(task['id'])
-                            if task.get('head_sha') != head:
-                                raise ValueError('Task advanced during capture; awaiting its new completion receipt.')
-                            task['completion_receipt'] = dict(commit=head, tests=receipt['tests'], verified_at=stamp())
-                            self.save(task, 'completion_verified', 'automatic_task_policy')
+                            receipt = self.read_receipt(task, run, head, path)
+                            if receipt['outcome'] == 'no_changes':
+                                if project_git.merge_state(path) or project_git.git(path, 'status', '--porcelain=v1', '--untracked-files=all').strip():
+                                    raise ValueError('A no-changes receipt requires a clean checkout without unfinished Git operations.')
+                                task.update(state='completed', auto_validate=False, auto_review=False, completion=dict(
+                                    outcome='no_changes', candidate=head, upstream=head, validation='not_applicable',
+                                    reason=str(receipt.get('reason') or 'The assigned agent verified that no code changes are required.')[:2000],
+                                    actor='automatic_task_policy', at=stamp()),
+                                    completion_receipt=dict(commit=head, tests=receipt['tests'], verified_at=stamp()))
+                                self.save(task, 'complete', 'automatic_task_policy')
+                                no_changes = True
+                            else:
+                                self.perform('candidate', {}, task['id'], 'automatic_task_policy')
+                                task = self.get(task['id'])
+                                if task.get('head_sha') != head:
+                                    raise ValueError('Task advanced during capture; awaiting its new completion receipt.')
+                                task['completion_receipt'] = dict(commit=head, tests=receipt['tests'], verified_at=stamp())
+                                self.save(task, 'completion_verified', 'automatic_task_policy')
+                    if no_changes:
+                        try:
+                            self.finish_execution(task, run, 'no-changes-' + task['id'], 'automatic_task_policy')
+                        except ValueError as error:
+                            # The task result stands; the session can be released manually.
+                            self.record_error(task['id'], error, 'finish_execution', 'automatic_task_policy')
+                        continue
                     # Do not automatically retry failures. One durable identity per task+SHA.
                     if head not in task.get('builds', {}):
                         self.perform('build', {'target': head}, task['id'], 'automatic_task_policy')
@@ -409,6 +461,148 @@ class Contributions:
         except (ValueError, OSError, sqlite3.Error):
             pass
 
+    def read_receipt(self, task, run, head, path):
+        """Read and validate the completion receipt for this execution attempt."""
+        receipt_path = path / '.ci-cache/herdr-guidance' / ('task-' + task['id']) / 'receipt.json'
+        if any(parent.is_symlink() for parent in (receipt_path.parent, receipt_path.parent.parent, path / '.ci-cache')):
+            raise ValueError('Completion receipt directories must not be symlinks.')
+        from collaboration import read_contribution
+        receipt = json.loads(read_contribution(receipt_path, label='task completion receipt'))
+        if not isinstance(receipt, dict) or receipt.get('outcome') not in ('complete', 'no_changes'):
+            raise ValueError('Completion receipt does not declare a finished outcome.')
+        if not run.get('completion_token') or receipt.get('token') != run.get('completion_token'):
+            raise ValueError('Completion receipt does not match this session token.')
+        if receipt.get('run_id') != task.get('run_id'):
+            raise ValueError('Completion receipt does not match this execution.')
+        if not isinstance(receipt.get('tests'), list):
+            raise ValueError('Completion receipt must include a tests array.')
+        if receipt.get('commit') != head:
+            raise ValueError('Completion receipt does not match the checked-out HEAD.')
+        if receipt['outcome'] == 'no_changes' and (not isinstance(receipt.get('reason'), str) or not receipt['reason'].strip()):
+            raise ValueError('A no-changes receipt must explain why no changes are required.')
+        if receipt['outcome'] == 'no_changes' and head != task.get('base_sha'):
+            raise ValueError('A no-changes receipt requires the unchanged recorded base commit.')
+        return receipt
+
+    def active_execution(self, profile_id, jobs=None):
+        """The launch job that currently occupies an agent, if any."""
+        jobs = self.store.snapshot(live_status=False)['jobs'] if jobs is None else jobs
+        return next((j for j in jobs if j.get('kind') == 'launch' and j.get('profile_id') == profile_id
+                     and j.get('state') not in TERMINAL_EXECUTIONS), None)
+
+    def execution_finished(self, task, run):
+        """Evidence that an execution finished. An idle pane alone is never evidence."""
+        if not run or run.get('state') != 'persona_sent':
+            return False, 'The previous execution is not an active session.'
+        if task.get('state') not in HANDOFF_TASK_STATES:
+            return False, "The previous task is still '" + str(task.get('state', 'unknown')) + "'."
+        if not task.get('worktree'):
+            return False, 'The previous task has no recorded checkout to verify.'
+        try:
+            path = self.tree_for(task)
+        except (ValueError, OSError) as error:
+            return False, str(error)
+        with repository_lock(path):
+            if project_git.merge_state(path) or project_git.git(path, 'status', '--porcelain=v1', '--untracked-files=all').strip():
+                return False, 'The previous checkout has uncommitted changes or an unfinished Git operation.'
+            if project_git.git(path, 'symbolic-ref', '--short', 'HEAD').strip() != task['branch']:
+                return False, 'The previous checkout is not on its assigned task branch.'
+            head = project_git.git(path, 'rev-parse', 'HEAD').strip()
+        expected = task.get('completion', {}).get('candidate') if task.get('state') == 'completed' else task.get('head_sha')
+        if head != expected:
+            return False, 'The previous checkout HEAD changed since its recorded candidate or completion.'
+        if task.get('state') != 'completed':
+            try:
+                self.read_receipt(task, run, head, path)
+            except ValueError as error:
+                return False, str(error)
+        from collaboration import current_run
+        try:
+            current_run(self.store, run)
+        except ValueError as error:
+            return False, str(error)
+        return True, ''
+
+    def finish_execution(self, task, run, request_id, actor):
+        """Archive, close and mark a verified-finished execution. Idempotent by request ID."""
+        self.store.manage_session(dict(mode='finish', job_id=run['id'], organization_id=task['organization_id'],
+                                       inspected=True, request_id=request_id[:64]), actor)
+
+    def queued_assignments(self, dispatch=False):
+        with closing(self.connect()) as db:
+            if dispatch:
+                # A long busy queue for one agent must not hide free agents
+                # beyond the ordinary first-page limit. Consider each queue head.
+                query = ("SELECT task_id, position FROM (SELECT a.task_id, a.position, a.rowid AS sequence, "
+                         "ROW_NUMBER() OVER (PARTITION BY json_extract(t.data, '$.profile_id') "
+                         "ORDER BY a.position, a.rowid) AS rank FROM assignments a JOIN tasks t ON t.id=a.task_id "
+                         "WHERE json_extract(t.data, '$.state')='draft') WHERE rank=1 "
+                         "ORDER BY position, sequence LIMIT 50")
+            else:
+                query = ('SELECT a.task_id, a.position FROM assignments a JOIN tasks t ON t.id = a.task_id '
+                         "WHERE json_extract(t.data, '$.state')='draft' ORDER BY a.position, a.rowid LIMIT 50")
+            return [dict(task_id=row[0], position=row[1]) for row in db.execute(query)]
+
+    def enqueue_assignment(self, task, actor):
+        if task.get('run_id') or task.get('state') != 'draft':
+            raise ValueError('Only a task that has not started can be queued.')
+        previous = task.get('assignment', {})
+        task['assignment'] = dict(state='queued', profile_id=task['profile_id'],
+                                  queued_at=previous.get('queued_at', stamp()), actor=actor)
+        if 'position' in previous:
+            task['assignment']['position'] = previous['position']
+        return task
+
+    def clear_assignment(self, task_id):
+        with closing(self.connect()) as db, db:
+            db.execute('DELETE FROM assignments WHERE task_id=?', (task_id,))
+
+    def dispatch_assignments(self):
+        """Start queued tasks in order whenever their assigned agent is free."""
+        assignments = self.queued_assignments(dispatch=True)
+        if not assignments:
+            return
+        # One snapshot per cycle is enough: rank-1 ordering and the launched set
+        # keep each agent's head current, and launch_task re-reads state itself.
+        jobs = self.store.snapshot(live_status=False).get('jobs', [])
+        launched = set()
+        for listed in assignments:
+            task_id = listed['task_id']
+            try:
+                with self.operation('task:' + task_id, timeout=0):
+                    task = self.get(task_id)
+                    if task.get('state') != 'draft' or task.get('assignment', {}).get('state') != 'queued':
+                        self.clear_assignment(task_id)
+                        continue
+                    if task['profile_id'] in launched:
+                        continue
+                    launched.add(task['profile_id'])  # Keep FIFO even when this task cannot start.
+                    blocking = self.active_execution(task['profile_id'], jobs)
+                    if blocking and blocking.get('task_id') != task_id:
+                        blocking_task = None
+                        if blocking.get('task_id'):
+                            try:
+                                blocking_task = self.get(blocking['task_id'])
+                            except ValueError:
+                                blocking_task = None
+                        if not blocking_task or blocking_task.get('state') not in HANDOFF_TASK_STATES:
+                            continue  # The agent is still working; the queue keeps its order silently.
+                    self.perform('launch', {}, task_id, 'task_scheduler')
+            except Busy:
+                continue
+            except (ValueError, OSError, sqlite3.Error) as error:
+                try:
+                    with self.operation('task:' + task_id, timeout=0):
+                        task = self.get(task_id)
+                        if task.get('state') != 'draft' or task.get('assignment', {}).get('state') != 'queued':
+                            continue  # Cancellation or launch won the race; don't restore an obsolete queue error.
+                        message = str(error)[:500]
+                        if task.get('assignment_error') != message:
+                            task['assignment_error'] = message
+                            self.save(task, 'assignment_waiting', 'task_scheduler')
+                except (ValueError, OSError, sqlite3.Error):
+                    continue
+
 
     def get(self, task_id):
         with closing(self.connect()) as db:
@@ -446,6 +640,15 @@ class Contributions:
         task.setdefault('audit', []).append(entry)
         task['audit'] = task['audit'][-100:]  # UI history; SQLite retains the latest 500 entries.
         with closing(self.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            assignment = task.get('assignment') if task.get('state') == 'draft' else None
+            if assignment and assignment.get('state') == 'queued':
+                if 'position' not in assignment:
+                    assignment['position'] = db.execute('SELECT COALESCE(MAX(position), 0) + 1 FROM assignments').fetchone()[0]
+                db.execute('INSERT OR REPLACE INTO assignments VALUES (?,?,?)',
+                           (task['id'], assignment['position'], json.dumps(assignment)))
+            else:
+                db.execute('DELETE FROM assignments WHERE task_id=?', (task['id'],))
             db.execute('INSERT INTO audit VALUES (?,?)', (task['id'], json.dumps(entry)))
             # Background pull-request polling must not grow the durable audit
             # table without bound; the task record keeps the recent trail.
@@ -554,6 +757,21 @@ class Contributions:
                 meetings.append(dict(reference, state='unavailable', proposals=[]))
         task['meeting_results'] = meetings
         task['participants'] = participants
+        blocking = self.active_execution(task.get('profile_id'), jobs)
+        if blocking and blocking.get('id') != task.get('run_id'):
+            blocking_task = None
+            if blocking.get('task_id'):
+                with closing(self.connect()) as db:
+                    row = db.execute('SELECT data FROM tasks WHERE id=?', (blocking['task_id'],)).fetchone()
+                blocking_task = json.loads(row[0]) if row else None
+            task['blocking_execution'] = dict(
+                run_id=blocking['id'], state=blocking['state'], alias=blocking.get('alias'),
+                task_id=blocking.get('task_id'), task_title=(blocking_task or {}).get('title', ''),
+                task_state=(blocking_task or {}).get('state', ''),
+                handoff_ready=bool(blocking.get('state') == 'persona_sent' and blocking_task and (blocking_task.get('state') == 'completed' or (
+                    blocking_task.get('state') in HANDOFF_TASK_STATES and blocking_task.get('completion_receipt')))))
+        else:
+            task['blocking_execution'] = None
         task['sessions'] = [{k: j.get(k) for k in ('id', 'kind', 'state', 'profile_id', 'created_at',
                             'updated_at', 'error', 'pane_id', 'alias', 'session_closed_at')} |
                             dict(history=[{k: h.get(k) for k in ('alias', 'pane_id', 'session_closed_at')}
@@ -677,25 +895,104 @@ class Contributions:
         return json.dumps({k: v for k, v in task.items() if k not in ('last_sync', 'updated_at')},
                           sort_keys=True, default=str)
 
+    def launch_task(self, task, actor):
+        # All task launch reservations share this lock, including manual starts.
+        with self.operation('launch-capacity', timeout=0):
+            jobs = self.store.snapshot(live_status=False).get('jobs', [])
+            if task.get('run_id'):
+                return task
+            reservations = [j for j in jobs if j.get('kind') == 'launch' and j.get('task_id') == task['id']]
+            existing = next((j for j in reservations if j.get('state') not in TERMINAL_EXECUTIONS), None)
+            if not existing and reservations:
+                raise ValueError('This task already has a finished or released launch reservation; create a new task for further work.')
+            blocking = self.active_execution(task['profile_id'], jobs)
+            active = sum(1 for j in jobs if j.get('kind') == 'launch' and j.get('task_id')
+                         and j.get('state') not in TERMINAL_EXECUTIONS)
+            if not existing and active - int(bool(blocking and blocking.get('task_id'))) >= MAX_ACTIVE_EXECUTIONS:
+                raise ValueError('Task execution capacity is full. Queue this task until a slot is available.')
+            if blocking and not existing:
+                if blocking.get('task_id') == task['id']:
+                    raise ValueError('This task already has an active session; refresh the task before launching again.')
+                blocking_task = None
+                if blocking.get('task_id'):
+                    try:
+                        blocking_task = self.get(blocking['task_id'])
+                    except ValueError:
+                        blocking_task = None
+                if not blocking_task:
+                    raise ValueError('Assigned agent has an active session without a task; inspect that session before assigning new work.')
+                with self.operation('task:' + blocking_task['id'], timeout=0):
+                    blocking_task = self.get(blocking_task['id'])
+                    verified, reason = self.execution_finished(blocking_task, blocking)
+                    if not verified:
+                        raise ValueError("Assigned agent is busy with task '" + blocking_task['title'] + "' (" + blocking_task['id'] + "). " + reason + ' Open that task to inspect its execution.')
+                    if blocking_task['state'] != 'completed' and blocking_task.get('completion_receipt', {}).get('commit') != blocking_task['head_sha']:
+                        receipt = self.read_receipt(blocking_task, blocking, blocking_task['head_sha'], self.tree_for(blocking_task))
+                        blocking_task['completion_receipt'] = dict(commit=blocking_task['head_sha'], tests=receipt['tests'], verified_at=stamp())
+                        self.save(blocking_task, 'completion_verified', actor)
+                    task['handoff'] = dict(stage='closing', blocking_run=blocking['id'], blocking_task=blocking_task['id'], at=stamp())
+                    self.save(task, 'handoff_started', actor)
+                    self.finish_execution(blocking_task, blocking, 'handoff-' + task['id'], actor)
+                    task = self.get(task['id'])
+                    task['handoff'] = dict(stage='closed', blocking_run=blocking['id'], blocking_task=blocking_task['id'], at=stamp())
+                    self.save(task, 'handoff_closed', actor)
+            prompt = 'Task: ' + task['title'] + '\n' + task['description']
+            if task.get('source', {}).get('task_id'):
+                try:
+                    origin = self.get(task['source']['task_id'])
+                except ValueError:
+                    origin = None
+                if origin:
+                    prompt = ('Follow-up of task ' + origin['id'] + ': ' + origin['title'] +
+                              '\nRecorded completion: ' + str(origin.get('completion', {}).get('reason', 'unavailable'))[:500] +
+                              '\n\n' + prompt)
+            if existing:
+                run = existing
+            else:
+                run = self.store.action('launch', dict(request_id='task-' + task['id'],
+                    organization_id=task['organization_id'], profile_id=task['profile_id'],
+                    task_id=task['id'], worktree_branch=task['branch'], start_sha=task['base_sha'],
+                    task_prompt=prompt +
+                        '\nWork only in your assigned task branch. Implement, run required checks, and commit your changes. '
+                        'Commit using git -c user.name=Herdr-Agent -c user.email=agent@herdr.local commit. Never infer the operator identity or change global Git config. '
+                        'Never push, open a pull request, update the shared checkout or deploy. '
+                        'When complete, write JSON to {{HERDR_TASK_RECEIPT}} with outcome=complete, commit=the full HEAD SHA, run_id={{HERDR_TASK_RUN}}, token={{HERDR_TASK_TOKEN}}, and tests as an array of actual check results. Write it last after committing. '
+                        'If and only if the task genuinely requires no code changes, write the same receipt with outcome=no_changes, commit=the unchanged recorded base SHA and a reason field instead of committing. '
+                        'Report commands and actual results; missing checks are not passes. Publishing is a dashboard administrator action.\n\n'
+                        'Task-local tool acquisition policy:\n' + task_tool_guidance()))
+            profile = next((p for p in self.store.snapshot(live_status=False)['profiles'] if p['id'] == task['profile_id']), {})
+            task.setdefault('participants', []).append(dict(profile_id=task['profile_id'], run_id=run['id'],
+                name=profile.get('name', 'Agent identity unavailable'), role=profile.get('role', ''),
+                runtime=profile.get('runtime', ''), model=profile.get('model'), provider=profile.get('provider'), assigned_at=stamp(), provenance='task_launch'))
+            task.update(run_id=run['id'], worktree=str((self.projects / '.herdr-worktrees' / run['id']).resolve()),
+                        state='implementing')
+            task.pop('handoff', None)
+            task.pop('assignment', None)
+            task.pop('assignment_error', None)
+            return self.save(task, 'launch', actor)
+
     def perform(self, action, body, task_id, actor):
         if action == 'create':
             try:
                 return self.get(task_id)
             except ValueError:
                 pass
-            for key, limit in [('title', 120), ('description', 8000), ('repository', 2000), ('base_ref', 250)]:
+            for key, limit in [('title', 120), ('description', 8000), ('repository', 2000)]:
                 value = body.get(key)
                 if not isinstance(value, str) or not value.strip() or len(value) > limit or '\x00' in value:
                     raise ValueError('Invalid task ' + key + '.')
             repository = project_directory(self.projects, str(self.projects / body['repository']))
-            if repository != Path(project_git.git(repository, 'rev-parse', '--show-toplevel').strip()).resolve():
+            try:
+                top = Path(project_git.git(repository, 'rev-parse', '--show-toplevel').strip()).resolve()
+            except ValueError as error:
+                raise ValueError('Selected project is not an accessible Git repository. Clone or initialize it before creating a task.') from error
+            if repository != top:
                 raise ValueError('Select the repository root.')
-            base = body['base_ref']
-            if not base.startswith('refs/remotes/origin/') or base.endswith('/HEAD'):
-                raise ValueError('Select an explicit origin base branch, not origin/HEAD.')
-            project_git.git(repository, 'check-ref-format', base)
+            requested = body.get('base_ref', '')
+            if not isinstance(requested, str) or len(requested) > 250 or '\x00' in requested:
+                raise ValueError('Invalid task base_ref.')
+            base, sha = task_base(repository, requested)
             remote = remote_info(repository)
-            sha = project_git.git(repository, 'rev-parse', '--verify', base + '^{commit}').strip()
             profiles = self.store.snapshot(live_status=False)['profiles']
             profile = next((p for p in profiles if p['id'] == body.get('profile_id') and not p.get('archived')), None)
             if not profile or Path(profile['project']).resolve() != repository or not profile.get('use_worktree', True):
@@ -714,30 +1011,14 @@ class Contributions:
         had_error = task.pop('error', None) is not None
         # An unchanged background refresh must not rewrite the task or its audit.
         unchanged = self.comparable(task) if action == 'refresh' else None
-        if task['state'] in ('merged', 'closed', 'completed') and action not in ('refresh', 'build', 'discuss', 'review_policy', 'proposal', 'complete'):
+        if task['state'] in ('merged', 'closed', 'completed') and action not in ('refresh', 'build', 'discuss', 'review_policy', 'proposal', 'complete', 'assignment'):
             raise ValueError('This task pull request is closed. Create a new task for further changes.')
-        repository = self.path_for(task)
-        if remote_info(repository) != task['github_repository']:
-            raise ValueError('Repository remote changed; inspect the task before continuing.')
+        if action != 'assignment':
+            repository = self.path_for(task)
+            if remote_info(repository) != task['github_repository']:
+                raise ValueError('Repository remote changed; inspect the task before continuing.')
         if action == 'launch':
-            if task.get('run_id'):
-                return task
-            run = self.store.action('launch', dict(request_id='task-' + task['id'],
-                organization_id=task['organization_id'], profile_id=task['profile_id'],
-                task_id=task['id'], worktree_branch=task['branch'], start_sha=task['base_sha'],
-                task_prompt='Task: ' + task['title'] + '\n' + task['description'] +
-                    '\nWork only in your assigned task branch. Implement, run required checks, and commit your changes. '
-                    'Commit using git -c user.name=Herdr-Agent -c user.email=agent@herdr.local commit. Never infer the operator identity or change global Git config. '
-                    'Never push, open a pull request, update the shared checkout or deploy. '
-                    'When complete, write JSON to {{HERDR_TASK_RECEIPT}} with outcome=complete, commit=the full HEAD SHA, run_id={{HERDR_TASK_RUN}}, token={{HERDR_TASK_TOKEN}}, and tests as an array of actual check results. Write it last after committing. '
-                    'Report commands and actual results; missing checks are not passes. Publishing is a dashboard administrator action.\n\n'
-                    'Task-local tool acquisition policy:\n' + task_tool_guidance()))
-            profile = next((p for p in self.store.snapshot(live_status=False)['profiles'] if p['id'] == task['profile_id']), {})
-            task.setdefault('participants', []).append(dict(profile_id=task['profile_id'], run_id=run['id'],
-                name=profile.get('name', 'Agent identity unavailable'), role=profile.get('role', ''),
-                runtime=profile.get('runtime', ''), model=profile.get('model'), provider=profile.get('provider'), assigned_at=stamp(), provenance='task_launch'))
-            task.update(run_id=run['id'], worktree=str((self.projects / '.herdr-worktrees' / run['id']).resolve()),
-                        state='implementing')
+            return self.launch_task(task, actor)
         elif action == 'complete':
             if task['state'] == 'completed':
                 saved = task.get('completion', {})
@@ -768,6 +1049,22 @@ class Contributions:
                 outcome=outcome, candidate=head, upstream=upstream,
                 validation='verified' if evidence.get('state') == 'complete' and evidence.get('target') == head and evidence.get('required_checks_verified') is True else 'not_verified',
                 reason=reason.strip(), actor=actor, at=stamp()))
+        elif action == 'assignment':
+            mode = body.get('mode')
+            if mode not in ('queue', 'cancel', 'move'):
+                raise ValueError('Choose queue, cancel or move.')
+            if mode == 'queue':
+                task = self.enqueue_assignment(task, actor)
+            elif mode == 'cancel':
+                task.pop('assignment', None)
+                task.pop('assignment_error', None)
+            else:
+                position = body.get('position')
+                if type(position) is not int or not 0 <= position <= 10000:
+                    raise ValueError('Invalid queue position.')
+                if task.get('assignment', {}).get('state') != 'queued':
+                    raise ValueError('This task has no queued assignment.')
+                task['assignment'] = dict(task.get('assignment', {}), position=position)
         elif action in ('discuss', 'review_policy'):
             groups = self.store.snapshot(live_status=False).get('groups', [])
             group = next((g for g in groups if g['id'] == body.get('group_id') and g['organization_id'] == task['organization_id'] and not g.get('removed_at')), None)
@@ -820,6 +1117,9 @@ class Contributions:
             created['source'] = dict(task_id=task_id, meeting_id=reference['job_id'], group_id=reference['group_id'], proposal_key=proposal['key'])
             self.save(created, 'proposal_accepted', actor)
             task.setdefault('follow_up_tasks', {})[proposal['key']] = new_id
+            if body.get('queue') is True:
+                created = self.enqueue_assignment(created, actor)
+                self.save(created, 'assignment_queued', actor)
         elif action == 'policy':
             if not isinstance(body.get('auto_validate'), bool):
                 raise ValueError('Choose whether automatic capture and validation is enabled.')

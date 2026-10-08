@@ -86,6 +86,33 @@ class OrganizationTests(unittest.TestCase):
         result = self.store.manage_session(dict(organization_id=org, mode='cleanup', inspected=True, job_ids=[run_id]), 'admin')
         self.assertEqual(result['results'][0]['state'], 'closed')
 
+    def test_finish_archives_marks_finished_and_frees_the_agent_slot(self):
+        org = self.organization()
+        profile = self.hire(org)
+        run_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        before = len(self.calls)
+        result = self.store.manage_session(dict(job_id=run_id, organization_id=org, mode='finish', inspected=True, request_id='finish-test'), 'admin')
+        finished = next(j for j in self.store.job_records() if j['id'] == run_id)
+        self.assertEqual(finished['state'], 'finished')
+        self.assertIsNotNone(finished.get('session_closed_at'))
+        self.assertTrue(finished.get('finished_at'))
+        self.assertFalse(self.store.checkout_in_use(finished['profile']['project']))
+        self.assertFalse(self.store.snapshot()['member_states'][profile]['active'])
+        self.assertEqual(result['archive_id'], finished['session_archive_id'])
+        self.assertTrue(any(args[:2] == ('pane', 'close') for args, _ in self.calls[before:]))
+        self.assertFalse(any(args[:2] == ('agent', 'start') for args, _ in self.calls[before:]))
+        # A finished execution no longer occupies the agent; a new launch proceeds.
+        second_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        second = next(j for j in self.store.job_records() if j['id'] == second_id)
+        self.assertEqual(second['state'], 'persona_sent')
+        # Replaying the finish request is idempotent and never relaunches.
+        count = len(self.calls)
+        again = self.store.manage_session(dict(job_id=run_id, organization_id=org, mode='finish', inspected=True, request_id='finish-test'), 'admin')
+        self.assertEqual(again['id'], run_id)
+        self.assertEqual(len(self.calls), count)
+
     def test_cleanup_skips_busy_and_changed_sessions(self):
         org = self.organization()
         profile = self.hire(org)
