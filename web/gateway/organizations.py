@@ -15,6 +15,7 @@ import uuid
 from project_files import project_directory
 from permissions import accessible_paths, permission_mode, prepare_permissions
 from herdr_ids import is_pane_id, is_workspace_id
+from herdr_errors import HerdrError, delivery_for, parse_completion, parse_resume, preview as preview_text
 
 
 def now():
@@ -103,6 +104,23 @@ class OrganizationStore:
                 if job['state'] in ('queued', 'running'):
                     job.update(state='uncertain', error='Gateway restarted. Inspect the SSH terminal before creating another run or task.', updated_at=now())
                     self.put(db, 'jobs', job)
+            # Refine restart recovery: annotate liveness of bound sessions without
+            # changing their state and without replaying any prompt.
+            bound = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs')]
+            bound = [job for job in bound if job['kind'] == 'launch' and job['state'] == 'persona_sent']
+            if bound:
+                try:
+                    response = self.command('agent', 'list', timeout=3)
+                    agents = response if isinstance(response, list) else response.get('agents') if isinstance(response, dict) else None
+                    live = {a.get('name') for a in agents if isinstance(a, dict)} if isinstance(agents, list) else None
+                except (ValueError, OSError):
+                    live = None
+                if live is not None:
+                    for job in bound:
+                        liveness = 'present' if job.get('alias') in live else 'missing'
+                        if job.get('session_liveness') != liveness:
+                            job.update(session_liveness=liveness, liveness_checked_at=now(), updated_at=now())
+                            self.put(db, 'jobs', job)
 
     def connect(self):
         db = sqlite3.connect(self.path, timeout=10)
@@ -164,7 +182,7 @@ class OrganizationStore:
             else:
                 data['jobs'] = [json.loads(r['data']) for r in db.execute('SELECT data FROM jobs ORDER BY rowid')]
         for table in ('profiles', 'groups'):
-            data[table] = [item for item in data[table] if not item.get('removed_at')]
+            data[table] = [item for item in data[table] if not item.get('removed_at') and not item.get('ephemeral')]
         if directory:
             # Task assignment needs the repository and worktree mode; a worktree
             # agent is the only kind that can own a task branch.
@@ -212,7 +230,25 @@ class OrganizationStore:
             query = "SELECT data FROM jobs"
             if launches_only:
                 query += " WHERE json_extract(data, '$.kind')='launch'"
-            return [json.loads(row['data']) for row in db.execute(query + ' ORDER BY rowid')]
+            else:
+                query += ' ORDER BY rowid'
+            return [json.loads(row['data']) for row in db.execute(query)]
+
+    def knowledge_jobs(self):
+        """Identity index for knowledge reconciliation; full records are fetched only on change."""
+        with self.lock, closing(self.connect()) as db:
+            rows = db.execute(
+                "SELECT json_extract(data, '$.id'), json_extract(data, '$.kind'), "
+                "json_extract(data, '$.state'), json_extract(data, '$.updated_at') FROM jobs "
+                "WHERE (json_extract(data, '$.kind')='discussion' AND json_extract(data, '$.state')='artifact_ready') "
+                "OR (json_extract(data, '$.kind')='delegate' AND json_extract(data, '$.state') IN ('reported_complete','completed')) "
+                "OR (json_extract(data, '$.kind')='chat' AND json_extract(data, '$.consultation')=1 AND json_extract(data, '$.state')='answered') "
+                "ORDER BY json_extract(data, '$.updated_at') DESC LIMIT 200").fetchall()
+        return [dict(id=row[0], kind=row[1], state=row[2], updated_at=row[3]) for row in rows]
+
+    def job_record(self, job_id):
+        with self.lock, closing(self.connect()) as db:
+            return self.get(db, 'jobs', job_id)
 
     def profile_records(self):
         """Narrow durable profile read with no runtime queries or integration callbacks."""
@@ -275,7 +311,7 @@ class OrganizationStore:
     def job_summary(job, document=False):
         omitted = {'runs', 'group_run', 'organization', 'profile'}
         if not document and job['kind'] not in ('launch', 'delegate'):
-            omitted.update(('result', 'contributions', 'group', 'prompt'))
+            omitted.update(('result', 'contributions', 'group', 'prompt', 'knowledge_pack'))
         return {k: v for k, v in job.items() if k not in omitted}
 
     def activity(self, body):
@@ -558,7 +594,9 @@ class OrganizationStore:
             job = self.get(db, 'jobs', job_id)
             job.update(**changes, updated_at=now())
             self.put(db, 'jobs', job)
-        if changes.get('state') in ('answered', 'persona_sent', 'needs_attention', 'delivered', 'artifact_ready'):
+        if changes.get('state') in ('answered', 'persona_sent', 'needs_attention', 'delivered', 'artifact_ready',
+                                    'finished', 'released', 'cancelled', 'completed', 'reported_complete',
+                                    'uncertain', 'waiting_for_members'):
             self.jobs_changed.set()
         return job
 
@@ -587,7 +625,7 @@ class OrganizationStore:
                     results.append(dict(id=job_id, state='skipped', reason=str(error)))
             return {'results': results}
         mode = body.get('mode')
-        if mode not in ('close', 'restart', 'continue', 'finish') or body.get('inspected') is not True:
+        if mode not in ('close', 'restart', 'continue', 'finish', 'resume', 'handover') or body.get('inspected') is not True:
             raise ValueError('Inspect the session and choose close or restart.')
         request_id = body.get('request_id')
         if request_id is not None and (not isinstance(request_id, str) or not 1 <= len(request_id) <= 64):
@@ -616,14 +654,35 @@ class OrganizationStore:
             from session_archives import archive, read, context
             saved = None
             status = 'closed'
-            if mode == 'continue':
+            target = None
+            if mode in ('continue', 'resume', 'handover'):
                 if not run.get('session_closed_at'):
                     raise ValueError('Archive and close this session before continuing from saved context.')
                 saved = read(self, run['organization_id'], text(body, 'archive_id', 40))
                 if saved['run_id'] != run['id']:
                     raise ValueError('Archive does not belong to this run.')
-                if any(j['kind'] == 'launch' and j['id'] != run['id'] and j.get('profile_id') == run['profile_id'] and j['state'] not in ('released', 'finished') for j in self.job_records()):
+                if mode == 'handover':
+                    with closing(self.connect()) as db:
+                        target = self.get(db, 'profiles', text(body, 'target_profile_id', 40), run['organization_id'])
+                    if target.get('group_id') or target.get('archived') or target.get('ephemeral'):
+                        raise ValueError('Choose an individual persistent agent as the handover target.')
+                    source_project = run.get('source_project') or (run.get('profile') or {}).get('project')
+                    if not source_project or Path(target.get('project', '')).resolve() != Path(source_project).resolve():
+                        raise ValueError('The handover target works in another repository.')
+                    if any(j['kind'] == 'launch' and j.get('profile_id') == target['id'] and j['state'] not in ('released', 'finished') for j in self.job_records()):
+                        raise ValueError('The handover target already has an active execution.')
+                    context_value = body.get('continuation_context')
+                    if not isinstance(context_value, str) or not context_value.strip() or len(context_value) > 20000:
+                        raise ValueError('The handover needs bounded context for the next agent.')
+                    task_prompt = body.get('task_prompt', '')
+                    if not isinstance(task_prompt, str) or len(task_prompt) > 12000:
+                        raise ValueError('Invalid handover task prompt.')
+                elif any(j['kind'] == 'launch' and j['id'] != run['id'] and j.get('profile_id') == run['profile_id'] and j['state'] not in ('released', 'finished') for j in self.job_records()):
                     raise ValueError('Release the current agent binding before continuing an archived session.')
+                if mode == 'resume':
+                    resume = saved.get('resume') if isinstance(saved.get('resume'), dict) else {}
+                    if saved.get('native_resume_available') is not True or resume.get('state') != 'verified' or not isinstance(resume.get('args'), list):
+                        raise ValueError('This archive has no verified native resume reference; start with saved context instead.')
             else:
                 response = self.command('agent', 'list')
                 live = response if isinstance(response, list) else response.get('agents')
@@ -665,16 +724,26 @@ class OrganizationStore:
                     session_request_id=request_id, session_request_mode=mode,
                     session_close_identity='agent_session' if run.get('agent_session') else 'pane_checkout',
                     **({'finished_at': now(), 'finished_by': actor} if mode == 'finish' else {}))
-            if mode in ('restart', 'continue'):
-                with self.lock, closing(self.connect()) as db:
-                    profile = self.get(db, 'profiles', run['profile_id'], run['organization_id'])
+            if mode in ('restart', 'continue', 'resume', 'handover'):
+                if mode == 'handover':
+                    profile = target
+                else:
+                    with self.lock, closing(self.connect()) as db:
+                        profile = self.get(db, 'profiles', run['profile_id'], run['organization_id'])
                 profile = dict(profile, project=run.get('source_project') or run['profile']['project'])
                 history = list(run.get('session_history', []))[-20:]
                 history.append({k: run.get(k) for k in ('alias', 'pane_id', 'agent_session', 'session_closed_at', 'session_archive_id')})
+                resume = saved.get('resume') if isinstance(saved.get('resume'), dict) else {}
                 self.update_job(run['id'], state='queued', reuse_checkout=True,
-                    profile=profile, alias='hire_' + uuid.uuid4().hex[:20], agent_session=None,
-                    session_closed_at=None, session_history=history, task_prompt='', error='', restarted_by=actor,
-                    continuation_context=context(saved) if mode == 'continue' else '', continuation_archive_id=saved['id'] if mode == 'continue' else None,
+                    profile_id=profile['id'], profile=profile, alias='hire_' + uuid.uuid4().hex[:20], agent_session=None,
+                    session_closed_at=None, session_history=history, error='', restarted_by=actor,
+                    task_prompt=str(body.get('task_prompt', '')) if mode == 'handover' else '',
+                    continuation_context=(str(body.get('continuation_context', '')) if mode == 'handover'
+                                          else context(saved) if mode == 'continue' else ''),
+                    continuation_archive_id=saved['id'] if mode in ('continue', 'resume', 'handover') else None,
+                    resume_args=list(resume.get('args'))[:20] if mode == 'resume' and isinstance(resume.get('args'), list) else None,
+                    resume_reference=resume.get('reference') if mode == 'resume' else None,
+                    handed_from=dict(profile_id=run.get('profile_id'), alias=run.get('alias'), archive_id=saved['id']) if mode == 'handover' else None,
                     session_request_id=request_id, session_request_mode=mode)
                 with self.lock:
                     future = self.worker.submit(self.execute, run['id'])
@@ -832,9 +901,65 @@ class OrganizationStore:
             raise ValueError('Agent binding changed. Inspect the terminal and launch a new run.')
         if run.get('agent_session') and agent.get('agent_session') != run['agent_session']:
             raise ValueError('Agent conversation changed. Launch a new run to deliver its persona.')
-        if ready and (agent.get('agent_status', agent.get('state')) not in ('idle', 'done') or agent.get('interactive_ready') is False or agent.get('launch_pending') is True):
-            raise ValueError('Agent is not ready for input. Check its terminal over SSH.')
+        if ready:
+            status = agent.get('agent_status', agent.get('state'))
+            if status not in ('idle', 'done') or agent.get('interactive_ready') is False or agent.get('launch_pending') is True:
+                if status == 'blocked':
+                    raise HerdrError('Agent needs a decision before new input; no prompt was sent.',
+                                     'agent_blocked', 'agent get', 'none')
+                if status in ('working', 'running', 'busy', 'thinking'):
+                    raise HerdrError('Agent is still working; no new prompt was sent.',
+                                     'agent_working', 'agent get', 'none')
+                raise HerdrError('Agent is not ready for input; no new prompt was sent.',
+                                 'agent_not_ready', 'agent get', 'none')
         return agent
+
+    @staticmethod
+    def completion_baseline(response):
+        """Record the completion sequence observed at prompt delivery, if any."""
+        agent = response.get('agent') if isinstance(response, dict) and isinstance(response.get('agent'), dict) else response
+        return parse_completion(agent)
+
+    def agent_state(self, run, preview=False):
+        """Live status for a bound run, with an optional bounded visible preview."""
+        response = self.command('agent', 'get', run['alias'], timeout=2)
+        agent = response.get('agent') if isinstance(response, dict) else None
+        if not isinstance(agent, dict):
+            raise ValueError('Agent state is unavailable.')
+        result = dict(status=agent.get('agent_status', agent.get('state', 'unknown')),
+                      interactive_ready=agent.get('interactive_ready'))
+        if preview and result['status'] == 'blocked':
+            try:
+                output = self.command('agent', 'read', run['alias'], '--source', 'visible', '--lines', '30', timeout=2)
+                text = output.get('output') if isinstance(output, dict) else ''
+            except (ValueError, OSError):
+                text = ''
+            result['preview'] = preview_text(text)
+        return result
+
+    def probe_resume(self, run):
+        """Read resume facts from the live agent without executing command text.
+
+        Best-effort: a probe failure must never block archival or closure.
+        """
+        agent = None
+        try:
+            response = self.command('agent', 'get', run['alias'], timeout=5)
+            agent = response.get('agent') if isinstance(response, dict) else None
+            if not isinstance(agent, dict):
+                agent = response if isinstance(response, dict) else None
+        except Exception:
+            agent = None
+        if not isinstance(agent, dict) or not agent.get('resume'):
+            try:
+                explained = self.command('agent', 'explain', run['alias'], timeout=5)
+                if isinstance(explained, dict):
+                    inner = explained.get('agent') if isinstance(explained.get('agent'), dict) else explained
+                    if isinstance(inner, dict):
+                        agent = dict(agent or {}, **inner)
+            except Exception:
+                pass
+        return parse_resume(agent)
 
     def close_identity(self, run, live=None):
         """Verify pane ownership for closure, including runtimes without session IDs.
@@ -1065,6 +1190,11 @@ class OrganizationStore:
                     from worker_guidance import local_bundle
                     guidance = local_bundle(job.get('worktree_path', project))
                 arguments = launch_arguments(profile) + prepare_permissions(profile, self.path.parent)
+                # Native resume uses adapter arguments validated before they were
+                # recorded; free-form command text is never executed here.
+                resume_args = job.get('resume_args')
+                if isinstance(resume_args, list) and resume_args and all(isinstance(a, str) and 0 < len(a) <= 200 for a in resume_args):
+                    arguments = arguments + [str(a) for a in resume_args][:20]
                 # Record the exact executable arguments sent to Herdr, separately
                 # from the editable profile and any later in-TUI model changes.
                 job = self.update_job(job_id, launch_arguments=arguments)
@@ -1121,7 +1251,9 @@ class OrganizationStore:
                 else:
                     if job.get('continuation_context'):
                         prompt += '\n\n' + job['continuation_context']
-                    self.command('agent', 'prompt', job['alias'], prompt)
+                    response = self.command('agent', 'prompt', job['alias'], prompt)
+                    self.update_job(job_id, delivery=dict(stage='sent', at=now(),
+                                                          completion=self.completion_baseline(response)))
                 self.update_job(job_id, state='persona_sent')
             else:
                 # Resolve persisted runs again: the operator may have released one while this was queued.
@@ -1139,7 +1271,12 @@ class OrganizationStore:
                 self.update_job(job_id, state='delivered')
         except Exception as exc:
             # Timeouts/errors can occur after input was sent. Do not retry the job.
+            code = getattr(exc, 'code', '')
+            delivery = delivery_for(exc)
             detail = str(exc)[:500]
+            if job['kind'] in ('launch', 'chat', 'delegate') and delivery in ('blocked', 'unknown') and code:
+                self.update_job(job_id, delivery=dict(stage='blocked' if delivery == 'blocked' else 'unknown',
+                                                      code=code, at=now()))
             if job['kind'] == 'chat':
                 # Diagnostics must never replace the original failure with their own.
                 try:
@@ -1153,6 +1290,10 @@ class OrganizationStore:
                 detail += ' Launch failed during preflight; no workspace or pane was created and no terminal input was sent.'
             elif job['kind'] == 'launch' and job.get('launch_stage') == 'workspace_preparing':
                 detail += ' Launch failed while preparing the workspace; no agent was started and no terminal input was sent.'
+            elif delivery == 'blocked':
+                detail += ' The agent needs a decision; no prompt input was sent. Inspect the session and choose an action.'
+            elif delivery == 'unknown' and code:
+                detail += ' Prompt delivery is unknown; inspect the terminal before retrying.'
             else:
                 detail += ' Inspect SSH before retrying; terminal input may have been sent.'
             self.update_job(job_id, state='needs_attention', error=detail)

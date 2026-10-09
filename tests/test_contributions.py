@@ -1563,3 +1563,65 @@ class ContributionTests(unittest.TestCase):
         prompt = self.store.action.call_args[0][1]['prompt']
         self.assertIn('automatic follow-up enabled', prompt)
         self.assertIn('needs_review=true', prompt)
+
+    def test_handover_builds_packet_and_switches_the_task_owner(self):
+        task = self.candidate()
+        self.store.snapshot.return_value['profiles'].append(dict(self.profile, id='target', name='Max'))
+        self.store.snapshot.return_value['jobs'] = [dict(id='run', kind='launch', state='finished', profile_id='worker',
+                                                         session_archive_id='archive', session_closed_at='today', alias='hire_old')]
+        handed = self.service.action('handover', dict(request_id='handover-1', task_id=task['id'], target_profile_id='target'), 'admin', 'admin')
+        self.assertEqual(handed['profile_id'], 'target')
+        self.assertEqual(handed['state'], 'implementing')
+        self.assertEqual(handed['handover_history'][0]['to_profile'], 'target')
+        self.assertEqual(handed['participants'][-1]['provenance'], 'handover')
+        request = self.store.manage_session.call_args[0][0]
+        self.assertEqual((request['mode'], request['target_profile_id'], request['archive_id']), ('handover', 'target', 'archive'))
+        self.assertIn('Handover from', request['continuation_context'])
+        self.assertIn('HERDR_TASK_RECEIPT', request['task_prompt'])
+
+    def test_handover_requires_an_archived_session(self):
+        task = self.candidate()
+        self.store.snapshot.return_value['jobs'] = [dict(id='run', kind='launch', state='persona_sent', profile_id='worker')]
+        with self.assertRaisesRegex(ValueError, 'Archive and close'):
+            self.service.action('handover', dict(request_id='handover-2', task_id=task['id'], target_profile_id='target'), 'admin', 'admin')
+
+    def test_consult_requires_an_idle_consultant_and_records_the_question(self):
+        task = self.candidate()
+        self.store.snapshot.return_value['profiles'].append(dict(self.profile, id='target', name='Max'))
+        self.store.snapshot.return_value['jobs'] = [dict(id='consultant-run', kind='launch', state='persona_sent', profile_id='target')]
+        self.store.agent_state.return_value = dict(status='idle')
+        self.store.action.return_value = dict(id='chat1')
+        consulted = self.service.action('consult', dict(request_id='consult-1', task_id=task['id'],
+                                                        consultant_profile_id='target', question='Does this conflict?'), 'admin', 'admin')
+        self.assertEqual(consulted['consultations'][0]['job_id'], 'chat1')
+        self.assertTrue(self.store.update_job.call_args.kwargs['consultation'])
+        self.store.agent_state.return_value = dict(status='blocked')
+        with self.assertRaisesRegex(ValueError, 'busy'):
+            self.service.action('consult', dict(request_id='consult-2', task_id=task['id'],
+                                                consultant_profile_id='target', question='Again?'), 'admin', 'admin')
+
+    def test_instance_launch_creates_an_ephemeral_profile_with_a_cap(self):
+        self.store.action.return_value = dict(id='run2')
+        launched = self.service.action('launch', dict(request_id='instance-1', task_id=self.task['id'], as_instance=True), 'admin', 'admin')
+        self.assertEqual(launched['execution']['mode'], 'template')
+        self.assertNotEqual(launched['profile_id'], 'worker')
+        self.store.put.assert_called_once()
+        instance = self.store.put.call_args[0][2]
+        self.assertTrue(instance['ephemeral'])
+        self.assertEqual(instance['template_id'], 'worker')
+        jobs = [dict(id=str(i), kind='launch', state='persona_sent', profile=dict(template_id='worker')) for i in range(2)]
+        self.store.snapshot.return_value['jobs'] = jobs
+        second = self.service.action('create', dict(self.body, request_id='create-3', title='Another'), 'admin', 'admin')
+        with self.assertRaisesRegex(ValueError, 'maximum parallel instances'):
+            self.service.action('launch', dict(request_id='instance-2', task_id=second['id'], as_instance=True), 'admin', 'admin')
+
+    def test_reap_instances_finishes_terminal_template_tasks(self):
+        task = self.candidate()
+        task.update(state='completed', execution=dict(mode='template', template_id='worker'),
+                    completion=dict(candidate=task['head_sha']))
+        self.service.save(task, 'complete', 'admin')
+        self.store.snapshot.return_value['jobs'] = [dict(id='run', kind='launch', state='persona_sent', profile_id='worker')]
+        with patch('collaboration.current_run'):
+            self.service.reap_instances()
+        request = self.store.manage_session.call_args[0][0]
+        self.assertEqual((request['mode'], request['job_id']), ('finish', 'run'))

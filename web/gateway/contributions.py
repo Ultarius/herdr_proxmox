@@ -25,6 +25,8 @@ from github_api import GitHubError
 from project_files import project_directory
 import project_git
 from repository_lock import repository_lock
+from herdr_errors import HerdrError, format_handover, parse_handover
+MAX_INSTANCES_PER_TEMPLATE = 2
 
 SHA = re.compile(r'[a-f0-9]{40}|[a-f0-9]{64}')
 BRANCH = re.compile(r'herdr/task-[a-f0-9]{12}')
@@ -198,6 +200,10 @@ class Contributions:
             db.execute('CREATE TABLE IF NOT EXISTS audit (task_id TEXT NOT NULL, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS assignments (task_id TEXT PRIMARY KEY, position INTEGER NOT NULL, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS policies (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
+        from knowledge import Knowledge
+        self.knowledge = Knowledge(self)
+        self.store.knowledge = self.knowledge
+        self.knowledge.sync_jobs()
         from discovery import Discovery
         self.discovery = Discovery(self)
 
@@ -233,13 +239,15 @@ class Contributions:
 
     def close(self):
         self.stopped.set()
+        self.store.jobs_changed.set()  # Wake the poller so shutdown is prompt.
         if self.thread:
             self.thread.join(timeout=2)
 
     def poll(self):
         cycles = 0
-        while not self.stopped.wait(10):
+        while not self.stopped.is_set():
             try:
+                self.knowledge.sync_jobs()
                 self.advance_automatic()
                 self.store.advance_discussions()
                 self.dispatch_assignments()
@@ -250,11 +258,16 @@ class Contributions:
                     self.reconcile_completed()
                     self.advance_reviews()
                     self.poll_once()
+                    self.reap_instances()
             except (ValueError, OSError, sqlite3.Error):
                 # A transient storage or API failure must never end the poller;
                 # the next cycle reconciles again. Never redispatch a push or a
                 # pull request creation from here.
-                continue
+                pass
+            # Job state changes wake reconciliation immediately; the timeout is
+            # only a backstop. Events never decide work, they only invalidate.
+            self.store.jobs_changed.wait(10)
+            self.store.jobs_changed.clear()
 
     def automatic_tasks(self):
         """Ids and states only, so a ten-second reconcile never parses stored diffs."""
@@ -312,8 +325,14 @@ class Contributions:
                                 task = self.get(task['id'])
                                 if task.get('head_sha') != head:
                                     raise ValueError('Task advanced during capture; awaiting its new completion receipt.')
-                                task['completion_receipt'] = dict(commit=head, tests=receipt['tests'], verified_at=stamp())
+                                task['completion_receipt'] = dict(commit=head, tests=receipt['tests'], verified_at=stamp(),
+                                                                  handover=receipt.get('handover'))
                                 self.save(task, 'completion_verified', 'automatic_task_policy')
+                                if run.get('id') and receipt.get('handover'):
+                                    try:
+                                        self.store.update_job(run['id'], handover=receipt['handover'])
+                                    except (ValueError, OSError):
+                                        pass
                     if no_changes:
                         try:
                             self.finish_execution(task, run, 'no-changes-' + task['id'], 'automatic_task_policy')
@@ -506,6 +525,8 @@ class Contributions:
             raise ValueError('A no-changes receipt must explain why no changes are required.')
         if receipt['outcome'] == 'no_changes' and head != task.get('base_sha'):
             raise ValueError('A no-changes receipt requires the unchanged recorded base commit.')
+        receipt['handover'] = parse_handover(receipt)
+        self.knowledge.capture_receipt(task, receipt)
         return receipt
 
     def active_execution(self, profile_id, jobs=None):
@@ -877,6 +898,7 @@ class Contributions:
                        '(SELECT rowid FROM audit WHERE task_id=? ORDER BY rowid DESC LIMIT 500)',
                        (task['id'], task['id']))
             db.execute('INSERT OR REPLACE INTO tasks VALUES (?,?)', (task['id'], json.dumps(task)))
+            self.knowledge.capture_task(db, task, action)
         return task
 
 
@@ -988,6 +1010,14 @@ class Contributions:
                 meetings.append(dict(reference, state='unavailable', proposals=[]))
         task['meeting_results'] = meetings
         task['participants'] = participants
+        consultations = []
+        for job in jobs:
+            if job.get('consultation') and job.get('task_id') == task_id:
+                consultations.append(dict(job_id=job['id'], profile_id=job.get('profile_id'),
+                    name=names.get(job.get('profile_id'), 'Agent'), state=job['state'],
+                    question=job.get('question', ''), answer=str(job.get('result') or '')[:4000],
+                    error=str(job.get('error') or '')[:500], at=job.get('created_at')))
+        task['consultations'] = consultations[-10:]
         blocking = self.active_execution(task.get('profile_id'), jobs)
         if blocking and blocking.get('id') != task.get('run_id'):
             blocking_task = None
@@ -1195,6 +1225,11 @@ class Contributions:
         if not active:
             return dict(state='offline', action='start', run_id=None,
                         detail='No session is running. Starting work opens a new agent session.')
+        delivery = active.get('delivery') or {}
+        if delivery.get('stage') == 'blocked':
+            return dict(state='decision', action='interact', run_id=active['id'], profile_id=profile_id,
+                        code=delivery.get('code', 'agent_blocked'),
+                        detail='The agent needs a decision; no prompt input was sent. Inspect the session and choose an action.')
         if active.get('state') in ('queued', 'running'):
             return dict(state='starting', action='wait', run_id=active['id'],
                         detail='The agent session is still starting; new work waits for it.')
@@ -1215,6 +1250,9 @@ class Contributions:
                 return dict(state='handoff', action='handoff', run_id=active['id'], task_id=task['id'],
                             task_title=task.get('title', ''),
                             detail='The previous task has recorded completion evidence; verify the checkout and session before handoff.')
+            blocked = self.blocked_state(active)
+            if blocked:
+                return dict(state='decision', action='interact', run_id=active['id'], profile_id=profile_id, **blocked)
             return dict(state='working', action='queue', run_id=active['id'], task_id=active.get('task_id'),
                         detail='The agent is working on another task; queued work waits for it.')
         owner = self.session_owner(active['id'], jobs)
@@ -1228,10 +1266,30 @@ class Contributions:
             self.verify_startup_session(active)
         except NonGitStartup as error:
             return dict(state='attention', action='archive_general', run_id=active['id'], detail=str(error))
+        except HerdrError as error:
+            if error.code == 'agent_blocked':
+                return dict(state='decision', action='interact', run_id=active['id'], profile_id=profile_id,
+                            code=error.code, detail='The agent is waiting at a prompt; inspect the session and choose an action.')
+            return dict(state='attention', action='inspect', run_id=active['id'], detail=str(error))
         except (ValueError, OSError) as error:
             return dict(state='attention', action='inspect', run_id=active['id'], detail=str(error))
         return dict(state='ready', action='start', run_id=active['id'],
                     detail='The agent is ready. Starting this task archives the startup conversation and opens a dedicated task execution.')
+
+    def blocked_state(self, run):
+        """Detect a blocked agent with a bounded visible preview; display-only."""
+        probe = getattr(self.store, 'agent_state', None)
+        if probe is None:
+            return None
+        try:
+            state = probe(run, preview=True)
+        except Exception:
+            return None
+        if not isinstance(state, dict) or state.get('status') != 'blocked':
+            return None
+        return dict(code='agent_blocked',
+                    detail='The agent needs a decision before new input; no prompt was sent.',
+                    preview=state.get('preview'))
 
     def verify_startup_session(self, run, allow_non_git=False):
         if run.get('task_id') or run.get('state') != 'persona_sent':
@@ -1298,7 +1356,108 @@ class Contributions:
                     and (run.get('launch_stage') == 'preflight' or
                          str(run.get('error', '')).startswith('OpenCode returned incomplete model metadata.')))
 
-    def launch_task(self, task, actor, inspected_general_session=None):
+    def task_instructions(self, task):
+        """The standard task prompt; shared by first launches and handovers."""
+        prompt = 'Task: ' + task['title'] + '\n' + task['description']
+        if task.get('source', {}).get('task_id'):
+            try:
+                origin = self.get(task['source']['task_id'])
+            except ValueError:
+                origin = None
+            if origin:
+                prompt = ('Follow-up of task ' + origin['id'] + ': ' + origin['title'] +
+                          '\nRecorded completion: ' + str(origin.get('completion', {}).get('reason', 'unavailable'))[:500] +
+                          '\n\n' + prompt)
+        return (prompt +
+                '\nWork only in your assigned task branch. Implement, run required checks, and commit your changes. '
+                'Commit using git -c user.name=Herdr-Agent -c user.email=agent@herdr.local commit. Never infer the operator identity or change global Git config. '
+                'Never push, open a pull request, update the shared checkout or deploy. '
+                'Before implementing, verify whether the requested behavior and its checks already exist at the recorded base; if the task is already satisfied, prove it with the checks and use the no_changes receipt instead of manufacturing a commit. '
+                'When complete, write JSON to {{HERDR_TASK_RECEIPT}} with outcome=complete, commit=the full HEAD SHA, run_id={{HERDR_TASK_RUN}}, token={{HERDR_TASK_TOKEN}}, and tests as an array of actual check results. Write it last after committing. '
+                'If and only if the task genuinely requires no code changes, write the same receipt with outcome=no_changes, commit=the unchanged recorded base SHA and a reason field instead of committing. '
+                'Optionally include a "knowledge" array (up to 10 items), each with kind=finding/decision/question/guidance, title and body. Include causes, lessons, limitations and open questions, never credentials. These are reported claims linked to this exact receipt, not verified facts. '
+                'Optionally include a "handover": {"state": ..., "decisions": ..., "questions": ..., "next_step": ...} note for another agent; it is recorded as reported guidance for later sessions. '
+                'Optionally include "follow_up": {"title": ..., "description": ...} when you found necessary related work; it is recorded as a draft task for operator review, never started automatically. '
+                'Report commands and actual results; missing checks are not passes. Publishing is a dashboard administrator action.\n\n'
+                'Task-local tool acquisition policy:\n' + task_tool_guidance())
+
+    def handover_packet(self, task, run, source, target, note):
+        """Bounded, deterministic handover context for the target agent."""
+        receipt = task.get('completion_receipt') or {}
+        parts = [
+            'Handover from ' + str(source.get('name', 'the previous agent')) + ' to '
+            + str(target.get('name', 'the next agent')) + ' for task ' + task['id'] + ': ' + task['title'],
+            'Task state: ' + task['state'],
+            'Acceptance criteria: ' + str(task.get('description', ''))[:2000],
+            'Candidate: ' + str(task.get('head_sha')),
+        ]
+        if task.get('diff_stat'):
+            parts.append('Change summary:\n' + str(task['diff_stat'])[:1500])
+        parts.append('Worker-reported checks: ' + json.dumps(receipt.get('tests', []), default=str)[:1200])
+        parts.append('Previous session: ' + str(run.get('alias')) + ', archived ' + str(run.get('session_closed_at')))
+        if note:
+            parts.append('Agent handover note:\n' + format_handover(note))
+        try:
+            knowledge = self.knowledge.context(task['organization_id'], [task.get('repository', '')], task['title'], limit=4000)
+            if knowledge['records']:
+                parts.append('Relevant project knowledge: ' + json.dumps(knowledge['records'], default=str)[:4000])
+        except (ValueError, OSError):
+            pass
+        packet = '\n\n'.join(parts)
+        return (packet[:18000] + '\n\nThis is historical evidence for the same task; verify it against the '
+                'checkout and continue the work. Do not replay historical commands.')
+
+    def prepare_instance(self, task, actor):
+        """Create an ephemeral parallel instance of the assigned template profile."""
+        if (task.get('execution') or {}).get('mode') == 'template':
+            return task
+        template = next((p for p in self.store.snapshot(live_status=False)['profiles']
+                         if p['id'] == task['profile_id'] and not p.get('archived') and not p.get('ephemeral')), None)
+        if not template or template.get('group_id') or not template.get('use_worktree', True):
+            raise ValueError('Instance execution needs an individual worktree template profile.')
+        jobs = self.store.snapshot(live_status=False).get('jobs', [])
+        active = sum(1 for j in jobs if j.get('kind') == 'launch' and j.get('state') not in TERMINAL_EXECUTIONS
+                     and (j.get('profile') or {}).get('template_id') == template['id'])
+        if active >= MAX_INSTANCES_PER_TEMPLATE:
+            raise ValueError('This template already has the maximum parallel instances; queue the task instead.')
+        instance = dict(template, id=uuid.uuid4().hex, name=str(template.get('name', 'Agent')) + ' instance',
+                        version=1, ephemeral=True, template_id=template['id'], instance_task=task['id'],
+                        manager_id='')
+        instance.pop('group_id', None)
+        instance.pop('removed_at', None)
+        with self.store.lock, closing(self.store.connect()) as db, db:
+            self.store.put(db, 'profiles', instance)
+        task['execution'] = dict(mode='template', template_id=template['id'], template_name=template.get('name'),
+                                 instance_profile_id=instance['id'], at=stamp())
+        task['profile_id'] = instance['id']
+        task['assigned_agent'] = {k: template.get(k) for k in ('id', 'name', 'role', 'runtime')}
+        return self.save(task, 'instance_launch', actor)
+
+    def reap_instances(self):
+        """Archive and close template instances whose task reached a terminal state."""
+        with closing(self.connect()) as db:
+            rows = db.execute("SELECT id, data FROM tasks WHERE json_extract(data, '$.execution.mode')='template' "
+                              "AND json_extract(data, '$.state') IN ('completed','merged','closed') LIMIT 50").fetchall()
+        if not rows:
+            return
+        jobs = self.store.snapshot(live_status=False).get('jobs', [])
+        for task_id, data in rows:
+            task = json.loads(data)
+            run = next((j for j in jobs if j.get('id') == task.get('run_id')), None)
+            if not run or run.get('state') != 'persona_sent':
+                continue
+            try:
+                with self.operation('task:' + task_id, timeout=0):
+                    task = self.get(task_id)
+                    verified, _ = self.execution_finished(task, run)
+                    if verified:
+                        self.finish_execution(task, run, 'reap-' + task_id, 'task_scheduler')
+            except Busy:
+                continue
+            except (ValueError, OSError, sqlite3.Error):
+                continue
+
+    def launch_task(self, task, actor, inspected_general_session=None, as_instance=False):
         # All task launch reservations share this lock, including manual starts.
         with self.operation('launch-capacity', timeout=0):
             jobs = self.store.snapshot(live_status=False).get('jobs', [])
@@ -1333,6 +1492,8 @@ class Contributions:
             if not existing and active - int(bool(blocking and blocking.get('task_id'))) >= MAX_ACTIVE_EXECUTIONS:
                 raise ValueError('Task execution capacity is full. Queue this task until a slot is available.')
             if not existing:
+                if as_instance:
+                    task = self.prepare_instance(task, actor)
                 # Validate replacement before archiving the currently usable pane.
                 profile = next((p for p in self.store.snapshot(live_status=False)['profiles'] if p['id'] == task['profile_id']), None)
                 if self.store.model_validator is not None and profile is not None:
@@ -1362,40 +1523,28 @@ class Contributions:
                             raise ValueError("Assigned agent is busy with task '" + blocking_task['title'] + "' (" + blocking_task['id'] + "). " + reason + ' Open that task to inspect its execution.')
                         if blocking_task['state'] != 'completed' and (blocking_task.get('completion_receipt') or {}).get('commit') != blocking_task['head_sha']:
                             receipt = self.read_receipt(blocking_task, blocking, blocking_task['head_sha'], self.tree_for(blocking_task))
-                            blocking_task['completion_receipt'] = dict(commit=blocking_task['head_sha'], tests=receipt['tests'], verified_at=stamp())
+                            blocking_task['completion_receipt'] = dict(commit=blocking_task['head_sha'], tests=receipt['tests'],
+                                                                       verified_at=stamp(), handover=receipt.get('handover'))
                             self.save(blocking_task, 'completion_verified', actor)
+                            if receipt.get('handover'):
+                                try:
+                                    self.store.update_job(blocking['id'], handover=receipt['handover'])
+                                except (ValueError, OSError):
+                                    pass
                         task['handoff'] = dict(stage='closing', blocking_run=blocking['id'], blocking_task=blocking_task['id'], at=stamp())
                         self.save(task, 'handoff_started', actor)
                         self.finish_execution(blocking_task, blocking, 'handoff-' + task['id'], actor)
                         task = self.get(task['id'])
                         task['handoff'] = dict(stage='closed', blocking_run=blocking['id'], blocking_task=blocking_task['id'], at=stamp())
                         self.save(task, 'handoff_closed', actor)
-            prompt = 'Task: ' + task['title'] + '\n' + task['description']
-            if task.get('source', {}).get('task_id'):
-                try:
-                    origin = self.get(task['source']['task_id'])
-                except ValueError:
-                    origin = None
-                if origin:
-                    prompt = ('Follow-up of task ' + origin['id'] + ': ' + origin['title'] +
-                              '\nRecorded completion: ' + str(origin.get('completion', {}).get('reason', 'unavailable'))[:500] +
-                              '\n\n' + prompt)
+            prompt = self.task_instructions(task)
             if existing:
                 run = existing
             else:
                 run = self.store.action('launch', dict(request_id='task-' + task['id'],
                     organization_id=task['organization_id'], profile_id=task['profile_id'],
                     task_id=task['id'], worktree_branch=task['branch'], start_sha=task['base_sha'],
-                    task_prompt=prompt +
-                        '\nWork only in your assigned task branch. Implement, run required checks, and commit your changes. '
-                        'Commit using git -c user.name=Herdr-Agent -c user.email=agent@herdr.local commit. Never infer the operator identity or change global Git config. '
-                        'Never push, open a pull request, update the shared checkout or deploy. '
-                        'Before implementing, verify whether the requested behavior and its checks already exist at the recorded base; if the task is already satisfied, prove it with the checks and use the no_changes receipt instead of manufacturing a commit. '
-                        'When complete, write JSON to {{HERDR_TASK_RECEIPT}} with outcome=complete, commit=the full HEAD SHA, run_id={{HERDR_TASK_RUN}}, token={{HERDR_TASK_TOKEN}}, and tests as an array of actual check results. Write it last after committing. '
-                        'If and only if the task genuinely requires no code changes, write the same receipt with outcome=no_changes, commit=the unchanged recorded base SHA and a reason field instead of committing. '
-                        'Optionally include "follow_up": {"title": ..., "description": ...} when you found necessary related work; it is recorded as a draft task for operator review, never started automatically. '
-                        'Report commands and actual results; missing checks are not passes. Publishing is a dashboard administrator action.\n\n'
-                        'Task-local tool acquisition policy:\n' + task_tool_guidance()))
+                    task_prompt=prompt))
             profile = next((p for p in self.store.snapshot(live_status=False)['profiles'] if p['id'] == task['profile_id']), {})
             task.setdefault('participants', []).append(dict(profile_id=task['profile_id'], run_id=run['id'],
                 name=profile.get('name', 'Agent identity unavailable'), role=profile.get('role', ''),
@@ -1456,7 +1605,7 @@ class Contributions:
             if remote_info(repository) != task['github_repository']:
                 raise ValueError('Repository remote changed; inspect the task before continuing.')
         if action == 'launch':
-            return self.launch_task(task, actor, body.get('inspected_general_session'))
+            return self.launch_task(task, actor, body.get('inspected_general_session'), body.get('as_instance') is True)
         elif action == 'complete':
             if task['state'] == 'completed':
                 saved = task.get('completion', {})
@@ -1487,6 +1636,69 @@ class Contributions:
                 outcome=outcome, candidate=head, upstream=upstream,
                 validation='verified' if evidence.get('state') == 'complete' and evidence.get('target') == head and evidence.get('required_checks_verified') is True else 'not_verified',
                 reason=reason.strip(), actor=actor, at=stamp()))
+        elif action == 'handover':
+            if task['state'] not in ('implementing', 'review_ready'):
+                raise ValueError('Hand over a task that is implementing or awaiting review.')
+            run = next((j for j in self.store.snapshot(live_status=False).get('jobs', []) if j.get('id') == task.get('run_id')), None)
+            if not run or run.get('state') not in ('finished', 'released') or not run.get('session_archive_id'):
+                raise ValueError('Archive and close the current session before handing over.')
+            profiles = self.store.snapshot(live_status=False)['profiles']
+            target = next((p for p in profiles if p['id'] == body.get('target_profile_id')
+                           and not p.get('archived') and not p.get('ephemeral')), None)
+            if not target or target.get('group_id') or not target.get('use_worktree', True):
+                raise ValueError('Choose an individual worktree agent for the handover.')
+            if Path(target['project']).resolve() != self.path_for(task):
+                raise ValueError('The handover target works in another repository.')
+            if self.active_execution(target['id']):
+                raise ValueError('The handover target is busy; queue the task or choose another agent.')
+            source = next((p for p in profiles if p['id'] == task['profile_id']), {})
+            note = ((task.get('completion_receipt') or {}).get('handover') or run.get('handover'))
+            packet = self.handover_packet(task, run, source, target, note)
+            self.store.manage_session(dict(mode='handover', job_id=run['id'], organization_id=task['organization_id'],
+                                           target_profile_id=target['id'], archive_id=run['session_archive_id'],
+                                           continuation_context=packet, task_prompt=self.task_instructions(task),
+                                           inspected=True, request_id='handover-task-' + task['id']), actor)
+            task['profile_id'] = target['id']
+            task['assigned_agent'] = {k: target.get(k) for k in ('id', 'name', 'role', 'runtime')}
+            task.setdefault('participants', []).append(dict(profile_id=target['id'], run_id=run['id'],
+                name=target.get('name', 'Agent identity unavailable'), role=target.get('role', ''),
+                runtime=target.get('runtime', ''), model=target.get('model'), provider=target.get('provider'),
+                assigned_at=stamp(), provenance='handover'))
+            task.setdefault('handover_history', []).append(dict(
+                from_profile=source.get('id'), from_name=source.get('name'), to_profile=target['id'],
+                to_name=target.get('name'), archive_id=run['session_archive_id'], actor=actor, at=stamp()))
+            task['handover_history'] = task['handover_history'][-20:]
+            task['state'] = 'implementing'
+            task.pop('handoff', None)
+        elif action == 'consult':
+            profiles = self.store.snapshot(live_status=False)['profiles']
+            consultant = next((p for p in profiles if p['id'] == body.get('consultant_profile_id')
+                               and not p.get('archived') and not p.get('ephemeral')), None)
+            question = body.get('question')
+            if not consultant or consultant.get('group_id'):
+                raise ValueError('Choose an individual agent as consultant.')
+            if not isinstance(question, str) or not 1 <= len(question.strip()) <= 2000:
+                raise ValueError('Ask a bounded question (up to 2000 characters).')
+            run = self.active_execution(consultant['id'])
+            if not run or run.get('state') != 'persona_sent':
+                raise ValueError('The consultant has no ready session; launch it first.')
+            state = None
+            try:
+                state = self.store.agent_state(run)
+            except (ValueError, OSError):
+                state = None
+            if not isinstance(state, dict) or state.get('status') not in ('idle', 'done'):
+                raise ValueError('The consultant is busy; ask again when it is idle.')
+            prompt = ('Consultation for task ' + task['id'] + ': ' + task['title'] +
+                      '\nTask state: ' + task['state'] + '\nCandidate: ' + str(task.get('head_sha')) +
+                      '\nQuestion:\n' + question.strip() +
+                      '\nAnswer with evidence from the repository, state uncertainty, and do not modify files.')
+            job = self.store.action('chat', dict(request_id='consult-' + task['id'] + '-' + uuid.uuid4().hex[:12],
+                organization_id=task['organization_id'], profile_id=consultant['id'], prompt=prompt[:8000], wait_seconds=120))
+            self.store.update_job(job['id'], task_id=task['id'], consultation=True, question=question.strip()[:2000])
+            task.setdefault('consultations', []).append(dict(job_id=job['id'], profile_id=consultant['id'],
+                name=consultant.get('name', 'Agent'), question=question.strip()[:2000], at=stamp()))
+            task['consultations'] = task['consultations'][-20:]
         elif action == 'assignment':
             mode = body.get('mode')
             if mode not in ('queue', 'cancel', 'move'):

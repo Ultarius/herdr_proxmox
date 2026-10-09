@@ -14,6 +14,10 @@ def archive(store, run, actor, terminal=None, unavailable=None):
             continue
         messages.append({k: str(job.get(k, ''))[:6000] for k in ('id', 'kind', 'created_at', 'prompt', 'task_prompt', 'task', 'result', 'error')})
     messages = messages[-20:]
+    # Probe resume capability while the agent is still live; Herdr clears its
+    # registration once the pane returns to an idle shell.
+    probe = getattr(store, 'probe_resume', None)
+    resume = probe(run) if probe else dict(state='unavailable', reason='Resume capability was not probed.')
     key = uuid.uuid5(uuid.NAMESPACE_URL, 'herdr-session:' + run['id'] + ':' + str(run.get('alias')) + ':' + hashlib.sha256(json.dumps([terminal, unavailable, messages], sort_keys=True).encode()).hexdigest()).hex
     with store.lock, closing(store.connect()) as db:
         existing = db.execute('SELECT data FROM session_archives WHERE id=?', (key,)).fetchone()
@@ -24,8 +28,9 @@ def archive(store, run, actor, terminal=None, unavailable=None):
         identity=identity, alias=run.get('alias'), pane_id=run.get('pane_id'), archived_at=now(), actor=actor,
         task_id=run.get('task_id'), source_project=run.get('source_project'), worktree_path=run.get('worktree_path'),
         worktree_branch=run.get('worktree_branch'), terminal=terminal, terminal_unavailable=unavailable,
-        terminal_is_complete_transcript=False, messages=messages, native_resume_available=False,
-        native_resume_reason='No verified provider conversation identifier and resume adapter are recorded.')
+        terminal_is_complete_transcript=False, messages=messages, handover=run.get('handover'), resume=resume,
+        native_resume_available=resume.get('state') == 'verified', native_resume_state=resume.get('state', 'unavailable'),
+        native_resume_reference=resume.get('reference'), native_resume_reason=resume.get('reason'))
     try:
         from project_files import project_directory
         from repository_lock import repository_lock
@@ -44,6 +49,12 @@ def archive(store, run, actor, terminal=None, unavailable=None):
     data['sha256'] = hashlib.sha256(evidence.encode('utf-8')).hexdigest()
     with store.lock, closing(store.connect()) as db, db:
         db.execute('INSERT OR IGNORE INTO session_archives VALUES (?,?,?)', (key, run['organization_id'], json.dumps(data)))
+    update = getattr(store, 'update_job', None)
+    if update:
+        try:
+            update(run['id'], resume=resume)
+        except ValueError:
+            pass
     return data
 
 
@@ -58,7 +69,9 @@ def read(store, org_id, archive_id):
 def listing(store, org_id):
     with closing(store.connect()) as db:
         rows = db.execute('SELECT data FROM session_archives WHERE organization_id=? ORDER BY rowid DESC LIMIT 100', (org_id,)).fetchall()
-    return [{k: data.get(k) for k in ('id', 'run_id', 'identity', 'alias', 'pane_id', 'archived_at', 'task_id', 'terminal_unavailable')}
+    return [{k: data.get(k) for k in ('id', 'run_id', 'identity', 'alias', 'pane_id', 'archived_at', 'task_id',
+                                      'terminal_unavailable', 'native_resume_available', 'native_resume_state',
+                                      'native_resume_reference')}
             for row in rows for data in [json.loads(row[0])]]
 
 
@@ -69,8 +82,13 @@ def context(data):
              'Task: ' + str(data.get('task_id')), 'Prior runtime/model: ' + str(data.get('identity', {})),
              'Checkout: ' + str(data.get('worktree_path') or data.get('source_project')),
              'Branch: ' + str(data.get('worktree_branch')), 'Recorded Git evidence: ' + str(data.get('checkout_evidence', data.get('checkout_evidence_unavailable'))),
-             'Prior saved dashboard messages/reports: ' + json.dumps(data.get('messages', []), ensure_ascii=False)[-20000:],
-             'Recent terminal evidence (bounded; may omit earlier conversation):\n' + (data.get('terminal') or data.get('terminal_unavailable') or 'Unavailable')[-12000:]]
+             'Prior saved dashboard messages/reports: ' + json.dumps(data.get('messages', []), ensure_ascii=False)[-20000:]]
+    handover = data.get('handover')
+    if isinstance(handover, dict) and handover:
+        from herdr_errors import format_handover
+        parts.append('Recorded handover note:\n' + format_handover(handover))
+    parts.append('Recent terminal evidence (bounded; may omit earlier conversation):\n'
+                 + (data.get('terminal') or data.get('terminal_unavailable') or 'Unavailable')[-12000:])
     body = '\n\n'.join(parts)
     if len(body) > 22000:
         body = body[:22000] + '\n\n(Handoff truncated; download the archive for full evidence.)'

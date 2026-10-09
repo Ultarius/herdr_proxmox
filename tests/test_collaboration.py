@@ -592,7 +592,7 @@ class CollaborationTests(unittest.TestCase):
             return self.store.action('recover', dict(request_id=uuid.uuid4().hex, organization_id=org, job_id=job_id))
         agent = self.agents[job['group_run']['alias']]
         agent['agent_status'] = 'blocked'
-        with self.assertRaisesRegex(ValueError, 'not ready'):
+        with self.assertRaisesRegex(ValueError, 'needs a decision'):
             recover()
         agent['agent_status'] = 'idle'
         old_session = agent['agent_session']

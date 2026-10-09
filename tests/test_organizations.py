@@ -731,7 +731,8 @@ class OrganizationTests(unittest.TestCase):
         self.drain()
         job = self.store.snapshot()['jobs'][-1]
         self.assertEqual(job['state'], 'needs_attention')
-        self.assertIn('not ready for input', job['error'])
+        self.assertIn('needs a decision', job['error'])
+        self.assertEqual(job['delivery']['stage'], 'blocked')
         self.assertEqual(len([args for args, _ in self.calls if args[:2] == ('agent', 'prompt')]), before)
 
     def test_http_create_hire_and_reconnect_without_herdr(self):
@@ -772,6 +773,138 @@ class OrganizationTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join()
+    def test_archive_records_verified_resume_and_resume_mode_relaunches(self):
+        org = self.organization()
+        profile = self.hire(org, use_worktree=False)
+        run_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        run = next(j for j in self.store.job_records() if j['id'] == run_id)
+        self.agents[run['alias']]['resume'] = {'reference': 'sess-42', 'args': ['--resume', 'sess-42'], 'source': 'test'}
+        closed = self.store.manage_session(dict(job_id=run_id, organization_id=org, mode='close', inspected=True, request_id='resume-close'), 'admin')
+        saved = self.store.manage_session(dict(mode='view_archive', organization_id=org, archive_id=closed['archive_id']), 'admin')
+        self.assertTrue(saved['native_resume_available'])
+        self.assertEqual(saved['resume']['reference'], 'sess-42')
+        before = len(self.calls)
+        self.store.manage_session(dict(job_id=run_id, organization_id=org, mode='resume', inspected=True,
+                                       archive_id=saved['id'], request_id='resume-start'), 'admin')
+        self.drain()
+        resumed = next(j for j in self.store.job_records() if j['id'] == run_id)
+        self.assertEqual(resumed['state'], 'persona_sent', resumed.get('error'))
+        self.assertEqual(resumed['resume_args'], ['--resume', 'sess-42'])
+        start = next(args for args, _ in self.calls[before:] if args[:3] == ('agent', 'start', resumed['alias']))
+        self.assertIn('--resume', start)
+        self.assertIn('sess-42', start)
+
+    def test_resume_mode_requires_a_verified_reference_and_continue_still_works(self):
+        org = self.organization()
+        profile = self.hire(org, use_worktree=False)
+        run_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        run = next(j for j in self.store.job_records() if j['id'] == run_id)
+        self.agents[run['alias']]['resume'] = {'reference': 'sess-9'}
+        closed = self.store.manage_session(dict(job_id=run_id, organization_id=org, mode='close', inspected=True, request_id='reported-close'), 'admin')
+        with self.assertRaisesRegex(ValueError, 'no verified native resume'):
+            self.store.manage_session(dict(job_id=run_id, organization_id=org, mode='resume', inspected=True,
+                                           archive_id=closed['archive_id'], request_id='reported-resume'), 'admin')
+        self.store.manage_session(dict(job_id=run_id, organization_id=org, mode='continue', inspected=True,
+                                       archive_id=closed['archive_id'], request_id='context-continue'), 'admin')
+        self.drain()
+        continued = next(j for j in self.store.job_records() if j['id'] == run_id)
+        self.assertEqual(continued['state'], 'persona_sent', continued.get('error'))
+
+    def test_startup_annotates_session_liveness_without_changing_state(self):
+        org = self.organization()
+        profile = self.hire(org, use_worktree=False)
+        run_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        run = next(j for j in self.store.job_records() if j['id'] == run_id)
+        restarted = gateway.OrganizationStore(self.store.path, self.projects, self.command)
+        try:
+            annotated = next(j for j in restarted.job_records() if j['id'] == run_id)
+            self.assertEqual(annotated['state'], 'persona_sent')
+            self.assertEqual(annotated['session_liveness'], 'present')
+            self.agents.pop(run['alias'])
+            missing = gateway.OrganizationStore(self.store.path, self.projects, self.command)
+            try:
+                inspected = next(j for j in missing.job_records() if j['id'] == run_id)
+                self.assertEqual(inspected['state'], 'persona_sent')
+                self.assertEqual(inspected['session_liveness'], 'missing')
+            finally:
+                missing.close()
+        finally:
+            restarted.close()
+
+    def test_terminal_job_states_wake_the_poller(self):
+        org = self.organization()
+        profile = self.hire(org, use_worktree=False)
+        run_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        self.store.jobs_changed.clear()
+        self.store.update_job(run_id, state='finished')
+        self.assertTrue(self.store.jobs_changed.is_set())
+
+    def test_input_records_operator_and_allows_shift_tab(self):
+        org = self.organization()
+        profile = self.hire(org, use_worktree=False)
+        self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        job_id = self.action('input', organization_id=org, profile_id=profile, key='shift+tab', _actor='damien')
+        self.drain()
+        job = next(j for j in self.store.job_records() if j['id'] == job_id)
+        self.assertEqual(job['state'], 'input_sent')
+        self.assertEqual(job['actor'], 'damien')
+        with self.assertRaisesRegex(ValueError, 'Unsupported terminal key'):
+            self.store.action('input', dict(request_id=uuid.uuid4().hex, organization_id=org, profile_id=profile, key='ctrl+z'))
+
+    def test_handover_mode_relaunches_archived_run_as_the_target_profile(self):
+        subprocess.run(['git', 'init', str(self.projects)], check=True, capture_output=True)
+        (self.projects / 'tracked.txt').write_text('base')
+        subprocess.run(['git', '-C', str(self.projects), 'add', '.'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.projects), '-c', 'user.name=Test',
+                        '-c', 'user.email=test@example.test', 'commit', '-m', 'base'], check=True, capture_output=True)
+        org = self.organization()
+        maya = self.hire(org, use_worktree=False)
+        noah = self.hire(org, 'Noah', use_worktree=False)
+        run_id = self.action('launch', organization_id=org, profile_id=maya)
+        self.drain()
+        closed = self.store.manage_session(dict(job_id=run_id, organization_id=org, mode='close', inspected=True, request_id='handover-close'), 'admin')
+        before = len(self.calls)
+        self.store.manage_session(dict(job_id=run_id, organization_id=org, mode='handover', target_profile_id=noah,
+                                       archive_id=closed['archive_id'], continuation_context='Handover packet for the next agent.',
+                                       task_prompt='Task: keep going', inspected=True, request_id='handover-move'), 'admin')
+        self.drain()
+        moved = next(j for j in self.store.job_records() if j['id'] == run_id)
+        self.assertEqual(moved['state'], 'persona_sent', moved.get('error'))
+        self.assertEqual(moved['profile_id'], noah)
+        self.assertEqual(moved['handed_from']['profile_id'], maya)
+        self.assertEqual(moved['continuation_context'], 'Handover packet for the next agent.')
+        self.assertEqual(moved['task_prompt'], 'Task: keep going')
+        start = next(args for args, _ in self.calls[before:] if args[:3] == ('agent', 'start', moved['alias']))
+        self.assertEqual(start[4], 'codex')
+
+    def test_handover_mode_refuses_busy_target_and_other_repository(self):
+        subprocess.run(['git', 'init', str(self.projects)], check=True, capture_output=True)
+        (self.projects / 'tracked.txt').write_text('base')
+        subprocess.run(['git', '-C', str(self.projects), 'add', '.'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.projects), '-c', 'user.name=Test',
+                        '-c', 'user.email=test@example.test', 'commit', '-m', 'base'], check=True, capture_output=True)
+        org = self.organization()
+        maya = self.hire(org, use_worktree=False)
+        noah = self.hire(org, 'Noah', use_worktree=False)
+        run_id = self.action('launch', organization_id=org, profile_id=maya)
+        self.drain()
+        closed = self.store.manage_session(dict(job_id=run_id, organization_id=org, mode='close', inspected=True, request_id='handover-close'), 'admin')
+        body = dict(job_id=run_id, organization_id=org, mode='handover', target_profile_id=noah,
+                    archive_id=closed['archive_id'], continuation_context='packet', task_prompt='Task: keep going', inspected=True)
+        self.action('launch', organization_id=org, profile_id=noah)
+        self.drain()
+        with self.assertRaisesRegex(ValueError, 'active execution'):
+            self.store.manage_session(dict(body, request_id='busy-target'), 'admin')
+        other = self.projects / 'other'
+        other.mkdir(exist_ok=True)
+        outsider = self.hire(org, 'Outsider', project=str(other))
+        with self.assertRaisesRegex(ValueError, 'another repository'):
+            self.store.manage_session(dict(body, target_profile_id=outsider, request_id='foreign-target'), 'admin')
 
 
 if __name__ == '__main__':

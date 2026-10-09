@@ -36,6 +36,7 @@ from updates import Updates
 from validation import ValidationRuns
 from github_api import GitHub, GitHubError
 from contributions import Contributions
+from herdr_errors import HerdrError, is_read_only, parse_error
 
 ROOT = Path(os.environ.get('HERDR_WEB_ROOT', '/opt/herdr-web/public')).resolve()
 PROJECTS = Path(os.environ.get('HERDR_PROJECTS', '/home/herdr/projects')).resolve()
@@ -46,18 +47,30 @@ BUILD_SERVICE_CONFIG = Path('/etc/herdr/build-service.json')
 
 
 def command(*args, timeout=10):
-    result = subprocess.run([BIN, *args], capture_output=True, text=True, timeout=timeout)
-    if result.returncode:
-        raise ValueError(result.stderr.strip()[:500] or 'Herdr command failed; start Herdr over SSH first.')
-    if args[:2] == ('agent', 'read'):
-        return {'output': result.stdout[-40000:]}
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise ValueError('Unexpected Herdr response; check the installed CLI version.') from exc
-    if isinstance(data, dict) and 'error' in data:
-        raise ValueError(str(data['error'])[:500])
-    return data.get('result', data) if isinstance(data, dict) else data
+    operation = ' '.join(args[:2])
+    attempts = 2 if is_read_only(args) else 1
+    for attempt in range(attempts):
+        try:
+            result = subprocess.run([BIN, *args], capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if attempt + 1 < attempts:
+                continue
+            raise HerdrError('Herdr command timed out.', 'timeout', operation, 'unknown') from None
+        if result.returncode:
+            error = parse_error(result.stderr, operation)
+            if error.code == 'herdr_error' and result.stdout.lstrip().startswith('{'):
+                error = parse_error(result.stdout, operation)
+            raise error
+        if args[:2] == ('agent', 'read'):
+            return {'output': result.stdout[-40000:]}
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise ValueError('Unexpected Herdr response; check the installed CLI version.') from exc
+        if isinstance(data, dict) and 'error' in data:
+            raise parse_error(result.stdout, operation)
+        return data.get('result', data) if isinstance(data, dict) else data
+    raise HerdrError('Herdr command failed.', 'herdr_error', operation)
 
 
 def listing(data, field):
@@ -475,7 +488,7 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'resolve_delegation', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'retry_discussion', 'cancel_discussion', 'remove_agent', 'remove_group', 'session')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close', 'verify')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/updates/alphas', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/guidance', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build', '/api/tasks/policy', '/api/tasks/complete', '/api/tasks/discuss', '/api/tasks/review_policy', '/api/tasks/proposal', '/api/tasks/assignment', '/api/tasks/automation', '/api/tasks/discovery'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/knowledge', '/api/updates/install', '/api/updates/check', '/api/updates/alphas', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/guidance', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build', '/api/tasks/policy', '/api/tasks/complete', '/api/tasks/discuss', '/api/tasks/review_policy', '/api/tasks/proposal', '/api/tasks/assignment', '/api/tasks/automation', '/api/tasks/discovery', '/api/tasks/handover', '/api/tasks/consult'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -536,6 +549,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, project_explorer.browse(PROJECTS, body))
             elif self.path == '/api/projects/clone':
                 self.reply(200, self.server.projects.start(body))
+            elif self.path == '/api/knowledge':
+                self.reply(200, self.server.contributions.knowledge.action(body, actor, role))
             elif self.path == '/api/models':
                 self.reply(200, model_catalog.discover_models(self.server.cli_setup, PROJECTS, body))
             elif self.path == '/api/updates/check':
@@ -580,6 +595,9 @@ class Handler(BaseHTTPRequestHandler):
                 if role != 'admin':
                     raise ValueError('Only an administrator can retry or cancel discussion preparation.')
                 self.reply(200, self.server.organizations.action(organization_actions[self.path], body))
+            elif self.path == '/api/organizations/input':
+                # Terminal key actions record the operator for audit.
+                self.reply(200, self.server.organizations.action('input', dict(body, _actor=actor)))
             elif self.path == '/api/organizations/resolve_delegation':
                 if role != 'admin':
                     raise ValueError('Only an administrator can resolve delegation ownership.')

@@ -355,6 +355,12 @@ class _AppShellState extends State<AppShell> {
             'organization',
           ),
           nav('Tasks', Icons.task_alt, TasksRoute(), 'tasks'),
+          nav(
+            'Project knowledge',
+            Icons.menu_book_outlined,
+            KnowledgeRoute(),
+            'knowledge',
+          ),
           nav('Agent activity', Icons.bolt_outlined, AgentsRoute(), 'agents'),
           heading('WORKSPACE'),
           nav(

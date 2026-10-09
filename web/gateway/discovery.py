@@ -150,6 +150,9 @@ def evidence_pack(service, policy):
     add('operations', 'deployment', json.dumps(build_snapshot()))
     add('operations', 'validation', 'Validation executor: ' + str(executor)
         + '. Individual test counts are not available in these records; do not infer them.')
+    knowledge_pack = service.knowledge.context(policy['organization_id'], [policy['discovery_repository']], policy.get('product_brief', ''), limit=5000)
+    for record in knowledge_pack['records'][:4]:
+        add('knowledge', 'knowledge:' + record['id'], json.dumps(record))
     order = {'backlog': 0, 'operations': 1, 'failed_checks': 2, 'repository_map': 3, 'docs_inventory': 4, 'readme': 5, 'recent_outcomes': 6}
     items.sort(key=lambda item: order.get(item['kind'], 7))
     for i, item in enumerate(items):

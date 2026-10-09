@@ -66,6 +66,58 @@ Provider-native conversation resume is not available. Herdr session identity is 
 proof of a provider conversation ID. Continuing an archived session supplies saved
 context to a fresh session; it never claims to restore provider state.
 
+## Handover, consultations and instances
+
+A finished session can hand its task to another agent without losing context.
+The outgoing agent may record a bounded `handover` note in its completion
+receipt (state, decisions, open questions, next step); it is captured as
+reported knowledge and included in the handover packet. Handover requires an
+archived source session, a same-repository target with no active execution, and
+produces a packet of task evidence, the handover note and relevant knowledge.
+The target continues in the same checkout with a fresh session and receipt
+token, and the lineage is recorded on both sides.
+
+Consultations ask a live individual agent a bounded question from a task. The
+answer is stored as reported knowledge on the task and never counts as
+validation evidence; the consultant must be idle and has no task authority.
+
+Template instances run a task as an ephemeral parallel copy of a profile's
+persona, model and permissions: their own profile record, session and worktree,
+bounded per template, and closed automatically when the task reaches a terminal
+state. They appear as executions, not as new team members, and never join
+rosters, queues or discussions.
+
+## Decisions, delivery certainty and wake
+
+A blocked agent is a first-class condition, not a generic failure. Availability
+reports **needs your decision** when the recorded delivery stage is `blocked` or
+the live agent reports `blocked`, including a bounded preview of the visible
+screen. Operator actions (Send Enter, Send Escape, Cycle permission mode) are
+ordinary audited input jobs: ownership is revalidated immediately before keys are
+sent and the operator name is recorded. Keys are labeled by their effect because
+Enter does not universally mean approval.
+
+Delivery certainty is preserved from the CLI's structured errors:
+
+- `none` - the operation was refused before any input (for example
+  `agent_blocked`); the prompt stays pending and may be retried safely;
+- `unknown` - a timeout or stalled submission may have delivered input; inspect
+  before retrying and never replay automatically;
+- `sent` - the prompt was submitted; the recorded completion baseline (sequence
+  plus server/session scope) lets later reconciliation decide whether a completed
+  turn is newer than this dispatch.
+
+Read-only Herdr commands retry once on timeout; prompt-like commands never retry.
+After a restart, bound sessions are annotated present or missing without state
+changes, and interrupted queued or running jobs remain `uncertain`.
+
+Job state changes wake reconciliation immediately instead of waiting for the next
+ten-second cycle; the periodic snapshot remains authoritative and the timeout is
+only a backstop. Events never decide work - locks, receipts and idempotent job
+transitions still do.
+
+
+
 ## Startup sessions and availability
 
 Hiring or turning on an agent creates a startup session: the persona is

@@ -273,6 +273,67 @@ void main() {
       await BlocScope.reset();
     },
   );
+  testWidgets('a blocked agent shows the decision banner and sends audited keys', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(500, 1400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final task = <String, dynamic>{
+      'id': 'task',
+      'title': 'Blocked task',
+      'state': 'implementing',
+      'repository': 'repo',
+      'organization_id': 'org',
+      'assigned_agent': {'name': 'Nora'},
+      'availability': {
+        'state': 'decision',
+        'action': 'interact',
+        'run_id': 'run',
+        'profile_id': 'worker',
+        'code': 'agent_blocked',
+        'preview': 'Allow Bash?',
+      },
+    };
+    final posts = <Map<String, dynamic>>[];
+    final connection = DashboardBloc(
+      client: MockClient((request) async {
+        if (request.method == 'POST') {
+          posts.add(Map<String, dynamic>.from(jsonDecode(request.body)));
+        }
+        return http.Response(
+          jsonEncode(
+            request.url.path.endsWith('/tasks')
+                ? {
+                    'tasks': [task],
+                    'github': {},
+                  }
+                : task,
+          ),
+          200,
+        );
+      }),
+    );
+    BlocScope.register<DashboardBloc>(() => connection);
+    connection.connect('token');
+    connection.operator.value = {'role': 'admin'};
+    await tester.pumpWidget(
+      const MaterialApp(home: Scaffold(body: TasksPage(taskId: 'task'))),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Nora needs your decision'), findsOneWidget);
+    expect(find.textContaining('Allow Bash?'), findsOneWidget);
+    await tester.tap(find.text('Send Escape'));
+    await tester.pumpAndSettle();
+    expect(posts.single['key'], 'esc');
+    expect(posts.single['profile_id'], 'worker');
+    expect(posts.single['organization_id'], 'org');
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await connection.disconnect();
+    await BlocScope.reset();
+  });
   testWidgets(
     'a ready startup session offers Start implementation with rotation context',
     (tester) async {
@@ -587,6 +648,51 @@ void main() {
     expect(posts.single['organization_id'], 'org');
     expect(posts.single['auto_queue_proposals'], true);
     expect(posts.single['daily_cap'], 5);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await connection.disconnect();
+    await BlocScope.reset();
+  });
+  testWidgets('a free agent offers a parallel template instance', (
+    tester,
+  ) async {
+    final task = <String, dynamic>{
+      'id': 'task',
+      'title': 'Next task',
+      'state': 'draft',
+      'repository': 'repo',
+      'organization_id': 'org',
+    };
+    final posts = <Map<String, dynamic>>[];
+    final connection = DashboardBloc(
+      client: MockClient((request) async {
+        if (request.method == 'POST') {
+          posts.add(Map<String, dynamic>.from(jsonDecode(request.body)));
+        }
+        return http.Response(
+          jsonEncode(
+            request.url.path.endsWith('/tasks')
+                ? {
+                    'tasks': [task],
+                    'github': {},
+                  }
+                : task,
+          ),
+          200,
+        );
+      }),
+    );
+    BlocScope.register<DashboardBloc>(() => connection);
+    connection.connect('token');
+    connection.operator.value = {'role': 'admin'};
+    await tester.pumpWidget(
+      const MaterialApp(home: Scaffold(body: TasksPage(taskId: 'task'))),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.textContaining('Instance of'));
+    await tester.pumpAndSettle();
+    expect(posts.single['as_instance'], true);
+    expect(posts.single['task_id'], 'task');
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
     await connection.disconnect();

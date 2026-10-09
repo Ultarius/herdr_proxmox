@@ -498,6 +498,15 @@ class _GroupPageState extends State<GroupPage> {
                         ),
                       ],
                     ),
+                    TextButton.icon(
+                      onPressed: () => widget.coordinator.push(
+                        KnowledgeRoute(group!['organization_id'] as String),
+                      ),
+                      icon: const Icon(Icons.menu_book_outlined),
+                      label: const Text(
+                        'Project knowledge used by discussions',
+                      ),
+                    ),
                     const SizedBox(height: 12),
                     Text(
                       (group!['description'] as String).split('\n').first,

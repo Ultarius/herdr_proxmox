@@ -1179,6 +1179,256 @@ class _TasksPageState extends State<TasksPage> {
     ),
   );
 
+  Future<void> sendKey(Map<String, dynamic> task, String key) async {
+    if (busy || !admin) return;
+    final epoch = connection.generation;
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      await connection.request('organizations/input', {
+        'organization_id': task['organization_id'],
+        'profile_id': (task['availability'] as Map?)?['profile_id'],
+        'key': key,
+      });
+      if (!mounted || epoch != connection.generation) return;
+      if (pending != null) await pending;
+      if (mounted && epoch == connection.generation) await refresh();
+    } catch (e) {
+      if (mounted && epoch == connection.generation)
+        setState(() => error = '$e');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Widget _decision(Map<String, dynamic> task) {
+    final availability = task['availability'] as Map?;
+    final preview = '${availability?['preview'] ?? ''}';
+    return Card(
+      color: Theme.of(context).colorScheme.errorContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '${taskAgentName(task, fallback: 'The agent')} needs your decision',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 8),
+            if (preview.isNotEmpty)
+              SelectableText(preview)
+            else
+              const Text('The agent is waiting at a prompt.'),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton(
+                  onPressed: admin && !busy
+                      ? () => sendKey(task, 'enter')
+                      : null,
+                  child: const Text('Send Enter'),
+                ),
+                OutlinedButton(
+                  onPressed: admin && !busy
+                      ? () => sendKey(task, 'esc')
+                      : null,
+                  child: const Text('Send Escape'),
+                ),
+                OutlinedButton(
+                  onPressed: admin && !busy
+                      ? () => sendKey(task, 'shift+tab')
+                      : null,
+                  child: const Text('Cycle permission mode'),
+                ),
+                if (widget.coordinator != null)
+                  TextButton(
+                    onPressed: () =>
+                        widget.coordinator!.navigate(OrganizationRoute('runs')),
+                    child: const Text('Inspect session'),
+                  ),
+              ],
+            ),
+            const Text(
+              'Keys are sent only to the inspected session and recorded with your operator name. Enter does not always mean approval.',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> _agents(Map task) async {
+    final directory = await connection.request('organizations/directory');
+    final profiles = List<Map<String, dynamic>>.from(directory['profiles'] ?? []);
+    final repository = '${task['repository']}'.replaceAll('\\', '/');
+    return profiles
+        .where(
+          (p) =>
+              p['group_id'] == null &&
+              '${p['project']}'.replaceAll('\\', '/').endsWith('/$repository'),
+        )
+        .toList();
+  }
+
+  Map? _archivedRun(Map task) {
+    for (final session in task['sessions'] as List? ?? []) {
+      if (session is Map &&
+          session['id'] == task['run_id'] &&
+          ['finished', 'released'].contains(session['state']) &&
+          session['session_closed_at'] != null)
+        return session;
+    }
+    return null;
+  }
+
+  Future<void> handoverTask(Map<String, dynamic> task) async {
+    try {
+      final agents = await _agents(task);
+      final current = '${task['profile_id']}';
+      final choices = agents.where((p) => '${p['id']}' != current).toList();
+      if (!mounted) return;
+      if (choices.isEmpty) {
+        setState(() => error = 'No other agent works in this repository.');
+        return;
+      }
+      String? target = '${choices.first['id']}';
+      final chosen = await showDialog<String>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+          builder: (context, update) => AlertDialog(
+            title: const Text('Hand over this task'),
+            content: SizedBox(
+              width: 480,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'The current session is archived. The next agent receives the task, the recorded evidence and any handover note, and continues in the same checkout.',
+                  ),
+                  DropdownButtonFormField<String>(
+                    initialValue: target,
+                    isExpanded: true,
+                    decoration: const InputDecoration(labelText: 'Next agent'),
+                    items: [
+                      for (final p in choices)
+                        DropdownMenuItem(
+                          value: '${p['id']}',
+                          child: Text('${p['name']}'),
+                        ),
+                    ],
+                    onChanged: (v) => update(() => target = v),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, target),
+                child: const Text('Hand over and start'),
+              ),
+            ],
+          ),
+        ),
+      );
+      if (chosen != null && mounted)
+        await act('handover', {
+          'task_id': task['id'],
+          'target_profile_id': chosen,
+        });
+    } catch (e) {
+      if (mounted) setState(() => error = '$e');
+    }
+  }
+
+  Future<void> consultTask(Map<String, dynamic> task) async {
+    try {
+      final agents = await _agents(task);
+      if (!mounted) return;
+      if (agents.isEmpty) {
+        setState(() => error = 'No agent works in this repository.');
+        return;
+      }
+      String? consultant = '${agents.first['id']}';
+      final question = TextEditingController();
+      final chosen = await showDialog<String>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+          builder: (context, update) => AlertDialog(
+            title: const Text('Ask a consultant'),
+            content: SizedBox(
+              width: 480,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'The answer is recorded as reported knowledge on this task. It is not validation evidence.',
+                  ),
+                  DropdownButtonFormField<String>(
+                    initialValue: consultant,
+                    isExpanded: true,
+                    decoration: const InputDecoration(labelText: 'Consultant'),
+                    items: [
+                      for (final p in agents)
+                        DropdownMenuItem(
+                          value: '${p['id']}',
+                          child: Text('${p['name']}'),
+                        ),
+                    ],
+                    onChanged: (v) => update(() => consultant = v),
+                  ),
+                  TextField(
+                    controller: question,
+                    maxLength: 2000,
+                    minLines: 3,
+                    maxLines: 6,
+                    decoration: const InputDecoration(
+                      labelText: 'Question',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(
+                  context,
+                  question.text.trim().isEmpty
+                      ? null
+                      : '$consultant\u0000${question.text}',
+                ),
+                child: const Text('Ask'),
+              ),
+            ],
+          ),
+        ),
+      );
+      question.dispose();
+      if (chosen != null && mounted) {
+        final parts = chosen.split('\u0000');
+        await act('consult', {
+          'task_id': task['id'],
+          'consultant_profile_id': parts.first,
+          'question': parts.length > 1 ? parts[1] : '',
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => error = '$e');
+    }
+  }
+
   String _blockingSessionLine(Map blocking, [Map? availability]) {
     final run = '${blocking['run_id'] ?? ''}';
     final short = run.isEmpty
@@ -1319,6 +1569,16 @@ class _TasksPageState extends State<TasksPage> {
                   : null,
               icon: const Icon(Icons.schedule),
               label: const Text('Queue for this agent'),
+            ),
+            OutlinedButton.icon(
+              onPressed: admin && !busy
+                  ? () => act('launch', {
+                      'task_id': task['id'],
+                      'as_instance': true,
+                    })
+                  : null,
+              icon: const Icon(Icons.copy_all_outlined),
+              label: Text('Instance of ${taskAgentName(task)}'),
             ),
           ],
         );
@@ -1586,6 +1846,7 @@ class _TasksPageState extends State<TasksPage> {
           ),
           const SizedBox(height: 20),
           if (section == 'Overview') ...[
+            if (task['availability']?['state'] == 'decision') _decision(task),
             if (task['source'] is Map) ...[
               Text(
                 'Follow-up proposed by group ${task['source']['group_id']} in meeting ${task['source']['meeting_id']}',
@@ -1603,6 +1864,27 @@ class _TasksPageState extends State<TasksPage> {
             Text(
               'Assigned agent: ${taskAgentName(task, fallback: 'Identity unavailable')}',
             ),
+            if (task['execution'] is Map)
+              Text(
+                'Execution: parallel instance of ${(task['execution'] as Map)['template_name'] ?? 'a template'}',
+              ),
+            for (final consult in task['consultations'] as List? ?? [])
+              if (consult is Map)
+                ExpansionTile(
+                  title: Text(
+                    'Consultation \u00b7 ${consult['name'] ?? ''} \u00b7 ${consult['state']}',
+                  ),
+                  subtitle: Text(
+                    '${consult['question'] ?? ''}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  children: [
+                    SelectableText(
+                      '${consult['answer'] ?? ''}${(consult['error'] as String? ?? '').isNotEmpty ? '\n' + consult['error'] : ''}',
+                    ),
+                  ],
+                ),
             if (task['error'] != null) Text('Task issue: ${task['error']}'),
             if (task['automation_error'] != null)
               Text('Automation waiting: ${task['automation_error']}'),
@@ -1653,6 +1935,23 @@ class _TasksPageState extends State<TasksPage> {
                           : null,
                       child: const Text('Edit policy'),
                     ),
+                  ),
+                if (admin)
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      TextButton.icon(
+                        onPressed: busy ? null : () => consultTask(task),
+                        icon: const Icon(Icons.support_agent),
+                        label: const Text('Ask a consultant'),
+                      ),
+                      if (_archivedRun(task) != null)
+                        TextButton.icon(
+                          onPressed: busy ? null : () => handoverTask(task),
+                          icon: const Icon(Icons.swap_horiz),
+                          label: const Text('Hand over to another agent'),
+                        ),
+                    ],
                   ),
               ],
             ),

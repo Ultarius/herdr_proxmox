@@ -9,6 +9,31 @@ import 'group_page.dart';
 import 'project_explorer_page.dart';
 import 'builds_page.dart';
 import 'tasks_page.dart';
+import 'knowledge_page.dart';
+
+class KnowledgeRoute extends AppRoute {
+  KnowledgeRoute([this.organizationId = '']);
+  final String organizationId;
+  @override
+  List<Object?> get props => [organizationId];
+  @override
+  Uri toUri() => Uri(
+    path: '/knowledge',
+    queryParameters: organizationId.isEmpty
+        ? null
+        : {'organization': organizationId},
+  );
+  @override
+  Widget build(AppCoordinator coordinator, BuildContext context) => AppShell(
+    coordinator: coordinator,
+    section: 'knowledge',
+    child: KnowledgePage(
+      key: ValueKey(organizationId),
+      coordinator: coordinator,
+      organizationId: organizationId,
+    ),
+  );
+}
 
 class TasksRoute extends AppRoute {
   @override
@@ -180,6 +205,7 @@ class AppCoordinator extends Coordinator<AppRoute> {
       '/configuration' => CliSetupRoute(),
       '/builds' => BuildsRoute(),
       '/tasks' => TasksRoute(),
+      '/knowledge' => KnowledgeRoute(uri.queryParameters['organization'] ?? ''),
       '/logs' => LogsRoute(),
       '/explorer' => ExplorerRoute(uri.queryParameters['path'] ?? ''),
       _ => NotFoundRoute(uri),
