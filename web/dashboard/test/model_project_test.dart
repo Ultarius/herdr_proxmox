@@ -19,6 +19,7 @@ void main() {
           if (projects.length == 1) return stale.future;
           return http.Response(
             jsonEncode({
+              'source': 'opencode models --verbose',
               'models': [
                 {'provider': 'new', 'id': 'model', 'name': 'New model'},
               ],
@@ -55,7 +56,6 @@ void main() {
         ),
       ),
     );
-    await tester.tap(find.text('Load models from OpenCode'));
     await tester.pump();
     project.value = '/home/herdr/projects/new';
     await tester.pump();
@@ -70,9 +70,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    expect(find.text('Load models from OpenCode'), findsOneWidget);
-    await tester.tap(find.text('Load models from OpenCode'));
-    await tester.pumpAndSettle();
+    expect(find.text('Refresh models'), findsOneWidget);
     expect(projects, ['/home/herdr/projects/old', '/home/herdr/projects/new']);
     await tester.tap(
       find.byWidgetPredicate(

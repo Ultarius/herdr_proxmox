@@ -41,7 +41,7 @@ class ModelCatalogTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'openai/missing'):
                 model_catalog.validate_selection(cli, Path('.'), dict(profile, model='missing'))
             data['supports_variants'] = False
-            with self.assertRaisesRegex(ValueError, 'v2'):
+            with self.assertRaisesRegex(ValueError, 'managed agent variants'):
                 model_catalog.validate_selection(cli, Path('.'), profile)
             model_catalog.validate_selection(cli, Path('.'), dict(profile, reasoning=''))
 
@@ -189,6 +189,64 @@ class ModelCatalogTests(unittest.TestCase):
             server.server_close()
             thread.join()
 
+
+    def test_persistent_cache_reuse_force_and_failed_refresh_preserve_good_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cli = Mock(home=root)
+            cli.binary.return_value = str(root / 'opencode')
+            body = dict(runtime='opencode', project=str(root))
+            catalog = dict(models=[dict(provider='go', id='test', reasoning=['high'])], supports_variants=True)
+            with patch.object(model_catalog, '_discover_models', return_value=catalog) as discover:
+                model_catalog.discover_models(cli, root, body)
+                self.assertTrue(model_catalog.discover_models(cli, root, body)['cached'])
+                self.assertEqual(discover.call_count, 1)
+                model_catalog.discover_models(cli, root, dict(body, force=True))
+                self.assertEqual(discover.call_count, 2)
+            with patch.object(model_catalog, '_discover_models', side_effect=ValueError('bad metadata')):
+                with self.assertRaisesRegex(ValueError, 'bad metadata'):
+                    model_catalog.discover_models(cli, root, dict(body, force=True))
+                self.assertEqual(model_catalog.discover_models(cli, root, body)['models'], catalog['models'])
+
+    def test_parse_failure_has_identifier_location_length_and_digest(self):
+        with self.assertRaisesRegex(ValueError, r'go/test; line .*output length .*digest'):
+            model_catalog.parse_models('go/test\n{"name":')
+
+    def test_known_v1_supports_agent_variants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cli = Mock(home=root)
+            cli.binary.return_value = str(root / 'opencode')
+            with patch.object(model_catalog.subprocess, 'run', side_effect=[Mock(returncode=0, stdout=VERBOSE), Mock(returncode=0, stdout='1.18.35')]):
+                self.assertTrue(model_catalog.discover_models(cli, root, dict(runtime='opencode', project=str(root)))['supports_variants'])
+
+
+    def test_old_missing_model_refreshes_and_config_changes_invalidate_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cli = Mock(home=root)
+            cli.binary.return_value = str(root / 'opencode')
+            body = dict(runtime='opencode', project=str(root))
+            catalog = dict(models=[dict(provider='go', id='old', reasoning=[])], supports_variants=True)
+            with patch.object(model_catalog.time, 'time', return_value=1000), patch.object(model_catalog, '_discover_models', return_value=catalog):
+                model_catalog.discover_models(cli, root, body)
+            new = dict(models=[dict(provider='go', id='new', reasoning=[])], supports_variants=True)
+            with patch.object(model_catalog.time, 'time', return_value=1120), patch.object(model_catalog, '_discover_models', return_value=new) as discover:
+                model_catalog.discover_models(cli, root, dict(body, provider='go', model='new'))
+                self.assertEqual(discover.call_count, 1)
+                (root / 'opencode.json').write_text('{}')
+                model_catalog.discover_models(cli, root, body)
+                self.assertEqual(discover.call_count, 2)
+
+    def test_one_malformed_enumeration_retries_read_only_then_caches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cli = Mock(home=root)
+            cli.binary.return_value = str(root / 'opencode')
+            with patch.object(model_catalog.subprocess, 'run', side_effect=[Mock(returncode=0, stdout='go/test\n{"name":'), Mock(returncode=0, stdout=VERBOSE), Mock(returncode=0, stdout='1.18.35')]) as run:
+                self.assertEqual(len(model_catalog.discover_models(cli, root, dict(runtime='opencode', project=str(root)))['models']), 2)
+                self.assertEqual(run.call_count, 3)
+                self.assertEqual(run.call_args_list[1].args[0][1:], ['models', '--verbose'])
 
 if __name__ == '__main__':
     unittest.main()

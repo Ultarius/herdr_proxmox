@@ -29,20 +29,22 @@ def permission_mode(body, runtime):
 def prepare_permissions(profile, output_root, home=None):
     mode = permission_mode(profile, profile['runtime'])
     paths = accessible_paths(profile, profile['runtime'])
-    if profile['runtime'] != 'opencode' or (mode == 'default' and not paths):
+    variant = bool(profile.get('provider') and profile.get('model') and profile.get('reasoning'))
+    if profile['runtime'] != 'opencode' or (mode == 'default' and not paths and not variant):
         return []
     name = 'herdr-dashboard-' + profile['id']
     if mode == 'dashboard_outputs':
         paths = [str(Path(output_root) / folder / '**')
                  for folder in ('chat-replies', 'discussion-artifacts')] + paths
-    permission = 'allow' if mode == 'full_autonomy' else {
+    permission = {} if mode == 'default' and not paths else 'allow' if mode == 'full_autonomy' else {
         'external_directory': {pattern: 'allow' for pattern in paths}
     }
     path = Path(home or Path.home()) / '.config/opencode/agents' / (name + '.md')
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # JSON objects and strings are valid YAML values in OpenCode's frontmatter.
     contents = ('---\ndescription: Dashboard-managed permission policy\nmode: primary\n'
-                'permission: ' + json.dumps(permission) + '\n---\n'
+                'permission: ' + json.dumps(permission) + '\n' +
+                ('model: ' + json.dumps(profile['provider'] + '/' + profile['model']) + '\nvariant: ' + json.dumps(profile['reasoning']) + '\n' if variant else '') + '---\n'
                 'Follow the conversation instructions and assigned persona.\n')
     if path.is_symlink():
         raise ValueError('Dashboard permission file must not be a symlink.')

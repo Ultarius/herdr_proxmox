@@ -993,6 +993,38 @@ class ContributionTests(unittest.TestCase):
         self.assertEqual((request['mode'], request['job_id'], request['inspected']), ('finish', 'startup-run', True))
         self.assertTrue(request['request_id'].startswith('rotate-'))
 
+    def test_retry_preflight_reuses_unallocated_run_only_after_validation(self):
+        self.task.update(run_id='run', state='implementing')
+        self.service.save(self.task, 'launch', 'admin')
+        run = dict(id='run', kind='launch', state='needs_attention', launch_stage='preflight', profile_id='worker', profile=dict(runtime='opencode', project=str(self.repo)))
+        self.store.snapshot.return_value['jobs'] = [run]
+        self.store.model_validator = MagicMock(side_effect=ValueError('still invalid'))
+        with self.assertRaisesRegex(ValueError, 'still invalid'):
+            self.service.action('launch', dict(request_id='retry-bad', task_id=self.task['id']), 'admin', 'admin')
+        self.store.worker.submit.assert_not_called()
+        self.store.model_validator.side_effect = None
+        self.service.action('launch', dict(request_id='retry-good', task_id=self.task['id']), 'admin', 'admin')
+        self.store.update_job.assert_called_once()
+        self.assertEqual(self.store.update_job.call_args.args, ('run',))
+        self.assertEqual(self.store.update_job.call_args.kwargs['state'], 'queued')
+        self.assertEqual(self.store.update_job.call_args.kwargs['profile']['id'], 'worker')
+        self.store.worker.submit.assert_called_once_with(self.store.execute, 'run')
+
+    def test_retryable_model_preflight_never_replays_an_allocated_launch(self):
+        run = dict(kind='launch', state='needs_attention', launch_stage='preflight')
+        self.assertTrue(self.service.retryable_preflight(run))
+        self.assertTrue(self.service.retryable_preflight(dict(kind='launch', state='needs_attention', error='OpenCode returned incomplete model metadata. Inspect SSH before retrying; terminal input may have been sent.')))
+        for change in (dict(pane_id='w1:p1'), dict(worktree_path='/project/tree'), dict(agent_session='session'), dict(state='running'), dict(launch_stage='agent_starting')):
+            self.assertFalse(self.service.retryable_preflight(dict(run, **change)))
+
+    def test_model_preflight_failure_keeps_startup_pane(self):
+        startup = dict(id='startup-run', kind='launch', organization_id='org', profile_id='worker', state='persona_sent', source_project=str(self.repo))
+        self.store.snapshot.return_value['jobs'] = [startup]
+        self.store.model_validator = MagicMock(side_effect=ValueError('bad model metadata'))
+        with self.assertRaisesRegex(ValueError, 'bad model metadata'):
+            self.service.action('launch', dict(request_id='bad-model', task_id=self.task['id']), 'admin', 'admin')
+        self.store.manage_session.assert_not_called()
+
     def test_rotation_is_refused_while_a_meeting_or_delegation_owns_the_session(self):
         startup = dict(id='startup-run', kind='launch', organization_id='org', profile_id='worker', state='persona_sent', source_project=str(self.repo))
         self.store.snapshot.return_value['jobs'] = [startup,

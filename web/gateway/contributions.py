@@ -274,10 +274,12 @@ class Contributions:
             try:
                 with self.operation('task:' + listed['id'], timeout=0):
                     task = self.get(listed['id'])
-                    path = self.tree_for(task)
                     run = next((j for j in runs if j['id'] == task.get('run_id')), None)
+                    if run and run['state'] in ('queued', 'running'):
+                        raise ValueError('Preparing workspace and starting the assigned agent.')
                     if not run or run['state'] not in ('persona_sent', 'finished'):
-                        raise ValueError('Awaiting the original task session.')
+                        raise ValueError('Agent launch needs attention: ' + str((run or {}).get('error') or 'Awaiting the original task session.'))
+                    path = self.tree_for(task)
                     if run['state'] == 'persona_sent':
                         from collaboration import current_run
                         current_run(self.store, run)
@@ -1005,6 +1007,7 @@ class Contributions:
                         and (blocking_task.get('completion_receipt') or {}).get('commit') == blocking_task.get('head_sha')))))
         else:
             task['blocking_execution'] = None
+        task['launch_retryable'] = self.retryable_preflight(next((j for j in jobs if j.get('id') == task.get('run_id')), None))
         task['availability'] = self.display_availability(task.get('profile_id'), jobs)
         task['sessions'] = [{k: j.get(k) for k in ('id', 'kind', 'state', 'profile_id', 'created_at',
                             'updated_at', 'error', 'pane_id', 'alias', 'session_closed_at')} |
@@ -1288,11 +1291,37 @@ class Contributions:
         finally:
             lock.release()
 
+    @staticmethod
+    def retryable_preflight(run):
+        return bool(run and run.get('kind') == 'launch' and run.get('state') == 'needs_attention'
+                    and not any(run.get(k) for k in ('pane_id', 'worktree_path', 'agent_session'))
+                    and (run.get('launch_stage') == 'preflight' or
+                         str(run.get('error', '')).startswith('OpenCode returned incomplete model metadata.')))
+
     def launch_task(self, task, actor, inspected_general_session=None):
         # All task launch reservations share this lock, including manual starts.
         with self.operation('launch-capacity', timeout=0):
             jobs = self.store.snapshot(live_status=False).get('jobs', [])
             if task.get('run_id'):
+                run = next((j for j in jobs if j.get('id') == task['run_id']), None)
+                if self.retryable_preflight(run):
+                    if self.active_execution(task['profile_id'], [j for j in jobs if j.get('id') != run['id']]):
+                        raise ValueError('This agent now has another active execution; inspect it before retrying.')
+                    profile = next((p for p in self.store.snapshot(live_status=False).get('profiles', []) if p['id'] == task['profile_id'] and not p.get('archived')), None)
+                    if not profile or not profile.get('use_worktree', True):
+                        raise ValueError('The assigned worktree agent is missing or archived; inspect the assignment before retrying.')
+                    if self.store.model_validator is not None:
+                        self.store.model_validator(profile)
+                    with self.store.lock:
+                        current = next((j for j in self.store.snapshot(live_status=False).get('jobs', []) if j.get('id') == run['id']), None)
+                        if not self.retryable_preflight(current):
+                            raise ValueError('Launch state changed; refresh before retrying.')
+                        self.store.update_job(run['id'], state='queued', error='', profile=dict(profile))
+                        future = self.store.worker.submit(self.store.execute, run['id'])
+                        self.store.futures.add(future)
+                        future.add_done_callback(self.store._finished)
+                    task.pop('automation_error', None)
+                    return self.save(task, 'launch_preflight_retry', actor)
                 return task
             reservations = [j for j in jobs if j.get('kind') == 'launch' and j.get('task_id') == task['id']]
             existing = next((j for j in reservations if j.get('state') not in TERMINAL_EXECUTIONS), None)
@@ -1303,6 +1332,11 @@ class Contributions:
                          and j.get('state') not in TERMINAL_EXECUTIONS)
             if not existing and active - int(bool(blocking and blocking.get('task_id'))) >= MAX_ACTIVE_EXECUTIONS:
                 raise ValueError('Task execution capacity is full. Queue this task until a slot is available.')
+            if not existing:
+                # Validate replacement before archiving the currently usable pane.
+                profile = next((p for p in self.store.snapshot(live_status=False)['profiles'] if p['id'] == task['profile_id']), None)
+                if self.store.model_validator is not None and profile is not None:
+                    self.store.model_validator(profile)
             if blocking and not existing:
                 if blocking.get('task_id') == task['id']:
                     raise ValueError('This task already has an active session; refresh the task before launching again.')

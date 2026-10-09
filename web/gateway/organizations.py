@@ -53,7 +53,7 @@ def launch_arguments(profile):
     provider, model, reasoning = (settings[k] for k in ('provider', 'model', 'reasoning'))
     args = []
     if runtime == 'opencode' and model:
-        args += ['--model', f'{provider}/{model}' + (f'#{reasoning}' if reasoning else '')]
+        args += ['--model', f'{provider}/{model}']
     elif runtime == 'codex':
         if model:
             args += ['--model', model]
@@ -1002,6 +1002,7 @@ class OrganizationStore:
                 from collaboration import execute as collaboration_execute
                 collaboration_execute(self, job)
             elif job['kind'] == 'launch':
+                job = self.update_job(job_id, launch_stage='preflight')
                 self.check_contract()
                 profile = job['profile']
                 if self.runtime_status is not None:
@@ -1010,6 +1011,7 @@ class OrganizationStore:
                         raise ValueError(f"{profile['name']} uses {profile['runtime']}. Connect this CLI on the CLI accounts page before launching; other CLI accounts do not configure it.")
                 if self.model_validator is not None:
                     self.model_validator(profile)
+                job = self.update_job(job_id, launch_stage='workspace_preparing')
                 project = self.project(profile['project'])
                 source = Path(project)
                 repository = any((parent / '.git').exists() for parent in (source, *source.parents))
@@ -1066,6 +1068,7 @@ class OrganizationStore:
                 # Record the exact executable arguments sent to Herdr, separately
                 # from the editable profile and any later in-TUI model changes.
                 job = self.update_job(job_id, launch_arguments=arguments)
+                job = self.update_job(job_id, launch_stage='agent_starting')
                 self.command('agent', 'start', job['alias'], '--kind', profile['runtime'], '--pane', pane, '--timeout', '60000', *(['--', *arguments] if arguments else []), timeout=70)
                 agent = self.identity(job)
                 job = self.update_job(job_id, agent_session=agent.get('agent_session'))
@@ -1146,6 +1149,10 @@ class OrganizationStore:
                 except Exception:
                     stage = 'unknown'
                 detail += f' Delivery stage: {stage}. Inspect Org chart → Chat before retrying; terminal input may have been sent.'
+            elif job['kind'] == 'launch' and job.get('launch_stage') == 'preflight':
+                detail += ' Launch failed during preflight; no workspace or pane was created and no terminal input was sent.'
+            elif job['kind'] == 'launch' and job.get('launch_stage') == 'workspace_preparing':
+                detail += ' Launch failed while preparing the workspace; no agent was started and no terminal input was sent.'
             else:
                 detail += ' Inspect SSH before retrying; terminal input may have been sent.'
             self.update_job(job_id, state='needs_attention', error=detail)

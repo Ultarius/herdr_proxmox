@@ -143,6 +143,16 @@ class _ModelFieldsState extends State<ModelFields> {
   String get selectedReasoning => widget.reasoning.text.trim();
 
   @override
+  void initState() {
+    super.initState();
+    if (widget.runtime == 'opencode') {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) discover();
+      });
+    }
+  }
+
+  @override
   void didUpdateWidget(ModelFields old) {
     super.didUpdateWidget(old);
     // Another runtime has its own provider list and model identifiers. A
@@ -154,6 +164,11 @@ class _ModelFieldsState extends State<ModelFields> {
       manualProvider = false;
       manualModel = false;
       error = null;
+      if (widget.runtime == 'opencode') {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) discover();
+        });
+      }
     }
   }
 
@@ -171,8 +186,14 @@ class _ModelFieldsState extends State<ModelFields> {
 
   /// Let the CLI enumerate the connected account's own catalog. Codex and
   /// Claude expose no such command, so this stays OpenCode-only.
-  Future<void> discover() async {
-    final connection = BlocScope.get<DashboardBloc>();
+  Future<void> discover({bool force = false}) async {
+    if (busy) return;
+    DashboardBloc connection;
+    try {
+      connection = BlocScope.get<DashboardBloc>();
+    } catch (_) {
+      return;
+    }
     final epoch = connection.generation;
     final current = ++requestId;
     setState(() {
@@ -183,6 +204,9 @@ class _ModelFieldsState extends State<ModelFields> {
       final result = await connection.request('models', {
         'runtime': widget.runtime,
         'project': widget.project,
+        'force': force,
+        'provider': selectedProvider,
+        'model': selectedModel,
       });
       if (!mounted || epoch != connection.generation || current != requestId)
         return;
@@ -194,6 +218,9 @@ class _ModelFieldsState extends State<ModelFields> {
         return;
       }
       setState(() {
+        error = result['stale'] == true
+            ? 'Using cached models because refresh failed: ${result['refresh_error']}'
+            : null;
         discovered = RuntimeCatalog(
           models: found.models,
           efforts: found.efforts.isEmpty ? options.efforts : found.efforts,
@@ -383,7 +410,7 @@ class _ModelFieldsState extends State<ModelFields> {
                 ]
               : catalog.efforts,
           helper: runtime == 'opencode' && !catalog.supportsVariants
-              ? 'Interactive reasoning variants require OpenCode v2. Choose Model default on v1.'
+              ? 'Load models to discover supported reasoning variants.'
               : 'Only variants reported for this model are offered.',
           manual: false,
           toggleManual: () {},
@@ -395,7 +422,7 @@ class _ModelFieldsState extends State<ModelFields> {
           children: [
             if (runtime == 'opencode')
               TextButton.icon(
-                onPressed: busy ? null : discover,
+                onPressed: busy ? null : () => discover(force: true),
                 icon: busy
                     ? const SizedBox(
                         width: 14,

@@ -1230,6 +1230,15 @@ class _TasksPageState extends State<TasksPage> {
   Widget _nextAction(Map<String, dynamic> task) {
     final target = task['merge_sha'] ?? task['head_sha'];
     final evidence = (task['builds'] as Map?)?[target] as Map?;
+    if (task['launch_retryable'] == true) {
+      return FilledButton.icon(
+        onPressed: admin && !busy
+            ? () => act('launch', {'task_id': task['id']})
+            : null,
+        icon: const Icon(Icons.refresh),
+        label: const Text('Retry agent launch'),
+      );
+    }
     if (task['state'] == 'draft') {
       final assignment = task['assignment'] as Map?;
       final blocking = task['blocking_execution'] as Map?;

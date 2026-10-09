@@ -47,3 +47,13 @@ class PermissionTests(unittest.TestCase):
         for paths in ('/path/*', ['relative/*'], ['/path/*\npermission: allow'], [None], ['/path/*'] * 21):
             with self.assertRaises(ValueError): accessible_paths({'accessible_paths': paths}, 'opencode')
         with self.assertRaises(ValueError): accessible_paths({'accessible_paths': ['~/docs/**']}, 'codex')
+
+    def test_variant_is_agent_scoped_without_widening_default_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            profile = dict(id='variant', runtime='opencode', provider='opencode-go', model='test', reasoning='high')
+            self.assertEqual(prepare_permissions(profile, home, home), ['--agent', 'herdr-dashboard-variant'])
+            content = (home / '.config/opencode/agents/herdr-dashboard-variant.md').read_text()
+            self.assertIn('variant: "high"', content)
+            self.assertIn('model: "opencode-go/test"', content)
+            self.assertIn('permission: {}', content)
