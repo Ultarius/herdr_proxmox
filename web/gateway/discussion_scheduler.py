@@ -31,6 +31,27 @@ def mark_waiting(store, job_id, reason):
 
 
 def prepare(store, job_id):
+    with store.lock, closing(store.connect()) as db:
+        job = store.get(db, 'jobs', job_id)
+    with store.lock:
+        budget_lock = store.agent_locks.setdefault('meeting-budget:' + job['organization_id'], threading.Lock())
+    if not budget_lock.acquire(blocking=False):
+        mark_waiting(store, job_id, 'Waiting for another meeting admission')
+        return False
+    try:
+        from contextlib import nullcontext
+        guard = store.capacity_guard() if getattr(store, 'capacity_guard', None) else nullcontext()
+        try:
+            with guard:
+                return prepare_locked(store, job_id)
+        except ValueError:
+            mark_waiting(store, job_id, 'Waiting for shared session admission capacity')
+            return False
+    finally:
+        budget_lock.release()
+
+
+def prepare_locked(store, job_id):
     try:
         with store.lock, closing(store.connect()) as db:
             job = store.get(db, 'jobs', job_id)
@@ -102,9 +123,42 @@ def prepare(store, job_id):
                 raise ValueError(profile['name'] + ': session requires inspection (' + str(status) + ')')
             store.identity(run)  # Validate interactive readiness too.
             selected[profile['id']] = run
+        # One shared organization budget across tasks, meetings, discovery and
+        # helpers: preparing this meeting must not exceed the session, meeting
+        # or daily-start limits. Waiting keeps the meeting queued, not failed.
+        if controller is not None and hasattr(controller, 'session_budget'):
+            budget = controller.session_budget(job['organization_id'], jobs)
+            policy = budget['policy']
+            if policy.get('paused'):
+                raise Waiting('Organization automation is paused')
+            needed = len(profiles) - len(selected)
+            limit = policy.get('max_active_sessions') or 0
+            if limit and budget['active'] + needed > limit:
+                raise Waiting('Shared session budget reached; waiting for sessions to finish')
+            meeting_limit = policy.get('max_active_meetings') or 0
+            if meeting_limit:
+                others = [j for j in jobs if j.get('organization_id') == job['organization_id']
+                          and j.get('kind') == 'discussion' and j.get('id') != job_id
+                          and (j.get('state') == 'running' or j.get('meeting_admitted_at'))
+                          and j.get('state') not in ('artifact_ready', 'cancelled', 'needs_attention', 'uncertain')]
+                earlier = [j for j in jobs if j.get('organization_id') == job['organization_id']
+                           and j.get('kind') == 'discussion' and j.get('id') != job_id
+                           and j.get('state') in ('queued', 'waiting_for_members')
+                           and (j.get('created_at', ''), j['id']) < (job.get('created_at', ''), job['id'])]
+                if earlier:
+                    raise Waiting('Waiting for an earlier meeting admission')
+                if len(others) >= meeting_limit:
+                    raise Waiting('Meeting budget reached; waiting for another meeting to finish')
+            daily = policy.get('daily_session_cap') or 0
+            if daily and budget['started'] + needed > daily:
+                raise Waiting('Daily session budget reached; waiting for the next window')
         # Nothing new is launched until all already-active members are eligible.
         # Reserve each absent session durably with a deterministic identity.
         with store.lock, closing(store.connect()) as db, db:
+            current = store.get(db, 'jobs', job_id)
+            job['meeting_admitted_at'] = current.get('meeting_admitted_at') or now()
+            current['meeting_admitted_at'] = job['meeting_admitted_at']
+            store.put(db, 'jobs', current)
             preparation = dict(job.get('preparation') or {})
             for profile in profiles:
                 if profile['id'] in selected:

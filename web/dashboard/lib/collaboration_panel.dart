@@ -574,6 +574,8 @@ class _DiscussionGroupFormState extends State<DiscussionGroupForm> {
   late final members = List<String>.from(widget.group?['members'] ?? []);
   late bool readOnly = widget.group?['read_only'] ?? true;
   late bool useWorktree = widget.group?['use_worktree'] ?? true;
+  late bool notifyOutcomes = widget.group?['notify_outcomes'] ?? true;
+  late bool createTasks = widget.group?['create_tasks'] ?? false;
   late String permissions = widget.group?['permission_mode'] ?? 'default';
   late final accessiblePaths = TextEditingController(
     text: (widget.group?['accessible_paths'] as List? ?? []).join('\n'),
@@ -649,6 +651,24 @@ class _DiscussionGroupFormState extends State<DiscussionGroupForm> {
                 value: useWorktree,
                 onChanged: (v) => setState(() => useWorktree = v),
               ),
+              SwitchListTile(
+                title: const Text('Notify this group when its task finishes'),
+                subtitle: const Text(
+                  'A task created from this group\u2019s proposal sends one outcome review back here when it completes, merges or closes.',
+                ),
+                value: notifyOutcomes,
+                onChanged: (v) => setState(() => notifyOutcomes = v),
+              ),
+              SwitchListTile(
+                title: const Text(
+                  'Let this group create tasks automatically',
+                ),
+                subtitle: const Text(
+                  'Finalized proposals from this group\u2019s discussions are created and queued under the organization limits, without an operator click.',
+                ),
+                value: createTasks,
+                onChanged: (v) => setState(() => createTasks = v),
+              ),
               const Text(
                 'Group permissions apply to the group agent on its next launch. Member agents keep their own permission settings. Non-default policies require OpenCode members.',
               ),
@@ -690,6 +710,8 @@ class _DiscussionGroupFormState extends State<DiscussionGroupForm> {
             'description': description.text.trim(),
             'read_only': readOnly,
             'use_worktree': useWorktree,
+            'notify_outcomes': notifyOutcomes,
+            'create_tasks': createTasks,
             'permission_mode': permissions,
             'accessible_paths': PermissionOptions.parsePaths(
               accessiblePaths.text,

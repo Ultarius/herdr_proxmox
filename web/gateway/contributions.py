@@ -62,10 +62,16 @@ HANDOFF_TASK_STATES = ('review_ready', 'published', 'pr_open', 'merged', 'closed
 MAX_ACTIVE_EXECUTIONS = 4
 # Organization follow-up automation is opt-in and fail-closed. Proposals that
 # qualify are created and queued; everything else stays a draft for the operator.
+# Per-group settings decide which groups may create tasks and receive outcome
+# notices; the organization policy provides limits, the shared session budget
+# and the pause switch. Budget values of 0 keep the legacy behavior.
 AUTOMATION_DEFAULTS = dict(auto_queue_proposals=False, max_per_meeting=1, max_open_per_agent=2,
-                           max_follow_up_depth=1, daily_cap=5, paused=False)
+                           max_follow_up_depth=1, daily_cap=5, paused=False,
+                           max_active_sessions=0, max_active_meetings=0, daily_session_cap=0)
 AUTOMATION_LIMITS = (('max_per_meeting', 0, 10), ('max_open_per_agent', 0, 50),
-                     ('max_follow_up_depth', 0, 10), ('daily_cap', 0, 100))
+                     ('max_follow_up_depth', 0, 10), ('daily_cap', 0, 100),
+                     ('max_active_sessions', 0, 50), ('max_active_meetings', 0, 10),
+                     ('daily_session_cap', 0, 500))
 
 
 def stamp():
@@ -194,12 +200,20 @@ class Contributions:
         self.validation = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self.connect()) as db, db:
+            from notifications import schema
+            schema(db)
             db.execute('CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS build_events (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS audit (task_id TEXT NOT NULL, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS assignments (task_id TEXT PRIMARY KEY, position INTEGER NOT NULL, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS policies (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
+        from notifications import Notifications
+        if not isinstance(getattr(self.store, 'events', None), Notifications):
+            self.store.events = Notifications()
+        self.store.capacity_guard = lambda: self.operation('launch-capacity', timeout=0)
+        self.events = self.store.events
+        self.mailbox = self.events.subscribe(('task', 'job', 'policy', 'runtime'))
         from knowledge import Knowledge
         self.knowledge = Knowledge(self)
         self.store.knowledge = self.knowledge
@@ -208,7 +222,11 @@ class Contributions:
         self.discovery = Discovery(self)
 
     def connect(self):
-        return sqlite3.connect(self.path, timeout=10)
+        from notifications import Connection
+        db = sqlite3.connect(self.path, timeout=10, factory=Connection)
+        if hasattr(self, 'events'):
+            db.notify = self.events.outbox_ready.set
+        return db
 
     @contextmanager
     def operation(self, key, timeout=30):
@@ -239,45 +257,86 @@ class Contributions:
 
     def close(self):
         self.stopped.set()
-        self.store.jobs_changed.set()  # Wake the poller so shutdown is prompt.
+        self.mailbox.set()  # Wake this consumer without clearing another's signal.
         if self.thread:
             self.thread.join(timeout=2)
 
     def poll(self):
-        cycles = 0
+        # Fast recovery covers receipts/files and external build workers which may
+        # not emit a runtime event. Housekeeping follows time, never event count.
+        next_safety = next_housekeeping = 0.0
+        batch = {('resync', '', '')}
         while not self.stopped.is_set():
-            try:
-                self.knowledge.sync_jobs()
-                self.advance_automatic()
-                self.store.advance_discussions()
-                self.dispatch_assignments()
-                self.advance_proposals()
-                self.discovery.advance()
-                cycles += 1
-                if cycles % 6 == 0:
-                    self.reconcile_completed()
-                    self.advance_reviews()
+            now = time.monotonic()
+            safety = now >= next_safety
+            if batch or safety:
+                if batch:
+                    batch |= self.mailbox.wait(.15)  # Coalesce bursts, without clearing races.
+                try:
+                    self.knowledge.sync_jobs()
+                    task_ids = {key for topic, key, _ in batch if topic == 'task'} if not safety and all(topic == 'task' for topic, _, _ in batch) else None
+                    self.advance_automatic(task_ids)
+                    self.store.advance_discussions()
+                    self.dispatch_assignments()
+                    self.advance_proposals()
+                    self.discovery.advance()
+                    self.reconcile_completed(task_ids)
+                    self.advance_acceptance(task_ids)
+                    self.advance_reviews(task_ids)
+                    self.advance_outcomes(task_ids)
+                except (ValueError, OSError, sqlite3.Error):
+                    pass  # Durable records and the safety pass recover missed hints.
+                if safety:
+                    next_safety = time.monotonic() + 10
+            if now >= next_housekeeping:
+                try:
                     self.poll_once()
                     self.reap_instances()
-            except (ValueError, OSError, sqlite3.Error):
-                # A transient storage or API failure must never end the poller;
-                # the next cycle reconciles again. Never redispatch a push or a
-                # pull request creation from here.
-                pass
-            # Job state changes wake reconciliation immediately; the timeout is
-            # only a backstop. Events never decide work, they only invalidate.
-            self.store.jobs_changed.wait(10)
-            self.store.jobs_changed.clear()
+                except (ValueError, OSError, sqlite3.Error):
+                    pass
+                next_housekeeping = time.monotonic() + 60
+            timeout = min(max(0, min(next_safety, next_housekeeping) - time.monotonic()), self.deadline_delay())
+            batch = self.mailbox.wait(timeout)
+            if not batch and timeout < 10:
+                batch = {('resync', '', '')}
 
-    def automatic_tasks(self):
-        """Ids and states only, so a ten-second reconcile never parses stored diffs."""
+    def deadline_delay(self):
+        """Wake at persistent acceptance deadlines, even without notifications."""
         with closing(self.connect()) as db:
-            return [dict(id=row[0], state=row[1]) for row in db.execute(
-                "SELECT json_extract(data, '$.id'), json_extract(data, '$.state') FROM tasks "
-                "WHERE json_extract(data, '$.auto_validate')=1 LIMIT 100")]
+            rows = db.execute("SELECT json_extract(data,'$.acceptance.waiting_since'), "
+                              "json_extract(data,'$.acceptance.requested_at'), json_extract(data,'$.acceptance.at') "
+                              "FROM tasks WHERE json_extract(data,'$.acceptance.auto')=1 AND "
+                              "json_extract(data,'$.state') IN ('review_ready','completed') AND "
+                              "json_extract(data,'$.acceptance.state') IN ('waiting','requested') LIMIT 100").fetchall()
+        now = datetime.now(timezone.utc)
+        delays = [10.0]
+        for waiting, requested, recorded in rows:
+            try:
+                started = datetime.fromisoformat(waiting or requested or recorded)
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                delays.append(max(.2, (started + timedelta(seconds=self.ACCEPTANCE_STALL_SECONDS) - now).total_seconds()))
+            except (ValueError, TypeError):
+                continue
+        return min(delays)
 
-    def advance_automatic(self):
-        tasks = [t for t in self.automatic_tasks() if t.get('state') in ('implementing', 'review_ready')]
+    def select_task_ids(self, condition, task_ids=None, limit=100):
+        args = []
+        if task_ids is not None:
+            if not task_ids:
+                return []
+            args = sorted(task_ids)[:256]
+            condition += ' AND id IN (' + ','.join('?' for _ in args) + ')'
+        with closing(self.connect()) as db:
+            return [row[0] for row in db.execute('SELECT id FROM tasks WHERE ' + condition + ' ORDER BY rowid LIMIT ?', [*args, limit])]
+
+    def automatic_tasks(self, task_ids=None):
+        ids = self.select_task_ids("json_extract(data, '$.auto_validate')=1", task_ids)
+        with closing(self.connect()) as db:
+            return [dict(id=identifier, state=json.loads(db.execute('SELECT data FROM tasks WHERE id=?', (identifier,)).fetchone()[0])['state']) for identifier in ids]
+
+    def advance_automatic(self, task_ids=None):
+        tasks = [t for t in self.automatic_tasks(task_ids) if t.get('state') in ('implementing', 'review_ready')]
         if not tasks:
             return
         if not self.validation or self.validation.snapshot().get('executor') != 'service':
@@ -361,9 +420,8 @@ class Contributions:
                 except (ValueError, OSError, sqlite3.Error):
                     continue
 
-    def reconcile_completed(self):
-        with closing(self.connect()) as db:
-            ids = [r[0] for r in db.execute("SELECT id FROM tasks WHERE json_extract(data, '$.state')='review_ready' LIMIT 100")]
+    def reconcile_completed(self, task_ids=None):
+        ids = self.select_task_ids("json_extract(data, '$.state')='review_ready'", task_ids)
         for task_id in ids:
             try:
                 with self.operation('task:' + task_id, timeout=0):
@@ -403,25 +461,29 @@ class Contributions:
         """Evidence identity for automatic reviews; transient states collapse."""
         build = task.get('builds', {}).get(task.get('head_sha'), {})
         state = build.get('state') if build.get('state') in ('complete', 'failed', 'error', 'interrupted') else 'pending'
+        acceptance = task.get('acceptance') or {}
         return hashlib.sha256(json.dumps([task.get('head_sha'), task.get('state'),
                                           task.get('automation_error'), state,
-                                          bool(build.get('required_checks_verified'))]).encode()).hexdigest()[:20]
+                                          bool(build.get('required_checks_verified')),
+                                          acceptance.get('state'), acceptance.get('reason')]).encode()).hexdigest()[:20]
 
-    def advance_reviews(self):
-        with closing(self.connect()) as db:
-            ids = [r[0] for r in db.execute("SELECT id FROM tasks WHERE json_extract(data, '$.auto_review')=1 LIMIT 100")]
+    def advance_reviews(self, task_ids=None):
+        ids = self.select_task_ids("json_extract(data, '$.auto_review')=1", task_ids)
         for task_id in ids:
             try:
                 with self.operation('task:' + task_id, timeout=0):
                     task = self.get(task_id)
-                    if task['state'] not in ('implementing', 'review_ready'):
+                    acceptance = task.get('acceptance') or {}
+                    escalated = acceptance.get('state') in ('not_satisfied', 'uncertain', 'inconclusive', 'attention')
+                    if task['state'] not in ('implementing', 'review_ready') and not (task['state'] == 'completed' and escalated):
                         continue
                     group_id = task.get('review_group_id')
                     if not group_id:
                         raise ValueError('Automatic review needs an active review group.')
                     head = task.get('head_sha')
                     build = task.get('builds', {}).get(head, {})
-                    if not (task.get('automation_error') or build.get('state') in ('failed', 'error') or task['state'] == 'review_ready'):
+                    if not (task.get('automation_error') or build.get('state') in ('failed', 'error')
+                            or task['state'] == 'review_ready' or escalated):
                         continue
                     signature = self.review_signature(task)
                     if task.get('review_signature') == signature:
@@ -442,6 +504,278 @@ class Contributions:
                         if task.get('review_error') != str(error)[:500]:
                             task['review_error'] = str(error)[:500]
                             self.save(task, 'review_waiting', 'task_review_policy')
+                except (ValueError, OSError, sqlite3.Error):
+                    continue
+
+    def advance_outcomes(self, task_ids=None):
+        """Notify the proposing group once when its task reaches a terminal outcome."""
+        with closing(self.connect()) as db:
+            saved = {row[0]: json.loads(row[1]) for row in db.execute('SELECT id, data FROM policies')}
+            selected = sorted(task_ids)[:256] if task_ids is not None else None
+            if selected == []:
+                return
+            paused = [org for org, policy in saved.items() if policy.get('paused')]
+            placeholders = ','.join('?' for _ in paused) or 'NULL'
+            rows = db.execute(
+                "SELECT id, json_extract(data, '$.organization_id') FROM tasks "
+                "WHERE json_extract(data, '$.state') IN ('completed','merged','closed') "
+                "AND json_extract(data, '$.source.group_id') IS NOT NULL "
+                "AND json_extract(data, '$.outcome_notice') IS NULL "
+                + ("AND json_extract(data, '$.organization_id') NOT IN (" + placeholders + ") " if paused else '')
+                + ("AND id IN (" + ','.join('?' for _ in selected) + ") " if selected is not None else '')
+                + "ORDER BY COALESCE(json_extract(data, '$.outcome_attempted_at'), ''), rowid LIMIT 50", [*paused, *(selected or [])]).fetchall()
+        if not rows:
+            return
+        groups = {group['id']: group for group in self.store.snapshot(live_status=False).get('groups', [])}
+        for task_id, organization_id in rows:
+            policy = dict(AUTOMATION_DEFAULTS, **saved.get(organization_id, {}))
+            if policy['paused']:
+                continue
+            try:
+                with self.operation('task:' + task_id, timeout=0):
+                    task = self.get(task_id)
+                    if task.get('outcome_notice') is not None or task.get('state') not in ('completed', 'merged', 'closed'):
+                        continue
+                    group_id = (task.get('source') or {}).get('group_id')
+                    group = groups.get(group_id)
+                    if not group or group.get('organization_id') != task['organization_id'] or group.get('removed_at'):
+                        task['outcome_notice'] = dict(state='unavailable', group_id=group_id,
+                                                      reason='The proposing group is no longer available.', at=stamp())
+                        task.pop('outcome_request', None)
+                        self.save(task, 'outcome_unavailable', 'task_outcome_policy')
+                        continue
+                    if group.get('notify_outcomes') is False:
+                        # Recorded as evaluated: enabling the notice later notifies
+                        # only work that finishes afterwards, never a backlog.
+                        task['outcome_notice'] = dict(state='off', group_id=group_id, at=stamp())
+                        task.pop('outcome_request', None)
+                        self.save(task, 'outcome_off', 'task_outcome_policy')
+                        continue
+                    request = task.get('outcome_request')
+                    if request is None:
+                        # Freeze before dispatch: lost responses must retry the exact
+                        # same fingerprint even if builds, knowledge or policy change.
+                        request = dict(request_id='task-outcome-' + task_id,
+                            organization_id=task['organization_id'], group_id=group_id,
+                            prompt=self.outcome_packet(task, group, policy))
+                        task['outcome_request'] = request
+                    # One save persists the frozen request and the fairness marker
+                    # before dispatch; an interruption in between retries unchanged.
+                    task['outcome_attempted_at'] = stamp()
+                    self.save(task, 'outcome_dispatching', 'task_outcome_policy')
+                    job = self.store.action('discuss', request)
+                    self.store.update_job(job['id'], task_id=task_id, outcome_notice=True)
+                    task.setdefault('meetings', []).append(dict(job_id=job['id'], group_id=group_id,
+                        group_name=group.get('name', 'Group'), outcome=True, at=stamp()))
+                    task['meetings'] = task['meetings'][-30:]
+                    task['outcome_notice'] = dict(state='scheduled', group_id=group_id,
+                        group_name=group.get('name', 'Group'), job_id=job['id'],
+                        outcome=task['state'], at=stamp())
+                    task.pop('outcome_error', None)
+                    task.pop('outcome_request', None)
+                    self.save(task, 'outcome_notice', 'task_outcome_policy')
+            except Busy:
+                continue
+            except (ValueError, OSError, sqlite3.Error) as error:
+                try:
+                    with self.operation('task:' + task_id, timeout=0):
+                        task = self.get(task_id)
+                        message = str(error)[:500]
+                        if task.get('outcome_error') != message:
+                            task['outcome_error'] = message
+                            self.save(task, 'outcome_waiting', 'task_outcome_policy')
+                except (ValueError, OSError, sqlite3.Error):
+                    continue
+
+    ACCEPTANCE_STALL_SECONDS = 6 * 3600
+
+    @staticmethod
+    def acceptance_evidence(task, head):
+        """Acceptance needs verified checks for the exact candidate, or proven no-changes."""
+        completion = task.get('completion') or {}
+        if completion.get('outcome') == 'no_changes' and completion.get('candidate') == head:
+            return True
+        build = (task.get('builds') or {}).get(head, {})
+        return bool(build.get('state') == 'complete' and build.get('target') == head
+                    and build.get('required_checks_verified') is True)
+
+    @staticmethod
+    def acceptance_verdict(result):
+        """Strict verdict parsing: fenced or raw JSON, bounded and allowlisted."""
+        if not isinstance(result, str):
+            return None
+        match = re.search(r'```json\s*(.*?)\s*```', result, re.DOTALL)
+        try:
+            data = json.loads(match[1] if match else result)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(data, dict) or data.get('verdict') not in ('satisfied', 'not_satisfied', 'uncertain'):
+            return None
+        reason = data.get('reason') if isinstance(data.get('reason'), str) else ''
+        evidence = [str(item)[:300] for item in (data.get('evidence') if isinstance(data.get('evidence'), list) else [])[:10]]
+        return dict(verdict=data['verdict'], reason=reason.strip()[:1000], evidence=evidence)
+
+    @staticmethod
+    def acceptance_stalled(since):
+        try:
+            started = datetime.fromisoformat(str(since))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return False
+        return (datetime.now(timezone.utc) - started).total_seconds() > Contributions.ACCEPTANCE_STALL_SECONDS
+
+    def acceptance_packet(self, task, reviewer, head):
+        """Bounded criteria-and-evidence packet for an independent verdict."""
+        receipt = task.get('completion_receipt') or {}
+        completion = task.get('completion') or {}
+        build = (task.get('builds') or {}).get(head, {})
+        checks = build.get('checks', []) if isinstance(build, dict) else []
+        passed = [str(c.get('id')) for c in checks if isinstance(c, dict) and c.get('status') == 'passed']
+        instruction = ('Acceptance review for task ' + task['id'] + '. Decide whether the recorded candidate satisfies the '
+            'acceptance criteria. Judge only from the provided evidence and the repository at commit ' + str(head) + '. '
+            'Read-only: do not modify files. Save ONLY JSON to the reply file, with no prose around it: '
+            '{"verdict":"satisfied|not_satisfied|uncertain","reason":"...","evidence":["..."]}. '
+            'Use uncertain when the evidence is insufficient; never claim a missing check passed.')
+        parts = [
+            'Task: ' + task['title'],
+            'Acceptance criteria: ' + str(task.get('description', ''))[:2500],
+            'Candidate commit: ' + str(head),
+            'Task state: ' + task['state'] + ', outcome: ' + str(completion.get('outcome', 'candidate ready')),
+            'Required checks verified for this exact commit: ' + str(self.acceptance_evidence(task, head)),
+            'Passed checks: ' + json.dumps(passed[:40])[:1200],
+        ]
+        if task.get('diff_stat'):
+            parts.append('Change summary:\n' + str(task['diff_stat'])[:1200])
+        if receipt.get('tests'):
+            parts.append('Worker-reported checks: ' + json.dumps(receipt.get('tests', []), default=str)[:1000])
+        return (instruction + '\n\n' + '\n\n'.join(parts))[:8000]
+
+    def request_acceptance(self, task, config, head, actor):
+        """Dispatch one bounded acceptance review for the current candidate."""
+        profiles = self.store.snapshot(live_status=False)['profiles']
+        reviewer = next((p for p in profiles if p['id'] == config.get('reviewer_profile_id')
+                         and not p.get('archived') and not p.get('ephemeral')), None)
+        if not reviewer or reviewer.get('group_id'):
+            raise ValueError('The acceptance reviewer is missing or archived.')
+        run = self.active_execution(reviewer['id'])
+        if not run or run.get('state') != 'persona_sent':
+            raise ValueError('The acceptance reviewer has no ready session; launch it first.')
+        try:
+            state = self.store.agent_state(run)
+        except (ValueError, OSError):
+            state = None
+        if not isinstance(state, dict) or state.get('status') not in ('idle', 'done'):
+            raise ValueError('The acceptance reviewer is busy; the review stays queued.')
+        request = config.get('request')
+        if request is None:
+            digest = hashlib.sha256((task['id'] + ':' + head + ':' + reviewer['id']).encode()).hexdigest()
+            request = dict(request_id='acceptance-' + digest[:64], organization_id=task['organization_id'],
+                           profile_id=reviewer['id'], prompt=self.acceptance_packet(task, reviewer, head), wait_seconds=120)
+            config = dict(config, request=request, request_sha=head)
+            task['acceptance'] = config
+            self.save(task, 'acceptance_reserved', actor)
+        job = self.store.action('chat', request)
+        self.store.update_job(job['id'], task_id=task['id'], acceptance=True,
+                              question='Acceptance review for ' + str(task.get('title', ''))[:80])
+        config = {k: v for k, v in config.items() if k not in ('request', 'request_sha', 'consumed_job_id')}
+        task['acceptance'] = dict(config, state='requested', sha=head, job_id=job['id'], requested_at=stamp(),
+                                  waiting_sha=None, waiting_since=None, reason=None, at=stamp())
+        return self.save(task, 'acceptance_requested', actor)
+
+    def record_acceptance(self, task, job):
+        """Parse one answered review into a verdict and reported knowledge."""
+        parsed = self.acceptance_verdict(job.get('result'))
+        acceptance = dict(task.get('acceptance') or {})
+        if not parsed:
+            acceptance.update(state='inconclusive', reason='Acceptance review returned no valid verdict.', consumed_job_id=job['id'], at=stamp())
+            task['acceptance'] = acceptance
+            self.save(task, 'acceptance_inconclusive', 'task_acceptance_policy')
+            return
+        acceptance.update(state=parsed['verdict'], reason=parsed['reason'], evidence=parsed['evidence'],
+                          verdict_at=stamp(), consumed_job_id=job['id'], at=stamp())
+        task['acceptance'] = acceptance
+        self.knowledge.capture_acceptance(task, acceptance, job)
+        self.save(task, 'acceptance_' + parsed['verdict'], 'task_acceptance_policy')
+
+    def advance_acceptance(self, task_ids=None):
+        """Dispatch and reconcile acceptance reviews for verified candidates."""
+        ids = self.select_task_ids("json_extract(data, '$.acceptance.auto')=1", task_ids)
+        if not ids:
+            return
+        jobs = self.store.snapshot(live_status=False).get('jobs', [])
+        for task_id in ids:
+            try:
+                with self.operation('task:' + task_id, timeout=0):
+                    task = self.get(task_id)
+                    config = task.get('acceptance') or {}
+                    if config.get('auto') is not True or task['state'] not in ('implementing', 'review_ready', 'completed'):
+                        continue
+                    head = task.get('head_sha') or (task.get('completion') or {}).get('candidate')
+                    if not head:
+                        continue
+                    if (config.get('job_id') and config.get('sha') != head) or (config.get('request') and config.get('request_sha') != head):
+                        history = task.setdefault('acceptance_history', [])
+                        history.append({k: v for k, v in config.items() if k != 'request'})
+                        task['acceptance_history'] = history[-20:]
+                        config = {k: config[k] for k in ('auto', 'reviewer_profile_id', 'reviewer_name') if k in config}
+                        config.update(state='waiting', waiting_sha=head, waiting_since=stamp(), at=stamp())
+                        task['acceptance'] = config
+                        self.save(task, 'acceptance_candidate_changed', 'task_acceptance_policy')
+                    if config.get('job_id'):
+                        if config.get('consumed_job_id') == config['job_id']:
+                            continue
+                        job = next((j for j in jobs if j.get('id') == config['job_id']), None)
+                        if job and job.get('state') == 'answered':
+                            self.record_acceptance(task, job)
+                        elif job and job.get('state') in ('needs_attention', 'uncertain', 'error'):
+                            config.update(state='inconclusive', consumed_job_id=config['job_id'], at=stamp(),
+                                          reason=str(job.get('error') or 'Acceptance review did not answer.')[:500])
+                            task['acceptance'] = config
+                            self.save(task, 'acceptance_inconclusive', 'task_acceptance_policy')
+                        elif not job:
+                            config.update(state='inconclusive', consumed_job_id=config['job_id'], reason='Acceptance review job is missing.', at=stamp())
+                            task['acceptance'] = config
+                            self.save(task, 'acceptance_inconclusive', 'task_acceptance_policy')
+                        elif self.acceptance_stalled(config.get('requested_at') or config.get('at')):
+                            config.update(state='attention', reason='Acceptance review stalled; inspect its delivery before retrying.', consumed_job_id=config['job_id'], at=stamp())
+                            task['acceptance'] = config
+                            self.save(task, 'acceptance_attention', 'task_acceptance_policy')
+                        continue
+                    if config.get('state') == 'attention':
+                        continue  # Inspection, rather than a timer, authorizes recovery.
+                    if config.get('state') in ('waiting', 'requested') and task['state'] in ('review_ready', 'completed'):
+                        since = config.get('waiting_since') or config.get('at')
+                        if since and self.acceptance_stalled(since):
+                            config.update(state='attention', at=stamp(),
+                                          reason='Acceptance review stalled; inspect the reviewer session.')
+                            task['acceptance'] = config
+                            self.save(task, 'acceptance_attention', 'task_acceptance_policy')
+                            continue
+                    if config.get('sha') == head:
+                        continue
+                    if not self.acceptance_evidence(task, head):
+                        if config.get('waiting_sha') != head:
+                            config.update(state='waiting', waiting_sha=head, waiting_since=stamp(), at=stamp(),
+                                          reason='Acceptance review waits for verified required checks.')
+                            task['acceptance'] = config
+                            self.save(task, 'acceptance_waiting', 'task_acceptance_policy')
+                        continue
+                    if self.policy(task['organization_id'])['paused']:
+                        continue
+                    self.request_acceptance(task, config, head, 'task_acceptance_policy')
+            except Busy:
+                continue
+            except (ValueError, OSError, sqlite3.Error) as error:
+                try:
+                    with self.operation('task:' + task_id, timeout=0):
+                        task = self.get(task_id)
+                        message = str(error)[:500]
+                        if (task.get('acceptance') or {}).get('reason') != message:
+                            acceptance = dict(task.get('acceptance') or {})
+                            acceptance.update(state='waiting', reason=message, waiting_since=acceptance.get('waiting_since') or stamp(), at=stamp())
+                            task['acceptance'] = acceptance
+                            self.save(task, 'acceptance_waiting', 'task_acceptance_policy')
                 except (ValueError, OSError, sqlite3.Error):
                     continue
 
@@ -710,6 +1044,8 @@ class Contributions:
             policy.update(updated_at=stamp(), updated_by=actor)
             with closing(self.connect()) as db, db:
                 db.execute('INSERT OR REPLACE INTO policies VALUES (?,?)', (organization_id, json.dumps(policy)))
+                from notifications import record
+                record(db, 'policy', organization_id, organization_id)
             return dict(policy=policy, organization_id=organization_id)
 
     def open_work_count(self, profile_id):
@@ -730,37 +1066,79 @@ class Contributions:
                               "AND json_extract(data, '$.source.auto_queued') IS NOT NULL "
                               "AND json_extract(data, '$.created_at') > ?", (organization_id, cutoff)).fetchone()[0]
 
+    @staticmethod
+    def active_session_jobs(jobs, organization_id):
+        """Launch bindings that currently occupy an agent for one organization."""
+        return [j for j in jobs if j.get('organization_id') == organization_id and j.get('kind') == 'launch'
+                and j.get('state') not in TERMINAL_EXECUTIONS]
+
+    def session_budget(self, organization_id, jobs=None):
+        """One shared budget over tasks, meetings, discovery and helpers.
+
+        Counts every active launch binding together with queued/running
+        discussions and the launch starts of the last 24 hours. Budget values
+        of 0 in the policy keep the legacy per-kind limits unchanged.
+        """
+        policy = self.policy(organization_id)
+        jobs = self.store.snapshot(live_status=False).get('jobs', []) if jobs is None else jobs
+        active = self.active_session_jobs(jobs, organization_id)
+        meetings = [j for j in jobs if j.get('organization_id') == organization_id and j.get('kind') == 'discussion'
+                    and j.get('state') in ('queued', 'running', 'waiting_for_members')]
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        started = sum(1 for j in jobs if j.get('organization_id') == organization_id and j.get('kind') == 'launch'
+                      and str(j.get('created_at') or '') > cutoff)
+        return dict(policy=policy, active=len(active), meetings=len(meetings), started=started)
+
     def advance_proposals(self):
-        """Materialize qualifying group proposals under the organization policy."""
+        """Materialize qualifying group proposals under the organization policy.
+
+        A meeting qualifies when its organization enables automatic follow-up or
+        its own group opted into creating tasks. Organization limits and the
+        pause switch always apply.
+        """
         with closing(self.connect()) as db:
             saved = {row[0]: json.loads(row[1]) for row in db.execute('SELECT id, data FROM policies')}
         policies = {organization: dict(AUTOMATION_DEFAULTS, **data) for organization, data in saved.items()}
+        groups = {group['id']: group for group in self.store.snapshot(live_status=False).get('groups', [])}
         active = [organization for organization, policy in policies.items()
                   if policy['auto_queue_proposals'] and not policy['paused']]
-        if not active:
+        creating = [group_id for group_id, group in groups.items()
+                    if group.get('create_tasks') is True and not group.get('removed_at')
+                    and not policies.get(group.get('organization_id'), AUTOMATION_DEFAULTS)['paused']]
+        if not active and not creating:
             return
         # Candidate pairs are unmarked meetings only, newest tasks first, so a
         # long history of evaluated reviews cannot starve new ones.
-        placeholders = ','.join('?' for _ in active)
+        org_placeholders = ','.join('?' for _ in active) or 'NULL'
+        group_placeholders = ','.join('?' for _ in creating) or 'NULL'
         with closing(self.connect()) as db:
             rows = db.execute(
                 "SELECT t.id, json_extract(t.data, '$.organization_id'), json_extract(m.value, '$.job_id'), "
-                "json_extract(m.value, '$.at') FROM tasks t, json_each(t.data, '$.meetings') m "
-                "WHERE json_extract(t.data, '$.state') IN ('review_ready','completed','merged') "
+                "json_extract(m.value, '$.at'), json_extract(m.value, '$.group_id') FROM tasks t, json_each(t.data, '$.meetings') m "
+                "WHERE json_extract(t.data, '$.state') IN ('review_ready','completed','merged','closed') "
                 "AND json_type(t.data, '$.meetings') = 'array' "
                 "AND json_extract(m.value, '$.job_id') IS NOT NULL "
-                "AND json_extract(t.data, '$.organization_id') IN (" + placeholders + ") "
+                "AND (json_extract(t.data, '$.organization_id') IN (" + org_placeholders + ") "
+                "OR json_extract(m.value, '$.group_id') IN (" + group_placeholders + ")) "
                 "AND json_extract(t.data, '$.auto_queue.\"' || json_extract(m.value, '$.job_id') || '\"') IS NULL "
-                "ORDER BY t.rowid DESC LIMIT 50", active).fetchall()
+                "ORDER BY t.rowid DESC LIMIT 50", [*active, *creating]).fetchall()
         seen = set()
-        for task_id, organization_id, job_id, meeting_at in rows:
-            policy = policies.get(organization_id)
-            if not policy or (task_id, job_id) in seen:
+        for task_id, organization_id, job_id, meeting_at, group_id in rows:
+            policy = policies.get(organization_id) or dict(AUTOMATION_DEFAULTS)
+            if policy['paused'] or (task_id, job_id) in seen:
                 continue
             seen.add((task_id, job_id))
+            group = groups.get(group_id) or {}
+            if group and (group.get('organization_id') != organization_id or group.get('removed_at')):
+                continue
+            if not (policy['auto_queue_proposals'] or group.get('create_tasks') is True):
+                continue
             since = policy.get('auto_queue_since') or policy.get('updated_at') or ''
+            if not policy['auto_queue_proposals']:
+                # A group opt-in evaluates meetings created since enablement.
+                since = group.get('create_tasks_since') or group.get('updated_at') or ''
             if str(meeting_at or '') < since:
-                # Discussions created before the policy was enabled never start
+                # Discussions created before automation was enabled never start
                 # retroactively; record the decision once so they are not rescanned.
                 try:
                     with self.operation('task:' + task_id, timeout=0):
@@ -897,6 +1275,12 @@ class Contributions:
             db.execute('DELETE FROM audit WHERE task_id=? AND rowid NOT IN '
                        '(SELECT rowid FROM audit WHERE task_id=? ORDER BY rowid DESC LIMIT 500)',
                        (task['id'], task['id']))
+            prior = db.execute('SELECT data FROM tasks WHERE id=?', (task['id'],)).fetchone()
+            def meaningful(value):
+                return {k: v for k, v in value.items() if k not in ('updated_at', 'audit', 'outcome_attempted_at')}
+            if not prior or meaningful(json.loads(prior[0])) != meaningful(task):
+                from notifications import record
+                record(db, 'task', task['id'], task['organization_id'])
             db.execute('INSERT OR REPLACE INTO tasks VALUES (?,?)', (task['id'], json.dumps(task)))
             self.knowledge.capture_task(db, task, action)
         return task
@@ -952,6 +1336,10 @@ class Contributions:
             tasks = [json.loads(row[0]) for row in db.execute('SELECT data FROM tasks ORDER BY rowid DESC LIMIT 100')]
         for task in tasks:
             task.pop('diff', None)  # Fetch the candidate only when reviewing it.
+            # The frozen dispatch payload is server-side retry state, not evidence.
+            task.pop('outcome_request', None)
+            if task.get('acceptance'):
+                task['acceptance'] = {k: v for k, v in task['acceptance'].items() if k != 'request'}
             task['audit'] = task.get('audit', [])[-20:]
         try:
             github = self.github.snapshot()
@@ -979,6 +1367,10 @@ class Contributions:
         if not isinstance(task_id, str) or not re.fullmatch(r'[a-f0-9]{32}', task_id):
             raise ValueError('Select a valid task.')
         task = self.get(task_id)
+        # The frozen dispatch payload is server-side retry state, not evidence.
+        task.pop('outcome_request', None)
+        if task.get('acceptance'):
+            task['acceptance'] = {k: v for k, v in task['acceptance'].items() if k != 'request'}
         with closing(self.connect()) as db:
             task['audit'] = list(reversed([json.loads(row[0]) for row in db.execute(
                 'SELECT data FROM audit WHERE task_id=? ORDER BY rowid DESC LIMIT 500', (task_id,))]))
@@ -1155,7 +1547,7 @@ class Contributions:
     def lightweight(task):
         """Replay view of a task without bulk review or build evidence."""
         return {k: v for k, v in task.items() if k not in ('diff', 'diff_stat', 'builds', 'checks',
-                                                           'statuses', 'reviews', 'audit')}
+                                                           'statuses', 'reviews', 'audit', 'outcome_request')}
 
     def comparable(self, task):
         """Task content without refresh timestamps, used to detect real changes."""
@@ -1381,6 +1773,51 @@ class Contributions:
                 'Report commands and actual results; missing checks are not passes. Publishing is a dashboard administrator action.\n\n'
                 'Task-local tool acquisition policy:\n' + task_tool_guidance())
 
+    def outcome_packet(self, task, group, policy):
+        """Bounded terminal-outcome notice for the group that proposed this task."""
+        completion = task.get('completion') or {}
+        receipt = task.get('completion_receipt') or {}
+        head = task.get('merge_sha') or task.get('head_sha') or completion.get('candidate')
+        build = (task.get('builds') or {}).get(head, {})
+        verified = bool(head and build.get('state') == 'complete' and build.get('target') == head
+                        and build.get('required_checks_verified') is True)
+        if (policy['auto_queue_proposals'] or group.get('create_tasks') is True) and not policy['paused']:
+            follow_up = ('Automatic follow-up is enabled: qualifying proposals are created and queued without further '
+                'operator review, up to ' + str(policy['max_per_meeting']) + ' per meeting and '
+                + str(policy['daily_cap']) + ' per day. Propose only necessary, self-contained work with acceptance '
+                'criteria and required checks; set needs_review=true on anything that changes scope, adds dependencies '
+                'or touches sensitive areas.')
+        else:
+            follow_up = 'These are drafts for operator review, not authorization to launch work.'
+        # The instruction comes first: bounded evidence may be truncated, never
+        # the proposal contract this discussion is evaluated by.
+        instruction = ('Outcome review for group ' + str(group.get('name', 'Group')) + ': the work this group proposed has '
+            'reached a terminal state. Confirm whether the recorded outcome satisfies the original proposal, note anything '
+            'missing, and propose only necessary follow-up work. Read-only discussion; do not edit, commit, push or deploy. '
+            'Do not treat missing validation as passed. In the final action-plan artifact include one fenced json object '
+            'with task_proposals: an array (at most 10) of {title, description, profile_id, needs_review}. Each description must include '
+            'acceptance criteria and required checks. Use an existing individual repository worker profile ID from the group '
+            'roster. An empty proposal array is valid. ' + follow_up)
+        parts = [
+            'Task ' + task['id'] + ': ' + task['title'],
+            'Task state: ' + task['state'],
+            'Recorded outcome: ' + str(completion.get('outcome', task['state'])) + ' - '
+            + str(completion.get('reason', ''))[:600],
+            'Candidate: ' + str(head),
+            'Required checks verified for this exact commit: ' + str(verified),
+            'Acceptance criteria: ' + str(task.get('description', ''))[:1500],
+            'Worker-reported checks: ' + json.dumps(receipt.get('tests', []), default=str)[:1000],
+        ]
+        if task.get('diff_stat'):
+            parts.append('Change summary:\n' + str(task['diff_stat'])[:1200])
+        try:
+            knowledge = self.knowledge.context(task['organization_id'], [task.get('repository', '')], task['title'], limit=3000)
+            if knowledge['records']:
+                parts.append('Relevant project knowledge: ' + json.dumps(knowledge['records'], default=str)[:3000])
+        except (ValueError, OSError):
+            pass
+        return (instruction + '\n\n' + '\n\n'.join(parts))[:8000]
+
     def handover_packet(self, task, run, source, target, note):
         """Bounded, deterministic handover context for the target agent."""
         receipt = task.get('completion_receipt') or {}
@@ -1491,6 +1928,20 @@ class Contributions:
                          and j.get('state') not in TERMINAL_EXECUTIONS)
             if not existing and active - int(bool(blocking and blocking.get('task_id'))) >= MAX_ACTIVE_EXECUTIONS:
                 raise ValueError('Task execution capacity is full. Queue this task until a slot is available.')
+            if not existing:
+                # One shared budget over tasks, meetings, discovery and helpers;
+                # a task handoff releases its previous binding before launch.
+                budget = self.session_budget(task['organization_id'], jobs)
+                budget_policy = budget['policy']
+                held = int(bool(blocking and blocking.get('task_id')))
+                limit = budget_policy['max_active_sessions']
+                if limit and budget['active'] - held >= limit:
+                    raise ValueError('The shared session budget is full (' + str(budget['active'] - held) + '/' + str(limit)
+                                     + '). Queue this task until a session finishes.')
+                daily = budget_policy['daily_session_cap']
+                if daily and budget['started'] >= daily:
+                    raise ValueError('The organization daily session budget is reached (' + str(budget['started']) + '/'
+                                     + str(daily) + '). Queue this task for the next window.')
             if not existing:
                 if as_instance:
                     task = self.prepare_instance(task, actor)
@@ -1699,6 +2150,31 @@ class Contributions:
             task.setdefault('consultations', []).append(dict(job_id=job['id'], profile_id=consultant['id'],
                 name=consultant.get('name', 'Agent'), question=question.strip()[:2000], at=stamp()))
             task['consultations'] = task['consultations'][-20:]
+        elif action == 'acceptance':
+            profiles = self.store.snapshot(live_status=False)['profiles']
+            reviewer = next((p for p in profiles if p['id'] == body.get('reviewer_profile_id')
+                             and not p.get('archived') and not p.get('ephemeral')), None)
+            if not reviewer or reviewer.get('group_id') or not reviewer.get('use_worktree', True):
+                raise ValueError('Choose an individual worktree agent as acceptance reviewer.')
+            if Path(reviewer['project']).resolve() != self.path_for(task):
+                raise ValueError('The acceptance reviewer works in another repository.')
+            if reviewer['id'] == task.get('profile_id') or reviewer['id'] == (task.get('execution') or {}).get('template_id'):
+                raise ValueError('The acceptance reviewer must not be the agent doing the work.')
+            auto = body.get('auto')
+            if not isinstance(auto, bool):
+                raise ValueError('Choose whether acceptance reviews run automatically.')
+            previous = task.get('acceptance') or {}
+            acceptance = dict(previous, reviewer_profile_id=reviewer['id'],
+                              reviewer_name=reviewer.get('name', 'Agent'), auto=auto, at=stamp())
+            if previous.get('reviewer_profile_id') != reviewer['id']:
+                for key in ('sha', 'job_id', 'verdict', 'reason', 'evidence', 'verdict_at', 'waiting_sha', 'waiting_since', 'consumed_job_id', 'request', 'request_sha', 'requested_at'):
+                    acceptance.pop(key, None)
+            if auto:
+                if acceptance.get('state') in (None, 'off'):
+                    acceptance['state'] = 'waiting'
+            else:
+                acceptance['state'] = 'off'
+            task['acceptance'] = acceptance
         elif action == 'assignment':
             mode = body.get('mode')
             if mode not in ('queue', 'cancel', 'move'):
@@ -1731,8 +2207,8 @@ class Contributions:
                 # never the required proposal contract. Automatic follow-up is
                 # stated honestly so agents propose sparingly when it is enabled.
                 policy = self.policy(task['organization_id'])
-                if policy['auto_queue_proposals'] and not policy['paused']:
-                    follow_up = ('This organization has automatic follow-up enabled: qualifying proposals are created and queued '
+                if (policy['auto_queue_proposals'] or group.get('create_tasks') is True) and not policy['paused']:
+                    follow_up = ('This review has automatic follow-up enabled: qualifying proposals are created and queued '
                         'without further operator review, up to ' + str(policy['max_per_meeting']) + ' per meeting and '
                         + str(policy['daily_cap']) + ' per day. Propose only necessary, self-contained work with acceptance criteria '
                         'and required checks. Set needs_review=true on a proposal that changes scope, adds dependencies or touches '
@@ -1742,12 +2218,14 @@ class Contributions:
                 instruction = ('Discuss remaining acceptance criteria, blockers, review evidence and possible duplicate/superseded work. '
                     'Read-only discussion; do not edit, commit, push or deploy. '
                     'Do not treat missing validation as passed. Propose only necessary follow-up work; do not recreate existing tasks. '
-                    'In the final action-plan artifact include one fenced json object with task_proposals: an array (at most 10) of {title, description, profile_id}. '
+                    'In the final action-plan artifact include one fenced json object with task_proposals: an array (at most 10) of {title, description, profile_id, needs_review}. '
                     'Each description must include acceptance criteria and required checks. Use an existing individual repository worker profile ID from the group roster. '
                     'Also consider one evidence-based improvement that would make similar work easier next time: documentation, tooling or UX. Do not invent work. '
                     'An empty proposal array is valid. ' + follow_up)
                 context = ('Review task ' + task['id'] + ': ' + task['title'] + '\n' + task['description'][:2000] +
                     '\nCandidate: ' + str(task.get('head_sha')) + '\nIssue: ' + str(task.get('automation_error', task.get('error', '')))[:500] +
+                    ('\nAcceptance: ' + str((task.get('acceptance') or {}).get('state')) + ' - '
+                     + str((task.get('acceptance') or {}).get('reason', ''))[:500] if task.get('acceptance') else '') +
                     '\nOther open work:\n' + '\n'.join(t['id'] + ' ' + t['title'][:120] + ' [' + t['state'] + ']' for t in open_tasks))
                 topic = (instruction + '\n\n' + context)[:8000]
                 signature = body.get('signature') or hashlib.sha256(str(body.get('request_id', uuid.uuid4().hex)).encode()).hexdigest()[:20]

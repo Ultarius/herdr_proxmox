@@ -10,6 +10,53 @@ import 'package:juice/juice.dart';
 void main() {
   JuiceLoggerConfig.minLevel = Level.warning;
   testWidgets(
+    'notification cursor refreshes records and stops after disconnect',
+    (tester) async {
+      var feeds = 0;
+      final feedRequests = <http.Request>[];
+      final connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.url.path == '/api/notifications') {
+            feeds++;
+            feedRequests.add(request);
+            if (feeds == 1) {
+              return http.Response(
+                '{"epoch":"gateway","revision":4,"reset":true,"changes":[]}',
+                200,
+              );
+            }
+
+            return http.Response(
+              '{}',
+              200,
+            ); // Older gateway disables push; periodic refresh remains.
+          }
+          return http.Response('{"workspaces":[],"agents":[]}', 200);
+        }),
+      );
+      BlocScope.register<DashboardBloc>(() => connection);
+      await tester.pumpWidget(const MaterialApp(home: SizedBox()));
+      BlocScope.get<DashboardBloc>();
+      connection.connect('token');
+      await tester.pump(const Duration(milliseconds: 110));
+      await tester.pumpAndSettle();
+      expect(feeds, greaterThanOrEqualTo(1));
+      expect(connection.notificationRevision.value, 1);
+      await tester.pump(const Duration(milliseconds: 110));
+      await tester.pumpAndSettle();
+      expect(feeds, 2);
+      expect(feedRequests.first.headers['Authorization'], 'Bearer token');
+      expect(feedRequests.last.url.queryParameters['after'], '4');
+      expect(feedRequests.last.url.queryParameters['epoch'], 'gateway');
+      await connection.disconnect();
+      await tester.pump(const Duration(seconds: 1));
+      expect(feeds, 2);
+      await tester.pumpWidget(const SizedBox());
+      await BlocScope.reset();
+    },
+  );
+
+  testWidgets(
     'dashboard starts a stopped Herdr server and refreshes its state',
     (tester) async {
       bool running = false;

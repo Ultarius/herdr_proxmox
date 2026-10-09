@@ -60,6 +60,11 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   String? _credential;
   int generation = 0;
   Timer? _timer;
+  Timer? _notificationTimer;
+  final notificationRevision = ValueNotifier<int>(0);
+  final runtimeEvents = ValueNotifier<Map<String, dynamic>>({});
+  String _notificationEpoch = '';
+  int _notificationCursor = 0;
   final selectedOrganization = ValueNotifier<String?>(null);
   final operator = ValueNotifier<Map<String, dynamic>>({
     'name': 'dashboard',
@@ -124,6 +129,14 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
     _credential = token;
     generation++;
     send(DashboardCommand('refresh'));
+    _notificationTimer?.cancel();
+    _notificationEpoch = '';
+    _notificationCursor = 0;
+    final attempt = generation;
+    _notificationTimer = Timer(
+      const Duration(milliseconds: 100),
+      () => _notifications(attempt),
+    );
     _timer?.cancel();
     _timer = Timer.periodic(
       const Duration(seconds: 5),
@@ -131,9 +144,50 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
     );
   }
 
+  Future<void> _notifications(int attempt) async {
+    if (attempt != generation || _credential == null || isClosing) return;
+    var delay = const Duration(milliseconds: 100);
+    try {
+      final response = await client
+          .get(
+            Uri.base.resolve(
+              '/api/notifications?after=$_notificationCursor&epoch=${Uri.encodeQueryComponent(_notificationEpoch)}',
+            ),
+            headers: {
+              if (_credential!.isNotEmpty)
+                'Authorization': 'Bearer $_credential',
+            },
+          )
+          .timeout(const Duration(seconds: 25));
+      if (attempt != generation || _credential == null || isClosing) return;
+      if (response.statusCode != 200)
+        throw StateError('Notification feed unavailable');
+      final data = jsonDecode(response.body);
+      // Older gateways keep the periodic refresh path. No busy retry loop.
+      if (data is! Map || data['epoch'] is! String || data['revision'] is! int)
+        return;
+      final changed =
+          data['reset'] == true || data['revision'] != _notificationCursor;
+      _notificationEpoch = data['epoch'];
+      _notificationCursor = data['revision'];
+      if (data['runtime'] is Map)
+        runtimeEvents.value = Map<String, dynamic>.from(data['runtime']);
+      if (changed) {
+        notificationRevision.value++;
+        send(DashboardCommand('refresh', null, true));
+      }
+    } catch (_) {
+      if (attempt != generation || _credential == null || isClosing) return;
+      delay = const Duration(seconds: 5);
+    }
+    _notificationTimer = Timer(delay, () => _notifications(attempt));
+  }
+
   Future<void> disconnect() async {
     final browserSession = _credential == '';
+    _notificationTimer?.cancel();
     _timer?.cancel();
+    runtimeEvents.value = {};
     _credential = null;
     selectedOrganization.value = null;
     operator.value = {'name': 'dashboard', 'role': 'admin'};
@@ -257,6 +311,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
 
   @override
   void dispose() {
+    _notificationTimer?.cancel();
     _timer?.cancel();
     _credential = null;
     generation++;

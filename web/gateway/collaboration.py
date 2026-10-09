@@ -132,6 +132,18 @@ def action(store, db, name, body, org):
             raise ValueError('Use worktree must be true or false.')
         if not isinstance(item['read_only'], bool):
             raise ValueError('Read-only must be true or false.')
+        # Per-group autonomy: outcome notices default on, task creation is an
+        # explicit opt-in bounded by the organization limits.
+        item['notify_outcomes'] = body.get('notify_outcomes', previous.get('notify_outcomes', True))
+        if not isinstance(item['notify_outcomes'], bool):
+            raise ValueError('Notify outcomes must be true or false.')
+        item['create_tasks'] = body.get('create_tasks', previous.get('create_tasks', False))
+        if not isinstance(item['create_tasks'], bool):
+            raise ValueError('Create tasks must be true or false.')
+        if item['create_tasks']:
+            item['create_tasks_since'] = (
+                previous.get('create_tasks_since') or previous.get('updated_at') or item['updated_at']
+            ) if previous.get('create_tasks') is True else item['updated_at']
         if (item['permission_mode'] != 'default' or item['accessible_paths']) and any(store.get(db, 'profiles', i, org_id)['runtime'] != 'opencode' for i in ids):
             raise ValueError('Choose CLI defaults for groups containing other runtimes.')
         if previous.get('facilitator_id'):

@@ -2,6 +2,7 @@
 from pathlib import Path
 import re
 import json
+import types
 import uuid
 import unittest
 import threading
@@ -680,6 +681,81 @@ class CollaborationTests(unittest.TestCase):
             self.assertIn('Discussion directory:', delivered)
         launches = [a for a, _ in self.calls if a[:2] == ('agent', 'start') and a[2] == run['alias']]
         self.assertEqual(len(launches), 1)
+
+    def test_group_autonomy_settings_round_trip_and_validate(self):
+        group_id = self.action('group', organization_id=self.org, name='Planning', description='Discuss architecture',
+                               members=[self.max, self.iris], notify_outcomes=True, create_tasks=True)
+        self.drain()
+        stored = next(g for g in self.store.snapshot()['groups'] if g['id'] == group_id)
+        self.assertTrue(stored['notify_outcomes'])
+        self.assertTrue(stored['create_tasks'])
+        defaults = self.action('group', organization_id=self.org, name='Defaults', description='Discuss defaults',
+                               members=[self.max, self.iris])
+        self.drain()
+        stored = next(g for g in self.store.snapshot()['groups'] if g['id'] == defaults)
+        self.assertTrue(stored['notify_outcomes'])
+        self.assertFalse(stored['create_tasks'])
+        for key in ('notify_outcomes', 'create_tasks'):
+            with self.assertRaisesRegex(ValueError, key.replace('_', ' ').capitalize()):
+                self.action('group', id=group_id, organization_id=self.org, name='Planning',
+                            description='Discuss architecture', members=[self.max, self.iris], **{key: 'yes'})
+
+    def test_group_edit_preserves_autonomy_and_enable_time(self):
+        group_id = self.action('group', organization_id=self.org, name='Review', description='Initial brief',
+                               members=[self.max, self.iris], notify_outcomes=False, create_tasks=True)
+        self.drain()
+        before = next(g for g in self.store.snapshot()['groups'] if g['id'] == group_id)
+        self.action('group', id=group_id, organization_id=self.org, name='Renamed', description='Edited brief',
+                    members=[self.max, self.iris])
+        self.drain()
+        after = next(g for g in self.store.snapshot()['groups'] if g['id'] == group_id)
+        self.assertTrue(after['create_tasks'])
+        self.assertFalse(after['notify_outcomes'])
+        self.assertEqual(after['create_tasks_since'], before['create_tasks_since'])
+        self.action('group', id=group_id, organization_id=self.org, name='Renamed', description='Edited brief',
+                    members=[self.max, self.iris], create_tasks=False)
+        self.drain()
+        disabled = next(g for g in self.store.snapshot()['groups'] if g['id'] == group_id)
+        self.assertNotIn('create_tasks_since', disabled)
+        self.action('group', id=group_id, organization_id=self.org, name='Renamed', description='Edited brief',
+                    members=[self.max, self.iris], create_tasks=True)
+        self.drain()
+        enabled = next(g for g in self.store.snapshot()['groups'] if g['id'] == group_id)
+        self.assertGreater(enabled['create_tasks_since'], before['create_tasks_since'])
+
+    def test_meeting_budget_waits_instead_of_starting_sessions(self):
+        group_id = self.group()
+        # A fake controller provides only the shared budget the scheduler reads.
+        self.store.contributions = types.SimpleNamespace(
+            session_owner=lambda *_: None,
+            session_budget=lambda *_: dict(
+                policy=dict(max_active_sessions=1, max_active_meetings=0, daily_session_cap=0),
+                active=2, meetings=0, started=2))
+        job_id = self.action('discuss', organization_id=self.org, group_id=group_id)
+        self.drain()
+        job = self.job(job_id)
+        self.assertEqual(job['state'], 'waiting_for_members')
+        self.assertIn('Shared session budget', job['progress'])
+
+    def test_meeting_capacity_one_admits_oldest_instead_of_two_queued_meetings_deadlocking(self):
+        from unittest.mock import Mock
+        group = self.group()
+        controller = Mock()
+        controller.session_budget.return_value = dict(active=3, started=3, policy=dict(max_active_sessions=0, max_active_meetings=1, daily_session_cap=0))
+        controller.session_owner.return_value = None
+        self.store.contributions = controller
+        # Freeze worker submission so both meetings are queued before preparation.
+        with patch.object(self.store, 'execute'):
+            first = self.action('discuss', organization_id=self.org, group_id=group, prompt='First')
+            second = self.action('discuss', organization_id=self.org, group_id=group, prompt='Second')
+            self.drain()
+        from discussion_scheduler import prepare
+        self.assertTrue(prepare(self.store, first))
+        self.assertTrue(self.job(first).get('meeting_admitted_at'))
+        self.assertFalse(prepare(self.store, second))
+        self.store.update_job(first, state='artifact_ready')
+        self.store.update_job(second, state='queued')  # Normal scheduler retry transition.
+        self.assertTrue(prepare(self.store, second))
 
     def test_legacy_group_gets_agent_on_first_message(self):
         with closing(self.store.connect()) as db, db:

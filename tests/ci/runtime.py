@@ -64,9 +64,22 @@ def envelope(value):
 def before():
     if os.getuid() == 0 or Path.home() != HOME:
         raise AssertionError('Run the runtime smoke test as herdr with its own HOME')
-    rejected(401, 'herdr-server/start', {}, token=False)
-    rejected(403, 'herdr-server/start', {}, origin='https://invalid.example')
+    # systemctl is-active only proves the process started. Asserting a 401
+    # before the gateway binds its socket fails on a slow first start, so wait
+    # for the listener and treat refusal as "not ready yet" rather than a
+    # rejected request.
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            rejected(401, 'herdr-server/start', {}, token=False)
+            break
+        except URLError as error:
+            if isinstance(error.reason, ConnectionRefusedError) and time.monotonic() < deadline:
+                time.sleep(1)
+                continue
+            raise
     wait_for(lambda: api('herdr-server'))
+    rejected(403, 'herdr-server/start', {}, origin='https://invalid.example')
     api('herdr-server/start', {})
     def running_server():
         if api('herdr-server')['state'] != 'running':

@@ -21,7 +21,7 @@ _REFUSED = ('agent_blocked', 'agent_not_ready', 'agent_not_found', 'agent_not_ru
 _AMBIGUOUS = ('timeout', 'agent_prompt_stalled', 'pane_input_failed', 'events_lost')
 # Read-only operations that may be retried without side effects.
 READ_ONLY = (('agent', 'list'), ('agent', 'get'), ('agent', 'read'), ('agent', 'explain'),
-             ('workspace', 'list'), ('pane', 'list'), ('pane', 'read'), ('api', 'schema'),
+             ('workspace', 'list'), ('pane', 'list'), ('pane', 'read'), ('api', 'schema'), ('api', 'snapshot'),
              ('agent', 'wait'))
 
 

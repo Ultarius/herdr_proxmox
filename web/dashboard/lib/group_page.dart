@@ -41,6 +41,7 @@ class _GroupPageState extends State<GroupPage> {
   @override
   void initState() {
     super.initState();
+    connection.notificationRevision.addListener(notificationRefresh);
     refresh();
     timer = Timer.periodic(const Duration(seconds: 1), (_) {
       final active = jobs.any(
@@ -51,8 +52,13 @@ class _GroupPageState extends State<GroupPage> {
     });
   }
 
+  void notificationRefresh() {
+    if (mounted) refresh();
+  }
+
   @override
   void dispose() {
+    connection.notificationRevision.removeListener(notificationRefresh);
     timer?.cancel();
     message.dispose();
     super.dispose();

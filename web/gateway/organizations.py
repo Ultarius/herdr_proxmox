@@ -1,7 +1,7 @@
 """Durable organization records and explicit, non-retrying Herdr jobs."""
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import closing
-from datetime import datetime, timezone
+from contextlib import closing, nullcontext
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -81,9 +81,12 @@ class OrganizationStore:
         # One-way notification only: never call the watcher while holding a
         # store/profile lock or SQLite transaction.
         self.jobs_changed = threading.Event()
+        from notifications import Notifications
+        self.events = Notifications()
         self.worker = ThreadPoolExecutor(max_workers=4, thread_name_prefix='organization')
         self.agent_locks = {}
         self.contributions = None
+        self.capacity_guard = None
         self.discussion_cursor = 0
         self.futures = set()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -98,6 +101,8 @@ class OrganizationStore:
                 CREATE TABLE IF NOT EXISTS requests (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, response TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS session_archives (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, data TEXT NOT NULL);
             ''')
+            from notifications import schema
+            schema(db)
             # A crash may have occurred after terminal input. Never replay automatically.
             for row in db.execute('SELECT id, data FROM jobs').fetchall():
                 job = json.loads(row['data'])
@@ -123,7 +128,9 @@ class OrganizationStore:
                             self.put(db, 'jobs', job)
 
     def connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
+        from notifications import Connection
+        db = sqlite3.connect(self.path, timeout=10, factory=Connection)
+        db.notify = self.events.outbox_ready.set
         db.row_factory = sqlite3.Row
         return db
 
@@ -131,6 +138,28 @@ class OrganizationStore:
         self.worker.shutdown(wait=True)
 
     def put(self, db, table, item):
+        from notifications import record
+        previous = db.execute(f'SELECT data FROM {table} WHERE id=?', (item['id'],)).fetchone()
+        def meaningful(value):
+            data = {k: v for k, v in value.items() if k not in ('updated_at',)}
+            if data.get('kind') == 'discussion' and data.get('state') in ('queued', 'waiting_for_members'):
+                data['state'] = 'pending_members'
+            return data
+        if table == 'jobs' and not previous and item.get('kind') == 'launch' and self.contributions is not None:
+            from contributions import TERMINAL_EXECUTIONS
+            policy = self.contributions.policy(item['organization_id'])
+            jobs = [json.loads(row[0]) for row in db.execute('SELECT data FROM jobs WHERE organization_id=?', (item['organization_id'],))]
+            active = sum(j.get('kind') == 'launch' and j.get('state') not in TERMINAL_EXECUTIONS for j in jobs)
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            started = sum(j.get('kind') == 'launch' and str(j.get('created_at') or '') > cutoff for j in jobs)
+            limit = policy.get('max_active_sessions') or 0
+            daily = policy.get('daily_session_cap') or 0
+            if limit and active >= limit:
+                raise ValueError('Shared session budget is full; wait for a session to finish.')
+            if daily and started >= daily:
+                raise ValueError('Organization daily session budget is reached; wait for the next window.')
+        if not previous or meaningful(json.loads(previous[0])) != meaningful(item):
+            record(db, 'job' if table == 'jobs' else 'policy', item['id'], item.get('organization_id', item['id']))
         if table == 'organizations':
             db.execute('INSERT INTO organizations VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data', (item['id'], json.dumps(item)))
         else:
@@ -433,6 +462,11 @@ class OrganizationStore:
         return item
 
     def action(self, action, body):
+        guard = self.capacity_guard() if self.capacity_guard and action in ('launch', 'group', 'discuss') else nullcontext()
+        with guard:
+            return self._action(action, body)
+
+    def _action(self, action, body):
         if not isinstance(body, dict):
             raise ValueError('Expected a JSON object.')
         key = text(body, 'request_id', 80)

@@ -111,6 +111,20 @@ class Knowledge:
                             'Handover: ' + str(task.get('title', ''))[:100], format_handover(handover), source,
                             'handover:' + task['id'] + ':' + receipt['commit'], 'reported')
 
+    def capture_acceptance(self, task, acceptance, job):
+        """Record an acceptance verdict as reported knowledge for the task."""
+        verdict = str(acceptance.get('state', 'unknown'))
+        source = dict(kind='acceptance', job_id=job.get('id'), task_id=task['id'],
+                      profile_id=acceptance.get('reviewer_profile_id'), source_sha=acceptance.get('sha'),
+                      checks_verified=False)
+        body = ('Verdict: ' + verdict + '\nReason: ' + str(acceptance.get('reason', ''))[:1000]
+                + '\nEvidence: ' + json.dumps(acceptance.get('evidence', []))[:1500]
+                + '\nAcceptance verdicts are reported reviews, not validation evidence.')
+        with closing(self.service.connect()) as db, db:
+            self.insert(db, task['organization_id'], task.get('repository', ''), 'finding',
+                        'Acceptance: ' + str(task.get('title', ''))[:100], body, source,
+                        'acceptance:' + task['id'] + ':' + str(acceptance.get('sha')) + ':' + str(job.get('id')) + ':' + verdict, 'reported')
+
     def repositories(self, org):
         snapshot = self.service.store.snapshot(live_status=False)
         root = self.service.projects.resolve()

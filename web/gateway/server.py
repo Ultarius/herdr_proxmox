@@ -37,6 +37,9 @@ from validation import ValidationRuns
 from github_api import GitHub, GitHubError
 from contributions import Contributions
 from herdr_errors import HerdrError, is_read_only, parse_error
+from notifications import OutboxPump
+from runtime_events import RuntimeEvents
+RUNTIME_EVENTS = None
 
 ROOT = Path(os.environ.get('HERDR_WEB_ROOT', '/opt/herdr-web/public')).resolve()
 PROJECTS = Path(os.environ.get('HERDR_PROJECTS', '/home/herdr/projects')).resolve()
@@ -47,6 +50,8 @@ BUILD_SERVICE_CONFIG = Path('/etc/herdr/build-service.json')
 
 
 def command(*args, timeout=10):
+    if RUNTIME_EVENTS is not None and not is_read_only(args):
+        RUNTIME_EVENTS.guard()
     operation = ' '.join(args[:2])
     attempts = 2 if is_read_only(args) else 1
     for attempt in range(attempts):
@@ -276,6 +281,29 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/api/'):
             if not self.authenticated():
                 return
+            if urlsplit(self.path).path == '/api/notifications':
+                query = parse_qs(urlsplit(self.path).query)
+                hub = getattr(getattr(self.server, 'organizations', None), 'events', None)
+                if hub is None:
+                    self.reply(503, {'error': 'Notifications are unavailable.'})
+                    return
+                try:
+                    after = int((query.get('after') or ['0'])[0])
+                    epoch = (query.get('epoch') or [''])[0][:80]
+                    slots = self.server.notification_slots
+                    if not slots.acquire(blocking=False):
+                        self.reply(503, {'error': 'Notification capacity is full; use periodic refresh.'})
+                        return
+                    try:
+                        data = hub.changes(after, epoch, timeout=20)
+                    finally:
+                        slots.release()
+                    if RUNTIME_EVENTS is not None:
+                        data['runtime'] = RUNTIME_EVENTS.snapshot()
+                    self.reply(200, data)
+                except (ValueError, TypeError):
+                    self.reply(400, {'error': 'Invalid notification cursor.'})
+                return
             if self.path.startswith('/api/validation/log?'):
                 query = parse_qs(urlsplit(self.path).query)
                 self.validation_log((query.get('id') or [''])[0])
@@ -488,7 +516,7 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'resolve_delegation', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'retry_discussion', 'cancel_discussion', 'remove_agent', 'remove_group', 'session')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close', 'verify')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/knowledge', '/api/updates/install', '/api/updates/check', '/api/updates/alphas', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/guidance', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build', '/api/tasks/policy', '/api/tasks/complete', '/api/tasks/discuss', '/api/tasks/review_policy', '/api/tasks/proposal', '/api/tasks/assignment', '/api/tasks/automation', '/api/tasks/discovery', '/api/tasks/handover', '/api/tasks/consult'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/knowledge', '/api/updates/install', '/api/updates/check', '/api/updates/alphas', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/guidance', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build', '/api/tasks/policy', '/api/tasks/complete', '/api/tasks/discuss', '/api/tasks/review_policy', '/api/tasks/proposal', '/api/tasks/assignment', '/api/tasks/automation', '/api/tasks/discovery', '/api/tasks/handover', '/api/tasks/consult', '/api/tasks/acceptance'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -503,7 +531,13 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == '/api/tasks/discovery':
                 self.reply(200, self.server.contributions.discovery.action(body, actor, role))
             elif self.path.startswith('/api/tasks/'):
-                self.reply(200, self.server.contributions.action(self.path.rsplit('/', 1)[1], body, actor, role))
+                task_action = self.path.rsplit('/', 1)[1]
+                self.reply(200, self.server.contributions.action(task_action, body, actor, role))
+                if task_action == 'build':
+                    # A submitted build must be noticed promptly; otherwise the
+                    # watcher can sleep through its full idle interval before it
+                    # starts fast-polling the queue.
+                    self.server.integration.wake()
             elif self.path == '/api/organizations/import':
                 self.reply(200, import_configuration(self.server.organizations, body))
             elif self.path == '/api/organizations/activity':
@@ -623,6 +657,7 @@ def serve_gateway(bind, port, policy, token, services, cookie_secure=False):
     while True:
         active_bind = configured_bind(policy, bind)
         server = ThreadingHTTPServer((active_bind, port), Handler)
+        server.notification_slots = threading.BoundedSemaphore(32)
         port = server.server_port
         server.token = token
         server.sessions = sessions
@@ -686,15 +721,22 @@ def main():
     validation = ValidationRuns(PROJECTS, build_event, record=record_build, queue=build_queue, minimum_free_bytes=minimum_build_space)
     contributions.validation = validation
     integration = IntegrationWatcher(PROJECTS, organizations.active_checkouts, coordinator=coordinator,
-                                     wake_event=organizations.jobs_changed)
+                                     wake_event=organizations.events.subscribe(('task', 'job', 'policy', 'runtime')))
     # Durable queue results reach their integration events even without a browser.
     integration.build_results = validation.snapshot
     integration.schedule_builds = lambda: coordinator.schedule_builds(validation)
     integration.wake()
+    outbox = OutboxPump(organizations.events, [organizations.path, contributions.path])
+    outbox.start()
+    global RUNTIME_EVENTS
+    RUNTIME_EVENTS = RuntimeEvents(organizations.events, command)
+    RUNTIME_EVENTS.start()
     contributions.start()
     try:
         serve_gateway(bind, 8787, policy, token, {'github': github, 'contributions': contributions, 'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator, 'operators': operators, 'sdk_install': sdk_install, 'validation': validation}, cookie_secure=secure_setting == '1')
     finally:
+        RUNTIME_EVENTS.close()
+        outbox.close()
         contributions.close()
         coordinator.close()
         integration.close()

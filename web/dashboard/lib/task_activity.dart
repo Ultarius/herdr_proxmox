@@ -42,6 +42,15 @@ String completionOutcome(Map task) {
 String taskNextStep(Map task) {
   if (task['automation_error'] != null)
     return 'Automation needs attention: ${task['automation_error']}';
+  final acceptance = task['acceptance'] as Map?;
+  final acceptanceState = '${acceptance?['state'] ?? ''}';
+  if ([
+    'not_satisfied',
+    'uncertain',
+    'inconclusive',
+    'attention',
+  ].contains(acceptanceState))
+    return 'Acceptance review needs attention: ${acceptance?['reason'] ?? acceptanceState}';
   if (task['state'] == 'completed')
     return 'Done: ${completionOutcome(task)}. Validation and deployment remain separate.';
   if (task['assignment_error'] != null)
@@ -111,6 +120,17 @@ const activityLabels = {
   'auto_queued': 'Follow-up task created and queued automatically',
   'auto_queue_checked': 'Review automation evaluated',
   'follow_up_reported': 'Worker-reported follow-up recorded as draft',
+  'outcome_notice': 'Proposing group outcome review scheduled',
+  'outcome_waiting': 'Outcome review waiting',
+  'outcome_off': 'Outcome review disabled for the proposing group',
+  'outcome_unavailable': 'Outcome review unavailable',
+  'acceptance_requested': 'Acceptance review requested',
+  'acceptance_satisfied': 'Acceptance review satisfied',
+  'acceptance_not_satisfied': 'Acceptance review not satisfied',
+  'acceptance_uncertain': 'Acceptance review uncertain',
+  'acceptance_inconclusive': 'Acceptance review inconclusive',
+  'acceptance_waiting': 'Acceptance review waiting',
+  'acceptance_attention': 'Acceptance review needs attention',
 };
 
 String activityLabel(Object? action) {

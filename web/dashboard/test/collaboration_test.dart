@@ -210,6 +210,8 @@ void main() {
       await tester.pumpAndSettle();
       expect(mutations.last['members'], ['max', 'iris']);
       expect(mutations.last['read_only'], isTrue);
+      expect(mutations.last['notify_outcomes'], isTrue);
+      expect(mutations.last['create_tasks'], isFalse);
       expect(mutations.last['permission_mode'], 'default');
       expect(mutations.last['description'], contains('deployment options'));
       await tester.pumpWidget(const SizedBox.shrink());

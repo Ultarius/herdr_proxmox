@@ -104,6 +104,49 @@ class BrowserSessionTests(unittest.TestCase):
             self.assertEqual(update.call_args.args[2:4], ('dashboard', 'admin'))
             self.server.integration.wake.assert_called_once()
 
+    def test_task_build_submission_wakes_the_integration_watcher(self):
+        self.server.contributions = Mock()
+        self.server.contributions.action.return_value = {'id': 't' * 32}
+        self.server.integration = Mock()
+        body = {'task_id': 't' * 32, 'target': 'a' * 40, 'request_id': 'build-1'}
+        def post(action):
+            return urlopen(Request(self.base + '/api/tasks/' + action,
+                                   data=json.dumps(body).encode(),
+                                   headers={'Authorization': 'Bearer secret', 'Content-Type': 'application/json'}))
+        self.assertEqual(json.load(post('build')), {'id': 't' * 32})
+        self.server.contributions.action.assert_called_once_with('build', body, 'dashboard', 'admin')
+        self.server.integration.wake.assert_called_once()
+        # Other task actions do not force a full watcher refresh.
+        self.server.integration.reset_mock()
+        post('refresh')
+        self.server.integration.wake.assert_not_called()
+
+    def test_notification_feed_requires_authentication_and_recovers_cursor(self):
+        from notifications import Notifications
+        self.server.organizations = Mock()
+        self.server.organizations.events = Notifications()
+        self.server.notification_slots = threading.BoundedSemaphore(32)
+        with self.assertRaises(HTTPError) as error:
+            self.request('/api/notifications')
+        self.assertEqual(error.exception.code, 401)
+        first = json.load(self.request('/api/notifications', Authorization='Bearer secret'))
+        self.assertTrue(first['reset'])
+        self.server.organizations.events.publish('task', 'changed-task', 'org')
+        path = '/api/notifications?after=0&epoch=' + first['epoch']
+        response = json.load(self.request(path, Authorization='Bearer secret'))
+        self.assertEqual(response['changes'][0]['key'], 'changed-task')
+        with self.assertRaises(HTTPError) as invalid:
+            self.request('/api/notifications?after=-1', Authorization='Bearer secret')
+        self.assertEqual(invalid.exception.code, 400)
+
+    def test_acceptance_endpoint_reaches_authenticated_task_controller(self):
+        self.server.contributions = Mock()
+        self.server.contributions.action.return_value = {'id': 'task'}
+        response = urlopen(Request(self.base + '/api/tasks/acceptance', data=b'{"task_id":"task"}',
+            headers={'Authorization': 'Bearer secret', 'Content-Type': 'application/json'}))
+        self.assertEqual(json.load(response), {'id': 'task'})
+        self.server.contributions.action.assert_called_once_with('acceptance', {'task_id': 'task'}, 'dashboard', 'admin')
+
     def test_operator_tokens_carry_their_identity_and_lose_it_on_removal(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'operators.json'

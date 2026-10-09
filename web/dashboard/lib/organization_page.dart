@@ -284,7 +284,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
                         '${archive['identity']?['name'] ?? 'Historical agent'}',
                       ),
                       subtitle: Text(
-                        '${archive['alias']}\nArchived ${archive['archived_at']}${archive['terminal_unavailable'] != null ? '\nTerminal history unavailable; saved records only.' : ''}',
+                        '${archive['alias']}${archive['native_resume_available'] == true ? ' \u00b7 native resume available' : ''}\nArchived ${archive['archived_at']}${archive['terminal_unavailable'] != null ? '\nTerminal history unavailable; saved records only.' : ''}',
                       ),
                       trailing: TextButton(
                         onPressed: () => Navigator.pop(context, archive),
@@ -310,7 +310,8 @@ class _OrganizationPageState extends State<OrganizationPage> {
         'archive_id': chosen['id'],
       });
       if (!current()) return;
-      final continueSession = await showDialog<bool>(
+      final nativeResume = data['native_resume_available'] == true;
+      final action = await showDialog<String>(
         context: context,
         builder: (context) => AlertDialog(
           title: Text(
@@ -323,8 +324,10 @@ class _OrganizationPageState extends State<OrganizationPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Text(
-                    'Bounded historical evidence, not a complete provider transcript. Continuing creates a fresh conversation and waits for instructions.',
+                  Text(
+                    nativeResume
+                        ? 'Bounded historical evidence, not a complete provider transcript. This archive records a verified native resume reference; resuming restores that conversation binding and is not completed work.'
+                        : 'Bounded historical evidence, not a complete provider transcript. Continuing creates a fresh conversation and waits for instructions.',
                   ),
                   SelectableText(
                     'Checkout: ${data['worktree_path'] ?? data['source_project']}\nBranch: ${data['worktree_branch']}\nTask: ${data['task_id']}',
@@ -347,17 +350,22 @@ class _OrganizationPageState extends State<OrganizationPage> {
               child: const Text('Download archive'),
             ),
             TextButton(
-              onPressed: () => Navigator.pop(context, false),
+              onPressed: () => Navigator.pop(context),
               child: const Text('Close'),
             ),
+            if (nativeResume)
+              OutlinedButton(
+                onPressed: () => Navigator.pop(context, 'resume'),
+                child: const Text('Resume original conversation'),
+              ),
             FilledButton(
-              onPressed: () => Navigator.pop(context, true),
+              onPressed: () => Navigator.pop(context, 'continue'),
               child: const Text('Continue with saved context'),
             ),
           ],
         ),
       );
-      if (continueSession == true && current())
+      if (action != null && current())
         await manageSession({
           'id': data['run_id'],
           'organization_id': organizationId,
@@ -365,7 +373,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
           'alias': data['alias'],
           'pane_id': data['pane_id'],
           'profile': data['identity'],
-        }, 'continue');
+        }, action);
     } catch (error) {
       if (current())
         ScaffoldMessenger.of(
@@ -383,6 +391,8 @@ class _OrganizationPageState extends State<OrganizationPage> {
               ? 'Restart agent session?'
               : mode == 'continue'
               ? 'Continue archived context?'
+              : mode == 'resume'
+              ? 'Resume provider conversation?'
               : 'Archive and close session?',
         ),
         content: Text(
@@ -391,6 +401,8 @@ class _OrganizationPageState extends State<OrganizationPage> {
               ? 'Restarts a fresh session in the retained checkout with the current agent profile. It waits for instructions and does not replay the task.'
               : mode == 'continue'
               ? 'Starts a fresh session in the retained checkout with the archived evidence and the current agent profile. It does not resume the provider conversation or replay the task.'
+              : mode == 'resume'
+              ? 'Restores the archived provider conversation binding in the retained checkout. Restoration is not completed work; the session waits for instructions.'
               : 'Preserves available evidence before closing a verified idle session. If capture fails, the pane stays open.'}',
         ),
         actions: [

@@ -142,6 +142,7 @@ class _TasksPageState extends State<TasksPage> {
       }
     });
     connected = connection.state.connected;
+    connection.notificationRevision.addListener(notificationRefresh);
     refresh();
     timer = Timer.periodic(const Duration(seconds: 15), (_) => refresh());
   }
@@ -164,8 +165,13 @@ class _TasksPageState extends State<TasksPage> {
     await refresh(force: true);
   }
 
+  void notificationRefresh() {
+    if (mounted) refresh(force: true);
+  }
+
   @override
   void dispose() {
+    connection.notificationRevision.removeListener(notificationRefresh);
     timer?.cancel();
     subscription?.cancel();
     super.dispose();
@@ -1059,12 +1065,55 @@ class _TasksPageState extends State<TasksPage> {
     (automation['${task['organization_id']}'] as Map?) ?? const {},
   );
 
+  Widget _outcomeNotice(Map notice) {
+    final state = '${notice['state'] ?? ''}';
+    if (state == 'scheduled')
+      return Text(
+        'Outcome review scheduled for: ${notice['group_name'] ?? 'group'} \u00b7 '
+        'outcome ${notice['outcome'] ?? ''} \u00b7 meeting ${notice['job_id'] ?? ''}.',
+      );
+    if (state == 'off')
+      return const Text(
+        'Outcome reviews are disabled for the proposing group.',
+      );
+    if (state == 'unavailable' || state == 'error')
+      return Text('Outcome notice: ${notice['reason'] ?? state}');
+    return const SizedBox.shrink();
+  }
+
+  String _acceptanceText(Map acceptance) {
+    final state = '${acceptance['state'] ?? ''}';
+    final reviewer = '${acceptance['reviewer_name'] ?? 'reviewer'}';
+    final reason = '${acceptance['reason'] ?? ''}';
+    return switch (state) {
+      'satisfied' => 'Acceptance: satisfied by $reviewer. $reason',
+      'not_satisfied' => 'Acceptance: not satisfied by $reviewer. $reason',
+      'uncertain' ||
+      'inconclusive' ||
+      'attention' => 'Acceptance: $state \u00b7 $reason',
+      'requested' => 'Acceptance review requested from $reviewer.',
+      'waiting' =>
+        'Acceptance review waiting: ${reason.isEmpty ? 'no reason recorded' : reason}',
+      'off' => 'Acceptance review is off.',
+      _ => 'Acceptance: $state',
+    };
+  }
+
   String _automationSummary(Map task) {
     final policy = _orgPolicy(task);
+    final budget = <String>[
+      if ((policy['max_active_sessions'] ?? 0) > 0)
+        '${policy['max_active_sessions']} active sessions',
+      if ((policy['max_active_meetings'] ?? 0) > 0)
+        '${policy['max_active_meetings']} meetings',
+      if ((policy['daily_session_cap'] ?? 0) > 0)
+        '${policy['daily_session_cap']} starts/day',
+    ].join(', ');
+    final budgetText = budget.isEmpty ? '' : 'Shared budget: $budget. ';
     if (policy['auto_queue_proposals'] != true)
-      return 'Off. Qualifying group proposals stay drafts until you create or queue them.';
+      return '${budgetText}Organization-wide follow-up is off. Individual groups may opt in; other proposals stay drafts.';
     final paused = policy['paused'] == true ? 'Paused. ' : '';
-    return '${paused}On: ${policy['max_per_meeting'] ?? 1}/meeting, '
+    return '$budgetText${paused}On: ${policy['max_per_meeting'] ?? 1}/meeting, '
         '${policy['max_open_per_agent'] ?? 2} open per agent, '
         'depth ${policy['max_follow_up_depth'] ?? 1}, '
         '${policy['daily_cap'] ?? 5}/day.';
@@ -1100,6 +1149,15 @@ class _TasksPageState extends State<TasksPage> {
       text: '${policy['max_follow_up_depth'] ?? 1}',
     );
     final daily = TextEditingController(text: '${policy['daily_cap'] ?? 5}');
+    final sessions = TextEditingController(
+      text: '${policy['max_active_sessions'] ?? 0}',
+    );
+    final meetings = TextEditingController(
+      text: '${policy['max_active_meetings'] ?? 0}',
+    );
+    final starts = TextEditingController(
+      text: '${policy['daily_session_cap'] ?? 0}',
+    );
     final selected = await showDialog<Map<String, dynamic>>(
       context: context,
       builder: (context) => StatefulBuilder(
@@ -1134,6 +1192,12 @@ class _TasksPageState extends State<TasksPage> {
                   _limitField(perAgent, 'Max open per agent (queued + active)'),
                   _limitField(depth, 'Max follow-up depth'),
                   _limitField(daily, 'Daily limit (organization)'),
+                  const Text(
+                    'Shared session budget: one limit over task executions, meetings, discovery and helpers. 0 turns a limit off.',
+                  ),
+                  _limitField(sessions, 'Max active sessions (organization)'),
+                  _limitField(meetings, 'Max active meetings (organization)'),
+                  _limitField(starts, 'Daily session starts (organization)'),
                 ],
               ),
             ),
@@ -1151,6 +1215,9 @@ class _TasksPageState extends State<TasksPage> {
                 'max_open_per_agent': int.tryParse(perAgent.text.trim()),
                 'max_follow_up_depth': int.tryParse(depth.text.trim()),
                 'daily_cap': int.tryParse(daily.text.trim()),
+                'max_active_sessions': int.tryParse(sessions.text.trim()),
+                'max_active_meetings': int.tryParse(meetings.text.trim()),
+                'daily_session_cap': int.tryParse(starts.text.trim()),
               }),
               child: const Text('Save policy'),
             ),
@@ -1162,6 +1229,9 @@ class _TasksPageState extends State<TasksPage> {
     perAgent.dispose();
     depth.dispose();
     daily.dispose();
+    sessions.dispose();
+    meetings.dispose();
+    starts.dispose();
     if (selected == null || !mounted || epoch != connection.generation) return;
     selected.removeWhere((key, value) => value == null);
     await act('automation', {
@@ -1234,9 +1304,7 @@ class _TasksPageState extends State<TasksPage> {
                   child: const Text('Send Enter'),
                 ),
                 OutlinedButton(
-                  onPressed: admin && !busy
-                      ? () => sendKey(task, 'esc')
-                      : null,
+                  onPressed: admin && !busy ? () => sendKey(task, 'esc') : null,
                   child: const Text('Send Escape'),
                 ),
                 OutlinedButton(
@@ -1264,7 +1332,9 @@ class _TasksPageState extends State<TasksPage> {
 
   Future<List<Map<String, dynamic>>> _agents(Map task) async {
     final directory = await connection.request('organizations/directory');
-    final profiles = List<Map<String, dynamic>>.from(directory['profiles'] ?? []);
+    final profiles = List<Map<String, dynamic>>.from(
+      directory['profiles'] ?? [],
+    );
     final repository = '${task['repository']}'.replaceAll('\\', '/');
     return profiles
         .where(
@@ -1390,9 +1460,7 @@ class _TasksPageState extends State<TasksPage> {
                     maxLength: 2000,
                     minLines: 3,
                     maxLines: 6,
-                    decoration: const InputDecoration(
-                      labelText: 'Question',
-                    ),
+                    decoration: const InputDecoration(labelText: 'Question'),
                   ),
                 ],
               ),
@@ -1422,6 +1490,89 @@ class _TasksPageState extends State<TasksPage> {
           'task_id': task['id'],
           'consultant_profile_id': parts.first,
           'question': parts.length > 1 ? parts[1] : '',
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => error = '$e');
+    }
+  }
+
+  Future<void> acceptanceTask(Map<String, dynamic> task) async {
+    try {
+      final agents = await _agents(task);
+      final current = '${task['profile_id']}';
+      final template = '${(task['execution'] as Map?)?['template_id'] ?? ''}';
+      final choices = agents
+          .where((p) => '${p['id']}' != current && '${p['id']}' != template)
+          .toList();
+      if (!mounted) return;
+      if (choices.isEmpty) {
+        setState(() => error = 'No other agent works in this repository.');
+        return;
+      }
+      final existing = task['acceptance'] as Map?;
+      var reviewer =
+          '${existing?['reviewer_profile_id'] ?? choices.first['id']}';
+      if (!choices.any((p) => '${p['id']}' == reviewer))
+        reviewer = '${choices.first['id']}';
+      var automatic = existing?['auto'] == true;
+      final chosen = await showDialog<List<String>>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+          builder: (context, update) => AlertDialog(
+            title: const Text('Acceptance review'),
+            content: SizedBox(
+              width: 480,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'An independent agent checks the acceptance criteria against the recorded candidate and verified checks, then saves a JSON verdict. The verdict is reported knowledge, not validation evidence.',
+                  ),
+                  DropdownButtonFormField<String>(
+                    initialValue: reviewer,
+                    isExpanded: true,
+                    decoration: const InputDecoration(labelText: 'Reviewer'),
+                    items: [
+                      for (final p in choices)
+                        DropdownMenuItem(
+                          value: '${p['id']}',
+                          child: Text('${p['name']}'),
+                        ),
+                    ],
+                    onChanged: (v) => update(() => reviewer = v ?? reviewer),
+                  ),
+                  SwitchListTile(
+                    value: automatic,
+                    onChanged: (v) => update(() => automatic = v),
+                    title: const Text(
+                      'Review every verified candidate automatically',
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, [
+                  reviewer,
+                  automatic ? 'auto' : 'manual',
+                ]),
+                child: const Text('Save'),
+              ),
+            ],
+          ),
+        ),
+      );
+      if (chosen != null && mounted) {
+        await act('acceptance', {
+          'task_id': task['id'],
+          'reviewer_profile_id': chosen.first,
+          'auto': chosen.last == 'auto',
         });
       }
     } catch (e) {
@@ -1701,7 +1852,9 @@ class _TasksPageState extends State<TasksPage> {
     if (target == null || ['closed', 'completed'].contains(task['state']))
       return const SizedBox.shrink();
     if (evidence?['state'] == 'complete') {
-      final verified = evidence?['required_checks_verified'] == true;
+      final verified =
+          evidence?['target'] == target &&
+          evidence?['required_checks_verified'] == true;
       if (verified &&
           !['merged', 'published', 'pr_open'].contains(task['state'])) {
         return FilledButton.icon(
@@ -1721,15 +1874,20 @@ class _TasksPageState extends State<TasksPage> {
         label: const Text('Inspect validation evidence'),
       );
     }
-    final running = ['queued', 'running'].contains(evidence?['state']);
+    if (['queued', 'running'].contains(evidence?['state']))
+      return OutlinedButton.icon(
+        onPressed: widget.coordinator == null
+            ? null
+            : () => widget.coordinator!.push(BuildsRoute()),
+        icon: const Icon(Icons.hourglass_top),
+        label: const Text('Validation in progress \u00b7 view build'),
+      );
     return FilledButton.icon(
-      onPressed: admin && !busy && !running
+      onPressed: admin && !busy
           ? () => act('build', {'task_id': task['id'], 'target': target})
           : null,
       icon: const Icon(Icons.fact_check),
-      label: Text(
-        running ? 'Validation in progress' : 'Validate latest commit',
-      ),
+      label: const Text('Validate latest commit'),
     );
   }
 
@@ -1856,6 +2014,12 @@ class _TasksPageState extends State<TasksPage> {
                 child: const Text('Open originating task'),
               ),
             ],
+            if (task['outcome_notice'] is Map)
+              _outcomeNotice(task['outcome_notice'] as Map),
+            if (task['acceptance'] is Map)
+              Text(_acceptanceText(task['acceptance'] as Map)),
+            if (task['outcome_error'] != null)
+              Text('Outcome review waiting: ${task['outcome_error']}'),
             const Text('Task description & acceptance criteria'),
             SelectableText(
               '${task['description'] ?? 'No description recorded.'}',
@@ -1945,6 +2109,11 @@ class _TasksPageState extends State<TasksPage> {
                         icon: const Icon(Icons.support_agent),
                         label: const Text('Ask a consultant'),
                       ),
+                      TextButton.icon(
+                        onPressed: busy ? null : () => acceptanceTask(task),
+                        icon: const Icon(Icons.verified_outlined),
+                        label: const Text('Acceptance review'),
+                      ),
                       if (_archivedRun(task) != null)
                         TextButton.icon(
                           onPressed: busy ? null : () => handoverTask(task),
@@ -1978,7 +2147,9 @@ class _TasksPageState extends State<TasksPage> {
                       else
                         expandedMeetings.remove('${meeting['job_id']}');
                     },
-                    title: Text('${meeting['group_name']} review'),
+                    title: Text(
+                      '${meeting['group_name']} ${meeting['outcome'] == true ? 'outcome review' : 'review'}',
+                    ),
                     subtitle: Text('${meeting['state']}'),
                     children: [
                       if (widget.coordinator != null)
@@ -2107,7 +2278,8 @@ class _TasksPageState extends State<TasksPage> {
                 final label = build is! Map
                     ? 'not run'
                     : build['state'] == 'complete'
-                    ? (build['required_checks_verified'] == true
+                    ? (build['target'] == target &&
+                              build['required_checks_verified'] == true
                           ? 'verified'
                           : 'finished without verified required checks')
                     : '${build['state']}';
@@ -2213,22 +2385,7 @@ class _TasksPageState extends State<TasksPage> {
               : null,
           child: const Text('Refresh PR status'),
         ),
-      if (task['head_sha'] != null)
-        OutlinedButton(
-          onPressed: admin && !busy
-              ? () => act('build', {
-                  'task_id': task['id'],
-                  'target': task['state'] == 'merged'
-                      ? task['merge_sha']
-                      : task['head_sha'],
-                })
-              : null,
-          child: Text(
-            task['state'] == 'merged'
-                ? 'Build merged result'
-                : 'Validate candidate',
-          ),
-        ),
+      _validateAction(task),
       if (task['pull'] is Map)
         TextButton(
           onPressed: () async {
@@ -2245,4 +2402,31 @@ class _TasksPageState extends State<TasksPage> {
         ),
     ],
   );
+
+  /// Validation for the current target. Verified evidence hides the action
+  /// (the durable queue would not re-run it) and an in-flight build disables it.
+  Widget _validateAction(Map<String, dynamic> task) {
+    final target = task['state'] == 'merged'
+        ? task['merge_sha']
+        : task['head_sha'];
+    if (target == null) return const SizedBox.shrink();
+    final build = (task['builds'] as Map?)?[target];
+    if (build is Map &&
+        build['target'] == target &&
+        build['state'] == 'complete' &&
+        build['required_checks_verified'] == true)
+      return const SizedBox.shrink();
+    final running =
+        build is Map && ['queued', 'running'].contains(build['state']);
+    return OutlinedButton(
+      onPressed: admin && !busy && !running
+          ? () => act('build', {'task_id': task['id'], 'target': target})
+          : null,
+      child: Text(
+        task['state'] == 'merged'
+            ? 'Build merged result'
+            : 'Validate candidate',
+      ),
+    );
+  }
 }

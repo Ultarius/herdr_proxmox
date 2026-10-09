@@ -62,9 +62,16 @@ repeat the predecessor's work.
 
 ## Native resume
 
-Provider-native conversation resume is not available. Herdr session identity is not
-proof of a provider conversation ID. Continuing an archived session supplies saved
-context to a fresh session; it never claims to restore provider state.
+Before closing a session the gateway probes the live agent for a resume reference
+and records `unavailable`, `reported`, `verified` or a failed probe on the archive.
+Only a `verified` capability — a reference with structured adapter arguments
+validated before storage — enables the portal's **Resume original conversation**
+action (Organization → Archived sessions), which relaunches the profile in the
+retained checkout with those arguments. A `reported` reference is recorded for
+operators but never executed; those archives offer **Continue with saved context**
+instead. Restoration is not completed work: the resumed session waits for
+instructions. Herdr session identity alone is never treated as proof of a provider
+conversation ID.
 
 ## Handover, consultations and instances
 
@@ -146,21 +153,26 @@ path remains available for every other case.
 
 ## Automatic follow-up from group reviews
 
-Group discussions produce draft proposals by default. An organization can opt into
-bounded automatic follow-up, per organization and off by default:
+Group discussions produce draft proposals by default. Follow-up can be enabled
+per organization and per group:
 
-- `auto_queue_proposals` — qualifying proposals are created and queued without a
-  separate operator click;
+- `auto_queue_proposals` (organization, off by default) — qualifying proposals
+  from every group are created and queued without a separate operator click;
+- `create_tasks` (group, off by default) — this group may create and queue
+  qualifying proposals from its own discussions on its own;
 - `max_per_meeting` — how many proposals from one discussion may start;
 - `max_open_per_agent` — queued plus active work allowed per assignee;
 - `max_follow_up_depth` — how many follow-up generations are allowed;
 - `daily_cap` — automatically created tasks per organization per 24 hours;
-- `paused` — kill switch; queued work stays queued and nothing new starts.
+- `paused` (organization) — kill switch; queued work stays queued and nothing
+  new starts automatically.
 
-A proposal qualifies only when all of the following hold:
+A meeting is evaluated when its organization enables automatic follow-up or its
+own group opted into creating tasks. A proposal qualifies only when all of the
+following hold:
 
 - its discussion is finalized and belongs to a task in review, completion or
-  merged state (evidence-backed review, not mid-implementation);
+  merged or closed state (terminal outcomes may need corrective follow-ups);
 - its assignee is an individual, non-archived worktree agent for the same
   repository;
 - the follow-up depth, per-meeting, per-agent and daily limits are not exceeded;
@@ -171,7 +183,9 @@ verified handoff path as manual work. Failures and uncertainty (repository
 unavailable, invalid assignee, capacity) leave the proposal as a draft and record
 the reason on the task. Enabling the policy starts a fresh evaluation window:
 discussions created before it are recorded as evaluated and are never queued
-retroactively. Each evaluation is recorded once per meeting.
+retroactively. Each evaluation is recorded once per meeting. The group enablement timestamp
+(`create_tasks_since`) changes only when task creation is enabled; ordinary
+group edits preserve it. Disabling and re-enabling starts a new window.
 
 Delivery remains operator-controlled: no automatic publication, merge, base
 update or deployment. Every automatically created task records its source
@@ -185,7 +199,59 @@ A worker can also report an optional `follow_up` object in its completion
 receipt. It is recorded once per commit as a draft task with recorded depth for
 operator review; it never starts automatically.
 
+## Outcome notices to the proposing group
 
+A task created from a group proposal or a discovery meeting records its origin in
+`source.group_id`. When that task reaches a terminal state (`completed`, `merged`
+or `closed`), the gateway schedules one outcome review with the originating group
+and records `outcome_notice` on the task:
+
+- the notice is one discussion per task, created with a stable request ID, so a
+  restart or a lost response cannot create a second meeting. The full request is
+  saved before dispatch and reused unchanged, including its evidence packet;
+- the organization pause switch also defers new outcome meetings; paused
+  organizations are excluded before selecting the bounded batch. Failed
+  dispatches rotate behind tasks that have not been attempted;
+- the group receives a bounded packet: task, recorded outcome and reason,
+  candidate or merged commit, whether required checks were verified for that
+  exact commit, worker-reported checks, change summary and relevant project
+  knowledge;
+- the discussion instruction asks the group to confirm the outcome satisfies the
+  original proposal and to propose only necessary follow-ups under the same
+  proposal contract; an empty proposal array is valid;
+- follow-ups from an outcome review use the ordinary follow-up policy: drafts by
+  default, queued when the organization or the group enables task creation;
+- each group has `notify_outcomes` (default on), set in the group form. When it
+  is off, the task is recorded as evaluated, and enabling it later notifies only
+  work that finishes afterwards;
+- a missing or removed group is recorded once as unavailable instead of being
+  retried forever; transient failures retry on the next poll and are recorded as
+  `outcome_error`, shown in the task overview. A scheduled notice means the
+  meeting is queued, not that the group has already received or completed it.
+
+Tasks without a group origin (manual creation, receipt `follow_up`) are never
+notified.
+
+## Acceptance verification
+
+Checks prove the commit builds; they do not prove it satisfies the task's
+acceptance criteria. A task can therefore name an acceptance reviewer in
+**Automation settings → Acceptance review**:
+
+- the reviewer must be an individual, non-ephemeral worktree agent in the same
+  repository and never the agent doing the work;
+- with automatic review on, the poller dispatches one bounded review per verified
+  candidate once required checks are verified for that exact commit (or the
+  worker proved no changes were required). A busy reviewer leaves the review
+  waiting with the reason recorded; it is never dropped;
+- the review prompt asks for strict JSON saved to the reply file:
+  `{"verdict":"satisfied|not_satisfied|uncertain","reason":"...","evidence":["..."]}`;
+- the verdict is recorded on the task, captured as reported knowledge and shown
+  in the overview. It is a reported review, not validation evidence;
+- `not_satisfied`, `uncertain`, `inconclusive` and `attention` (stalled past six
+  hours) join the review evidence signature, so a configured automatic review
+  group convenes with the verdict in its context, and the task's next step says
+  the acceptance review needs attention.
 
 A retry reconciles an already-reserved organization launch by task identity, without
 sending a second prompt or regenerating its request fingerprint. Pending launches count
@@ -193,9 +259,14 @@ against the task execution cap. Closing an old task session does not prevent aut
 validation of its unchanged, receipt-verified candidate; validation cannot recapture new
 commits from a finished session.
 
-The cap covers task executions launched by the contribution controller. General
-organization and group sessions are outside this task cap. Provider-native state is not
-restored, and no task assignment grants publication or deployment permission.
+The organization can additionally set one shared session budget over task
+executions, meetings, discovery and helpers: `max_active_sessions` (concurrent
+launch bindings), `max_active_meetings` (concurrent discussions) and
+`daily_session_cap` (launch starts per 24 hours). 0 keeps a limit off. Meetings
+wait in `waiting_for_members` and tasks report a full-budget reason instead of
+starting sessions past the budget; the legacy task execution cap still applies.
+Provider-native state is not restored, and no task assignment grants publication
+or deployment permission.
 
 ## Legacy session closure
 
@@ -258,3 +329,45 @@ rotation. The task page offers **Archive inspected session and start**, requirin
 explicit confirmation pinned to the exact run. Bounded terminal history is saved,
 old files remain intact, and implementation starts in its separate Git worktree.
 Invalid Git metadata is an inspection error, never a reason to skip Git checks.
+
+## Next steps for reliable autonomous execution
+
+The feedback loop is now planning -> draft/queued task -> implementation ->
+exact-commit validation -> outcome discussion -> bounded follow-up. Publication
+and deployment still require their separate explicit policies.
+
+Prioritize the following before broadening automatic execution:
+
+1. **Delivery recovery:** preserve structured runtime errors, distinguish input
+   refused before submission from ambiguous submission, and reconcile receipts
+   after restart. Never replay a possibly delivered prompt blindly.
+2. **Permission interactions:** show approval/question states with a current
+   visible-screen preview and audited operator controls. Never auto-approve.
+3. **Native session resume:** record verified conversation references, runtime,
+   endpoint and checkout; reconcile restored bindings without treating restored
+   sessions as proof of task completion. Keep archived-context fallback.
+4. **Events with snapshot recovery:** events should invalidate cached readiness
+   and wake durable queues. Reconnect/resnapshot on lost events, coalesce bursts,
+   and retain periodic reconciliation.
+5. **Shared execution budgets:** include task, group, discovery and temporary
+   helper jobs in organization/global capacity and cost controls. A task-only
+   execution cap does not bound the full team.
+6. **Progress and acceptance:** distinguish lifecycle activity from meaningful
+   task progress; require bounded retries and explicit escalation. Evaluate
+   proposal acceptance criteria against exact artifacts, not prose claims.
+7. **Recovery tests:** inject crashes after reservation, prompt submission,
+   receipt creation, build completion and meeting creation. Demonstrate no
+   duplicate work, no lost source links and no false verified status.
+
+Measure queue wait time, unresolved delivery age, permission wait time, validated
+outcome rate and follow-up depth/cost. Use those measurements to expand autonomy
+rather than enabling publication or unlimited self-generated tasks at once.
+
+## Event-driven scheduling
+
+The gateway now wakes durable workflows through independent notification
+mailboxes, transactional task/job outboxes and runtime lifecycle subscriptions.
+Task and group pages follow an authenticated notification feed. Periodic
+reconciliation, verified evidence and explicit permission decisions remain
+required. See [Event-driven execution](event-driven-execution.md) for recovery,
+capacity, compatibility and deployment verification details.

@@ -428,6 +428,111 @@ class ContributionTests(unittest.TestCase):
         self.service.advance_reviews()
         self.assertEqual(self.store.action.call_count, count + 1)  # Changed evidence reviews again.
 
+    def test_outcome_notice_notifies_the_proposing_group_once(self):
+        task = self.candidate()
+        task['source'] = dict(group_id='group', meeting_id='origin', task_id='parent', depth=1)
+        task.update(state='completed', completion=dict(outcome='incorporated_upstream', candidate=task['head_sha'],
+                                                      reason='Exact candidate file tree matches the fetched base.',
+                                                      validation='verified'))
+        self.service.save(task, 'complete', 'admin')
+        self.store.snapshot.return_value['groups'] = [dict(id='group', organization_id='org', name='Project Review')]
+        self.store.action.return_value = dict(id='outcome-meeting', state='queued')
+        self.service.advance_outcomes()
+        request = self.store.action.call_args.args[1]
+        self.assertEqual((request['group_id'], request['request_id']), ('group', 'task-outcome-' + task['id']))
+        self.assertIn('Outcome review', request['prompt'])
+        self.assertIn('task_proposals', request['prompt'])
+        stored = self.service.get(task['id'])
+        self.assertEqual(stored['outcome_notice']['state'], 'scheduled')
+        self.assertEqual(stored['outcome_notice']['job_id'], 'outcome-meeting')
+        self.assertEqual(stored['meetings'][-1]['outcome'], True)
+        self.assertTrue(self.store.update_job.call_args.kwargs['outcome_notice'])
+        count = self.store.action.call_count
+        self.service.advance_outcomes()
+        self.assertEqual(self.store.action.call_count, count)  # One notice per task.
+
+    def test_outcome_notice_respects_group_settings_and_records_missing_groups(self):
+        first = self.service.action('create', dict(self.body, request_id='create-2', title='First'), 'admin', 'admin')
+        first['source'] = dict(group_id='group')
+        first.update(state='completed', completion=dict(outcome='superseded', candidate='a' * 40,
+                                                       reason='Superseded by another change.'))
+        self.service.save(first, 'complete', 'admin')
+        self.store.snapshot.return_value['groups'] = [dict(id='group', organization_id='org', name='Review',
+                                                           notify_outcomes=False)]
+        self.service.advance_outcomes()
+        self.store.action.assert_not_called()
+        self.assertEqual(self.service.get(first['id'])['outcome_notice']['state'], 'off')
+        # A task whose group is gone is recorded once, not retried forever.
+        second = self.service.action('create', dict(self.body, request_id='create-3', title='Second'), 'admin', 'admin')
+        second['source'] = dict(group_id='missing')
+        second.update(state='completed', completion=dict(outcome='superseded', candidate='b' * 40,
+                                                        reason='Superseded by another change.'))
+        self.service.save(second, 'complete', 'admin')
+        self.store.snapshot.return_value['groups'] = []
+        self.service.advance_outcomes()
+        self.store.action.assert_not_called()
+        self.assertEqual(self.service.get(second['id'])['outcome_notice']['state'], 'unavailable')
+
+    def test_outcome_retry_freezes_the_original_request_across_changed_evidence(self):
+        task = self.candidate()
+        task.update(state='completed', source=dict(group_id='group'))
+        self.service.save(task, 'complete', 'admin')
+        self.store.snapshot.return_value['groups'] = [dict(id='group', organization_id='org', name='Review')]
+        self.store.action.side_effect = [OSError('Lost response'), dict(id='outcome-job')]
+        self.service.advance_outcomes()
+        request = dict(self.store.action.call_args.args[1])
+        stored = self.service.get(task['id'])
+        self.assertEqual(stored['outcome_request'], request)
+        self.assertIn('Lost response', stored['outcome_error'])
+        stored['description'] = 'Changed evidence after the original submission'
+        self.service.save(stored, 'edit', 'admin')
+        self.service.advance_outcomes()
+        self.assertEqual(self.store.action.call_args.args[1], request)
+        stored = self.service.get(task['id'])
+        self.assertEqual(stored['outcome_notice']['job_id'], 'outcome-job')
+        self.assertNotIn('outcome_request', stored)
+        self.assertNotIn('outcome_error', stored)
+
+    def test_paused_organization_does_not_start_outcome_meetings(self):
+        task = self.candidate()
+        task.update(state='closed', source=dict(group_id='group'))
+        self.service.save(task, 'close', 'admin')
+        self.store.snapshot.return_value['groups'] = [dict(id='group', organization_id='org', name='Review')]
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        self.service.action('automation', dict(request_id='pause-outcomes', organization_id='org', paused=True), 'admin', 'admin')
+        self.service.advance_outcomes()
+        self.store.action.assert_not_called()
+        self.assertNotIn('outcome_notice', self.service.get(task['id']))
+
+    def test_paused_outcome_backlog_cannot_starve_another_organization(self):
+        task = self.candidate()
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        self.service.action('automation', dict(request_id='pause-backlog', organization_id='org', paused=True), 'admin', 'admin')
+        for index in range(50):
+            pending = dict(task, id='paused-' + str(index), state='closed', source=dict(group_id='paused-group'))
+            self.service.save(pending, 'close', 'admin')
+        active = dict(task, id='active-outcome', organization_id='other', state='closed', source=dict(group_id='active-group'))
+        self.service.save(active, 'close', 'admin')
+        self.store.snapshot.return_value['groups'] = [dict(id='active-group', organization_id='other', name='Active review')]
+        self.store.action.return_value = dict(id='active-meeting')
+        self.service.advance_outcomes()
+        self.store.action.assert_called_once()
+        self.assertEqual(self.store.action.call_args.args[1]['organization_id'], 'other')
+        self.assertEqual(self.service.get(active['id'])['outcome_notice']['job_id'], 'active-meeting')
+
+    def test_closed_outcome_review_can_create_bounded_group_followups(self):
+        task = self.candidate()
+        task['state'] = 'closed'
+        self.store.snapshot.return_value['groups'] = [dict(id='review', organization_id='org', create_tasks=True,
+            create_tasks_since='2026-01-01', updated_at='2099-01-01')]
+        proposals = [dict(title='Fix closure cause', description='Acceptance criteria: cover the failure. Required checks: unit tests.', profile_id='worker')]
+        self._meeting(task, proposals)
+        self.service.advance_proposals()
+        self.assertEqual(len(self.service.get(task['id'])['auto_queue']['meeting']['queued']), 1)
+        packet = self.service.outcome_packet(task, self.store.snapshot.return_value['groups'][0], contributions.AUTOMATION_DEFAULTS)
+        self.assertIn('Automatic follow-up is enabled', packet)
+        self.assertIn('needs_review', packet)
+
     def pull_data(self, task, **changes):
         result = dict(number=7, state='open', draft=True, head=dict(ref=task['branch'], sha=task['head_sha'],
                       repo=dict(full_name='owner/repo')), base=dict(ref='main'), mergeable=None)
@@ -1465,6 +1570,34 @@ class ContributionTests(unittest.TestCase):
         self.service.advance_proposals()
         self.assertNotIn('off', self.service.get(task['id']).get('auto_queue', {}))
 
+    def test_group_create_tasks_queues_without_the_organization_policy(self):
+        task = self.candidate()
+        self.store.snapshot.return_value['groups'] = [dict(id='review', organization_id='org', name='Project Review',
+                                                           create_tasks=True)]
+        proposals = [dict(title='Add tests', description='Cover the remaining boundary case with checks.', profile_id='worker')]
+        self._meeting(task, proposals)
+        self.service.advance_proposals()
+        origin = self.service.get(task['id'])
+        marker = origin['auto_queue']['meeting']
+        self.assertEqual(len(marker['queued']), 1)
+        created = self.service.get(origin['follow_up_tasks'][marker['queued'][0]])
+        self.assertEqual(created['assignment']['state'], 'queued')
+        # Without the group opt-in the same meeting stays draft-only.
+        self.store.snapshot.return_value['groups'] = [dict(id='review', organization_id='org', name='Project Review')]
+        task = self.service.get(task['id'])
+        self._meeting(task, proposals, job_id='second')
+        self.service.advance_proposals()
+        self.assertNotIn('second', self.service.get(task['id']).get('auto_queue', {}))
+        # The organization pause still stops group-initiated work.
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        self.service.action('automation', dict(request_id='a-1', organization_id='org', paused=True), 'admin', 'admin')
+        self.store.snapshot.return_value['groups'] = [dict(id='review', organization_id='org', name='Project Review',
+                                                           create_tasks=True)]
+        task = self.service.get(task['id'])
+        self._meeting(task, proposals, job_id='paused')
+        self.service.advance_proposals()
+        self.assertNotIn('paused', self.service.get(task['id']).get('auto_queue', {}))
+
     def test_auto_queue_skips_ineligible_assignees_and_review_requests(self):
         self.store.snapshot.return_value['organizations'] = [dict(id='org')]
         task = self.candidate()
@@ -1599,6 +1732,157 @@ class ContributionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'busy'):
             self.service.action('consult', dict(request_id='consult-2', task_id=task['id'],
                                                 consultant_profile_id='target', question='Again?'), 'admin', 'admin')
+
+    def test_acceptance_review_records_a_strict_verdict_once(self):
+        task = self.candidate()
+        task['builds'] = {task['head_sha']: dict(state='complete', target=task['head_sha'], required_checks_verified=True)}
+        self.service.save(task, 'build_result', 'runner')
+        self.store.snapshot.return_value['profiles'].append(dict(self.profile, id='reviewer', name='Iris'))
+        self.store.snapshot.return_value['jobs'] = [dict(id='reviewer-run', kind='launch', state='persona_sent', profile_id='reviewer')]
+        self.store.agent_state.return_value = dict(status='idle')
+        self.store.action.return_value = dict(id='acceptance-job', state='queued')
+        self.service.action('acceptance', dict(request_id='acc-1', task_id=task['id'],
+                                               reviewer_profile_id='reviewer', auto=True), 'admin', 'admin')
+        self.service.advance_acceptance()
+        request = self.store.action.call_args.args[1]
+        self.assertRegex(request['request_id'], r'^acceptance-[a-f0-9]{64}$')
+        self.assertIn('satisfied|not_satisfied|uncertain', request['prompt'])
+        stored = self.service.get(task['id'])
+        self.assertEqual(stored['acceptance']['state'], 'requested')
+        self.assertEqual(stored['acceptance']['sha'], task['head_sha'])
+        # An answered review with a strict verdict is recorded once.
+        self.store.snapshot.return_value['jobs'][-1].update(id='acceptance-job', kind='chat', state='answered',
+            task_id=task['id'], result='{"verdict":"not_satisfied","reason":"Missing boundary check.","evidence":["file.dart:12"]}')
+        self.service.advance_acceptance()
+        stored = self.service.get(task['id'])
+        self.assertEqual(stored['acceptance']['state'], 'not_satisfied')
+        self.assertIn('Missing boundary check', stored['acceptance']['reason'])
+        self.assertNotEqual(self.service.review_signature(stored),
+                            self.service.review_signature(dict(stored, acceptance=dict(state='satisfied'))))
+        count = self.store.action.call_count
+        before = self.service.get(task['id'])
+        self.service.advance_acceptance()
+        self.assertEqual(self.store.action.call_count, count)
+        self.assertEqual(self.service.get(task['id'])['audit'], before['audit'])
+
+    def test_acceptance_invalid_verdict_is_consumed_once_and_new_candidate_replaces_it(self):
+        task = self.candidate()
+        task.update(acceptance=dict(auto=True, reviewer_profile_id='reviewer', state='requested',
+                                   sha=task['head_sha'], job_id='acceptance-job', at=contributions.stamp()))
+        self.service.save(task, 'acceptance_requested', 'admin')
+        self.store.snapshot.return_value['jobs'] = [dict(id='acceptance-job', state='answered', result='no json')]
+        self.service.advance_acceptance()
+        stored = self.service.get(task['id'])
+        self.assertEqual(stored['acceptance']['state'], 'inconclusive')
+        self.assertEqual(stored['acceptance']['consumed_job_id'], 'acceptance-job')
+        audit = stored['audit']
+        self.service.advance_acceptance()
+        self.assertEqual(self.service.get(task['id'])['audit'], audit)
+        stored['head_sha'] = 'c' * 40
+        self.service.save(stored, 'candidate', 'admin')
+        self.service.advance_acceptance()
+        refreshed = self.service.get(task['id'])
+        self.assertNotIn('job_id', refreshed['acceptance'])
+        self.assertEqual(refreshed['acceptance']['waiting_sha'], 'c' * 40)
+        self.assertEqual(refreshed['acceptance_history'][-1]['sha'], task['head_sha'])
+
+    def test_acceptance_lost_response_reuses_frozen_payload(self):
+        task = self.candidate()
+        task['builds'] = {task['head_sha']: dict(state='complete', target=task['head_sha'], required_checks_verified=True)}
+        self.service.save(task, 'build_result', 'runner')
+        self.store.snapshot.return_value['profiles'].append(dict(self.profile, id='reviewer', name='Iris'))
+        self.store.snapshot.return_value['jobs'] = [dict(id='reviewer-run', kind='launch', state='persona_sent', profile_id='reviewer')]
+        self.store.agent_state.return_value = dict(status='idle')
+        self.service.action('acceptance', dict(request_id='reserve-review', task_id=task['id'], reviewer_profile_id='reviewer', auto=True), 'admin', 'admin')
+        self.store.action.side_effect = [OSError('lost response'), dict(id='acceptance-job')]
+        self.service.advance_acceptance()
+        request = dict(self.store.action.call_args.args[1])
+        saved = self.service.get(task['id'])
+        saved['description'] = 'Changed after submission'
+        self.service.save(saved, 'edit', 'admin')
+        self.service.advance_acceptance()
+        self.assertEqual(self.store.action.call_args.args[1], request)
+        self.assertEqual(self.service.get(task['id'])['acceptance']['job_id'], 'acceptance-job')
+
+    def test_acceptance_deadline_is_clock_driven_and_applies_to_pending_jobs(self):
+        task = self.candidate()
+        since = (contributions.datetime.now(contributions.timezone.utc) - contributions.timedelta(hours=7)).isoformat()
+        task['acceptance'] = dict(auto=True, state='requested', sha=task['head_sha'], job_id='slow-review', at=since, requested_at=since)
+        self.service.save(task, 'acceptance_requested', 'admin')
+        self.assertLessEqual(self.service.deadline_delay(), 1)
+        self.store.snapshot.return_value['jobs'] = [dict(id='slow-review', state='running')]
+        self.service.advance_acceptance()
+        self.assertEqual(self.service.get(task['id'])['acceptance']['state'], 'attention')
+        self.store.action.assert_not_called()
+
+    def test_task_notifications_are_atomic_and_scoped_reconciliation_selects_requested_ids(self):
+        task = self.candidate()
+        self.assertIn(task['id'], self.service.select_task_ids("1=1", {task['id']}))
+        self.assertEqual(self.service.select_task_ids("1=1", set()), [])
+        with closing(self.service.connect()) as db:
+            rows = db.execute('SELECT topic,record_id FROM notification_outbox').fetchall()
+        self.assertIn(('task', task['id']), rows)
+
+    def test_acceptance_review_waits_for_evidence_and_a_busy_reviewer(self):
+        task = self.candidate()
+        self.store.snapshot.return_value['profiles'].append(dict(self.profile, id='reviewer', name='Iris'))
+        self.store.snapshot.return_value['jobs'] = [dict(id='reviewer-run', kind='launch', state='persona_sent', profile_id='reviewer')]
+        self.service.action('acceptance', dict(request_id='acc-1', task_id=task['id'],
+                                               reviewer_profile_id='reviewer', auto=True), 'admin', 'admin')
+        self.service.advance_acceptance()
+        self.store.action.assert_not_called()
+        self.assertIn('verified required checks', self.service.get(task['id'])['acceptance']['reason'])
+        task = self.service.get(task['id'])
+        task['builds'] = {task['head_sha']: dict(state='complete', target=task['head_sha'], required_checks_verified=True)}
+        self.service.save(task, 'build_result', 'runner')
+        self.store.agent_state.return_value = dict(status='blocked')
+        self.service.advance_acceptance()
+        self.store.action.assert_not_called()
+        self.assertIn('busy', self.service.get(task['id'])['acceptance']['reason'])
+
+    def test_acceptance_requires_an_independent_reviewer(self):
+        task = self.candidate()
+        self.store.snapshot.return_value['profiles'].append(dict(self.profile, id='reviewer', name='Iris'))
+        with self.assertRaisesRegex(ValueError, 'must not be the agent doing the work'):
+            self.service.action('acceptance', dict(request_id='acc-owner', task_id=task['id'],
+                                                   reviewer_profile_id='worker', auto=True), 'admin', 'admin')
+        with self.assertRaisesRegex(ValueError, 'automatically'):
+            self.service.action('acceptance', dict(request_id='acc-auto', task_id=task['id'],
+                                                   reviewer_profile_id='reviewer', auto='yes'), 'admin', 'admin')
+
+    def test_shared_session_budget_blocks_launch_across_purposes(self):
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        task = self.candidate()
+        self.store.snapshot.return_value['jobs'] = [
+            dict(id='other-run', kind='launch', state='persona_sent', profile_id='someone', organization_id='org'),
+            dict(id='meeting-run', kind='launch', state='persona_sent', profile_id='other', organization_id='org'),
+        ]
+        self.service.action('automation', dict(request_id='a-1', organization_id='org', max_active_sessions=2), 'admin', 'admin')
+        second = self.service.action('create', dict(self.body, request_id='create-2', title='Second'), 'admin', 'admin')
+        self.store.action.return_value = dict(id='run-2')
+        with self.assertRaisesRegex(ValueError, 'shared session budget'):
+            self.service.action('launch', dict(request_id='launch-budget', task_id=second['id']), 'admin', 'admin')
+        self.service.action('automation', dict(request_id='a-2', organization_id='org', max_active_sessions=3), 'admin', 'admin')
+        launched = self.service.action('launch', dict(request_id='launch-ok', task_id=second['id']), 'admin', 'admin')
+        self.assertEqual(launched['state'], 'implementing')
+        # The daily start budget counts every launch created in the window.
+        self.store.snapshot.return_value['jobs'].append(dict(id='fresh', kind='launch', state='persona_sent',
+                                                             organization_id='org', created_at=contributions.stamp()))
+        third = self.service.action('create', dict(self.body, request_id='create-3', title='Third'), 'admin', 'admin')
+        self.service.action('automation', dict(request_id='a-3', organization_id='org', max_active_sessions=0,
+                                               daily_session_cap=1), 'admin', 'admin')
+        with self.assertRaisesRegex(ValueError, 'daily session budget'):
+            self.service.action('launch', dict(request_id='launch-daily', task_id=third['id']), 'admin', 'admin')
+
+    def test_session_budget_counts_meetings_and_ignores_terminal_sessions(self):
+        jobs = [
+            dict(id='run', kind='launch', state='persona_sent', organization_id='org', created_at=contributions.stamp()),
+            dict(id='done', kind='launch', state='finished', organization_id='org'),
+            dict(id='meeting', kind='discussion', state='running', organization_id='org'),
+            dict(id='other', kind='launch', state='persona_sent', organization_id='other'),
+        ]
+        budget = self.service.session_budget('org', jobs)
+        self.assertEqual((budget['active'], budget['meetings'], budget['started']), (1, 1, 1))
 
     def test_instance_launch_creates_an_ephemeral_profile_with_a_cap(self):
         self.store.action.return_value = dict(id='run2')

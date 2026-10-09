@@ -389,4 +389,226 @@ void main() {
     await connection.disconnect();
     await BlocScope.reset();
   });
+
+  testWidgets('queued validation links to the builds page', (tester) async {
+    tester.view.physicalSize = const Size(1280, 1400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final head = ''.padLeft(40, 'b');
+    final task = {
+      'id': 'task-1',
+      'title': 'Implement feature',
+      'state': 'review_ready',
+      'repository': 'repo',
+      'github_repository': 'owner/repo',
+      'run_id': 'run',
+      'branch': 'herdr/task-abcdefabcdef',
+      'base_ref': 'refs/remotes/origin/main',
+      'base_sha': ''.padLeft(40, 'a'),
+      'head_sha': head,
+      'builds': {
+        head: {'run_id': 'run-1', 'state': 'queued', 'target': head},
+      },
+      'audit': [],
+    };
+    final connection = DashboardBloc(
+      client: MockClient(
+        (request) async => http.Response(
+          jsonEncode(
+            request.url.path.endsWith('/tasks/detail')
+                ? task
+                : {
+                    'tasks': [task],
+                    'github': {'configured': false},
+                    'executor': 'service',
+                  },
+          ),
+          200,
+        ),
+      ),
+    );
+    BlocScope.register<DashboardBloc>(() => connection);
+    connection.connect('token');
+    connection.operator.value = {'name': 'admin', 'role': 'admin'};
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TasksPage(taskId: 'task-1', coordinator: AppCoordinator()),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final chip = find.widgetWithText(
+      OutlinedButton,
+      'Validation in progress \u00b7 view build',
+    );
+    expect(chip, findsOneWidget);
+    expect(find.text('Validate latest commit'), findsNothing);
+    // The link is usable rather than a disabled "in progress" button.
+    expect(tester.widget<OutlinedButton>(chip).onPressed, isNotNull);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await connection.disconnect();
+    await BlocScope.reset();
+  });
+
+  for (final exactTarget in [true, false]) {
+    testWidgets('validate action respects exact target: $exactTarget', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1280, 2000);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final head = ''.padLeft(40, 'b');
+      final task = {
+        'id': 'task-1',
+        'title': 'Implement feature',
+        'state': 'review_ready',
+        'repository': 'repo',
+        'github_repository': 'owner/repo',
+        'run_id': 'run',
+        'branch': 'herdr/task-abcdefabcdef',
+        'base_ref': 'refs/remotes/origin/main',
+        'base_sha': ''.padLeft(40, 'a'),
+        'head_sha': head,
+        'builds': {
+          head: {
+            'run_id': 'run-1',
+            'state': 'complete',
+            'target': exactTarget ? head : ''.padLeft(40, 'a'),
+            'exit_code': 0,
+            'required_checks_verified': true,
+            'checks': [
+              {'id': 'unit', 'status': 'passed'},
+            ],
+          },
+        },
+        'audit': [],
+      };
+      final connection = DashboardBloc(
+        client: MockClient(
+          (request) async => http.Response(
+            jsonEncode(
+              request.url.path.endsWith('/tasks/detail')
+                  ? task
+                  : {
+                      'tasks': [task],
+                      'github': {'configured': false},
+                      'executor': 'service',
+                    },
+            ),
+            200,
+          ),
+        ),
+      );
+      BlocScope.register<DashboardBloc>(() => connection);
+      connection.connect('token');
+      connection.operator.value = {'name': 'admin', 'role': 'admin'};
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(body: TasksPage(taskId: 'task-1')),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Checks & builds'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text(
+          exactTarget
+              ? 'Current candidate validation: verified'
+              : 'Current candidate validation: finished without verified required checks',
+        ),
+        findsOneWidget,
+      );
+      // Re-running the same identity is a no-op, so the action is hidden.
+      expect(
+        find.text('Validate candidate'),
+        exactTarget ? findsNothing : findsOneWidget,
+      );
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await connection.disconnect();
+      await BlocScope.reset();
+    });
+  }
+
+  testWidgets('the task overview states the group outcome notice', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1280, 1400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final task = {
+      'id': 'task-1',
+      'title': 'Implement feature',
+      'state': 'completed',
+      'repository': 'repo',
+      'source': {
+        'group_id': 'group',
+        'meeting_id': 'origin',
+        'task_id': 'parent',
+      },
+      'outcome_notice': {
+        'state': 'scheduled',
+        'group_name': 'Project Review',
+        'job_id': 'meeting-9',
+        'outcome': 'completed',
+      },
+      'acceptance': {
+        'state': 'not_satisfied',
+        'reviewer_name': 'Iris',
+        'reason': 'Missing boundary check.',
+      },
+      'audit': [],
+    };
+    final connection = DashboardBloc(
+      client: MockClient(
+        (request) async => http.Response(
+          jsonEncode(
+            request.url.path.endsWith('/tasks/detail')
+                ? task
+                : {
+                    'tasks': [task],
+                    'github': {'configured': false},
+                  },
+          ),
+          200,
+        ),
+      ),
+    );
+    BlocScope.register<DashboardBloc>(() => connection);
+    connection.connect('token');
+    connection.operator.value = {'name': 'admin', 'role': 'admin'};
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(body: TasksPage(taskId: 'task-1')),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.textContaining(
+        'Outcome review scheduled for: Project Review \u00b7 outcome completed \u00b7 meeting meeting-9.',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining(
+        'Acceptance: not satisfied by Iris. Missing boundary check.',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining(
+        'Acceptance review needs attention: Missing boundary check.',
+      ),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await connection.disconnect();
+    await BlocScope.reset();
+  });
 }
