@@ -203,10 +203,19 @@ void main() {
         'state': 'draft',
         'repository': 'repo',
         'organization_id': 'org',
+        'assigned_agent': {'name': 'Nora'},
         'assignment': {
           'state': 'queued',
           'position': 2,
           'profile_id': 'worker',
+        },
+        'blocking_execution': {
+          'run_id': 'run',
+          'state': 'persona_sent',
+          'created_at': 'today',
+          'task_id': null,
+          'task_title': '',
+          'handoff_ready': false,
         },
       };
       final posts = <Map<String, dynamic>>[];
@@ -240,6 +249,18 @@ void main() {
       expect(find.text('Queued \u00b7 repo'), findsOneWidget);
       expect(find.textContaining('Queued for this agent'), findsOneWidget);
       expect(find.textContaining('order 2'), findsOneWidget);
+      expect(
+        find.text("Waiting on: Nora's active session"),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('Session run \u00b7 persona_sent'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('release it in Org chart'),
+        findsOneWidget,
+      );
       await tester.tap(find.text('Change queue order'));
       await tester.pumpAndSettle();
       await tester.tap(find.byTooltip('Later'));

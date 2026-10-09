@@ -979,6 +979,27 @@ class ContributionTests(unittest.TestCase):
         self.assertIsNone(launched.get('assignment'))
         self.assertEqual(self.service.queued_assignments(), [])
 
+    def test_queue_surfaces_a_taskless_active_session_blocker(self):
+        successor = self.service.action('create', dict(self.body, request_id='create-4', title='Next'), 'admin', 'admin')
+        self.service.action('assignment', dict(request_id='queue-3', task_id=successor['id'], mode='queue'), 'admin', 'admin')
+        self.store.snapshot.return_value['jobs'] = [dict(id='general-run', kind='launch', profile_id='worker', state='persona_sent')]
+        self.store.action.reset_mock()
+        self.service.dispatch_assignments()
+        self.store.action.assert_not_called()
+        waiting = self.service.get(successor['id'])
+        self.assertEqual(waiting['assignment']['state'], 'queued')
+        self.assertIn('without a task', waiting['assignment_error'])
+
+    def test_detail_reports_the_blocking_session_identity(self):
+        self.store.snapshot.return_value['jobs'] = [dict(id='general-run', kind='launch', profile_id='worker',
+                                                         state='persona_sent', alias='hire_x', created_at='today')]
+        blocking = self.service.detail(self.task['id'])['blocking_execution']
+        self.assertEqual(blocking['run_id'], 'general-run')
+        self.assertEqual(blocking['state'], 'persona_sent')
+        self.assertEqual(blocking['alias'], 'hire_x')
+        self.assertEqual(blocking['created_at'], 'today')
+        self.assertIsNone(blocking['task_id'])
+
     def test_queue_waits_for_a_busy_agent_and_surfaces_unverified_evidence(self):
         blocker = self.service.action('create', dict(self.body, request_id='create-2', title='Blocker'), 'admin', 'admin')
         successor = self.service.action('create', dict(self.body, request_id='create-3', title='Next'), 'admin', 'admin')

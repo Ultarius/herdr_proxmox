@@ -13,8 +13,13 @@ import 'remove_entry_dialog.dart';
 import 'configuration_transfer.dart';
 
 class OrganizationPage extends StatefulWidget {
-  const OrganizationPage({super.key, required this.coordinator});
+  const OrganizationPage({
+    super.key,
+    required this.coordinator,
+    this.initialView = 'chart',
+  });
   final AppCoordinator coordinator;
+  final String initialView;
   @override
   State<OrganizationPage> createState() => _OrganizationPageState();
 }
@@ -23,7 +28,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
   late final OrganizationBloc bloc = OrganizationBloc(connection);
   Timer? timer;
-  String view = 'chart';
+  late String view = widget.initialView;
   bool cleaningSessions = false;
   // Keep the exact request across lost responses so a retried restart or close
   // reconciles instead of repeating the pane operation.

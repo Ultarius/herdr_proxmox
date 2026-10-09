@@ -1179,6 +1179,19 @@ class _TasksPageState extends State<TasksPage> {
     ),
   );
 
+  String _blockingSessionLine(Map blocking) {
+    final run = '${blocking['run_id'] ?? ''}';
+    final short = run.isEmpty
+        ? 'unknown run'
+        : run.substring(0, run.length.clamp(0, 8));
+    final state = '${blocking['state'] ?? 'unknown'}';
+    final created = '${blocking['created_at'] ?? ''}';
+    final taskless = blocking['task_id'] == null;
+    return 'Session $short \u00b7 $state'
+        '${created.isEmpty ? '' : ' \u00b7 started $created'}'
+        '${taskless ? ' \u00b7 release it in Org chart \u2192 Runs to free this agent.' : ''}';
+  }
+
   Widget _nextAction(Map<String, dynamic> task) {
     final target = task['merge_sha'] ?? task['head_sha'];
     final evidence = (task['builds'] as Map?)?[target] as Map?;
@@ -1186,6 +1199,11 @@ class _TasksPageState extends State<TasksPage> {
       final assignment = task['assignment'] as Map?;
       final blocking = task['blocking_execution'] as Map?;
       if (assignment?['state'] == 'queued') {
+        final waitingTitle = blocking == null
+            ? null
+            : '${blocking['task_title'] ?? ''}'.isNotEmpty
+            ? '${blocking['task_title']}'
+            : "${taskAgentName(task, fallback: 'The assigned agent')}'s active session";
         return Wrap(
           spacing: 8,
           runSpacing: 8,
@@ -1196,6 +1214,12 @@ class _TasksPageState extends State<TasksPage> {
                 'Queued for this agent \u00b7 order ${assignment?['position']}',
               ),
             ),
+            if (waitingTitle != null)
+              Chip(
+                avatar: const Icon(Icons.hourglass_empty, size: 18),
+                label: Text('Waiting on: $waitingTitle'),
+              ),
+            if (blocking != null) Text(_blockingSessionLine(blocking)),
             OutlinedButton.icon(
               onPressed: admin && !busy ? () => moveAssignment(task) : null,
               icon: const Icon(Icons.reorder),
@@ -1242,7 +1266,7 @@ class _TasksPageState extends State<TasksPage> {
       final blockingTaskId = blocking['task_id'];
       final title = '${blocking['task_title'] ?? ''}'.isNotEmpty
           ? '${blocking['task_title']}'
-          : 'Existing agent session';
+          : "${taskAgentName(task, fallback: 'The assigned agent')}'s active session";
       if (blocking['handoff_ready'] == true) {
         return Wrap(
           spacing: 8,
@@ -1274,29 +1298,37 @@ class _TasksPageState extends State<TasksPage> {
           ],
         );
       }
-      return Wrap(
-        spacing: 8,
-        runSpacing: 8,
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          OutlinedButton.icon(
-            onPressed: blockingTaskId != null
-                ? () => openTask('$blockingTaskId')
-                : widget.coordinator == null
-                ? null
-                : () => widget.coordinator!.navigate(OrganizationRoute()),
-            icon: const Icon(Icons.block),
-            label: Text('Blocked by: $title'),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              OutlinedButton.icon(
+                onPressed: blockingTaskId != null
+                    ? () => openTask('$blockingTaskId')
+                    : widget.coordinator == null
+                    ? null
+                    : () =>
+                          widget.coordinator!.navigate(OrganizationRoute('runs')),
+                icon: const Icon(Icons.block),
+                label: Text('Blocked by: $title'),
+              ),
+              OutlinedButton.icon(
+                onPressed: admin && !busy
+                    ? () => act('assignment', {
+                        'task_id': task['id'],
+                        'mode': 'queue',
+                      })
+                    : null,
+                icon: const Icon(Icons.schedule),
+                label: const Text('Queue for this agent'),
+              ),
+            ],
           ),
-          OutlinedButton.icon(
-            onPressed: admin && !busy
-                ? () => act('assignment', {
-                    'task_id': task['id'],
-                    'mode': 'queue',
-                  })
-                : null,
-            icon: const Icon(Icons.schedule),
-            label: const Text('Queue for this agent'),
-          ),
+          const SizedBox(height: 8),
+          Text(_blockingSessionLine(blocking)),
         ],
       );
     }

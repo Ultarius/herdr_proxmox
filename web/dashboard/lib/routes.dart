@@ -127,13 +127,20 @@ class AgentsRoute extends AppRoute {
 }
 
 class OrganizationRoute extends AppRoute {
+  OrganizationRoute([this.view = 'chart']);
+  final String view;
   @override
-  Uri toUri() => Uri.parse('/organization');
+  List<Object?> get props => [view];
+  @override
+  Uri toUri() => Uri(
+    path: '/organization',
+    queryParameters: view == 'chart' ? null : {'view': view},
+  );
   @override
   Widget build(AppCoordinator coordinator, BuildContext context) => AppShell(
     coordinator: coordinator,
     section: 'organization',
-    child: OrganizationPage(coordinator: coordinator),
+    child: OrganizationPage(coordinator: coordinator, initialView: view),
   );
 }
 
@@ -167,7 +174,9 @@ class AppCoordinator extends Coordinator<AppRoute> {
     return switch (uri.path) {
       '/' || '' => DashboardRoute(),
       '/agents' => AgentsRoute(),
-      '/organization' => OrganizationRoute(),
+      '/organization' => OrganizationRoute(
+        uri.queryParameters['view'] ?? 'chart',
+      ),
       '/configuration' => CliSetupRoute(),
       '/builds' => BuildsRoute(),
       '/tasks' => TasksRoute(),

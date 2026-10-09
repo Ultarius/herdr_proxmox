@@ -626,7 +626,17 @@ class Contributions:
                                 blocking_task = self.get(blocking['task_id'])
                             except ValueError:
                                 blocking_task = None
-                        if not blocking_task or blocking_task.get('state') not in HANDOFF_TASK_STATES:
+                        if not blocking_task:
+                            # A taskless session (for example a group member kept
+                            # on) can never satisfy a task handoff; surface it
+                            # instead of waiting silently forever.
+                            message = ('Assigned agent has an active session without a task; '
+                                       'release that session to start queued work.')
+                            if task.get('assignment_error') != message:
+                                task['assignment_error'] = message
+                                self.save(task, 'assignment_waiting', 'task_scheduler')
+                            continue
+                        if blocking_task.get('state') not in HANDOFF_TASK_STATES:
                             continue  # The agent is still working; the queue keeps its order silently.
                     self.perform('launch', {}, task_id, 'task_scheduler')
             except Busy:
@@ -987,6 +997,8 @@ class Contributions:
                 blocking_task = json.loads(row[0]) if row else None
             task['blocking_execution'] = dict(
                 run_id=blocking['id'], state=blocking['state'], alias=blocking.get('alias'),
+                created_at=blocking.get('created_at'), updated_at=blocking.get('updated_at'),
+                pane_id=blocking.get('pane_id'),
                 task_id=blocking.get('task_id'), task_title=(blocking_task or {}).get('title', ''),
                 task_state=(blocking_task or {}).get('state', ''),
                 handoff_ready=bool(blocking.get('state') == 'persona_sent' and blocking_task and (blocking_task.get('state') == 'completed' or (
