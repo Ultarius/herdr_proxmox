@@ -104,6 +104,9 @@ const activityLabels = {
   'finish_execution': 'Execution finished',
   'assignment_queued': 'Task queued for its agent',
   'assignment_waiting': 'Queued task waiting for its agent',
+  'auto_queued': 'Follow-up task created and queued automatically',
+  'auto_queue_checked': 'Review automation evaluated',
+  'follow_up_reported': 'Worker-reported follow-up recorded as draft',
 };
 
 String activityLabel(Object? action) {
@@ -121,6 +124,9 @@ String activitySection(Object? action) {
     case 'finish_execution':
     case 'assignment_queued':
     case 'assignment_waiting':
+    case 'auto_queued':
+    case 'auto_queue_checked':
+    case 'follow_up_reported':
       return 'Activity & agents';
     case 'candidate':
     case 'completion_verified':

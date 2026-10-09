@@ -356,10 +356,87 @@ void main() {
     );
     await tester.pumpAndSettle();
     expect(find.text('Verify handoff and start'), findsOneWidget);
+    expect(find.text('Inspect previous task'), findsOneWidget);
+    expect(find.text('Launch task agent'), findsNothing);
     expect(find.text('Queue instead'), findsOneWidget);
     await tester.tap(find.text('Verify handoff and start'));
     await tester.pumpAndSettle();
     expect(posts.single, endsWith('/tasks/launch'));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await connection.disconnect();
+    await BlocScope.reset();
+  });
+  testWidgets('the organization follow-up policy is editable per task', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(500, 1400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final task = <String, dynamic>{
+      'id': 'task',
+      'title': 'Next task',
+      'state': 'draft',
+      'repository': 'repo',
+      'organization_id': 'org',
+      'source': {
+        'task_id': 'parent',
+        'auto_queued': {'at': 'today'},
+      },
+    };
+    final posts = <Map<String, dynamic>>[];
+    final connection = DashboardBloc(
+      client: MockClient((request) async {
+        if (request.method == 'POST') {
+          posts.add(Map<String, dynamic>.from(jsonDecode(request.body)));
+        }
+        return http.Response(
+          jsonEncode(
+            request.url.path.endsWith('/tasks')
+                ? {
+                    'tasks': [task],
+                    'github': {},
+                    'automation': {
+                      'org': {
+                        'auto_queue_proposals': true,
+                        'paused': false,
+                        'max_per_meeting': 1,
+                        'max_open_per_agent': 2,
+                        'max_follow_up_depth': 1,
+                        'daily_cap': 5,
+                      },
+                    },
+                  }
+                : task,
+          ),
+          200,
+        );
+      }),
+    );
+    BlocScope.register<DashboardBloc>(() => connection);
+    connection.connect('token');
+    connection.operator.value = {'role': 'admin'};
+    await tester.pumpWidget(
+      const MaterialApp(home: Scaffold(body: TasksPage(taskId: 'task'))),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Auto-queued from group review of task parent.'),
+      findsOneWidget,
+    );
+    await tester.ensureVisible(find.text('Automation settings'));
+    await tester.tap(find.text('Automation settings'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('On: 1/meeting'), findsOneWidget);
+    await tester.tap(find.text('Edit policy'));
+    await tester.pumpAndSettle();
+    expect(find.text('Follow-up automation policy'), findsOneWidget);
+    await tester.tap(find.text('Save policy'));
+    await tester.pumpAndSettle();
+    expect(posts.single['organization_id'], 'org');
+    expect(posts.single['auto_queue_proposals'], true);
+    expect(posts.single['daily_cap'], 5);
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
     await connection.disconnect();

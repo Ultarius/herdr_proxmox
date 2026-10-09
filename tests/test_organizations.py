@@ -204,6 +204,74 @@ class OrganizationTests(unittest.TestCase):
         self.assertIn('already absent', saved['terminal_unavailable'])
         self.assertFalse(any(args[:2] == ('pane', 'close') for args, _ in self.calls))
 
+    def legacy_session(self):
+        org = self.organization()
+        profile = self.hire(org, use_worktree=False)
+        run_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        run = self.store.update_job(run_id, agent_session=None)
+        self.agents[run['alias']].pop('agent_session', None)
+        inventory = dict(cwd=run['source_project'], panes=[dict(pane_id=run['pane_id'])])
+        original = self.store.command
+        def command(*args, **kwargs):
+            if args == ('workspace', 'list'):
+                return {'workspaces': [dict(workspace_id=run['pane_id'].split(':')[0], cwd=inventory['cwd'])]}
+            if args[:2] == ('pane', 'list'):
+                return {'panes': inventory['panes']}
+            return original(*args, **kwargs)
+        self.store.command = command
+        return run, inventory
+
+    def test_legacy_session_finishes_with_verified_pane_and_checkout(self):
+        run, inventory = self.legacy_session()
+        result = self.store.manage_session(dict(job_id=run['id'], organization_id=run['organization_id'],
+            mode='finish', inspected=True, request_id='legacy-finish'), 'admin')
+        finished = next(j for j in self.store.job_records() if j['id'] == run['id'])
+        self.assertEqual(finished['state'], 'finished')
+        self.assertEqual(finished['session_close_identity'], 'pane_checkout')
+        self.assertIsNone(finished.get('agent_session'))
+        self.assertTrue(result['archive_id'])
+        self.assertTrue(any(args[:2] == ('pane', 'close') for args, _ in self.calls))
+        next_id = self.action('launch', organization_id=run['organization_id'], profile_id=run['profile_id'])
+        self.drain()
+        self.assertEqual(next(j for j in self.store.job_records() if j['id'] == next_id)['state'], 'persona_sent')
+
+    def test_legacy_session_refuses_changed_checkout(self):
+        run, inventory = self.legacy_session()
+        other = self.projects / 'other'
+        other.mkdir()
+        inventory['cwd'] = str(other)
+        with self.assertRaisesRegex(ValueError, 'checkout changed'):
+            self.store.manage_session(dict(job_id=run['id'], organization_id=run['organization_id'], mode='finish', inspected=True), 'admin')
+        self.assertFalse(any(args[:2] == ('pane', 'close') for args, _ in self.calls))
+
+    def test_legacy_session_refuses_ambiguous_agent_ownership(self):
+        run, inventory = self.legacy_session()
+        self.agents['replacement'] = dict(self.agents[run['alias']], name='replacement')
+        with self.assertRaisesRegex(ValueError, 'ambiguous agent ownership'):
+            self.store.manage_session(dict(job_id=run['id'], organization_id=run['organization_id'], mode='finish', inspected=True), 'admin')
+        self.assertFalse(any(args[:2] == ('pane', 'close') for args, _ in self.calls))
+
+    def test_legacy_session_refuses_missing_pane_inventory(self):
+        run, inventory = self.legacy_session()
+        inventory['panes'] = []
+        with self.assertRaisesRegex(ValueError, 'pane is absent'):
+            self.store.manage_session(dict(job_id=run['id'], organization_id=run['organization_id'], mode='finish', inspected=True), 'admin')
+        self.assertFalse(any(args[:2] == ('pane', 'close') for args, _ in self.calls))
+
+    def test_legacy_session_rechecks_ownership_after_terminal_capture(self):
+        run, inventory = self.legacy_session()
+        original = self.store.command
+        def command(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if args[:2] == ('agent', 'read'):
+                inventory['panes'] = []
+            return result
+        self.store.command = command
+        with self.assertRaisesRegex(ValueError, 'pane is absent'):
+            self.store.manage_session(dict(job_id=run['id'], organization_id=run['organization_id'], mode='finish', inspected=True), 'admin')
+        self.assertFalse(any(args[:2] == ('pane', 'close') for args, _ in self.calls))
+
     def test_created_pane_recovers_from_authoritative_checkout_records(self):
         def command(*args, **kwargs):
             if args == ('workspace', 'list'):

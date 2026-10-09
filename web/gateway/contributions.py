@@ -5,7 +5,7 @@ Network operations never hold SQLite transactions; pending requests can be
 reconciled after restart by repeating the same administrator request ID.
 """
 from contextlib import closing, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import threading
 import json
@@ -53,6 +53,12 @@ TERMINAL_EXECUTIONS = ('finished', 'released')
 HANDOFF_TASK_STATES = ('review_ready', 'published', 'pr_open', 'merged', 'closed', 'completed')
 # Independent of the build-service limit: sessions are launched concurrently.
 MAX_ACTIVE_EXECUTIONS = 4
+# Organization follow-up automation is opt-in and fail-closed. Proposals that
+# qualify are created and queued; everything else stays a draft for the operator.
+AUTOMATION_DEFAULTS = dict(auto_queue_proposals=False, max_per_meeting=1, max_open_per_agent=2,
+                           max_follow_up_depth=1, daily_cap=5, paused=False)
+AUTOMATION_LIMITS = (('max_per_meeting', 0, 10), ('max_open_per_agent', 0, 50),
+                     ('max_follow_up_depth', 0, 10), ('daily_cap', 0, 100))
 
 
 def stamp():
@@ -184,6 +190,9 @@ class Contributions:
             db.execute('CREATE TABLE IF NOT EXISTS build_events (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS audit (task_id TEXT NOT NULL, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS assignments (task_id TEXT PRIMARY KEY, position INTEGER NOT NULL, data TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS policies (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
+        from discovery import Discovery
+        self.discovery = Discovery(self)
 
     def connect(self):
         return sqlite3.connect(self.path, timeout=10)
@@ -226,6 +235,8 @@ class Contributions:
             try:
                 self.advance_automatic()
                 self.dispatch_assignments()
+                self.advance_proposals()
+                self.discovery.advance()
                 cycles += 1
                 if cycles % 6 == 0:
                     self.reconcile_completed()
@@ -270,6 +281,7 @@ class Contributions:
                             raise ValueError('Task branch changed; inspect before continuing.')
                         head = project_git.git(path, 'rev-parse', 'HEAD').strip()
                         no_changes = False
+                        receipt = None
                         if run['state'] == 'finished' and (task['state'] == 'implementing' or head != task.get('head_sha')
                                 or task.get('completion_receipt', {}).get('commit') != head):
                             raise ValueError('Finished execution no longer matches its verified candidate.')
@@ -299,6 +311,8 @@ class Contributions:
                             # The task result stands; the session can be released manually.
                             self.record_error(task['id'], error, 'finish_execution', 'automatic_task_policy')
                         continue
+                    if receipt is not None:
+                        self.materialize_follow_up(task, receipt, 'automatic_task_policy')
                     # Do not automatically retry failures. One durable identity per task+SHA.
                     if head not in task.get('builds', {}):
                         self.perform('build', {'target': head}, task['id'], 'automatic_task_policy')
@@ -528,6 +542,33 @@ class Contributions:
         self.store.manage_session(dict(mode='finish', job_id=run['id'], organization_id=task['organization_id'],
                                        inspected=True, request_id=request_id[:64]), actor)
 
+    def materialize_follow_up(self, task, receipt, actor):
+        """Record a worker-reported follow-up as a draft task, once per commit."""
+        follow = receipt.get('follow_up')
+        if not isinstance(follow, dict):
+            return
+        title, description = follow.get('title'), follow.get('description')
+        if not isinstance(title, str) or not 1 <= len(title.strip()) <= 120:
+            return
+        if not isinstance(description, str) or not 5 <= len(description.strip()) <= 7000:
+            return
+        key = hashlib.sha256(json.dumps([task['id'], receipt.get('commit'), title.strip()]).encode()).hexdigest()[:24]
+        marker = 'receipt:' + key
+        if (task.get('follow_up_tasks') or {}).get(marker):
+            return
+        new_id = uuid.uuid5(uuid.NAMESPACE_URL, 'herdr:' + task['id'] + ':' + marker).hex
+        try:
+            created = self.perform('create', dict(title=title.strip(), description=description.strip(),
+                repository=task['repository'], base_ref=task['base_ref'], profile_id=task['profile_id']), new_id, actor)
+        except (ValueError, OSError) as error:
+            self.record_error(task['id'], error, 'follow_up', actor)
+            return
+        created['source'] = dict(task_id=task['id'], depth=((task.get('source') or {}).get('depth') or 0) + 1,
+                                 receipt_follow_up=True)
+        self.save(created, 'follow_up_reported', actor)
+        task.setdefault('follow_up_tasks', {})[marker] = new_id
+        self.save(task, 'follow_up_reported', actor)
+
     def queued_assignments(self, dispatch=False):
         with closing(self.connect()) as db:
             if dispatch:
@@ -602,6 +643,176 @@ class Contributions:
                             self.save(task, 'assignment_waiting', 'task_scheduler')
                 except (ValueError, OSError, sqlite3.Error):
                     continue
+
+    def policy(self, organization_id):
+        """Organization follow-up automation policy with defaults applied."""
+        merged = dict(AUTOMATION_DEFAULTS)
+        with closing(self.connect()) as db:
+            row = db.execute('SELECT data FROM policies WHERE id=?', (organization_id,)).fetchone()
+        if row:
+            merged.update(json.loads(row[0]))
+        return merged
+
+    def set_automation_policy(self, body, actor):
+        organization_id = body.get('organization_id')
+        if not isinstance(organization_id, str) or not 1 <= len(organization_id) <= 64 or '\x00' in organization_id:
+            raise ValueError('Select a valid organization.')
+        if not any(o.get('id') == organization_id for o in self.store.snapshot(live_status=False).get('organizations', [])):
+            raise ValueError('Organization not found.')
+        with self.operation('policy:' + organization_id):
+            policy = self.policy(organization_id)
+            was_enabled = policy['auto_queue_proposals']
+            for key in ('auto_queue_proposals', 'paused'):
+                if key in body:
+                    if not isinstance(body[key], bool):
+                        raise ValueError('Invalid automation policy value.')
+                    policy[key] = body[key]
+            for key, low, high in AUTOMATION_LIMITS:
+                if key in body:
+                    if type(body[key]) is not int or not low <= body[key] <= high:
+                        raise ValueError('Invalid automation limit.')
+                    policy[key] = body[key]
+            if policy['auto_queue_proposals'] and not was_enabled:
+                # Enabling starts a fresh window: discussions created earlier are
+                # never queued retroactively.
+                policy['auto_queue_since'] = stamp()
+            policy.update(updated_at=stamp(), updated_by=actor)
+            with closing(self.connect()) as db, db:
+                db.execute('INSERT OR REPLACE INTO policies VALUES (?,?)', (organization_id, json.dumps(policy)))
+            return dict(policy=policy, organization_id=organization_id)
+
+    def open_work_count(self, profile_id):
+        """Queued assignments plus active task executions for one agent."""
+        jobs = self.store.snapshot(live_status=False).get('jobs', [])
+        active = sum(1 for j in jobs if j.get('kind') == 'launch' and j.get('profile_id') == profile_id
+                     and j.get('task_id') and j.get('state') not in TERMINAL_EXECUTIONS)
+        with closing(self.connect()) as db:
+            queued = db.execute("SELECT COUNT(*) FROM assignments a JOIN tasks t ON t.id = a.task_id "
+                                "WHERE json_extract(t.data, '$.profile_id')=? AND json_extract(t.data, '$.state')='draft'",
+                                (profile_id,)).fetchone()[0]
+        return active + queued
+
+    def auto_created_today(self, organization_id):
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        with closing(self.connect()) as db:
+            return db.execute("SELECT COUNT(*) FROM tasks WHERE json_extract(data, '$.organization_id')=? "
+                              "AND json_extract(data, '$.source.auto_queued') IS NOT NULL "
+                              "AND json_extract(data, '$.created_at') > ?", (organization_id, cutoff)).fetchone()[0]
+
+    def advance_proposals(self):
+        """Materialize qualifying group proposals under the organization policy."""
+        with closing(self.connect()) as db:
+            saved = {row[0]: json.loads(row[1]) for row in db.execute('SELECT id, data FROM policies')}
+        policies = {organization: dict(AUTOMATION_DEFAULTS, **data) for organization, data in saved.items()}
+        active = [organization for organization, policy in policies.items()
+                  if policy['auto_queue_proposals'] and not policy['paused']]
+        if not active:
+            return
+        # Candidate pairs are unmarked meetings only, newest tasks first, so a
+        # long history of evaluated reviews cannot starve new ones.
+        placeholders = ','.join('?' for _ in active)
+        with closing(self.connect()) as db:
+            rows = db.execute(
+                "SELECT t.id, json_extract(t.data, '$.organization_id'), json_extract(m.value, '$.job_id'), "
+                "json_extract(m.value, '$.at') FROM tasks t, json_each(t.data, '$.meetings') m "
+                "WHERE json_extract(t.data, '$.state') IN ('review_ready','completed','merged') "
+                "AND json_type(t.data, '$.meetings') = 'array' "
+                "AND json_extract(m.value, '$.job_id') IS NOT NULL "
+                "AND json_extract(t.data, '$.organization_id') IN (" + placeholders + ") "
+                "AND json_extract(t.data, '$.auto_queue.\"' || json_extract(m.value, '$.job_id') || '\"') IS NULL "
+                "ORDER BY t.rowid DESC LIMIT 50", active).fetchall()
+        seen = set()
+        for task_id, organization_id, job_id, meeting_at in rows:
+            policy = policies.get(organization_id)
+            if not policy or (task_id, job_id) in seen:
+                continue
+            seen.add((task_id, job_id))
+            since = policy.get('auto_queue_since') or policy.get('updated_at') or ''
+            if str(meeting_at or '') < since:
+                # Discussions created before the policy was enabled never start
+                # retroactively; record the decision once so they are not rescanned.
+                try:
+                    with self.operation('task:' + task_id, timeout=0):
+                        task = self.get(task_id)
+                        if (task.get('auto_queue') or {}).get(job_id) is None:
+                            task.setdefault('auto_queue', {})[job_id] = dict(
+                                at=stamp(), queued=[], skipped={},
+                                unavailable='Discussion created before automatic follow-up was enabled.',
+                                policy={k: policy[k] for k in AUTOMATION_DEFAULTS})
+                            self.save(task, 'auto_queue_checked', 'group_auto_queue')
+                except (Busy, ValueError, OSError, sqlite3.Error):
+                    pass
+                continue
+            try:
+                with self.operation('task:' + task_id, timeout=0):
+                    self.materialize_meeting(task_id, job_id, policy, 'group_auto_queue')
+            except Busy:
+                continue
+            except (ValueError, OSError, sqlite3.Error, KeyError, TypeError) as error:
+                self.record_error(task_id, error, 'auto_queue', 'group_auto_queue')
+
+    def materialize_meeting(self, task_id, job_id, policy, actor):
+        """Create and queue qualifying proposals from one finalized discussion."""
+        task = self.get(task_id)
+        if (task.get('auto_queue') or {}).get(job_id) is not None:
+            return
+        jobs = self.store.snapshot(live_status=False).get('jobs', [])
+        job = next((j for j in jobs if j.get('id') == job_id), None)
+        if not job:
+            task.setdefault('auto_queue', {})[job_id] = dict(
+                at=stamp(), queued=[], skipped={}, unavailable='Discussion record unavailable.',
+                policy={k: policy[k] for k in AUTOMATION_DEFAULTS})
+            self.save(task, 'auto_queue_checked', actor)
+            return
+        if job.get('state') != 'artifact_ready':
+            return  # Evaluate once the discussion finalizes; not marked yet.
+        proposals = self.discussion_proposals(job)
+        queued, skipped = [], {}
+        depth = ((task.get('source') or {}).get('depth') or 0) + 1
+        if depth > policy['max_follow_up_depth']:
+            skipped = {p['key']: 'follow-up depth limit reached' for p in proposals}
+        else:
+            profiles = {p['id']: p for p in self.store.snapshot(live_status=False).get('profiles', [])}
+            repository = self.path_for(task)
+            for proposal in proposals:
+                if str(proposal.get('needs_review', '')).lower() in ('true', 'yes'):
+                    skipped[proposal['key']] = 'proposal requested operator review'
+                    continue
+                if len(queued) >= policy['max_per_meeting']:
+                    skipped[proposal['key']] = 'meeting limit reached'
+                    continue
+                profile = profiles.get(proposal['profile_id'])
+                if not profile or profile.get('archived') or not profile.get('use_worktree', True):
+                    skipped[proposal['key']] = 'assignee is not an eligible worktree agent'
+                    continue
+                if not profile.get('project') or Path(profile['project']).resolve() != repository:
+                    skipped[proposal['key']] = 'assignee is assigned to another repository'
+                    continue
+                if self.open_work_count(proposal['profile_id']) >= policy['max_open_per_agent']:
+                    skipped[proposal['key']] = 'assignee queue limit reached'
+                    continue
+                if self.auto_created_today(task['organization_id']) >= policy['daily_cap']:
+                    skipped[proposal['key']] = 'daily automation limit reached'
+                    continue
+                try:
+                    self.perform('proposal', dict(meeting_id=job_id, proposal_key=proposal['key'], queue=True), task_id, actor)
+                except (ValueError, OSError) as error:
+                    skipped[proposal['key']] = str(error)[:300]
+                    continue
+                origin = self.get(task_id)
+                created_id = (origin.get('follow_up_tasks') or {}).get(proposal['key'])
+                if created_id:
+                    created = self.get(created_id)
+                    created.setdefault('source', {})['auto_queued'] = dict(
+                        at=stamp(), meeting_id=job_id, group_id=job.get('group_id'),
+                        policy={k: policy[k] for k in AUTOMATION_DEFAULTS})
+                    self.save(created, 'auto_queued', actor)
+                    queued.append(proposal['key'])
+        task = self.get(task_id)
+        task.setdefault('auto_queue', {})[job_id] = dict(
+            at=stamp(), queued=queued, skipped=skipped,
+            policy={k: policy[k] for k in AUTOMATION_DEFAULTS})
+        self.save(task, 'auto_queue_checked', actor)
 
 
     def get(self, task_id):
@@ -720,7 +931,17 @@ class Contributions:
             github = dict(configured=bool(github.get('configured')))
         executor = ('unavailable' if self.validation is None
                     else 'service' if self.validation.queue is not None else 'gateway')
-        return dict(tasks=tasks, github=github, executor=executor)
+        with closing(self.connect()) as db:
+            saved = {row[0]: json.loads(row[1]) for row in db.execute('SELECT id, data FROM policies')}
+            organizations = {row[0] for row in db.execute(
+                "SELECT DISTINCT json_extract(data, '$.organization_id') FROM tasks "
+                "WHERE json_extract(data, '$.organization_id') IS NOT NULL")}
+        automation = {organization: dict(AUTOMATION_DEFAULTS, **saved.get(organization, {}))
+                      for organization in organizations}
+        if role != 'admin':
+            automation = {organization: {k: v for k, v in policy.items() if k in AUTOMATION_DEFAULTS}
+                          for organization, policy in automation.items()}
+        return dict(tasks=tasks, github=github, executor=executor, automation=automation)
 
     def detail(self, task_id):
         if not isinstance(task_id, str) or not re.fullmatch(r'[a-f0-9]{32}', task_id):
@@ -846,7 +1067,7 @@ class Contributions:
             raise ValueError('Only an administrator can manage contribution tasks.')
         if not isinstance(body, dict) or not REQUEST.fullmatch(str(body.get('request_id', ''))):
             raise ValueError('A stable request ID is required.')
-        if action != 'create' and (not isinstance(body.get('task_id'), str)
+        if action not in ('create', 'automation') and (not isinstance(body.get('task_id'), str)
                                   or not re.fullmatch(r'[a-f0-9]{32}', body['task_id'])):
             raise ValueError('Select a valid task.')
         fingerprint = hashlib.sha256(json.dumps([action, body, actor], sort_keys=True).encode()).hexdigest()
@@ -869,7 +1090,7 @@ class Contributions:
             except (ValueError, OSError) as error:
                 # Keep the request pending: explicit retry rechecks reality,
                 # especially a push/PR whose HTTP response was lost.
-                if action != 'create':
+                if action not in ('create', 'automation'):
                     task = self.get(record['task_id'])
                     task['error'] = str(error)[:500]
                     self.save(task, action + '_error', actor)
@@ -958,6 +1179,7 @@ class Contributions:
                         'Never push, open a pull request, update the shared checkout or deploy. '
                         'When complete, write JSON to {{HERDR_TASK_RECEIPT}} with outcome=complete, commit=the full HEAD SHA, run_id={{HERDR_TASK_RUN}}, token={{HERDR_TASK_TOKEN}}, and tests as an array of actual check results. Write it last after committing. '
                         'If and only if the task genuinely requires no code changes, write the same receipt with outcome=no_changes, commit=the unchanged recorded base SHA and a reason field instead of committing. '
+                        'Optionally include "follow_up": {"title": ..., "description": ...} when you found necessary related work; it is recorded as a draft task for operator review, never started automatically. '
                         'Report commands and actual results; missing checks are not passes. Publishing is a dashboard administrator action.\n\n'
                         'Task-local tool acquisition policy:\n' + task_tool_guidance()))
             profile = next((p for p in self.store.snapshot(live_status=False)['profiles'] if p['id'] == task['profile_id']), {})
@@ -972,6 +1194,8 @@ class Contributions:
             return self.save(task, 'launch', actor)
 
     def perform(self, action, body, task_id, actor):
+        if action == 'automation':
+            return self.set_automation_policy(body, actor)
         if action == 'create':
             try:
                 return self.get(task_id)
@@ -1078,13 +1302,24 @@ class Contributions:
                 with closing(self.connect()) as db:
                     open_tasks = [json.loads(r[0]) for r in db.execute("SELECT data FROM tasks WHERE json_extract(data, '$.organization_id')=? AND json_extract(data, '$.state') NOT IN ('completed','closed','merged') LIMIT 10", (task['organization_id'],))]
                 # The instruction comes first: bounded context may be truncated,
-                # never the required proposal contract.
+                # never the required proposal contract. Automatic follow-up is
+                # stated honestly so agents propose sparingly when it is enabled.
+                policy = self.policy(task['organization_id'])
+                if policy['auto_queue_proposals'] and not policy['paused']:
+                    follow_up = ('This organization has automatic follow-up enabled: qualifying proposals are created and queued '
+                        'without further operator review, up to ' + str(policy['max_per_meeting']) + ' per meeting and '
+                        + str(policy['daily_cap']) + ' per day. Propose only necessary, self-contained work with acceptance criteria '
+                        'and required checks. Set needs_review=true on a proposal that changes scope, adds dependencies or touches '
+                        'sensitive areas; those stay drafts.')
+                else:
+                    follow_up = 'These are drafts for operator review, not authorization to launch work.'
                 instruction = ('Discuss remaining acceptance criteria, blockers, review evidence and possible duplicate/superseded work. '
                     'Read-only discussion; do not edit, commit, push or deploy. '
                     'Do not treat missing validation as passed. Propose only necessary follow-up work; do not recreate existing tasks. '
                     'In the final action-plan artifact include one fenced json object with task_proposals: an array (at most 10) of {title, description, profile_id}. '
                     'Each description must include acceptance criteria and required checks. Use an existing individual repository worker profile ID from the group roster. '
-                    'An empty proposal array is valid. These are drafts for operator review, not authorization to launch work.')
+                    'Also consider one evidence-based improvement that would make similar work easier next time: documentation, tooling or UX. Do not invent work. '
+                    'An empty proposal array is valid. ' + follow_up)
                 context = ('Review task ' + task['id'] + ': ' + task['title'] + '\n' + task['description'][:2000] +
                     '\nCandidate: ' + str(task.get('head_sha')) + '\nIssue: ' + str(task.get('automation_error', task.get('error', '')))[:500] +
                     '\nOther open work:\n' + '\n'.join(t['id'] + ' ' + t['title'][:120] + ' [' + t['state'] + ']' for t in open_tasks))
@@ -1114,7 +1349,8 @@ class Contributions:
             new_id = uuid.uuid5(uuid.NAMESPACE_URL, 'herdr:' + task_id + ':' + reference['job_id'] + ':' + proposal['key']).hex
             created = self.perform('create', dict(title=proposal['title'], description=proposal['description'],
                 repository=task['repository'], base_ref=task['base_ref'], profile_id=proposal['profile_id']), new_id, actor)
-            created['source'] = dict(task_id=task_id, meeting_id=reference['job_id'], group_id=reference['group_id'], proposal_key=proposal['key'])
+            created['source'] = dict(task_id=task_id, meeting_id=reference['job_id'], group_id=reference['group_id'],
+                                     proposal_key=proposal['key'], depth=(task.get('source', {}).get('depth') or 0) + 1)
             self.save(created, 'proposal_accepted', actor)
             task.setdefault('follow_up_tasks', {})[proposal['key']] = new_id
             if body.get('queue') is True:

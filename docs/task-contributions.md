@@ -2,7 +2,8 @@
 
 Tasks is the outbound contribution workflow. Worktree integration remains the
 separate upstream-to-worker flow. Publishing never updates the shared checkout,
-merges a pull request or deploys a build.
+merges a pull request or deploys a build. For a step-by-step first run, see
+[first-task-walkthrough.md](first-task-walkthrough.md).
 
 ## Administrator workflow
 
@@ -89,9 +90,9 @@ than as a pass.
 
 ## Durability and current limits
 
-`tasks.sqlite3` contains task records, queued assignments, immutable build-event
-selections and durable request fingerprints. Mutating task operations require
-administrator identity and
+`tasks.sqlite3` contains task records, queued assignments, organization
+follow-up automation policies, immutable build-event selections and durable
+request fingerprints. Mutating task operations require administrator identity and
 a stable request ID; reusing an ID for different content is rejected. Pending push
 requests reconcile remote head before redispatch; PR creation finds before creating.
 Background polling never pushes, creates a PR or merges. Gateway restarts do not

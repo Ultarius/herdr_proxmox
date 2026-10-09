@@ -66,7 +66,48 @@ Provider-native conversation resume is not available. Herdr session identity is 
 proof of a provider conversation ID. Continuing an archived session supplies saved
 context to a fresh session; it never claims to restore provider state.
 
-## Restart recovery and validation
+## Automatic follow-up from group reviews
+
+Group discussions produce draft proposals by default. An organization can opt into
+bounded automatic follow-up, per organization and off by default:
+
+- `auto_queue_proposals` — qualifying proposals are created and queued without a
+  separate operator click;
+- `max_per_meeting` — how many proposals from one discussion may start;
+- `max_open_per_agent` — queued plus active work allowed per assignee;
+- `max_follow_up_depth` — how many follow-up generations are allowed;
+- `daily_cap` — automatically created tasks per organization per 24 hours;
+- `paused` — kill switch; queued work stays queued and nothing new starts.
+
+A proposal qualifies only when all of the following hold:
+
+- its discussion is finalized and belongs to a task in review, completion or
+  merged state (evidence-backed review, not mid-implementation);
+- its assignee is an individual, non-archived worktree agent for the same
+  repository;
+- the follow-up depth, per-meeting, per-agent and daily limits are not exceeded;
+- the proposal did not set `needs_review=true`, which always keeps it a draft.
+
+Qualifying proposals go through the same task creation, assignment queue and
+verified handoff path as manual work. Failures and uncertainty (repository
+unavailable, invalid assignee, capacity) leave the proposal as a draft and record
+the reason on the task. Enabling the policy starts a fresh evaluation window:
+discussions created before it are recorded as evaluated and are never queued
+retroactively. Each evaluation is recorded once per meeting.
+
+Delivery remains operator-controlled: no automatic publication, merge, base
+update or deployment. Every automatically created task records its source
+meeting, proposal, depth and the policy snapshot in force, appears in activity
+and can have its queued assignment cancelled.
+
+When the policy is enabled, the discussion instruction states it explicitly and
+asks agents to propose sparingly, with acceptance criteria and checks.
+
+A worker can also report an optional `follow_up` object in its completion
+receipt. It is recorded once per commit as a draft task with recorded depth for
+operator review; it never starts automatically.
+
+
 
 A retry reconciles an already-reserved organization launch by task identity, without
 sending a second prompt or regenerating its request fingerprint. Pending launches count
@@ -77,3 +118,20 @@ commits from a finished session.
 The cap covers task executions launched by the contribution controller. General
 organization and group sessions are outside this task cap. Provider-native state is not
 restored, and no task assignment grants publication or deployment permission.
+
+## Legacy session closure
+
+Some Herdr versions omit `agent_session`. Their task completion and conversation
+identity are separate: marking a task done does not close its pane. For closure,
+the gateway can verify the exact recorded alias, runtime, idle status, unique pane
+ownership, workspace and managed checkout instead. It reads authoritative agent,
+workspace and pane inventories and repeats these checks after terminal archival,
+immediately before closing. Changed or ambiguous ownership remains a blocker.
+The run records `session_close_identity: pane_checkout`; no conversation ID is
+invented or adopted. Runtimes with a recorded session ID still require it to match.
+
+## Product discovery
+
+For meetings about product gaps that do not need a host task, see
+[Product discovery](product-discovery.md). Its opt-in schedule produces reviewed
+drafts; approved tasks reuse the queue and handoff described above.

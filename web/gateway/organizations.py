@@ -634,20 +634,19 @@ class OrganizationStore:
                     saved = archive(self, run, actor, unavailable='Agent and recorded pane were already absent. Terminal history cannot be recovered from them.')
                     status = 'already_closed'
                 else:
-                    if not run.get('agent_session'):
-                        raise ValueError('Session identity is missing; inspect manually.')
-                    self.identity(run, agent=agent)
+                    self.close_identity(run, live=live)
                     output = self.command('agent', 'read', run['alias'], '--source', 'recent-unwrapped', '--lines', '2000', timeout=10)
                     terminal = output.get('output') if isinstance(output, dict) else None
                     if not isinstance(terminal, str) or not terminal.strip():
                         raise ValueError('Terminal preservation failed or returned empty output; the pane was not closed.')
                     saved = archive(self, run, actor, terminal=terminal[-40000:])
-                    self.identity(run)  # Recheck after archive capture and immediately before closure.
+                    self.close_identity(run)  # Recheck ownership after capture and immediately before closure.
                     self.command('pane', 'close', run['pane_id'], timeout=10)
                 terminal = 'finished' if mode == 'finish' else 'released'
                 run = self.update_job(run['id'], state=terminal, session_closed_at=now(),
                     session_closed_by=actor, session_archive_id=saved['id'], session_close_status=status,
                     session_request_id=request_id, session_request_mode=mode,
+                    session_close_identity='agent_session' if run.get('agent_session') else 'pane_checkout',
                     **({'finished_at': now(), 'finished_by': actor} if mode == 'finish' else {}))
             if mode in ('restart', 'continue'):
                 with self.lock, closing(self.connect()) as db:
@@ -818,6 +817,52 @@ class OrganizationStore:
             raise ValueError('Agent conversation changed. Launch a new run to deliver its persona.')
         if ready and (agent.get('agent_status', agent.get('state')) not in ('idle', 'done') or agent.get('interactive_ready') is False or agent.get('launch_pending') is True):
             raise ValueError('Agent is not ready for input. Check its terminal over SSH.')
+        return agent
+
+    def close_identity(self, run, live=None):
+        """Verify pane ownership for closure, including runtimes without session IDs.
+
+        The legacy fallback identifies the managed pane and checkout, not a
+        provider conversation. Never adopt a newly observed conversation ID.
+        """
+        if live is None:
+            response = self.command('agent', 'list')
+            live = response if isinstance(response, list) else response.get('agents') if isinstance(response, dict) else None
+        if not isinstance(live, list) or any(not isinstance(item, dict) for item in live):
+            raise ValueError('Cannot verify live sessions before closure.')
+        matches = [item for item in live if item.get('name') == run.get('alias')]
+        if len(matches) != 1:
+            raise ValueError('Original session is absent or ambiguous; refresh its run before closure.')
+        agent = self.identity(run, agent=matches[0])
+        if run.get('agent_session'):
+            return agent
+        pane = run.get('pane_id')
+        workspace_id = run.get('workspace_id') or (pane.split(':')[0] if isinstance(pane, str) else None)
+        if not is_workspace_id(workspace_id) or not is_pane_id(pane, workspace_id):
+            raise ValueError('Legacy session has no verifiable pane identity; inspect its run.')
+        if len([item for item in live if item.get('pane_id') == pane]) != 1:
+            raise ValueError('Legacy session pane has ambiguous agent ownership; inspect its run.')
+        response = self.command('workspace', 'list')
+        workspaces = response if isinstance(response, list) else response.get('workspaces') if isinstance(response, dict) else None
+        if not isinstance(workspaces, list) or any(not isinstance(item, dict) for item in workspaces):
+            raise ValueError('Cannot verify legacy session workspace inventory.')
+        owners = [item for item in workspaces if (item.get('workspace_id') or item.get('id')) == workspace_id]
+        if len(owners) != 1:
+            raise ValueError('Legacy session workspace is absent or ambiguous; inspect its run.')
+        worktree = owners[0].get('worktree')
+        checkout = worktree.get('checkout_path') if isinstance(worktree, dict) else None
+        checkout = checkout or owners[0].get('cwd')
+        expected = run.get('worktree_path') or run.get('source_project') or run['profile'].get('project')
+        if not isinstance(checkout, str) or not checkout or not isinstance(expected, str) or not expected:
+            raise ValueError('Legacy session checkout identity is unavailable; inspect its run.')
+        if project_directory(self.projects, checkout) != project_directory(self.projects, expected):
+            raise ValueError('Legacy session checkout changed; the pane was not closed.')
+        response = self.command('pane', 'list', '--workspace', workspace_id)
+        panes = response if isinstance(response, list) else response.get('panes') if isinstance(response, dict) else None
+        if not isinstance(panes, list) or any(not isinstance(item, dict) for item in panes):
+            raise ValueError('Cannot verify legacy session pane inventory.')
+        if len([item for item in panes if item.get('pane_id') == pane]) != 1:
+            raise ValueError('Legacy session pane is absent or ambiguous; inspect its run.')
         return agent
 
     def check_contract(self):

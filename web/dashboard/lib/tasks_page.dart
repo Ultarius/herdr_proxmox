@@ -1,3 +1,4 @@
+import 'discovery_panel.dart';
 import 'routes.dart';
 import 'task_activity.dart';
 import 'task_timeline.dart';
@@ -97,6 +98,7 @@ class _TasksPageState extends State<TasksPage> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
   List<Map<String, dynamic>> tasks = [];
   Map<String, dynamic> github = {};
+  Map<String, dynamic> automation = {};
   String executor = 'unavailable';
   String section = 'Overview';
   final Set<String> expandedMeetings = {};
@@ -225,6 +227,7 @@ class _TasksPageState extends State<TasksPage> {
           }
           github = Map<String, dynamic>.from(data['github'] ?? {});
           executor = '${data['executor'] ?? 'unavailable'}';
+          automation = Map<String, dynamic>.from(data['automation'] ?? {});
         });
       }
     } catch (e) {
@@ -715,6 +718,7 @@ class _TasksPageState extends State<TasksPage> {
                 ),
               ),
             for (final task in tasks) _summary(task),
+            DiscoveryPanel(coordinator: widget.coordinator),
           ],
         )
       : _detail();
@@ -1051,6 +1055,130 @@ class _TasksPageState extends State<TasksPage> {
       });
   }
 
+  Map<String, dynamic> _orgPolicy(Map task) => Map<String, dynamic>.from(
+    (automation['${task['organization_id']}'] as Map?) ?? const {},
+  );
+
+  String _automationSummary(Map task) {
+    final policy = _orgPolicy(task);
+    if (policy['auto_queue_proposals'] != true)
+      return 'Off. Qualifying group proposals stay drafts until you create or queue them.';
+    final paused = policy['paused'] == true ? 'Paused. ' : '';
+    return '${paused}On: ${policy['max_per_meeting'] ?? 1}/meeting, '
+        '${policy['max_open_per_agent'] ?? 2} open per agent, '
+        'depth ${policy['max_follow_up_depth'] ?? 1}, '
+        '${policy['daily_cap'] ?? 5}/day.';
+  }
+
+  String _automationOutcome(Map result) {
+    final unavailable = '${result['unavailable'] ?? ''}';
+    if (unavailable.isNotEmpty) return unavailable;
+    final queued = (result['queued'] as List? ?? []).length;
+    final reasons = ((result['skipped'] as Map? ?? const {}).values)
+        .map((value) => '$value')
+        .toSet()
+        .take(2)
+        .join('; ');
+    if (queued == 0 && reasons.isEmpty)
+      return 'Automation evaluated this review: no proposals.';
+    return 'Automation: $queued created and queued'
+        '${reasons.isEmpty ? '' : ' \u00b7 kept as drafts: $reasons'}';
+  }
+
+  Future<void> editAutomation(Map<String, dynamic> task) async {
+    final epoch = connection.generation;
+    final policy = _orgPolicy(task);
+    var enabled = policy['auto_queue_proposals'] == true;
+    var paused = policy['paused'] == true;
+    final perMeeting = TextEditingController(
+      text: '${policy['max_per_meeting'] ?? 1}',
+    );
+    final perAgent = TextEditingController(
+      text: '${policy['max_open_per_agent'] ?? 2}',
+    );
+    final depth = TextEditingController(
+      text: '${policy['max_follow_up_depth'] ?? 1}',
+    );
+    final daily = TextEditingController(text: '${policy['daily_cap'] ?? 5}');
+    final selected = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, update) => AlertDialog(
+          title: const Text('Follow-up automation policy'),
+          content: SizedBox(
+            width: 480,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Applies to all group reviews in this organization. Qualifying proposals are created and queued; everything else stays a draft. Publishing, merging and deployment are never automatic.',
+                  ),
+                  SwitchListTile(
+                    value: enabled,
+                    onChanged: (value) => update(() => enabled = value == true),
+                    title: const Text(
+                      'Automatically queue qualifying follow-up proposals',
+                    ),
+                  ),
+                  SwitchListTile(
+                    value: paused,
+                    onChanged: (value) => update(() => paused = value == true),
+                    title: const Text('Pause automatic follow-up'),
+                    subtitle: const Text(
+                      'Queued work stays queued; nothing new starts automatically.',
+                    ),
+                  ),
+                  _limitField(perMeeting, 'Max per meeting'),
+                  _limitField(perAgent, 'Max open per agent (queued + active)'),
+                  _limitField(depth, 'Max follow-up depth'),
+                  _limitField(daily, 'Daily limit (organization)'),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, {
+                'auto_queue_proposals': enabled,
+                'paused': paused,
+                'max_per_meeting': int.tryParse(perMeeting.text.trim()),
+                'max_open_per_agent': int.tryParse(perAgent.text.trim()),
+                'max_follow_up_depth': int.tryParse(depth.text.trim()),
+                'daily_cap': int.tryParse(daily.text.trim()),
+              }),
+              child: const Text('Save policy'),
+            ),
+          ],
+        ),
+      ),
+    );
+    perMeeting.dispose();
+    perAgent.dispose();
+    depth.dispose();
+    daily.dispose();
+    if (selected == null || !mounted || epoch != connection.generation) return;
+    selected.removeWhere((key, value) => value == null);
+    await act('automation', {
+      'organization_id': task['organization_id'],
+      ...selected,
+    });
+  }
+
+  Widget _limitField(TextEditingController controller, String label) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 4),
+    child: TextField(
+      controller: controller,
+      keyboardType: TextInputType.number,
+      decoration: InputDecoration(labelText: label, isDense: true),
+    ),
+  );
+
   Widget _nextAction(Map<String, dynamic> task) {
     final target = task['merge_sha'] ?? task['head_sha'];
     final evidence = (task['builds'] as Map?)?[target] as Map?;
@@ -1127,6 +1255,12 @@ class _TasksPageState extends State<TasksPage> {
               icon: const Icon(Icons.swap_horiz),
               label: const Text('Verify handoff and start'),
             ),
+            if (blockingTaskId != null)
+              OutlinedButton.icon(
+                onPressed: () => openTask('$blockingTaskId'),
+                icon: const Icon(Icons.history),
+                label: const Text('Inspect previous task'),
+              ),
             OutlinedButton.icon(
               onPressed: admin && !busy
                   ? () => act('assignment', {
@@ -1334,6 +1468,12 @@ class _TasksPageState extends State<TasksPage> {
               SelectableText(
                 'Completion receipt recorded for ${task['completion_receipt']['commit']}. Worker reports are separate from validation.',
               ),
+            if ((task['source'] as Map?)?['task_id'] != null)
+              Text(
+                (task['source'] as Map)['auto_queued'] is Map
+                    ? 'Auto-queued from group review of task ${(task['source'] as Map)['task_id']}.'
+                    : 'Follow-up of task ${(task['source'] as Map)['task_id']}.',
+              ),
             ExpansionTile(
               title: const Text('Automation settings'),
               children: [
@@ -1361,6 +1501,17 @@ class _TasksPageState extends State<TasksPage> {
                         })
                       : null,
                 ),
+                if (task['organization_id'] != null)
+                  ListTile(
+                    title: const Text('Organization follow-up automation'),
+                    subtitle: Text(_automationSummary(task)),
+                    trailing: TextButton(
+                      onPressed: admin && !busy
+                          ? () => editAutomation(task)
+                          : null,
+                      child: const Text('Edit policy'),
+                    ),
+                  ),
               ],
             ),
             const SizedBox(height: 12),
@@ -1402,6 +1553,14 @@ class _TasksPageState extends State<TasksPage> {
                       SelectableText(
                         '${meeting['result'] ?? 'Waiting for discussion output.'}',
                       ),
+                      if ((task['auto_queue'] as Map?)?[meeting['job_id']]
+                          is Map)
+                        Text(
+                          _automationOutcome(
+                            (task['auto_queue'] as Map)[meeting['job_id']]
+                                as Map,
+                          ),
+                        ),
                       for (final proposal
                           in meeting['proposals'] as List? ?? [])
                         if (proposal is Map)
@@ -1550,13 +1709,6 @@ class _TasksPageState extends State<TasksPage> {
     spacing: 8,
     runSpacing: 8,
     children: [
-      if (task['run_id'] == null)
-        FilledButton(
-          onPressed: admin && !busy
-              ? () => act('launch', {'task_id': task['id']})
-              : null,
-          child: const Text('Launch task agent'),
-        ),
       if (task['run_id'] != null &&
           !['merged', 'closed', 'completed'].contains(task['state']))
         OutlinedButton(

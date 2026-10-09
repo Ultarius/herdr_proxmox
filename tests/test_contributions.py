@@ -1178,3 +1178,180 @@ class ContributionTests(unittest.TestCase):
             self.service.action('launch', dict(request_id='launch-dead', task_id=self.task['id']), 'admin', 'admin')
         self.store.action.assert_not_called()
         self.assertIsNone(self.service.get(self.task['id']).get('run_id'))
+
+    def _meeting(self, task, proposals, job_id='meeting', state='artifact_ready', group_id='review'):
+        task.setdefault('meetings', []).append(dict(job_id=job_id, group_id=group_id, group_name='Project Review',
+                                                    at=contributions.stamp(), signature='a' * 20))
+        self.service.save(task, 'discuss', 'admin')
+        jobs = self.store.snapshot.return_value['jobs']
+        jobs[:] = [j for j in jobs if j.get('id') != job_id]
+        jobs.append(dict(id=job_id, kind='discussion', organization_id='org', group_id=group_id, state=state,
+                         result='```json\n' + json.dumps({'task_proposals': proposals}) + '\n```'))
+        return self.service.get(task['id'])
+
+    def test_automation_policy_requires_admin_validates_and_is_snapshotted(self):
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        with self.assertRaisesRegex(ValueError, 'administrator'):
+            self.service.action('automation', dict(request_id='a-1', organization_id='org', auto_queue_proposals=True), 'operator', 'operator')
+        with self.assertRaisesRegex(ValueError, 'valid organization'):
+            self.service.action('automation', dict(request_id='a-2', organization_id='', auto_queue_proposals=True), 'admin', 'admin')
+        with self.assertRaisesRegex(ValueError, 'not found'):
+            self.service.action('automation', dict(request_id='a-3', organization_id='nope', auto_queue_proposals=True), 'admin', 'admin')
+        with self.assertRaisesRegex(ValueError, 'automation limit'):
+            self.service.action('automation', dict(request_id='a-4', organization_id='org', daily_cap=1000), 'admin', 'admin')
+        with self.assertRaisesRegex(ValueError, 'policy value'):
+            self.service.action('automation', dict(request_id='a-5', organization_id='org', paused='yes'), 'admin', 'admin')
+        saved = self.service.action('automation', dict(request_id='a-6', organization_id='org', auto_queue_proposals=True,
+            max_per_meeting=2, max_open_per_agent=3, max_follow_up_depth=2, daily_cap=7), 'admin', 'admin')
+        self.assertEqual(saved['policy']['max_per_meeting'], 2)
+        snapshot = self.service.snapshot()
+        self.assertTrue(snapshot['automation']['org']['auto_queue_proposals'])
+        self.assertEqual(snapshot['automation']['org']['daily_cap'], 7)
+        updated = self.service.action('automation', dict(request_id='a-7', organization_id='org', paused=True), 'admin', 'admin')
+        self.assertEqual(updated['policy']['max_per_meeting'], 2)
+        self.assertTrue(updated['policy']['paused'])
+
+    def test_auto_queue_materializes_qualifying_proposals_with_caps_and_depth(self):
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        task = self.candidate()
+        self.service.action('automation', dict(request_id='a-1', organization_id='org', auto_queue_proposals=True,
+            max_per_meeting=1, daily_cap=5, max_follow_up_depth=1), 'admin', 'admin')
+        proposals = [dict(title='Add tests', description='Cover the remaining boundary case with checks.', profile_id='worker'),
+                     dict(title='Update docs', description='Document the new flag and its required checks.', profile_id='worker')]
+        self._meeting(task, proposals)
+        self.service.advance_proposals()
+        origin = self.service.get(task['id'])
+        marker = origin['auto_queue']['meeting']
+        self.assertEqual(len(marker['queued']), 1)
+        self.assertEqual(len(marker['skipped']), 1)
+        self.assertIn('meeting limit', list(marker['skipped'].values())[0])
+        created = self.service.get(origin['follow_up_tasks'][marker['queued'][0]])
+        self.assertEqual(created['state'], 'draft')
+        self.assertEqual(created['assignment']['state'], 'queued')
+        self.assertEqual(created['source']['depth'], 1)
+        self.assertEqual(created['source']['task_id'], task['id'])
+        self.assertIn('auto_queued', created['source'])
+        self.assertEqual(self.service.queued_assignments()[0]['task_id'], created['id'])
+        # A second pass is a no-op; the marker and deterministic identity hold.
+        before = len(self.service.snapshot()['tasks'])
+        self.service.advance_proposals()
+        self.assertEqual(len(self.service.snapshot()['tasks']), before)
+
+    def test_auto_queue_respects_depth_pause_and_disabled_policy(self):
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        task = self.candidate()
+        task['source'] = dict(task_id='parent', depth=1)
+        self.service.action('automation', dict(request_id='a-1', organization_id='org', auto_queue_proposals=True, max_follow_up_depth=1), 'admin', 'admin')
+        task = self._meeting(task, [dict(title='Deep', description='Follow-up beyond the depth limit.', profile_id='worker')], job_id='deep')
+        self.service.advance_proposals()
+        marker = self.service.get(task['id'])['auto_queue']['deep']
+        self.assertEqual(marker['queued'], [])
+        self.assertIn('depth', list(marker['skipped'].values())[0])
+        # Paused and disabled policies leave finalized meetings unprocessed.
+        self.service.action('automation', dict(request_id='a-2', organization_id='org', paused=True), 'admin', 'admin')
+        task = self._meeting(task, [dict(title='Paused', description='Must wait while automation is paused.', profile_id='worker')], job_id='paused')
+        self.service.advance_proposals()
+        self.assertNotIn('paused', self.service.get(task['id']).get('auto_queue', {}))
+        self.service.action('automation', dict(request_id='a-3', organization_id='org', paused=False, auto_queue_proposals=False), 'admin', 'admin')
+        task = self._meeting(task, [dict(title='Off', description='Must not start while automation is off.', profile_id='worker')], job_id='off')
+        self.service.advance_proposals()
+        self.assertNotIn('off', self.service.get(task['id']).get('auto_queue', {}))
+
+    def test_auto_queue_skips_ineligible_assignees_and_review_requests(self):
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        task = self.candidate()
+        self.store.snapshot.return_value['profiles'].append(dict(self.profile, id='outsider', project=str(self.root / 'other')))
+        self.service.action('automation', dict(request_id='a-1', organization_id='org', auto_queue_proposals=True, max_per_meeting=5), 'admin', 'admin')
+        proposals = [
+            dict(title='Needs review', description='Changes scope and must stay a draft.', profile_id='worker', needs_review=True),
+            dict(title='Wrong repo', description='Assignee works in another repository.', profile_id='outsider'),
+            dict(title='Valid work', description='A necessary, self-contained follow-up with checks.', profile_id='worker'),
+        ]
+        self._meeting(task, proposals)
+        self.service.advance_proposals()
+        marker = self.service.get(task['id'])['auto_queue']['meeting']
+        self.assertEqual(len(marker['queued']), 1)
+        reasons = ' '.join(marker['skipped'].values())
+        self.assertIn('operator review', reasons)
+        self.assertIn('another repository', reasons)
+
+    def test_auto_queue_enforces_agent_and_daily_caps_and_replays_policy(self):
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        task = self.candidate()
+        existing = self.service.action('create', dict(self.body, request_id='create-cap', title='Existing queued work'), 'admin', 'admin')
+        self.service.action('assignment', dict(request_id='queue-cap', task_id=existing['id'], mode='queue'), 'admin', 'admin')
+        self.service.action('automation', dict(request_id='a-1', organization_id='org', auto_queue_proposals=True,
+            max_open_per_agent=1, max_per_meeting=5, daily_cap=5), 'admin', 'admin')
+        task = self._meeting(task, [dict(title='Capped', description='Must wait for the assignee queue.', profile_id='worker')], job_id='capped')
+        self.service.advance_proposals()
+        marker = self.service.get(task['id'])['auto_queue']['capped']
+        self.assertEqual(marker['queued'], [])
+        self.assertIn('queue limit', list(marker['skipped'].values())[0])
+        # A zero daily cap blocks even with a free agent.
+        self.service.action('assignment', dict(request_id='cancel-cap', task_id=existing['id'], mode='cancel'), 'admin', 'admin')
+        self.service.action('automation', dict(request_id='a-2', organization_id='org', daily_cap=0), 'admin', 'admin')
+        task = self._meeting(task, [dict(title='Daily capped', description='Must respect the daily cap.', profile_id='worker')], job_id='daily')
+        self.service.advance_proposals()
+        marker = self.service.get(task['id'])['auto_queue']['daily']
+        self.assertEqual(marker['queued'], [])
+        self.assertIn('daily', list(marker['skipped'].values())[0])
+        # Replaying a policy request returns its stored response.
+        replay = self.service.action('automation', dict(request_id='a-1', organization_id='org', auto_queue_proposals=True,
+            max_open_per_agent=1, max_per_meeting=5, daily_cap=5), 'admin', 'admin')
+        self.assertEqual(replay['policy']['daily_cap'], 5)
+        # The replay must not re-execute: the stored policy still reflects a-2.
+        self.assertEqual(self.service.policy('org')['daily_cap'], 0)
+
+    def test_auto_queue_does_not_start_reviews_created_before_enabling(self):
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        task = self.candidate()
+        task = self._meeting(task, [dict(title='Old review', description='Created before automation was enabled.', profile_id='worker')], job_id='old')
+        task['meetings'][-1]['at'] = '2000-01-01T00:00:00+00:00'
+        self.service.save(task, 'discuss', 'admin')
+        self.service.action('automation', dict(request_id='a-1', organization_id='org', auto_queue_proposals=True), 'admin', 'admin')
+        self.service.advance_proposals()
+        marker = self.service.get(task['id'])['auto_queue']['old']
+        self.assertEqual(marker['queued'], [])
+        self.assertIn('before automatic follow-up', marker['unavailable'])
+
+    def test_worker_reported_follow_up_creates_one_draft_task(self):
+        task = self.candidate()
+        task.update(state='implementing', auto_validate=True)
+        task.pop('head_sha')
+        self.service.save(task, 'policy', 'admin')
+        run = self.store.snapshot.return_value['jobs'][0]
+        run.update(profile_id='worker', completion_token='token')
+        tree = Path(task['worktree'])
+        (self.repo / '.git/info/exclude').write_text('/.ci-cache/\n')
+        receipt = tree / '.ci-cache/herdr-guidance' / ('task-' + task['id']) / 'receipt.json'
+        receipt.parent.mkdir(parents=True)
+        head = self.git('rev-parse', 'HEAD', path=tree).strip()
+        receipt.write_text(json.dumps(dict(outcome='complete', commit=head, run_id='run', token='token', tests=[],
+                                           follow_up=dict(title='Add regression test',
+                                                          description='Cover the boundary case found during this task.'))))
+        self.service.validation = MagicMock()
+        self.service.validation.snapshot.return_value = {'executor': 'service'}
+        self.service.validation.submit.return_value = dict(id='build1', state='queued', checks=[])
+        with patch('collaboration.current_run'):
+            self.service.advance_automatic()
+        origin = self.service.get(task['id'])
+        markers = [m for m in origin['follow_up_tasks'] if m.startswith('receipt:')]
+        self.assertEqual(len(markers), 1)
+        created = self.service.get(origin['follow_up_tasks'][markers[0]])
+        self.assertEqual(created['state'], 'draft')
+        self.assertNotIn('assignment', created)
+        self.assertTrue(created['source']['receipt_follow_up'])
+        self.assertEqual(created['source']['depth'], 1)
+        with patch('collaboration.current_run'):
+            self.service.advance_automatic()
+        self.assertEqual(len(self.service.get(task['id'])['follow_up_tasks']), 1)
+
+    def test_discussion_prompt_states_automatic_follow_up_policy(self):
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        self.store.snapshot.return_value['groups'] = [dict(id='review', organization_id='org', name='Project Review')]
+        self.store.action.return_value = dict(id='meeting-1')
+        self.service.action('automation', dict(request_id='a-1', organization_id='org', auto_queue_proposals=True, max_per_meeting=2), 'admin', 'admin')
+        self.service.action('discuss', dict(request_id='d-1', task_id=self.task['id'], group_id='review'), 'admin', 'admin')
+        prompt = self.store.action.call_args[0][1]['prompt']
+        self.assertIn('automatic follow-up enabled', prompt)
+        self.assertIn('needs_review=true', prompt)
