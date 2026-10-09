@@ -66,6 +66,32 @@ Provider-native conversation resume is not available. Herdr session identity is 
 proof of a provider conversation ID. Continuing an archived session supplies saved
 context to a fresh session; it never claims to restore provider state.
 
+## Startup sessions and availability
+
+Hiring or turning on an agent creates a startup session: the persona is
+delivered and the agent waits for work. An open conversation is not the same
+fact as executing work, so every task start classifies the agent first:
+
+- **ready** — an idle startup session, or a session whose chats and meetings
+  have all completed; starting the task archives that conversation and opens a
+  dedicated task execution;
+- **occupied** — a chat, discussion or delegation is queued or running; the
+  task waits and starts when the reservation ends;
+- **working** — another task is executing; queued work waits behind it;
+- **handoff** — the previous task has recorded completion evidence; its checkout
+  and live session are verified before archival and the next task starts;
+- **attention** — permission prompts, uncertain identity, a dirty checkout or
+  unfinished delegation work; inspect the session before new work.
+
+Rotation of a startup session verifies the live identity and idle state,
+refuses when the checkout has uncommitted changes or an unfinished Git
+operation, preserves bounded terminal history and saved messages before
+closing the pane, and records durable `closing`/`closed` stages on the task so a retry or restart
+reuses the same closure request. Delegations and pending interactions always
+require inspection; completed chats and meetings keep their artifacts and
+archived transcripts, so they do not block rotation. The manual close/restart
+path remains available for every other case.
+
 ## Automatic follow-up from group reviews
 
 Group discussions produce draft proposals by default. An organization can opt into
@@ -135,3 +161,48 @@ invented or adopted. Runtimes with a recorded session ID still require it to mat
 For meetings about product gaps that do not need a host task, see
 [Product discovery](product-discovery.md). Its opt-in schedule produces reviewed
 drafts; approved tasks reuse the queue and handoff described above.
+
+
+## Autonomous session preparation and delegation resolution
+
+Task-detail availability is a display snapshot, cached for at most five seconds
+and invalidated when the saved job fingerprint changes. The response includes
+`checked_at`, `cached` and `max_age_seconds`. Starting work never relies on that
+cache: identity, readiness, reservations and checkout checks run again.
+
+An administrator can resolve a legacy delegation in Organization → Runs. First
+record its completion report, then choose **Accept completion and free agent**,
+or choose **Cancel after inspection** for delivered/interrupted work. A reason
+and inspection acknowledgement are required. Resolution is recorded with actor
+and time, and repeated requests are idempotent. `completed` and `cancelled`
+delegations release their work reservations. Acceptance is an operator decision,
+not independent validation; cancellation does not interrupt a live agent. Fresh
+readiness checks still prevent a task or meeting from interrupting active work.
+
+Group discussions prepare offline members on demand. A waiting meeting holds no
+participant locks or worker thread between poll cycles. Active work takes
+priority; ready waiting meetings are considered before new queued tasks, overlapping meetings preserve their order, and absent members are not
+launched until existing active members are eligible. Each preparation launch has
+a durable deterministic identity, retains the selected runtime/model/persona,
+and uses the normal managed checkout setup. Task sessions can participate only
+after their completion evidence, checkout and live readiness have been verified.
+
+The gateway poll loop rechecks `waiting_for_members` meetings in rotating batches
+of twenty every ten seconds, so busy early meetings do not hide later ones.
+After 24 hours waiting becomes `needs_attention`. Group history shows preparation
+progress; administrators can cancel a waiting meeting or retry inspected failed
+preparation (at most three retries). Once a discussion prompt has been submitted,
+it can only recover its saved artifact and transcript: it is never resent.
+Legacy interrupted discussions without a verified preparation marker likewise
+use artifact recovery. Gateway restart keeps waiting meetings. A known unsubmitted preparation can be
+retried after inspection; uncertain launches or submitted discussions use
+inspection and artifact recovery rather than automatic replay.
+
+Product discovery also prepares an absent facilitator when it needs an evidence
+checkout. This does not grant implementation, publication or deployment rights.
+
+A startup conversation in a non-Git directory does not qualify for automatic
+rotation. The task page offers **Archive inspected session and start**, requiring
+explicit confirmation pinned to the exact run. Bounded terminal history is saved,
+old files remain intact, and implementation starts in its separate Git worktree.
+Invalid Git metadata is an inspection error, never a reason to skip Git checks.

@@ -27,6 +27,7 @@ REPOSITORY = 'Ultarius/herdr_proxmox'
 REQUIRED = ('web/gateway/server.py', 'web/public/index.html',
             'web/public/main.dart.js', 'web/public/dashboard/index.html', 'VERSION')
 RELEASE = re.compile(r'v[0-9]+\.[0-9]+\.[0-9]+')
+ALPHA = re.compile(r'alpha-[a-z0-9-]+-[a-f0-9]{12}-b[1-9][0-9]*')
 # Operator state that outlives any single deployment: task records and the
 # GitHub publishing credential.
 PRESERVED_CONFIG = ('tasks.sqlite3', 'github.json')
@@ -79,7 +80,7 @@ def read_request():
     if not isinstance(payload, dict):
         raise ValueError('Invalid update request.')
     mode = payload.get('mode', 'release')
-    if mode not in ('release', 'local', 'rollback', 'provenance'):
+    if mode not in ('release', 'alpha', 'local', 'rollback', 'provenance'):
         raise ValueError('Invalid deployment mode.')
     if mode in ('rollback', 'provenance'):
         return dict(mode=mode, actor=str(payload.get('actor', ''))[:80])
@@ -99,9 +100,9 @@ def read_request():
         return dict(mode='local', build_id=build_id, sha256=digest, path=archive,
                     actor=str(payload.get('actor', ''))[:80])
     version = payload.get('version', '')
-    if not isinstance(version, str) or not RELEASE.fullmatch(version):
+    if not isinstance(version, str) or not (ALPHA if mode == 'alpha' else RELEASE).fullmatch(version):
         raise ValueError('Invalid release version.')
-    return dict(mode='release', version=version, actor=str(payload.get('actor', ''))[:80])
+    return dict(mode=mode, version=version, actor=str(payload.get('actor', ''))[:80])
 
 
 def extract(archive, staging):
@@ -123,7 +124,7 @@ def extract(archive, staging):
 
 def resolve_tag_sha(version):
     """Best-effort GitHub tag-to-commit lookup; never blocks an installation."""
-    if not isinstance(version, str) or not RELEASE.fullmatch(version):
+    if not isinstance(version, str) or not (RELEASE.fullmatch(version) or ALPHA.fullmatch(version)):
         return None
     headers = {'User-Agent': 'herdr-proxmox-updater', 'Accept': 'application/vnd.github+json'}
     try:
@@ -158,7 +159,18 @@ def release_identity(source, version):
                 or not SOURCE.fullmatch(str(supplied.get('source_sha', '')))):
             raise ValueError('Release build identity does not match the package.')
         identity['source_sha'] = supplied['source_sha']
+        if ALPHA.fullmatch(version):
+            if supplied.get('channel') != 'alpha' or not str(supplied.get('source_branch', '')).startswith('alpha/'):
+                raise ValueError('Alpha package must identify its feature branch and channel.')
+            branch = supplied['source_branch']
+            slug = re.sub(r'[^a-z0-9]+', '-', branch[6:].lower()).strip('-')[:48] or 'feature'
+            prefix = f'alpha-{slug}-{hashlib.sha256(branch.encode()).hexdigest()[:12]}-b'
+            if not version.startswith(prefix):
+                raise ValueError('Alpha tag does not match the declared feature branch.')
+            identity.update(channel='alpha', source_branch=branch)
     else:
+        if ALPHA.fullmatch(version):
+            raise ValueError('Alpha packages require source identity.')
         # Legacy or repackaged releases carry no BUILD.json. Resolve the tag's
         # commit as a best-effort association, not proof of the archive's contents.
         identity['source_sha'] = resolve_tag_sha(version)
@@ -340,7 +352,7 @@ def main():
         pass
     try:
         request = read_request()
-        if request['mode'] == 'release':
+        if request['mode'] in ('release', 'alpha'):
             identity_path = ROOT / 'BUILD.json'
             if identity_path.exists():
                 try:
@@ -362,7 +374,7 @@ def main():
         expected = None
         with tempfile.TemporaryDirectory(prefix='herdr-update-') as staging:
             staging = Path(staging)
-            if request['mode'] == 'release':
+            if request['mode'] in ('release', 'alpha'):
                 archive, checksum = staging / 'release.tar.gz', staging / 'checksum'
                 base = f'https://github.com/Ultarius/herdr_proxmox/releases/download/{request["version"]}'
                 download(base + '/herdr-proxmox.tar.gz', archive, 250_000_000)
@@ -377,6 +389,10 @@ def main():
                 if (source / 'VERSION').read_text().strip() != request['version']:
                     raise ValueError('Release version does not match package.')
                 build_identity = release_identity(source, request['version'])
+                if request['mode'] == 'alpha':
+                    resolved = resolve_tag_sha(request['version'])
+                    if not resolved or resolved != build_identity['source_sha']:
+                        raise ValueError('Alpha package source does not match its immutable tag.')
             else:
                 # Verify and extract the same root-owned copy. The retained
                 # build file belongs to herdr and may change after approval.
@@ -400,7 +416,7 @@ def main():
                         or not SOURCE.fullmatch(str(build_identity.get('source_sha', '')))):
                     raise ValueError('Local deployment identity does not match the approved build.')
                 expected = build_identity['build_id']
-            if request['mode'] == 'release':
+            if request['mode'] in ('release', 'alpha'):
                 expected = request['version']
             subprocess.run(['/usr/bin/python3', '-m', 'compileall', '-q', str(source / 'web/gateway')], check=True)
             service('stop')

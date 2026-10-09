@@ -69,6 +69,7 @@ def launch_arguments(profile):
 
 
 class OrganizationStore:
+    supports_discussion_preparation = True
     def __init__(self, path, projects, command, runtime_status=None, model_validator=None):
         self.path = Path(path)
         self.projects = Path(projects).resolve()
@@ -81,6 +82,8 @@ class OrganizationStore:
         self.jobs_changed = threading.Event()
         self.worker = ThreadPoolExecutor(max_workers=4, thread_name_prefix='organization')
         self.agent_locks = {}
+        self.contributions = None
+        self.discussion_cursor = 0
         self.futures = set()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with closing(self.connect()) as db, db:
@@ -427,12 +430,12 @@ class OrganizationStore:
             else:
                 org_id = text(body, 'organization_id', 40)
                 org = self.get(db, 'organizations', org_id)
-                if action in ('group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript'):
+                if action in ('group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'retry_discussion', 'cancel_discussion'):
                     from collaboration import action as collaboration_action
                     item = collaboration_action(self, db, action, body, org)
                     if action == 'group':
                         submitted = item.get('launch_job_id')
-                    if action in ('chat', 'discuss', 'input'):
+                    if action in ('chat', 'discuss', 'input', 'retry_discussion'):
                         submitted = item['id']
                     if action in ('inspect', 'transcript'):
                         return item
@@ -500,11 +503,25 @@ class OrganizationStore:
                     item.update(state='queued', error='', result='', created_at=now(), updated_at=now())
                     self.put(db, 'jobs', item)
                     submitted = item['id']
-                elif action in ('release', 'report'):
+                elif action in ('release', 'report', 'resolve_delegation'):
                     item = self.get(db, 'jobs', text(body, 'job_id', 40), org_id)
                     if item['state'] in ('queued', 'running'):
                         raise ValueError('Wait for the running job to finish.')
-                    if action == 'release':
+                    if action == 'resolve_delegation':
+                        if item['kind'] != 'delegate' or item['state'] not in ('delivered', 'reported_complete', 'needs_attention', 'uncertain', 'completed', 'cancelled'):
+                            raise ValueError('Inspect a delivered or interrupted delegation before resolving it.')
+                        decision = body.get('decision')
+                        if body.get('inspected') is not True or decision not in ('complete', 'cancel'):
+                            raise ValueError('Inspect the delegation and choose complete or cancel.')
+                        reason = text(body, 'reason', 2000)
+                        if item['state'] not in ('completed', 'cancelled'):
+                            if decision == 'complete' and item['state'] != 'reported_complete':
+                                raise ValueError('Record a completion report before accepting completion.')
+                            item.update(state='completed' if decision == 'complete' else 'cancelled',
+                                resolution=dict(decision=decision, reason=reason, actor=body.get('_actor', 'administrator'), at=now()))
+                        elif item.get('resolution', {}).get('decision') != decision:
+                            raise ValueError('This delegation was already resolved differently.')
+                    elif action == 'release':
                         if item['kind'] != 'launch':
                             raise ValueError('Only run bindings can be released.')
                         item['state'] = 'released'
@@ -914,23 +931,72 @@ class OrganizationStore:
             time.sleep(0.25)
         raise ValueError('New pane shell did not become available. Inspect its terminal over SSH.')
 
+    def advance_discussions(self):
+        # Waiting meetings reserve no busy workers. Recheck on the normal poll loop.
+        with self.lock, closing(self.connect()) as db:
+            rows = db.execute(
+                "SELECT rowid,data FROM jobs WHERE json_extract(data, '$.kind')='discussion' "
+                "AND json_extract(data, '$.state')='waiting_for_members' AND rowid>? ORDER BY rowid LIMIT 20",
+                (self.discussion_cursor,)).fetchall()
+            if not rows and self.discussion_cursor:
+                self.discussion_cursor = 0
+                rows = db.execute(
+                    "SELECT rowid,data FROM jobs WHERE json_extract(data, '$.kind')='discussion' "
+                    "AND json_extract(data, '$.state')='waiting_for_members' ORDER BY rowid LIMIT 20").fetchall()
+            if rows:
+                self.discussion_cursor = rows[-1]['rowid']
+            waiting = [json.loads(row['data']) for row in rows]
+            for job in waiting:
+                job.update(state='queued', updated_at=now())
+                self.put(db, 'jobs', job)
+            db.commit()
+        for job in waiting:
+            with self.lock:
+                future = self.worker.submit(self.execute, job['id'])
+                self.futures.add(future)
+                future.add_done_callback(self._finished)
+
     def execute(self, job_id):
         with self.lock, closing(self.connect()) as db:
             job = self.get(db, 'jobs', job_id)
+            if job.get('state') != 'queued':
+                return  # A second worker/retry must never replay an accepted job.
             ids = sorted(set(job.get('participants') or [job.get('profile_id')]) - {None})
             locks = [self.agent_locks.setdefault(profile_id, threading.RLock()) for profile_id in ids]
-        # Ordered acquisition also protects discussions/delegations involving
-        # several agents, without holding the global store lock during work.
-        for lock in locks:
-            lock.acquire()
+        acquired = []
         try:
+            for lock in locks:
+                if job['kind'] == 'discussion':
+                    if not lock.acquire(blocking=False):
+                        from discussion_scheduler import mark_waiting
+                        mark_waiting(self, job_id, 'Waiting for active member work; no discussion prompt sent')
+                        return
+                else:
+                    lock.acquire()
+                acquired.append(lock)
+            if job['kind'] == 'discussion':
+                from discussion_scheduler import prepare
+                try:
+                    prepared = prepare(self, job_id)
+                except Exception as error:  # A preparation fault must stay visible, never silently queued.
+                    self.update_job(job_id, state='needs_attention',
+                                    error=(str(error) or error.__class__.__name__)[:500],
+                                    progress='Preparation stopped before discussion submission')
+                    return
+                if not prepared:
+                    return
             self._execute(job_id)
         finally:
-            for lock in reversed(locks):
+            for lock in reversed(acquired):
                 lock.release()
 
     def _execute(self, job_id):
-        job = self.update_job(job_id, state='running')
+        with self.lock, closing(self.connect()) as db, db:
+            job = self.get(db, 'jobs', job_id)
+            if job.get('state') != 'queued':
+                return
+            job.update(state='running', updated_at=now())
+            self.put(db, 'jobs', job)
         try:
             if job['kind'] in ('chat', 'discussion', 'input'):
                 from collaboration import execute as collaboration_execute

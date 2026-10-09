@@ -57,6 +57,25 @@ def launch_group(store, db, group, org):
 
 def action(store, db, name, body, org):
     org_id = org['id']
+    if name in ('retry_discussion', 'cancel_discussion'):
+        job = store.get(db, 'jobs', text(body, 'job_id', 40), org_id)
+        if job['kind'] != 'discussion' or job.get('preparation_version') != 1 or job.get('discussion_submitted_at') or job['state'] not in ('waiting_for_members', 'needs_attention', 'uncertain', 'queued', 'cancelled'):
+            raise ValueError('Only a discussion that has not been submitted can be retried or cancelled. Recover submitted artifacts instead.')
+        if body.get('inspected') is not True:
+            raise ValueError('Inspect the participant sessions first.')
+        if name == 'cancel_discussion':
+            job.update(state='cancelled', progress='Cancelled before discussion submission', cancelled_at=now())
+        else:
+            if job['state'] not in ('needs_attention', 'uncertain'):
+                raise ValueError('Only a preparation needing attention can be retried.')
+            attempts = job.get('preparation_attempt', 0) + 1
+            if attempts > 3:
+                raise ValueError('Preparation retry limit reached; inspect and create a new meeting.')
+            job.update(state='queued', preparation_attempt=attempts, preparation={}, runs=[], waiting_since=None,
+                       error='', progress='Retrying inspected preparation; no previous discussion prompt was sent')
+        job['updated_at'] = now()
+        store.put(db, 'jobs', job)
+        return job
     if name == 'transcript':
         job = store.get(db, 'jobs', text(body, 'job_id', 40), org_id)
         if job['kind'] != 'discussion' or job['state'] != 'artifact_ready':
@@ -65,7 +84,7 @@ def action(store, db, name, body, org):
         return dict(content=json.dumps(data, ensure_ascii=False, indent=2) + '\n', filename='discussion.json')
     if name == 'recover':
         job = store.get(db, 'jobs', text(body, 'job_id', 40), org_id)
-        if job['kind'] != 'discussion' or job['state'] not in ('needs_attention', 'artifact_ready'):
+        if job['kind'] != 'discussion' or job['state'] not in ('needs_attention', 'uncertain', 'artifact_ready'):
             raise ValueError('Only interrupted discussions can recover saved output.')
         if job['state'] == 'artifact_ready':
             return job
@@ -124,21 +143,10 @@ def action(store, db, name, body, org):
         runs = [active_run(store, db, org_id, text(body, 'profile_id', 40))]
     else:
         group = store.get(db, 'groups', text(body, 'group_id', 40), org_id)
+        # Preparation happens outside this transaction, under participant locks.
+        # The roster is frozen on the discussion; no member must be turned on manually.
         runs = []
-        inactive = []
-        for profile_id in group['members']:
-            member = store.get(db, 'profiles', profile_id, org_id)
-            try:
-                run = active_run(store, db, org_id, profile_id)
-                store.identity(run)
-                runs.append(run)
-            except ValueError:
-                inactive.append(member['name'])
-        if inactive:
-            raise ValueError('Members not ready: ' + ', '.join(inactive) + '. Open Members to turn them on or inspect their terminal.')
         group_run = launch_group(store, db, group, org)
-        if group_run['state'] not in ('queued', 'running', 'persona_sent'):
-            raise ValueError('Inspect and release the group agent run before retrying.')
     if name == 'inspect':
         agent = store.identity(runs[0], ready=False, agent=store.command('agent', 'get', runs[0]['alias'], timeout=2).get('agent'))
         status = agent.get('agent_status', agent.get('state', 'unknown'))
@@ -157,14 +165,14 @@ def action(store, db, name, body, org):
         return {'output': output['output'], 'status': status, 'reply_draft': draft,
                 'reply_job_id': current['id'] if current else None}
 
-    ids = {run['profile_id'] for run in runs}
+    ids = set(group['members']) if name == 'discuss' else {run['profile_id'] for run in runs}
     if name == 'discuss':
         ids.add(group_run['profile_id'])
     for row in db.execute('SELECT data FROM jobs'):
         job = json.loads(row['data'])
         if name == 'discuss' and job['id'] == group_run['id']:
             continue
-        if job['state'] in ('queued', 'running') and ids.intersection(job.get('participants', [job.get('profile_id')])):
+        if name != 'discuss' and job['state'] in ('queued', 'running') and ids.intersection(job.get('participants', [job.get('profile_id')])):
             raise ValueError('An agent already has a queued or running task. Wait for it to finish.')
     item = dict(id=uuid.uuid4().hex, organization_id=org_id,
                 kind=name if name in ('chat', 'input') else 'discussion', participants=list(ids), runs=runs,
@@ -180,7 +188,7 @@ def action(store, db, name, body, org):
     else:
         item.update(group_id=group['id'], group=group, group_run=group_run,
                     prompt=text(body, 'prompt', 8000, optional=True) or group['description'],
-                    contributions=[], progress='Waiting for group agent')
+                    contributions=[], progress='Preparing discussion sessions', preparation={}, preparation_version=1)
     store.put(db, 'jobs', item)
     return item
 
@@ -471,6 +479,7 @@ def execute(store, job):
         "Write and update the artifact as your synthesis develops. Save both files before finishing."
     )
     run = current_run(store, group_run)
+    store.update_job(job['id'], discussion_submitted_at=now(), progress='Discussion submitted; awaiting saved artifacts')
     store.command('agent', 'prompt', run['alias'], prompt, '--wait', '--timeout', '900000', timeout=910)
     current_run(store, run)
     for member in job['runs']:

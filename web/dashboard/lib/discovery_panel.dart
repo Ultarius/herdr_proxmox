@@ -152,7 +152,7 @@ class _DiscoveryPanelState extends State<DiscoveryPanel> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     const Text(
-                      'Choose a read-only Product group. Start its members on the group page before running discovery. Proposals become drafts after approval; this does not enable automatic task launch.',
+                      'Choose a read-only Product group. Offline members are prepared on demand; active work is allowed to finish first. Proposals become drafts after approval; this does not enable automatic task launch.',
                     ),
                     TextField(
                       controller: brief,
@@ -465,9 +465,7 @@ class _DiscoveryPanelState extends State<DiscoveryPanel> {
                   '${proposal['title']}',
                   style: Theme.of(context).textTheme.titleMedium,
                 ),
-                Text(
-                  '${proposal['type']} \u00b7 ${_proposalState(proposal)}',
-                ),
+                Text('${proposal['type']} \u00b7 ${_proposalState(proposal)}'),
                 Text('${proposal['problem']}\n${proposal['impact']}'),
                 ExpansionTile(
                   title: const Text('Scope and acceptance criteria'),

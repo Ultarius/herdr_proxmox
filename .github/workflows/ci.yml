@@ -74,7 +74,7 @@ jobs:
   release:
     name: Publish installable dashboard release
     needs: [checks, web]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || (startsWith(github.ref, 'refs/heads/alpha/') && startsWith(github.event.head_commit.message, 'alpha:')))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -87,23 +87,37 @@ jobs:
         with:
           name: web-assets
           path: web/public/
+      - name: Select release identity
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/heads/alpha/* ]]; then
+            python3 scripts/alpha-release.py
+          else
+            [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+            echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+            echo 'RELEASE_CHANNEL=stable' >> "$GITHUB_ENV"
+          fi
       - name: Package matching installer, gateway and compiled UI
         run: |
           mkdir -p "$RUNNER_TEMP/package/herdr-proxmox/web"
           cp -R ct install "$RUNNER_TEMP/package/herdr-proxmox/"
           cp README.md "$RUNNER_TEMP/package/herdr-proxmox/"
-          printf '%s\n' '${{ github.ref_name }}' > "$RUNNER_TEMP/package/herdr-proxmox/VERSION"
-          python3 -c 'import json,os,sys; from pathlib import Path; Path(sys.argv[1]).write_text(json.dumps(dict(build_id=os.environ["GITHUB_REF_NAME"], source_sha=os.environ["GITHUB_SHA"], package_version=os.environ["GITHUB_REF_NAME"], deployment_mode="release")))' "$RUNNER_TEMP/package/herdr-proxmox/BUILD.json"
+          printf '%s\n' "$RELEASE_TAG" > "$RUNNER_TEMP/package/herdr-proxmox/VERSION"
+          python3 -c 'import json,os,sys; from pathlib import Path; Path(sys.argv[1]).write_text(json.dumps(dict(build_id=os.environ["RELEASE_TAG"], source_sha=os.environ["GITHUB_SHA"], package_version=os.environ["RELEASE_TAG"], deployment_mode="release", channel=os.environ["RELEASE_CHANNEL"], source_branch=os.environ["GITHUB_REF_NAME"] if os.environ["RELEASE_CHANNEL"] == "alpha" else None)))' "$RUNNER_TEMP/package/herdr-proxmox/BUILD.json"
           cp -R web/gateway web/public "$RUNNER_TEMP/package/herdr-proxmox/web/"
           tar -czf herdr-proxmox.tar.gz -C "$RUNNER_TEMP/package" herdr-proxmox
           sha256sum herdr-proxmox.tar.gz > herdr-proxmox.tar.gz.sha256
       - name: Publish GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes
+            if [[ "$RELEASE_CHANNEL" == alpha ]]; then
+              gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --prerelease --latest=false --title "$RELEASE_TAG" --notes "Testing build from $GITHUB_REF_NAME at $GITHUB_SHA."
+            else
+              gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes
+            fi
           fi
           existing_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
           for asset in herdr-proxmox.tar.gz herdr-proxmox.tar.gz.sha256; do

@@ -41,6 +41,9 @@ void main() {
       );
       BlocScope.register<DashboardBloc>(() => connection);
       connection.connect('token');
+      await connection.stream.firstWhere(
+        (_) => connection.state.refreshed != null,
+      );
       await tester.pumpWidget(
         MaterialApp(
           theme: ThemeData(brightness: brightness),
@@ -132,6 +135,9 @@ void main() {
       BlocScope.register<DashboardBloc>(() => connection);
       connection.operator.value = {'name': 'damien', 'role': 'admin'};
       connection.connect('token');
+      await connection.stream.firstWhere(
+        (_) => connection.state.refreshed != null,
+      );
       await tester.pumpWidget(
         MaterialApp(home: const Scaffold(body: BuildsPage())),
       );
@@ -166,6 +172,7 @@ void main() {
         return;
       }
       await tester.ensureVisible(find.text('Roll back last deployment'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('Roll back last deployment'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Restore previous deployment'));

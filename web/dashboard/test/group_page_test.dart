@@ -9,6 +9,89 @@ import 'package:herdr_dashboard/group_page.dart';
 import 'package:herdr_dashboard/routes.dart';
 
 void main() {
+  testWidgets(
+    'failed preparation retries only after explicit inspection confirmation',
+    (tester) async {
+      tester.view.physicalSize = const Size(1400, 1200);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final data = {
+        'organizations': [
+          {'id': 'org', 'name': 'Org'},
+        ],
+        'profiles': [],
+        'groups': [
+          {
+            'id': 'group',
+            'organization_id': 'org',
+            'name': 'Product',
+            'description': 'Review',
+            'members': ['one', 'two'],
+          },
+        ],
+        'jobs': [
+          {
+            'id': 'meeting',
+            'kind': 'discussion',
+            'group_id': 'group',
+            'organization_id': 'org',
+            'state': 'needs_attention',
+            'created_at': '2026-10-09',
+            'preparation_version': 1,
+            'prompt': 'Review',
+            'error': 'Inspect member',
+            'group': {'description': 'Review'},
+            'contributions': [],
+          },
+        ],
+      };
+      final posted = <Map<String, dynamic>>[];
+      final connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.url.path.endsWith('/retry_discussion')) {
+            posted.add(jsonDecode(request.body) as Map<String, dynamic>);
+            return http.Response('{"id":"meeting"}', 200);
+          }
+          return http.Response(
+            jsonEncode(
+              request.url.path.contains('/organizations')
+                  ? data
+                  : {'authenticated': true, 'workspaces': [], 'agents': []},
+            ),
+            200,
+          );
+        }),
+      );
+      BlocScope.register<DashboardBloc>(() => connection);
+      final connected = connection.stream.firstWhere(
+        (_) => connection.state.connected,
+      );
+      connection.connect('token');
+      await connected;
+      connection.operator.value = {'role': 'admin'};
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: GroupPage(id: 'group', coordinator: AppCoordinator()),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('Retry inspected preparation'));
+      await tester.tap(find.text('Retry inspected preparation'));
+      await tester.pumpAndSettle();
+      expect(posted, isEmpty);
+      await tester.tap(find.text('Confirm'));
+      await tester.pumpAndSettle();
+      expect(posted.single['inspected'], true);
+      expect(posted.single['job_id'], 'meeting');
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await connection.disconnect();
+      await BlocScope.reset();
+    },
+  );
   testWidgets('sidebar groups open round posts and their matching artifacts', (
     tester,
   ) async {

@@ -1179,7 +1179,7 @@ class _TasksPageState extends State<TasksPage> {
     ),
   );
 
-  String _blockingSessionLine(Map blocking) {
+  String _blockingSessionLine(Map blocking, [Map? availability]) {
     final run = '${blocking['run_id'] ?? ''}';
     final short = run.isEmpty
         ? 'unknown run'
@@ -1187,9 +1187,44 @@ class _TasksPageState extends State<TasksPage> {
     final state = '${blocking['state'] ?? 'unknown'}';
     final created = '${blocking['created_at'] ?? ''}';
     final taskless = blocking['task_id'] == null;
+    final availabilityState = '${availability?['state'] ?? ''}';
+    final tail = !taskless
+        ? ''
+        : availabilityState == 'ready'
+        ? ' \u00b7 it will be archived automatically to start this task.'
+        : availabilityState == 'occupied' || availabilityState == 'starting'
+        ? ' \u00b7 the task starts when it finishes.'
+        : ' \u00b7 inspect it in Org chart \u2192 Runs for session details.';
     return 'Session $short \u00b7 $state'
         '${created.isEmpty ? '' : ' \u00b7 started $created'}'
-        '${taskless ? ' \u00b7 release it in Org chart \u2192 Runs to free this agent.' : ''}';
+        '$tail';
+  }
+
+  Future<void> archiveGeneralSession(Map task, String runId) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Archive inspected general session?'),
+        content: const Text(
+          'Inspect the session in Organization → Runs first. This preserves bounded terminal history and closes this exact session. Its files remain intact. The task starts in a separate Git worktree.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('I inspected it; archive and start'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true && mounted)
+      await act('launch', {
+        'task_id': task['id'],
+        'inspected_general_session': runId,
+      });
   }
 
   Widget _nextAction(Map<String, dynamic> task) {
@@ -1198,8 +1233,10 @@ class _TasksPageState extends State<TasksPage> {
     if (task['state'] == 'draft') {
       final assignment = task['assignment'] as Map?;
       final blocking = task['blocking_execution'] as Map?;
+      final availability = task['availability'] as Map?;
       if (assignment?['state'] == 'queued') {
-        final waitingTitle = blocking == null
+        final waitingTitle =
+            blocking == null || availability?['state'] == 'ready'
             ? null
             : '${blocking['task_title'] ?? ''}'.isNotEmpty
             ? '${blocking['task_title']}'
@@ -1219,7 +1256,21 @@ class _TasksPageState extends State<TasksPage> {
                 avatar: const Icon(Icons.hourglass_empty, size: 18),
                 label: Text('Waiting on: $waitingTitle'),
               ),
-            if (blocking != null) Text(_blockingSessionLine(blocking)),
+            if ('${availability?['detail'] ?? ''}'.isNotEmpty)
+              Text('${availability?['detail']}'),
+            if (blocking != null)
+              Text(_blockingSessionLine(blocking, availability)),
+            if (availability?['action'] == 'archive_general')
+              OutlinedButton.icon(
+                onPressed: admin && !busy
+                    ? () => archiveGeneralSession(
+                        task,
+                        '${availability?['run_id']}',
+                      )
+                    : null,
+                icon: const Icon(Icons.archive_outlined),
+                label: const Text('Archive inspected session and start'),
+              ),
             OutlinedButton.icon(
               onPressed: admin && !busy ? () => moveAssignment(task) : null,
               icon: const Icon(Icons.reorder),
@@ -1259,6 +1310,49 @@ class _TasksPageState extends State<TasksPage> {
                   : null,
               icon: const Icon(Icons.schedule),
               label: const Text('Queue for this agent'),
+            ),
+          ],
+        );
+      }
+      if (availability?['action'] == 'archive_general') {
+        return OutlinedButton.icon(
+          onPressed: admin && !busy
+              ? () => archiveGeneralSession(task, '${availability?['run_id']}')
+              : null,
+          icon: const Icon(Icons.archive_outlined),
+          label: const Text('Archive inspected session and start'),
+        );
+      }
+      if (availability?['state'] == 'ready') {
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: admin && !busy
+                      ? () => act('launch', {'task_id': task['id']})
+                      : null,
+                  icon: const Icon(Icons.play_arrow),
+                  label: const Text('Start implementation'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: admin && !busy
+                      ? () => act('assignment', {
+                          'task_id': task['id'],
+                          'mode': 'queue',
+                        })
+                      : null,
+                  icon: const Icon(Icons.schedule),
+                  label: const Text('Queue for this agent'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '${taskAgentName(task, fallback: 'The agent')} is ready. Starting this task archives the startup conversation and opens a dedicated task execution.',
             ),
           ],
         );
@@ -1310,8 +1404,9 @@ class _TasksPageState extends State<TasksPage> {
                     ? () => openTask('$blockingTaskId')
                     : widget.coordinator == null
                     ? null
-                    : () =>
-                          widget.coordinator!.navigate(OrganizationRoute('runs')),
+                    : () => widget.coordinator!.navigate(
+                        OrganizationRoute('runs'),
+                      ),
                 icon: const Icon(Icons.block),
                 label: Text('Blocked by: $title'),
               ),
@@ -1327,8 +1422,10 @@ class _TasksPageState extends State<TasksPage> {
               ),
             ],
           ),
+          if ('${availability?['detail'] ?? ''}'.isNotEmpty)
+            Text('${availability?['detail']}'),
           const SizedBox(height: 8),
-          Text(_blockingSessionLine(blocking)),
+          Text(_blockingSessionLine(blocking, availability)),
         ],
       );
     }
@@ -1405,6 +1502,10 @@ class _TasksPageState extends State<TasksPage> {
               style: Theme.of(context).textTheme.titleMedium,
             ),
           ),
+          if ((task['availability'] as Map?)?['checked_at'] != null)
+            Text(
+              'Availability checked ${task['availability']['checked_at']} · display checks may be cached for ${task['availability']['max_age_seconds']} seconds; starting work verifies it again.',
+            ),
           Align(alignment: Alignment.centerLeft, child: _nextAction(task)),
           Wrap(
             spacing: 8,

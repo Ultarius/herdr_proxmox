@@ -4,7 +4,7 @@ Product discovery lets a group assess the product without creating a host task f
 
 ## First setup
 
-1. Create a read-only **Product** group in the organization. Include the people/agents needed to assess product gaps, such as a reviewer and an implementer. Start its members and facilitator from the group page and ensure they are ready for input.
+1. Create a read-only **Product** group in the organization. Include the people/agents needed to assess product gaps, such as a reviewer and an implementer. Offline sessions are prepared on demand. Busy members finish their current work before the meeting; uncertain sessions require inspection.
 2. Assign an individual worktree agent to the managed Git repository. Discovery requires a valid assignee for eventual drafts.
 3. Open **Tasks → Product discovery** as an administrator. Choose the organization and **Configure discovery**.
 4. Select the repository and group. Write the product brief, one to six focus areas, and exclusions. For example: “A new user should reach their first validated task in ten minutes”; focus: onboarding, documentation, reliability; exclude pricing and credential changes.

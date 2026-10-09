@@ -4,10 +4,11 @@ This is the outbound contribution lifecycle, not upstream worktree integration.
 Network operations never hold SQLite transactions; pending requests can be
 reconciled after restart by repeating the same administrator request ID.
 """
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 import hashlib
 import threading
+import time
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,10 @@ from repository_lock import repository_lock
 SHA = re.compile(r'[a-f0-9]{40}|[a-f0-9]{64}')
 BRANCH = re.compile(r'herdr/task-[a-f0-9]{12}')
 REQUEST = re.compile(r'[A-Za-z0-9_-]{1,64}')
+
+
+class NonGitStartup(ValueError):
+    pass
 
 
 def task_tool_guidance():
@@ -176,6 +181,8 @@ class Contributions:
     def __init__(self, path, projects, store, github):
         self.path, self.projects = Path(path), Path(projects).resolve()
         self.store, self.github = store, github
+        self.store.contributions = self
+        self.availability_cache = {}
         self.lock = threading.RLock()
         self.operation_locks = {}
         self.held = {}
@@ -234,6 +241,7 @@ class Contributions:
         while not self.stopped.wait(10):
             try:
                 self.advance_automatic()
+                self.store.advance_discussions()
                 self.dispatch_assignments()
                 self.advance_proposals()
                 self.discovery.advance()
@@ -626,18 +634,8 @@ class Contributions:
                                 blocking_task = self.get(blocking['task_id'])
                             except ValueError:
                                 blocking_task = None
-                        if not blocking_task:
-                            # A taskless session (for example a group member kept
-                            # on) can never satisfy a task handoff; surface it
-                            # instead of waiting silently forever.
-                            message = ('Assigned agent has an active session without a task; '
-                                       'release that session to start queued work.')
-                            if task.get('assignment_error') != message:
-                                task['assignment_error'] = message
-                                self.save(task, 'assignment_waiting', 'task_scheduler')
-                            continue
-                        if blocking_task.get('state') not in HANDOFF_TASK_STATES:
-                            continue  # The agent is still working; the queue keeps its order silently.
+                        if blocking_task is not None and blocking_task.get('state') not in HANDOFF_TASK_STATES:
+                            continue  # Working on a task; the queue keeps its order silently.
                     self.perform('launch', {}, task_id, 'task_scheduler')
             except Busy:
                 continue
@@ -1001,10 +999,13 @@ class Contributions:
                 pane_id=blocking.get('pane_id'),
                 task_id=blocking.get('task_id'), task_title=(blocking_task or {}).get('title', ''),
                 task_state=(blocking_task or {}).get('state', ''),
-                handoff_ready=bool(blocking.get('state') == 'persona_sent' and blocking_task and (blocking_task.get('state') == 'completed' or (
-                    blocking_task.get('state') in HANDOFF_TASK_STATES and blocking_task.get('completion_receipt')))))
+                handoff_ready=bool(blocking.get('state') == 'persona_sent' and blocking_task and (
+                    blocking_task.get('state') == 'completed' or (
+                        blocking_task.get('state') in HANDOFF_TASK_STATES
+                        and (blocking_task.get('completion_receipt') or {}).get('commit') == blocking_task.get('head_sha')))))
         else:
             task['blocking_execution'] = None
+        task['availability'] = self.display_availability(task.get('profile_id'), jobs)
         task['sessions'] = [{k: j.get(k) for k in ('id', 'kind', 'state', 'profile_id', 'created_at',
                             'updated_at', 'error', 'pane_id', 'alias', 'session_closed_at')} |
                             dict(history=[{k: h.get(k) for k in ('alias', 'pane_id', 'session_closed_at')}
@@ -1128,7 +1129,166 @@ class Contributions:
         return json.dumps({k: v for k, v in task.items() if k not in ('last_sync', 'updated_at')},
                           sort_keys=True, default=str)
 
-    def launch_task(self, task, actor):
+    @staticmethod
+    def session_reference(job, run_id):
+        """Whether a job explicitly refers to one launch run."""
+        if any(value == run_id or (isinstance(value, dict) and value.get('id') == run_id)
+               for value in (job.get('runs') or [])):
+            return True
+        for key in ('group_run', 'recipient_run', 'sender_run'):
+            value = job.get(key)
+            if isinstance(value, dict) and value.get('id') == run_id:
+                return True
+        return False
+
+    def session_owner(self, run_id, jobs):
+        """The job that still owns a session, if any.
+
+        Completed chats and meetings preserve their own artifacts and archived
+        transcripts, so they do not block rotation. Pending interactions and
+        any delegation do: a delivered delegation may still be unfinished even
+        when the terminal looks idle.
+        """
+        launch = next((j for j in jobs if j.get('id') == run_id), {})
+        profile_id = launch.get('profile_id')
+        for job in jobs:
+            reserved = bool(profile_id and job.get('state') in ('queued', 'running') and
+                            profile_id in job.get('participants', [job.get('profile_id')]))
+            if job.get('id') == run_id or not (reserved or self.session_reference(job, run_id)):
+                continue
+            kind = job.get('kind')
+            if kind in ('delegate', 'delegation'):
+                if job.get('state') not in ('completed', 'cancelled'):
+                    return job
+            if kind in ('chat', 'discussion', 'input'):
+                if job.get('state') not in ('answered', 'artifact_ready', 'input_sent', 'waiting_for_members', 'cancelled'):
+                    return job
+        return None
+
+    def display_availability(self, profile_id, jobs):
+        # Display-only TTL. Execution always calls fresh verification, never this cache.
+        fingerprint = hashlib.sha256(json.dumps(jobs, sort_keys=True, default=str).encode()).hexdigest()
+        key = (profile_id, fingerprint)
+        with self.lock:
+            cached = self.availability_cache.get(key)
+            if cached and time.monotonic() - cached[0] < 5:
+                return dict(cached[1], cached=True)
+        result = dict(self.availability(profile_id, jobs), checked_at=stamp(), cached=False, max_age_seconds=5)
+        with self.lock:
+            if len(self.availability_cache) > 100:
+                self.availability_cache.clear()
+            self.availability_cache[key] = (time.monotonic(), result)
+        return result
+
+    def availability(self, profile_id, jobs=None):
+        """Classify an agent's readiness for new work with a precise reason.
+
+        An open conversation is not the same fact as executing work: a verified
+        idle startup session is ready to be rotated into a task execution,
+        while unfinished interactions and delegations need inspection.
+        """
+        jobs = self.store.snapshot(live_status=False).get('jobs', []) if jobs is None else jobs
+        active = self.active_execution(profile_id, jobs)
+        if not active:
+            return dict(state='offline', action='start', run_id=None,
+                        detail='No session is running. Starting work opens a new agent session.')
+        if active.get('state') in ('queued', 'running'):
+            return dict(state='starting', action='wait', run_id=active['id'],
+                        detail='The agent session is still starting; new work waits for it.')
+        if active.get('state') not in ('persona_sent',):
+            return dict(state='attention', action='inspect', run_id=active['id'],
+                        detail='The agent session needs inspection before new work.')
+        if active.get('task_id'):
+            task = None
+            try:
+                task = self.get(active['task_id'])
+            except ValueError:
+                task = None
+            if task is None:
+                return dict(state='attention', action='inspect', run_id=active['id'], detail='The execution references a missing task; inspect its run.')
+            receipt = (task or {}).get('completion_receipt') or {}
+            if task and (task.get('state') == 'completed' or (task.get('state') in HANDOFF_TASK_STATES
+                        and receipt.get('commit') == task.get('head_sha'))):
+                return dict(state='handoff', action='handoff', run_id=active['id'], task_id=task['id'],
+                            task_title=task.get('title', ''),
+                            detail='The previous task has recorded completion evidence; verify the checkout and session before handoff.')
+            return dict(state='working', action='queue', run_id=active['id'], task_id=active.get('task_id'),
+                        detail='The agent is working on another task; queued work waits for it.')
+        owner = self.session_owner(active['id'], jobs)
+        if owner:
+            if owner.get('state') not in ('queued', 'running'):
+                return dict(state='attention', action='inspect', run_id=active['id'], owner_kind=owner.get('kind', 'job'),
+                            detail='The agent has an unresolved ' + str(owner.get('kind', 'job')) + '; inspect it before starting new work.')
+            return dict(state='occupied', action='queue', run_id=active['id'], owner_kind=owner.get('kind', 'job'),
+                        detail="Waiting for the agent's active " + str(owner.get('kind', 'job')) + '.')
+        try:
+            self.verify_startup_session(active)
+        except NonGitStartup as error:
+            return dict(state='attention', action='archive_general', run_id=active['id'], detail=str(error))
+        except (ValueError, OSError) as error:
+            return dict(state='attention', action='inspect', run_id=active['id'], detail=str(error))
+        return dict(state='ready', action='start', run_id=active['id'],
+                    detail='The agent is ready. Starting this task archives the startup conversation and opens a dedicated task execution.')
+
+    def verify_startup_session(self, run, allow_non_git=False):
+        if run.get('task_id') or run.get('state') != 'persona_sent':
+            raise ValueError('Only a ready taskless session can be rotated; inspect this execution first.')
+        if not isinstance(run.get('organization_id'), str) or not run['organization_id']:
+            raise ValueError('The startup session identity is incomplete; inspect its run before starting new work.')
+        from collaboration import current_run
+        current_run(self.store, run)
+        checkout = run.get('worktree_path') or run.get('source_project') or (run.get('profile') or {}).get('project')
+        if not isinstance(checkout, str) or not checkout:
+            raise ValueError('The startup session checkout is missing; inspect its run before starting new work.')
+        path = project_directory(self.projects, checkout)
+        try:
+            top = Path(project_git.git(path, 'rev-parse', '--show-toplevel').strip()).resolve()
+        except ValueError as error:
+            if (path / '.git').exists() or (path / '.git').is_symlink():
+                raise ValueError('The startup Git checkout is inaccessible; inspect it before new work.') from error
+            if allow_non_git:
+                return path  # Explicitly inspected general session; files remain untouched.
+            raise NonGitStartup('This is a general session in a non-Git directory. Inspect and archive it before starting the Git task.') from error
+        if top != path:
+            raise ValueError('The startup session is not in its recorded repository root.')
+        with repository_lock(path):
+            if project_git.merge_state(path) or project_git.git(path, 'status', '--porcelain=v1', '--untracked-files=all').strip():
+                raise ValueError('The startup session has uncommitted changes or an unfinished Git operation; inspect it before starting new work.')
+        return path
+
+    def rotate_startup_session(self, task, run, actor, inspected_general_session=None):
+        """Verify, archive and close the same reserved startup session on retry."""
+        previous = task.get('handoff') or {}
+        if previous.get('kind') == 'startup' and previous.get('blocking_run') != run['id']:
+            raise ValueError('The startup session changed during handoff; inspect it before retrying.')
+        lock = self.store.agent_locks.setdefault(run['profile_id'], threading.RLock())
+        if not lock.acquire(blocking=False):
+            raise ValueError('The agent is executing work; wait before starting this task.')
+        try:
+            jobs = self.store.snapshot(live_status=False).get('jobs', [])
+            owner = self.session_owner(run['id'], jobs)
+            if owner:
+                raise ValueError('Assigned agent is reserved by an active ' + str(owner.get('kind', 'job')) + '; inspect its work first.')
+            if inspected_general_session is not None and inspected_general_session != run['id']:
+                raise ValueError('The inspected general session changed; inspect the current run before starting.')
+            path = self.verify_startup_session(run, allow_non_git=inspected_general_session == run['id'])
+            git_checkout = (path / '.git').exists()
+            with repository_lock(path) if git_checkout else nullcontext():
+                # Recheck after obtaining the lock and retain it through archival/closure.
+                if git_checkout and (project_git.merge_state(path) or project_git.git(path, 'status', '--porcelain=v1', '--untracked-files=all').strip()):
+                    raise ValueError('The startup checkout changed before closure; inspect its work first.')
+                task['handoff'] = dict(stage='closing', kind='startup', blocking_run=run['id'], inspected_general=not git_checkout, at=stamp())
+                self.save(task, 'rotation_started', actor)
+                self.store.manage_session(dict(mode='finish', job_id=run['id'], organization_id=task['organization_id'],
+                                               inspected=True, request_id='rotate-' + task['id']), actor)
+            task = self.get(task['id'])
+            task['handoff'] = dict(stage='closed', kind='startup', blocking_run=run['id'], at=stamp())
+            self.save(task, 'rotation_closed', actor)
+            return task
+        finally:
+            lock.release()
+
+    def launch_task(self, task, actor, inspected_general_session=None):
         # All task launch reservations share this lock, including manual starts.
         with self.operation('launch-capacity', timeout=0):
             jobs = self.store.snapshot(live_status=False).get('jobs', [])
@@ -1153,22 +1313,29 @@ class Contributions:
                     except ValueError:
                         blocking_task = None
                 if not blocking_task:
-                    raise ValueError('Assigned agent has an active session without a task; inspect that session before assigning new work.')
-                with self.operation('task:' + blocking_task['id'], timeout=0):
-                    blocking_task = self.get(blocking_task['id'])
-                    verified, reason = self.execution_finished(blocking_task, blocking)
-                    if not verified:
-                        raise ValueError("Assigned agent is busy with task '" + blocking_task['title'] + "' (" + blocking_task['id'] + "). " + reason + ' Open that task to inspect its execution.')
-                    if blocking_task['state'] != 'completed' and blocking_task.get('completion_receipt', {}).get('commit') != blocking_task['head_sha']:
-                        receipt = self.read_receipt(blocking_task, blocking, blocking_task['head_sha'], self.tree_for(blocking_task))
-                        blocking_task['completion_receipt'] = dict(commit=blocking_task['head_sha'], tests=receipt['tests'], verified_at=stamp())
-                        self.save(blocking_task, 'completion_verified', actor)
-                    task['handoff'] = dict(stage='closing', blocking_run=blocking['id'], blocking_task=blocking_task['id'], at=stamp())
-                    self.save(task, 'handoff_started', actor)
-                    self.finish_execution(blocking_task, blocking, 'handoff-' + task['id'], actor)
-                    task = self.get(task['id'])
-                    task['handoff'] = dict(stage='closed', blocking_run=blocking['id'], blocking_task=blocking_task['id'], at=stamp())
-                    self.save(task, 'handoff_closed', actor)
+                    if blocking.get('task_id'):
+                        raise ValueError('The previous execution references a missing task; inspect it before starting new work.')
+                    owner = self.session_owner(blocking['id'], jobs)
+                    if owner:
+                        raise ValueError("Assigned agent is reserved by an active " + str(owner.get('kind', 'job'))
+                                         + '; wait for it to finish or inspect the session.')
+                    task = self.rotate_startup_session(task, blocking, actor, inspected_general_session)
+                else:
+                    with self.operation('task:' + blocking_task['id'], timeout=0):
+                        blocking_task = self.get(blocking_task['id'])
+                        verified, reason = self.execution_finished(blocking_task, blocking)
+                        if not verified:
+                            raise ValueError("Assigned agent is busy with task '" + blocking_task['title'] + "' (" + blocking_task['id'] + "). " + reason + ' Open that task to inspect its execution.')
+                        if blocking_task['state'] != 'completed' and (blocking_task.get('completion_receipt') or {}).get('commit') != blocking_task['head_sha']:
+                            receipt = self.read_receipt(blocking_task, blocking, blocking_task['head_sha'], self.tree_for(blocking_task))
+                            blocking_task['completion_receipt'] = dict(commit=blocking_task['head_sha'], tests=receipt['tests'], verified_at=stamp())
+                            self.save(blocking_task, 'completion_verified', actor)
+                        task['handoff'] = dict(stage='closing', blocking_run=blocking['id'], blocking_task=blocking_task['id'], at=stamp())
+                        self.save(task, 'handoff_started', actor)
+                        self.finish_execution(blocking_task, blocking, 'handoff-' + task['id'], actor)
+                        task = self.get(task['id'])
+                        task['handoff'] = dict(stage='closed', blocking_run=blocking['id'], blocking_task=blocking_task['id'], at=stamp())
+                        self.save(task, 'handoff_closed', actor)
             prompt = 'Task: ' + task['title'] + '\n' + task['description']
             if task.get('source', {}).get('task_id'):
                 try:
@@ -1189,6 +1356,7 @@ class Contributions:
                         '\nWork only in your assigned task branch. Implement, run required checks, and commit your changes. '
                         'Commit using git -c user.name=Herdr-Agent -c user.email=agent@herdr.local commit. Never infer the operator identity or change global Git config. '
                         'Never push, open a pull request, update the shared checkout or deploy. '
+                        'Before implementing, verify whether the requested behavior and its checks already exist at the recorded base; if the task is already satisfied, prove it with the checks and use the no_changes receipt instead of manufacturing a commit. '
                         'When complete, write JSON to {{HERDR_TASK_RECEIPT}} with outcome=complete, commit=the full HEAD SHA, run_id={{HERDR_TASK_RUN}}, token={{HERDR_TASK_TOKEN}}, and tests as an array of actual check results. Write it last after committing. '
                         'If and only if the task genuinely requires no code changes, write the same receipt with outcome=no_changes, commit=the unchanged recorded base SHA and a reason field instead of committing. '
                         'Optionally include "follow_up": {"title": ..., "description": ...} when you found necessary related work; it is recorded as a draft task for operator review, never started automatically. '
@@ -1254,7 +1422,7 @@ class Contributions:
             if remote_info(repository) != task['github_repository']:
                 raise ValueError('Repository remote changed; inspect the task before continuing.')
         if action == 'launch':
-            return self.launch_task(task, actor)
+            return self.launch_task(task, actor, body.get('inspected_general_session'))
         elif action == 'complete':
             if task['state'] == 'completed':
                 saved = task.get('completion', {})

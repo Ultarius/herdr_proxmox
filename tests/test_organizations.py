@@ -86,6 +86,92 @@ class OrganizationTests(unittest.TestCase):
         result = self.store.manage_session(dict(organization_id=org, mode='cleanup', inspected=True, job_ids=[run_id]), 'admin')
         self.assertEqual(result['results'][0]['state'], 'closed')
 
+    def test_first_task_rotates_real_startup_binding_and_preserves_archive(self):
+        from contributions import Contributions
+        from unittest.mock import MagicMock
+        repo = self.projects / 'repo'
+        repo.mkdir()
+        def git(*args):
+            return subprocess.check_output(['git', '-C', str(repo), *args], stderr=subprocess.DEVNULL).decode().strip()
+        git('init', '-b', 'main')
+        (repo / 'file').write_text('base')
+        git('add', '.')
+        git('-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-m', 'base')
+        git('remote', 'add', 'origin', 'https://github.com/owner/repo.git')
+        git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        original = self.store.command
+        def command(*args, **kwargs):
+            if args[:2] == ('worktree', 'create'):
+                self.calls.append((args, kwargs))
+                git('worktree', 'add', '-b', args[args.index('--branch') + 1], args[args.index('--path') + 1])
+                return {'root_pane': {'pane_id': f'w{900 + len(self.calls)}:p1'}}
+            return original(*args, **kwargs)
+        self.store.command = command
+        org = self.organization()
+        profile = self.hire(org, project=str(repo))
+        startup_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        startup = next(j for j in self.store.job_records() if j['id'] == startup_id)
+        self.assertEqual(startup['state'], 'persona_sent', startup.get('error'))
+        service = Contributions(self.root / 'data/tasks.sqlite3', self.projects, self.store, MagicMock())
+        try:
+            task = service.action('create', dict(request_id='first-task', title='First task', description='Implement and test.',
+                repository='repo', base_ref='refs/remotes/origin/main', profile_id=profile), 'admin', 'admin')
+            self.assertEqual(service.detail(task['id'])['availability']['state'], 'ready')
+            launched = service.action('launch', dict(request_id='start-task', task_id=task['id']), 'admin', 'admin')
+            self.drain()
+            old = next(j for j in self.store.job_records() if j['id'] == startup_id)
+            new = next(j for j in self.store.job_records() if j['id'] == launched['run_id'])
+            self.assertEqual(old['state'], 'finished')
+            self.assertTrue(old['session_archive_id'])
+            self.assertEqual(new['state'], 'persona_sent', new.get('error'))
+            self.assertEqual(new['task_id'], task['id'])
+            self.assertEqual(new['worktree_branch'], task['branch'])
+            self.assertTrue(new['completion_token'])
+            self.assertNotEqual(new['worktree_path'], old['worktree_path'])
+            self.assertTrue(Path(old['worktree_path']).exists())
+            saved = self.store.manage_session(dict(mode='view_archive', organization_id=org, archive_id=old['session_archive_id']), 'admin')
+            self.assertIn('Saved terminal context', saved['terminal'])
+        finally:
+            service.close()
+
+    def test_delegation_resolution_requires_report_and_records_inspected_decision(self):
+        org = self.organization()
+        first, second = self.hire(org, 'First'), self.hire(org, 'Second')
+        for profile in (first, second):
+            self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        delegation = self.action('delegate', organization_id=org, sender_id=first, profile_id=second, task='Inspect the project')
+        self.drain()
+        with self.assertRaisesRegex(ValueError, 'completion report'):
+            self.action('resolve_delegation', organization_id=org, job_id=delegation, inspected=True, decision='complete', reason='Inspected')
+        self.action('report', organization_id=org, job_id=delegation, result='Checks completed; no project changes')
+        body = dict(request_id='resolve-delegation', organization_id=org, job_id=delegation, inspected=True, decision='complete', reason='Reviewed the checks', _actor='admin')
+        resolved = self.store.action('resolve_delegation', body)
+        self.assertEqual(self.store.action('resolve_delegation', body), resolved)
+        record = next(j for j in self.store.job_records() if j['id'] == delegation)
+        self.assertEqual(record['state'], 'completed')
+        self.assertEqual(record['resolution']['actor'], 'admin')
+        with self.assertRaisesRegex(ValueError, 'differently'):
+            self.action('resolve_delegation', organization_id=org, job_id=delegation, inspected=True, decision='cancel', reason='Different')
+
+    def test_http_resolution_requires_admin(self):
+        server = gateway.ThreadingHTTPServer(('127.0.0.1', 0), gateway.Handler)
+        server.token = 'admin-token'
+        server.organizations = self.store
+        server.operators = SimpleNamespace(identify=lambda token: dict(name='viewer', role='operator') if token == 'operator-token' else None)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for endpoint in ('resolve_delegation', 'retry_discussion', 'cancel_discussion'):
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(Request(f'http://127.0.0.1:{server.server_port}/api/organizations/{endpoint}',
+                        headers={'Authorization':'Bearer operator-token','Content-Type':'application/json'}, data=b'{}'))
+                self.assertEqual(error.exception.code, 400)
+                self.assertIn('administrator', error.exception.read().decode())
+        finally:
+            server.shutdown(); server.server_close(); thread.join()
+
     def test_finish_archives_marks_finished_and_frees_the_agent_slot(self):
         org = self.organization()
         profile = self.hire(org)

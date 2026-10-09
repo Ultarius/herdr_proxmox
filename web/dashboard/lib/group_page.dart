@@ -211,6 +211,39 @@ class _GroupPageState extends State<GroupPage> {
     }
   }
 
+  Future<void> managePreparation(Map job, bool retry) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(
+          retry
+              ? 'Retry inspected session preparation?'
+              : 'Cancel waiting meeting?',
+        ),
+        content: Text(
+          retry
+              ? 'Inspect and repair the member sessions first. This retries preparation only; submitted discussions must recover their artifacts instead.'
+              : 'No discussion prompt has been sent. Cancel this waiting meeting and release its scheduling reservation.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Back'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Confirm'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true && mounted)
+      await submit(retry ? 'retry_discussion' : 'cancel_discussion', {
+        'job_id': job['id'],
+        'inspected': true,
+      });
+  }
+
   Future<void> edit() async {
     final values = await showDialog<Map<String, dynamic>>(
       context: context,
@@ -666,8 +699,11 @@ class _GroupPageState extends State<GroupPage> {
                               label: Text(switch (job['state']) {
                                 'artifact_ready' => 'Completed',
                                 'needs_attention' => 'Needs attention',
+                                'uncertain' => 'Inspect after gateway restart',
                                 'running' => 'In progress',
-                                'queued' => 'Queued',
+                                'queued' => 'Preparing sessions',
+                                'waiting_for_members' => 'Waiting for members',
+                                'cancelled' => 'Cancelled before submission',
                                 _ => '${job['state']}',
                               }),
                             ),
@@ -707,7 +743,43 @@ class _GroupPageState extends State<GroupPage> {
                           Text(job['progress'] as String),
                         if ((job['error'] as String? ?? '').isNotEmpty)
                           Text(job['error'] as String),
-                        if (job['state'] == 'needs_attention') ...[
+                        if (connection.operator.value['role'] == 'admin' &&
+                            job['preparation_version'] == 1 &&
+                            job['discussion_submitted_at'] == null &&
+                            [
+                              'waiting_for_members',
+                              'queued',
+                              'needs_attention',
+                              'uncertain',
+                            ].contains(job['state']))
+                          Wrap(
+                            children: [
+                              if ([
+                                'needs_attention',
+                                'uncertain',
+                              ].contains(job['state']))
+                                TextButton(
+                                  onPressed: busy
+                                      ? null
+                                      : () => managePreparation(job, true),
+                                  child: const Text(
+                                    'Retry inspected preparation',
+                                  ),
+                                ),
+                              TextButton(
+                                onPressed: busy
+                                    ? null
+                                    : () => managePreparation(job, false),
+                                child: const Text('Cancel waiting meeting'),
+                              ),
+                            ],
+                          ),
+                        if ([
+                              'needs_attention',
+                              'uncertain',
+                            ].contains(job['state']) &&
+                            (job['discussion_submitted_at'] != null ||
+                                job['preparation_version'] == null)) ...[
                           const Text(
                             'The dashboard stopped waiting for this discussion. If the agents have finished, recover their saved artifact and transcript without sending another prompt.',
                           ),

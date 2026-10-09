@@ -136,12 +136,15 @@ grep -q 'Please answer yes or no' "$tmp/output"
 grep -q 'Downloading dashboard release: v0.0.1' "$tmp/output"
 grep -q 'Browser access:' "$tmp/output"
 grep -q 'releases/download/v0.0.1/herdr-proxmox.tar.gz' "$HERDR_TEST_DOWNLOADS"
-# Stable installable builds take priority over prereleases; empty releases do not.
+# Stable installable builds take priority over versioned prereleases; empty
+# releases and feature-branch alphas are never selected.
 python3 - "$HERDR_TEST_RELEASE_METADATA" <<'PY'
 import json, sys
 path = sys.argv[1]
 data = json.load(open(path))
-data += [dict(data[0], tag_name='v0.0.0', prerelease=False, published_at='2026-10-03T00:00:00Z'), dict(data[0], tag_name='v0.0.2', prerelease=False, assets=[])]
+data += [dict(data[0], tag_name='v0.0.0', prerelease=False, published_at='2026-10-03T00:00:00Z'),
+         dict(data[0], tag_name='v0.0.2', prerelease=False, assets=[]),
+         dict(data[0], tag_name='alpha-new-ui-abc123-b7', prerelease=True, published_at='2026-10-09T00:00:00Z')]
 with open(path, 'w') as output: json.dump(data, output)
 PY
 bash -c "$(cat "$tmp/ct/herdr.sh")" -- --web --template local:vztmpl/debian-13-standard_test_amd64.tar.zst >"$tmp/output"
@@ -163,4 +166,17 @@ grep -q 'Release checksum failed' "$tmp/output"
 if HERDR_TEST_FAIL=1 bash "$tmp/ct/herdr.sh" --template local:vztmpl/debian-13-standard_test_amd64.tar.zst --storage local-lvm >"$tmp/output" 2>&1; then exit 1; fi
 grep -q 'preserved for diagnosis' "$tmp/output"
 if grep -q '^destroy ' "$HERDR_TEST_LOG"; then exit 1; fi
+# A catalog with only feature-branch alphas is refused; alphas are installed
+# explicitly from the dashboard instead.
+python3 - "$HERDR_TEST_RELEASE_METADATA" <<'PY'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path))
+alpha = next(r for r in data if r['tag_name'].startswith('alpha-'))
+with open(path, 'w') as output: json.dump([alpha], output)
+PY
+before=$(wc -l <"$HERDR_TEST_LOG")
+if bash -c "$(cat "$tmp/ct/herdr.sh")" -- --web --template local:vztmpl/debian-13-standard_test_amd64.tar.zst >"$tmp/output" 2>&1; then exit 1; fi
+grep -q 'No published release contains the dashboard archive and checksum' "$tmp/output"
+[[ $(wc -l <"$HERDR_TEST_LOG") == "$before" ]]
 printf 'Host installer mock tests passed.\n'

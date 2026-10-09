@@ -249,18 +249,12 @@ void main() {
       expect(find.text('Queued \u00b7 repo'), findsOneWidget);
       expect(find.textContaining('Queued for this agent'), findsOneWidget);
       expect(find.textContaining('order 2'), findsOneWidget);
-      expect(
-        find.text("Waiting on: Nora's active session"),
-        findsOneWidget,
-      );
+      expect(find.text("Waiting on: Nora's active session"), findsOneWidget);
       expect(
         find.textContaining('Session run \u00b7 persona_sent'),
         findsOneWidget,
       );
-      expect(
-        find.textContaining('release it in Org chart'),
-        findsOneWidget,
-      );
+      expect(find.textContaining('inspect it in Org chart'), findsOneWidget);
       await tester.tap(find.text('Change queue order'));
       await tester.pumpAndSettle();
       await tester.tap(find.byTooltip('Later'));
@@ -273,6 +267,139 @@ void main() {
       await tester.pumpAndSettle();
       expect(posts.last['mode'], 'cancel');
       expect(posts.last['task_id'], 'task');
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await connection.disconnect();
+      await BlocScope.reset();
+    },
+  );
+  testWidgets(
+    'a ready startup session offers Start implementation with rotation context',
+    (tester) async {
+      final task = <String, dynamic>{
+        'id': 'task',
+        'title': 'Next task',
+        'state': 'draft',
+        'repository': 'repo',
+        'organization_id': 'org',
+        'assigned_agent': {'name': 'Nora'},
+        'blocking_execution': {
+          'run_id': 'run',
+          'state': 'persona_sent',
+          'created_at': 'today',
+          'task_id': null,
+          'task_title': '',
+          'handoff_ready': false,
+        },
+        'availability': {
+          'state': 'ready',
+          'action': 'start',
+          'run_id': 'run',
+          'detail': 'The agent is ready.',
+        },
+      };
+      final posts = <String>[];
+      final connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.method == 'POST') posts.add(request.url.path);
+          return http.Response(
+            jsonEncode(
+              request.url.path.endsWith('/tasks')
+                  ? {
+                      'tasks': [task],
+                      'github': {},
+                    }
+                  : task,
+            ),
+            200,
+          );
+        }),
+      );
+      BlocScope.register<DashboardBloc>(() => connection);
+      connection.connect('token');
+      connection.operator.value = {'role': 'admin'};
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(body: TasksPage(taskId: 'task')),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Start implementation'), findsOneWidget);
+      expect(
+        find.text(
+          'Nora is ready. Starting this task archives the startup conversation and opens a dedicated task execution.',
+        ),
+        findsOneWidget,
+      );
+      expect(find.textContaining('Blocked by'), findsNothing);
+      await tester.tap(find.text('Start implementation'));
+      await tester.pumpAndSettle();
+      expect(posts.single, endsWith('/tasks/launch'));
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await connection.disconnect();
+      await BlocScope.reset();
+    },
+  );
+  testWidgets(
+    'general session archival requires confirmation and pins the inspected run',
+    (tester) async {
+      final task = <String, dynamic>{
+        'id': 'task',
+        'title': 'Task',
+        'state': 'draft',
+        'repository': 'repo',
+        'organization_id': 'org',
+        'blocking_execution': {
+          'run_id': 'general',
+          'state': 'persona_sent',
+          'task_id': null,
+        },
+        'availability': {
+          'state': 'attention',
+          'action': 'archive_general',
+          'run_id': 'general',
+          'detail': 'Inspect general session',
+        },
+      };
+      final posts = <Map<String, dynamic>>[];
+      final connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.method == 'POST')
+            posts.add(jsonDecode(request.body) as Map<String, dynamic>);
+          return http.Response(
+            jsonEncode(
+              request.url.path.endsWith('/tasks')
+                  ? {
+                      'tasks': [task],
+                      'github': {},
+                    }
+                  : task,
+            ),
+            200,
+          );
+        }),
+      );
+      BlocScope.register<DashboardBloc>(() => connection);
+      connection.connect('token');
+      connection.operator.value = {'role': 'admin'};
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(body: TasksPage(taskId: 'task')),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Archive inspected session and start'));
+      await tester.pumpAndSettle();
+      expect(posts, isEmpty);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(posts, isEmpty);
+      await tester.tap(find.text('Archive inspected session and start'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('I inspected it; archive and start'));
+      await tester.pumpAndSettle();
+      expect(posts.single['inspected_general_session'], 'general');
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
       await connection.disconnect();
@@ -439,7 +566,9 @@ void main() {
     connection.connect('token');
     connection.operator.value = {'role': 'admin'};
     await tester.pumpWidget(
-      const MaterialApp(home: Scaffold(body: TasksPage(taskId: 'task'))),
+      const MaterialApp(
+        home: Scaffold(body: TasksPage(taskId: 'task')),
+      ),
     );
     await tester.pumpAndSettle();
     expect(

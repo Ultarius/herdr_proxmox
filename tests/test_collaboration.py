@@ -136,19 +136,161 @@ class CollaborationTests(unittest.TestCase):
         self.assertEqual(changed.read_text(), 'uncommitted work')
         self.assertFalse(any(a[:2] == ('pane', 'close') for a, _ in self.calls))
 
-    def test_inactive_members_are_named_and_can_be_relaunched(self):
+    def test_inactive_members_are_prepared_on_demand(self):
         group = self.group()
         for member in (self.max, self.iris):
             run = next(j for j in self.store.snapshot()['jobs'] if j['kind'] == 'launch' and j['profile_id'] == member)
             self.action('release', organization_id=self.org, job_id=run['id'])
-        with self.assertRaisesRegex(ValueError, 'Max, Iris'):
-            self.action('discuss', organization_id=self.org, group_id=group)
-        states = self.store.snapshot()['member_states']
-        self.assertFalse(states[self.max]['active'])
-        self.assertEqual(states[self.max]['status'], 'off')
-        self.action('launch', organization_id=self.org, profile_id=self.max)
+        meeting = self.action('discuss', organization_id=self.org, group_id=group)
         self.drain()
+        job = self.job(meeting)
+        self.assertEqual(job['state'], 'artifact_ready', job.get('error'))
+        self.assertEqual(len(job['preparation']), 2)
+        before = len(self.calls)
+        self.store.execute(meeting)
+        self.assertEqual(len(self.calls), before)
         self.assertTrue(self.store.snapshot()['member_states'][self.max]['active'])
+
+    def test_busy_meeting_waits_without_preparing_other_offline_member_then_runs_once(self):
+        group = self.group()
+        first = next(j for j in self.store.job_records() if j.get('profile_id') == self.max and j['kind'] == 'launch')
+        other = next(j for j in self.store.job_records() if j.get('profile_id') == self.iris and j['kind'] == 'launch')
+        self.action('release', organization_id=self.org, job_id=other['id'])
+        self.agents[first['alias']]['agent_status'] = 'working'
+        before = len([a for a, _ in self.calls if a[:2] == ('agent', 'start')])
+        body = dict(request_id='waiting-discussion', organization_id=self.org, group_id=group, prompt='Review the product')
+        meeting = self.store.action('discuss', body)['id']
+        self.drain()
+        self.assertEqual(self.job(meeting)['state'], 'waiting_for_members')
+        self.assertEqual(len([a for a, _ in self.calls if a[:2] == ('agent', 'start')]), before)
+        self.assertEqual(self.store.action('discuss', body)['id'], meeting)
+        self.agents[first['alias']]['agent_status'] = 'idle'
+        self.store.advance_discussions()
+        self.drain()
+        job = self.job(meeting)
+        self.assertEqual(job['state'], 'artifact_ready', job.get('error'))
+        self.assertTrue(job['discussion_submitted_at'])
+        prompts = [a for a, _ in self.calls if a[:2] == ('agent', 'prompt') and 'Discussion directory:' in a[3]]
+        self.assertEqual(len(prompts), 1)
+
+    def test_preparation_failure_requires_inspection_and_submitted_meetings_never_retry(self):
+        group = self.group()
+        run = next(j for j in self.store.job_records() if j.get('profile_id') == self.max and j['kind'] == 'launch')
+        self.agents[run['alias']]['agent_status'] = 'blocked'
+        meeting = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        self.assertEqual(self.job(meeting)['state'], 'needs_attention')
+        self.assertFalse(self.job(meeting).get('discussion_submitted_at'))
+        self.agents[run['alias']]['agent_status'] = 'idle'
+        self.action('retry_discussion', organization_id=self.org, job_id=meeting, inspected=True)
+        self.drain()
+        self.assertEqual(self.job(meeting)['state'], 'artifact_ready')
+        self.store.update_job(meeting, state='needs_attention')
+        with self.assertRaisesRegex(ValueError, 'submitted'):
+            self.action('retry_discussion', organization_id=self.org, job_id=meeting, inspected=True)
+
+    def test_waiting_meeting_can_be_cancelled_without_terminal_input(self):
+        group = self.group()
+        run = next(j for j in self.store.job_records() if j.get('profile_id') == self.max and j['kind'] == 'launch')
+        self.agents[run['alias']]['agent_status'] = 'working'
+        meeting = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        before = len([a for a, _ in self.calls if a[:2] == ('agent', 'prompt')])
+        self.action('cancel_discussion', organization_id=self.org, job_id=meeting, inspected=True)
+        self.store.advance_discussions()
+        self.drain()
+        self.assertEqual(self.job(meeting)['state'], 'cancelled')
+        self.assertEqual(len([a for a, _ in self.calls if a[:2] == ('agent', 'prompt')]), before)
+
+    def test_legacy_interrupted_meeting_cannot_use_preparation_retry(self):
+        group = self.group()
+        meeting = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        self.store.update_job(meeting, state='needs_attention', preparation_version=None, discussion_submitted_at=None)
+        with self.assertRaisesRegex(ValueError, 'submitted'):
+            self.action('retry_discussion', organization_id=self.org, job_id=meeting, inspected=True)
+
+    def test_two_waiting_meetings_run_in_order_without_duplicate_submission(self):
+        group = self.group()
+        run = next(j for j in self.store.job_records() if j.get('profile_id') == self.max and j['kind'] == 'launch')
+        self.agents[run['alias']]['agent_status'] = 'working'
+        first = self.action('discuss', organization_id=self.org, group_id=group, prompt='First')
+        self.drain()
+        second = self.action('discuss', organization_id=self.org, group_id=group, prompt='Second')
+        self.drain()
+        self.agents[run['alias']]['agent_status'] = 'idle'
+        for _ in range(3):
+            self.store.advance_discussions()
+            self.drain()
+        self.assertEqual(self.job(first)['state'], 'artifact_ready')
+        self.assertEqual(self.job(second)['state'], 'artifact_ready')
+        prompts = [a[3] for a, _ in self.calls if a[:2] == ('agent', 'prompt') and 'Discussion directory:' in a[3]]
+        self.assertEqual(len(prompts), 2)
+        self.assertIn('User message:\nFirst', prompts[0])
+        self.assertIn('User message:\nSecond', prompts[1])
+
+    def test_waiting_batch_does_not_starve_meetings_beyond_twenty(self):
+        with self.store.lock, closing(self.store.connect()) as db, db:
+            for index in range(21):
+                self.store.put(db, 'jobs', dict(id='pending-' + str(index), organization_id=self.org, kind='discussion',
+                    state='waiting_for_members', participants=[self.max, self.iris]))
+        visited = []
+        def remain_waiting(identity):
+            visited.append(identity)
+            self.store.update_job(identity, state='waiting_for_members')
+        with patch.object(self.store, 'execute', side_effect=remain_waiting):
+            self.store.advance_discussions(); self.drain()
+            self.store.advance_discussions(); self.drain()
+        self.assertIn('pending-20', visited)
+        self.assertEqual(len(visited), 21)
+
+    def test_waiting_meeting_expires_without_submitting(self):
+        from datetime import datetime, timedelta, timezone
+        group = self.group()
+        run = next(j for j in self.store.job_records() if j.get('profile_id') == self.max and j['kind'] == 'launch')
+        self.agents[run['alias']]['agent_status'] = 'working'
+        meeting = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        self.store.update_job(meeting, waiting_since=(datetime.now(timezone.utc)-timedelta(hours=25)).isoformat())
+        self.store.advance_discussions(); self.drain()
+        self.assertEqual(self.job(meeting)['state'], 'needs_attention')
+        self.assertIn('24 hours', self.job(meeting)['error'])
+        self.assertFalse(self.job(meeting).get('discussion_submitted_at'))
+
+    def test_discovery_can_prepare_a_closed_facilitator_once(self):
+        from discussion_scheduler import ensure_facilitator
+        group = self.group()
+        record = next(g for g in self.store.snapshot()['groups'] if g['id'] == group)
+        old = next(j for j in self.store.job_records() if j.get('profile_id') == record['facilitator_id'])
+        self.store.manage_session(dict(mode='finish', inspected=True, organization_id=self.org, job_id=old['id'], request_id='finish-facilitator'), 'admin')
+        run = ensure_facilitator(self.store, group, self.org)
+        self.assertEqual(run['state'], 'persona_sent')
+        self.assertNotEqual(run['id'], old['id'])
+        count = len([a for a, _ in self.calls if a[:2] == ('agent', 'start')])
+        again = ensure_facilitator(self.store, group, self.org)
+        self.assertEqual(again['id'], run['id'])
+        self.assertEqual(len([a for a, _ in self.calls if a[:2] == ('agent', 'start')]), count)
+
+    def test_uncertain_unsubmitted_meeting_can_retry_inspected_preparation(self):
+        group = self.group()
+        run = next(j for j in self.store.job_records() if j.get('profile_id') == self.max and j['kind'] == 'launch')
+        self.agents[run['alias']]['agent_status'] = 'blocked'
+        meeting = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        self.store.update_job(meeting, state='uncertain')
+        self.agents[run['alias']]['agent_status'] = 'idle'
+        self.action('retry_discussion', organization_id=self.org, job_id=meeting, inspected=True)
+        self.drain()
+        self.assertEqual(self.job(meeting)['state'], 'artifact_ready')
+
+    def test_uncertain_submitted_meeting_recovers_artifacts_without_resending(self):
+        meeting = self.action('discuss', organization_id=self.org, group_id=self.group())
+        self.drain()
+        self.store.update_job(meeting, state='uncertain', result='')
+        count = len([a for a, _ in self.calls if a[:2] == ('agent', 'prompt')])
+        self.action('recover', organization_id=self.org, job_id=meeting)
+        self.assertEqual(self.job(meeting)['state'], 'artifact_ready')
+        self.assertEqual(len([a for a, _ in self.calls if a[:2] == ('agent', 'prompt')]), count)
 
     def test_missing_live_agent_is_off_despite_persisted_launch(self):
         run = next(j for j in self.store.snapshot()['jobs'] if j['kind'] == 'launch' and j['profile_id'] == self.max)

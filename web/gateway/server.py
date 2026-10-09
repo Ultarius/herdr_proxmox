@@ -97,7 +97,7 @@ def workspace_action(name, body):
 
 def validate_label(label):
     if not isinstance(label, str) or not label.strip() or len(label) > 120 or label.startswith('-') or any(ord(c) < 32 for c in label):
-        raise ValueError('Use a workspace name of 1–120 characters, without control characters or a leading dash.')
+        raise ValueError('Use a workspace name of 1\u2013120 characters, without control characters or a leading dash.')
 
 
 class BrowserSessions:
@@ -472,10 +472,10 @@ class Handler(BaseHTTPRequestHandler):
         actor = getattr(self, 'operator', {}).get('name', 'dashboard_operator')
         role = getattr(self, 'operator', {}).get('role', 'operator')
         actions = {f'/api/workspaces/{name}': name for name in ('create', 'focus', 'rename')}
-        organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'remove_agent', 'remove_group', 'session')}
+        organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'resolve_delegation', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'retry_discussion', 'cancel_discussion', 'remove_agent', 'remove_group', 'session')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close', 'verify')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/guidance', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build', '/api/tasks/policy', '/api/tasks/complete', '/api/tasks/discuss', '/api/tasks/review_policy', '/api/tasks/proposal', '/api/tasks/assignment', '/api/tasks/automation', '/api/tasks/discovery'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/updates/install', '/api/updates/check', '/api/updates/alphas', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/guidance', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build', '/api/tasks/policy', '/api/tasks/complete', '/api/tasks/discuss', '/api/tasks/review_policy', '/api/tasks/proposal', '/api/tasks/assignment', '/api/tasks/automation', '/api/tasks/discovery'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -540,7 +540,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, model_catalog.discover_models(self.server.cli_setup, PROJECTS, body))
             elif self.path == '/api/updates/check':
                 self.reply(200, self.server.updates.snapshot(force=True))
+            elif self.path == '/api/updates/alphas':
+                self.reply(200, self.server.updates.alphas())
             elif self.path == '/api/updates/install':
+                if role != 'admin':
+                    raise ValueError('Only an administrator can install dashboard builds.')
                 self.reply(200, self.server.updates.install(body))
             elif self.path == '/api/updates/promote':
                 if role != 'admin':
@@ -572,6 +576,14 @@ class Handler(BaseHTTPRequestHandler):
                 if role != 'admin':
                     raise ValueError('Only an administrator can close or restart sessions.')
                 self.reply(200, self.server.organizations.manage_session(body, actor))
+            elif self.path in ('/api/organizations/retry_discussion', '/api/organizations/cancel_discussion'):
+                if role != 'admin':
+                    raise ValueError('Only an administrator can retry or cancel discussion preparation.')
+                self.reply(200, self.server.organizations.action(organization_actions[self.path], body))
+            elif self.path == '/api/organizations/resolve_delegation':
+                if role != 'admin':
+                    raise ValueError('Only an administrator can resolve delegation ownership.')
+                self.reply(200, self.server.organizations.action('resolve_delegation', dict(body, _actor=actor)))
             elif self.path in organization_actions:
                 self.reply(200, self.server.organizations.action(organization_actions[self.path], body))
             else:

@@ -81,7 +81,9 @@ GitHub's `/releases/latest/download` URL excludes prereleases. The installer
 queries release metadata to select a build containing both required assets, so a
 prerelease such as `v0.0.1` can be installed automatically when no stable build
 exists. To select it explicitly, prefix the install command with
-`HERDR_RELEASE=v0.0.1`.
+`HERDR_RELEASE=v0.0.1`. Feature-branch alpha builds (`alpha-…` tags) are never
+selected automatically; install them from **Dashboard updates → Browse alpha
+builds**.
 
 For automation without questions, supply these environment properties:
 

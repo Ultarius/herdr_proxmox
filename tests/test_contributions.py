@@ -175,6 +175,7 @@ class ContributionTests(unittest.TestCase):
         self.api.snapshot.return_value = dict(configured=True)
         self.profile = dict(id='worker', organization_id='org', project=str(self.repo), use_worktree=True)
         self.store = MagicMock()
+        self.store.agent_locks = {}
         self.store.snapshot.return_value = dict(profiles=[self.profile], jobs=[])
         self.service = Contributions(self.root / 'tasks.sqlite3', self.root, self.store, self.api)
         self.body = dict(request_id='create-1', title='Fix task', description='Implement and test.',
@@ -979,26 +980,180 @@ class ContributionTests(unittest.TestCase):
         self.assertIsNone(launched.get('assignment'))
         self.assertEqual(self.service.queued_assignments(), [])
 
-    def test_queue_surfaces_a_taskless_active_session_blocker(self):
-        successor = self.service.action('create', dict(self.body, request_id='create-4', title='Next'), 'admin', 'admin')
-        self.service.action('assignment', dict(request_id='queue-3', task_id=successor['id'], mode='queue'), 'admin', 'admin')
-        self.store.snapshot.return_value['jobs'] = [dict(id='general-run', kind='launch', profile_id='worker', state='persona_sent')]
+    def test_startup_session_rotation_starts_the_first_task(self):
+        self.store.snapshot.return_value['jobs'] = [dict(id='startup-run', kind='launch', organization_id='org', profile_id='worker', state='persona_sent', source_project=str(self.repo))]
         self.store.action.reset_mock()
-        self.service.dispatch_assignments()
-        self.store.action.assert_not_called()
-        waiting = self.service.get(successor['id'])
-        self.assertEqual(waiting['assignment']['state'], 'queued')
-        self.assertIn('without a task', waiting['assignment_error'])
+        self.store.action.return_value = dict(id='run2')
+        with patch('collaboration.current_run'):
+            launched = self.service.action('launch', dict(request_id='launch-first', task_id=self.task['id']), 'admin', 'admin')
+        self.assertEqual(launched['run_id'], 'run2')
+        self.assertEqual(launched['state'], 'implementing')
+        self.store.manage_session.assert_called_once()
+        request = self.store.manage_session.call_args[0][0]
+        self.assertEqual((request['mode'], request['job_id'], request['inspected']), ('finish', 'startup-run', True))
+        self.assertTrue(request['request_id'].startswith('rotate-'))
+
+    def test_rotation_is_refused_while_a_meeting_or_delegation_owns_the_session(self):
+        startup = dict(id='startup-run', kind='launch', organization_id='org', profile_id='worker', state='persona_sent', source_project=str(self.repo))
+        self.store.snapshot.return_value['jobs'] = [startup,
+            dict(id='discussion', kind='discussion', state='queued', organization_id='org', runs=[dict(id='startup-run')])]
+        with self.assertRaisesRegex(ValueError, 'reserved by an active discussion'):
+            self.service.action('launch', dict(request_id='launch-blocked', task_id=self.task['id']), 'admin', 'admin')
+        self.store.manage_session.assert_not_called()
+        self.store.snapshot.return_value['jobs'] = [startup,
+            dict(id='delegation', kind='delegate', state='delivered', recipient_run=dict(id='startup-run'))]
+        with self.assertRaisesRegex(ValueError, 'reserved by an active delegate'):
+            self.service.action('launch', dict(request_id='launch-delegated', task_id=self.task['id']), 'admin', 'admin')
+        self.store.manage_session.assert_not_called()
+
+    def test_rotation_allows_a_completed_discussion_and_scheduler_rotates(self):
+        successor = self.service.action('create', dict(self.body, request_id='create-2', title='Next'), 'admin', 'admin')
+        self.service.action('assignment', dict(request_id='queue-1', task_id=successor['id'], mode='queue'), 'admin', 'admin')
+        self.store.snapshot.return_value['jobs'] = [
+            dict(id='startup-run', kind='launch', organization_id='org', profile_id='worker', state='persona_sent', source_project=str(self.repo)),
+            dict(id='discussion', kind='discussion', state='artifact_ready', runs=[dict(id='startup-run')])]
+        self.store.action.return_value = dict(id='run2')
+        with patch('collaboration.current_run'):
+            self.service.dispatch_assignments()
+        self.store.manage_session.assert_called_once()
+        launched = self.service.get(successor['id'])
+        self.assertEqual(launched['run_id'], 'run2')
+        self.assertEqual(launched['state'], 'implementing')
+
+    def test_rotation_refuses_a_dirty_startup_checkout(self):
+        tree = self.root / 'tree'
+        self.git('worktree', 'add', '-b', self.task['branch'], str(tree), self.base)
+        self.store.snapshot.return_value['jobs'] = [dict(id='startup-run', kind='launch', organization_id='org', profile_id='worker',
+                                                         state='persona_sent', worktree_path=str(tree))]
+        (tree / 'file').write_text('uncommitted work')
+        with patch('collaboration.current_run'), self.assertRaisesRegex(ValueError, 'uncommitted changes'):
+            self.service.action('launch', dict(request_id='launch-dirty', task_id=self.task['id']), 'admin', 'admin')
+        self.store.manage_session.assert_not_called()
+
+    @patch('collaboration.current_run')
+    def test_availability_classifies_agent_states(self, current_run):
+        self.assertEqual(self.service.availability('worker')['state'], 'offline')
+        startup = dict(id='startup', kind='launch', organization_id='org', profile_id='worker', state='persona_sent', source_project=str(self.repo))
+        self.assertEqual(self.service.availability('worker', [startup])['state'], 'ready')
+        self.assertEqual(self.service.availability('worker', [startup,
+            dict(id='discussion', kind='discussion', state='running', runs=[dict(id='startup')])])['state'], 'occupied')
+        self.assertEqual(self.service.availability('worker',
+            [dict(id='run', kind='launch', organization_id='org', profile_id='worker', state='persona_sent', task_id=self.task['id'])])['state'], 'working')
+        self.assertEqual(self.service.availability('worker',
+            [dict(id='run', kind='launch', organization_id='org', profile_id='worker', state='needs_attention')])['state'], 'attention')
 
     def test_detail_reports_the_blocking_session_identity(self):
-        self.store.snapshot.return_value['jobs'] = [dict(id='general-run', kind='launch', profile_id='worker',
-                                                         state='persona_sent', alias='hire_x', created_at='today')]
-        blocking = self.service.detail(self.task['id'])['blocking_execution']
+        self.store.snapshot.return_value['jobs'] = [dict(id='general-run', kind='launch', organization_id='org', profile_id='worker',
+                                                         state='persona_sent', alias='hire_x', created_at='today', source_project=str(self.repo))]
+        with patch('collaboration.current_run'):
+            detail = self.service.detail(self.task['id'])
+        blocking = detail['blocking_execution']
         self.assertEqual(blocking['run_id'], 'general-run')
         self.assertEqual(blocking['state'], 'persona_sent')
         self.assertEqual(blocking['alias'], 'hire_x')
         self.assertEqual(blocking['created_at'], 'today')
         self.assertIsNone(blocking['task_id'])
+        self.assertEqual(detail['availability']['state'], 'ready')
+
+    def test_failed_chat_with_real_run_reference_blocks_rotation(self):
+        startup = dict(id='startup', kind='launch', organization_id='org', profile_id='worker', state='persona_sent')
+        self.store.snapshot.return_value['jobs'] = [startup,
+            dict(id='chat', kind='chat', state='needs_attention', runs=[dict(id='startup')])]
+        with self.assertRaisesRegex(ValueError, 'active chat'):
+            self.service.action('launch', dict(request_id='failed-chat', task_id=self.task['id']), 'admin', 'admin')
+        self.store.manage_session.assert_not_called()
+
+    def test_missing_task_record_does_not_become_startup_session(self):
+        self.store.snapshot.return_value['jobs'] = [dict(id='run', kind='launch', organization_id='org', profile_id='worker',
+            state='persona_sent', task_id='missing')]
+        with self.assertRaisesRegex(ValueError, 'missing task'):
+            self.service.action('launch', dict(request_id='missing-task', task_id=self.task['id']), 'admin', 'admin')
+        self.store.manage_session.assert_not_called()
+
+    def test_live_readiness_and_checkout_errors_are_attention(self):
+        startup = dict(id='startup', kind='launch', organization_id='org', profile_id='worker', state='persona_sent', source_project=str(self.repo))
+        with patch('collaboration.current_run', side_effect=ValueError('Agent is not ready for input')):
+            result = self.service.availability('worker', [startup])
+        self.assertEqual(result['state'], 'attention')
+        self.assertIn('not ready', result['detail'])
+        with patch('collaboration.current_run'):
+            startup.pop('source_project')
+            self.assertEqual(self.service.availability('worker', [startup])['state'], 'attention')
+            startup['source_project'] = str(self.repo)
+            (self.repo / 'file').write_text('dirty')
+            self.assertEqual(self.service.availability('worker', [startup])['state'], 'attention')
+
+    def test_rotation_retry_does_not_close_replacement_session(self):
+        self.task['handoff'] = dict(kind='startup', stage='closing', blocking_run='original')
+        self.service.save(self.task, 'rotation_started', 'admin')
+        self.store.snapshot.return_value['jobs'] = [dict(id='replacement', kind='launch', organization_id='org', profile_id='worker', state='persona_sent')]
+        with self.assertRaisesRegex(ValueError, 'session changed'):
+            self.service.action('launch', dict(request_id='changed-run', task_id=self.task['id']), 'admin', 'admin')
+        self.store.manage_session.assert_not_called()
+
+    def test_archive_failure_does_not_launch_and_retry_reuses_closure_identity(self):
+        self.store.snapshot.return_value['jobs'] = [dict(id='startup', kind='launch', organization_id='org', profile_id='worker',
+            state='persona_sent', source_project=str(self.repo))]
+        self.store.manage_session.side_effect = ValueError('Terminal preservation failed')
+        self.store.action.reset_mock()
+        with patch('collaboration.current_run'), self.assertRaisesRegex(ValueError, 'preservation'):
+            self.service.action('launch', dict(request_id='archive-failed', task_id=self.task['id']), 'admin', 'admin')
+        request = self.store.manage_session.call_args.args[0]
+        self.store.action.assert_not_called()
+        self.assertEqual(self.service.get(self.task['id'])['handoff']['stage'], 'closing')
+        self.store.manage_session.side_effect = None
+        self.store.action.return_value = dict(id='next-run')
+        with patch('collaboration.current_run'):
+            launched = self.service.action('launch', dict(request_id='archive-retry', task_id=self.task['id']), 'admin', 'admin')
+        self.assertEqual(self.store.manage_session.call_args.args[0], request)
+        self.assertEqual(launched['state'], 'implementing')
+
+    def test_preparing_meeting_reserves_profiles_before_run_selection(self):
+        launch = dict(id='run', kind='launch', profile_id='worker', state='persona_sent')
+        meeting = dict(id='meeting', kind='discussion', state='queued', participants=['worker'], runs=[])
+        self.assertEqual(self.service.session_owner('run', [launch, meeting])['id'], 'meeting')
+        meeting['state'] = 'waiting_for_members'
+        self.assertIsNone(self.service.session_owner('run', [launch, meeting]))
+
+    def test_resolved_delegations_release_reservations(self):
+        for state in ('completed', 'cancelled'):
+            self.assertIsNone(self.service.session_owner('run', [dict(id='delegate', kind='delegate', state=state, recipient_run=dict(id='run'))]))
+        self.assertIsNotNone(self.service.session_owner('run', [dict(id='delegate', kind='delegate', state='reported_complete', recipient_run=dict(id='run'))]))
+
+    @patch('collaboration.current_run')
+    def test_display_cache_never_authorizes_rotation(self, current_run):
+        startup = dict(id='startup', kind='launch', organization_id='org', profile_id='worker', state='persona_sent', source_project=str(self.repo))
+        self.store.snapshot.return_value['jobs'] = [startup]
+        one = self.service.detail(self.task['id'])['availability']
+        two = self.service.detail(self.task['id'])['availability']
+        self.assertEqual(one['state'], 'ready')
+        self.assertTrue(two['cached'])
+        self.assertEqual(current_run.call_count, 1)
+        (self.repo / 'file').write_text('new dirty work')
+        with self.assertRaisesRegex(ValueError, 'uncommitted'):
+            self.service.action('launch', dict(request_id='cached-launch', task_id=self.task['id']), 'admin', 'admin')
+        self.store.manage_session.assert_not_called()
+        changed = dict(startup, state='needs_attention')
+        self.assertEqual(self.service.display_availability('worker', [changed])['state'], 'attention')
+
+    @patch('collaboration.current_run')
+    def test_general_session_requires_exact_inspected_identity_and_preserves_files(self, current_run):
+        directory = self.root / 'general'
+        directory.mkdir()
+        note = directory / 'note.txt'
+        note.write_text('Preserve this context')
+        self.store.snapshot.return_value['jobs'] = [dict(id='general', kind='launch', organization_id='org', profile_id='worker',
+            state='persona_sent', source_project=str(directory))]
+        self.assertEqual(self.service.detail(self.task['id'])['availability']['action'], 'archive_general')
+        with self.assertRaises(ValueError):
+            self.service.action('launch', dict(request_id='general-auto', task_id=self.task['id']), 'admin', 'admin')
+        with self.assertRaisesRegex(ValueError, 'session changed'):
+            self.service.action('launch', dict(request_id='general-wrong', task_id=self.task['id'], inspected_general_session='other'), 'admin', 'admin')
+        self.store.manage_session.assert_not_called()
+        self.store.action.return_value = dict(id='task-run')
+        result = self.service.action('launch', dict(request_id='general-inspected', task_id=self.task['id'], inspected_general_session='general'), 'admin', 'admin')
+        self.assertEqual(result['state'], 'implementing')
+        self.assertEqual(note.read_text(), 'Preserve this context')
 
     def test_queue_waits_for_a_busy_agent_and_surfaces_unverified_evidence(self):
         blocker = self.service.action('create', dict(self.body, request_id='create-2', title='Blocker'), 'admin', 'admin')

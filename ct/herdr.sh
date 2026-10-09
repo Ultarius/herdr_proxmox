@@ -105,12 +105,15 @@ if [[ -z $repo || ! -f $repo/install/herdr-install.sh ]]; then
       command -v python3 >/dev/null || die 'Missing command: python3 (needed to select a dashboard release).'
       curl -fsSL --retry 3 'https://api.github.com/repos/Ultarius/herdr_proxmox/releases?per_page=100' -o "$checkout/releases.json" || die 'Cannot read GitHub releases. Retry, or select a known tag with HERDR_RELEASE.'
       release=$(python3 - "$checkout/releases.json" <<'PY'
-import json, sys
+import json, sys, re
 releases = json.load(open(sys.argv[1]))
 required = {'herdr-proxmox.tar.gz', 'herdr-proxmox.tar.gz.sha256'}
 available = [r for r in releases if not r.get('draft') and required.issubset({a.get('name') for a in r.get('assets', [])})]
-stable = [r for r in available if not r.get('prerelease')]
-candidates = stable or available
+# Version tags only: feature-branch alpha releases use alpha-<slug>-<hash>-b<n>
+# and must be installed explicitly from the dashboard, never by the installer.
+versioned = [r for r in available if re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', r.get('tag_name', ''))]
+stable = [r for r in versioned if not r.get('prerelease')]
+candidates = stable or versioned
 if not candidates:
     sys.exit('No published release contains the dashboard archive and checksum.')
 print(max(candidates, key=lambda r: r.get('published_at') or '')['tag_name'])

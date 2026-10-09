@@ -281,7 +281,7 @@ class Discovery:
             if due and now() < due:
                 return previous  # One meeting per window, even for repeated manual clicks.
         snapshot = self.service.store.snapshot(live_status=False)
-        if any(j.get('discovery_id') and j.get('organization_id') == organization and j.get('state') in ('queued', 'running', 'needs_attention')
+        if any(j.get('discovery_id') and j.get('organization_id') == organization and j.get('state') in ('queued', 'running', 'waiting_for_members', 'needs_attention', 'uncertain')
                for j in snapshot.get('jobs', [])):
             raise ValueError('An existing discovery meeting needs completion or inspection first.')
         identity = uuid.uuid4().hex
@@ -304,6 +304,9 @@ class Discovery:
         policy = record['policy']
         group, profiles = self.validate(policy)
         if not record.get('prompt'):
+            if getattr(self.service.store, 'supports_discussion_preparation', False) is True:
+                from discussion_scheduler import ensure_facilitator
+                ensure_facilitator(self.service.store, record['group_id'], record['organization_id'])
             snapshot = self.service.store.snapshot(live_status=False)
             run = next((j for j in reversed(snapshot.get('jobs', [])) if j.get('kind') == 'launch'
                         and j.get('profile_id') == group.get('facilitator_id') and j.get('state') == 'persona_sent'), None)
@@ -542,7 +545,7 @@ class Discovery:
                         self.service.store.update_job(job['id'], discovery_processed_at=record['processed_at'])
                     except (ValueError, OSError):
                         pass
-                elif job.get('state') in ('error', 'needs_attention'):
+                elif job.get('state') in ('error', 'needs_attention', 'uncertain'):
                     record.update(state='needs_attention', error='Inspect the group meeting; discovery will not resend it.')
                     self.save(record)
         with closing(self.service.connect()) as db:

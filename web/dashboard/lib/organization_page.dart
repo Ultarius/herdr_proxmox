@@ -468,6 +468,31 @@ class _OrganizationPageState extends State<OrganizationPage> {
       });
   }
 
+  Future<void> resolveDelegation(
+    Map<String, dynamic> job,
+    String decision,
+  ) async {
+    final reason = await showDialog<String>(
+      context: context,
+      builder: (_) => ReportForm(
+        title: decision == 'complete'
+            ? 'Accept inspected delegation completion'
+            : 'Cancel inspected delegation',
+        label: 'Inspection evidence and reason (releases the work reservation)',
+        button: 'Confirm resolution',
+        limit: 2000,
+      ),
+    );
+    if (reason != null && mounted)
+      await submit('resolve_delegation', {
+        'organization_id': job['organization_id'],
+        'job_id': job['id'],
+        'decision': decision,
+        'inspected': true,
+        'reason': reason,
+      });
+  }
+
   @override
   Widget build(BuildContext context) => JuiceBuilder<DashboardBloc>(
     builder: (context, connection, status) {
@@ -930,6 +955,40 @@ class _OrganizationPageState extends State<OrganizationPage> {
                                         ).colorScheme.error,
                                       ),
                                     ),
+                                  if (job['resolution'] is Map)
+                                    Text(
+                                      'Resolved: ${job['resolution']['decision']} · ${job['resolution']['reason']}',
+                                    ),
+                                  if (job['kind'] == 'delegate' &&
+                                      connection.operator.value['role'] ==
+                                          'admin' &&
+                                      [
+                                        'delivered',
+                                        'reported_complete',
+                                        'needs_attention',
+                                        'uncertain',
+                                      ].contains(job['state']))
+                                    Wrap(
+                                      children: [
+                                        if (job['state'] == 'reported_complete')
+                                          TextButton(
+                                            onPressed: () => resolveDelegation(
+                                              job,
+                                              'complete',
+                                            ),
+                                            child: const Text(
+                                              'Accept completion and free agent',
+                                            ),
+                                          ),
+                                        TextButton(
+                                          onPressed: () =>
+                                              resolveDelegation(job, 'cancel'),
+                                          child: const Text(
+                                            'Cancel after inspection',
+                                          ),
+                                        ),
+                                      ],
+                                    ),
                                   if ((job['result'] ?? '') != '')
                                     Text(
                                       'Operator completion report: ${job['result']}',
@@ -980,7 +1039,11 @@ class _OrganizationPageState extends State<OrganizationPage> {
                                       child: const Text('Release run binding'),
                                     ),
                                   if (job['state'] == 'delivered' &&
-                                      job['kind'] == 'delegate')
+                                      job['kind'] == 'delegate' &&
+                                      [
+                                        'delivered',
+                                        'reported_complete',
+                                      ].contains(job['state']))
                                     TextButton(
                                       onPressed: state.busy
                                           ? null
@@ -1398,7 +1461,15 @@ class _DelegationFormState extends State<DelegationForm> {
 }
 
 class ReportForm extends StatefulWidget {
-  const ReportForm({super.key});
+  const ReportForm({
+    super.key,
+    this.title = 'Record completion report',
+    this.label = 'Verified result or reply from SSH',
+    this.button = 'Save report',
+    this.limit = 8000,
+  });
+  final String title, label, button;
+  final int limit;
   @override
   State<ReportForm> createState() => _ReportFormState();
 }
@@ -1414,18 +1485,13 @@ class _ReportFormState extends State<ReportForm> {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
-    title: const Text('Record completion report'),
+    title: Text(widget.title),
     content: SizedBox(
       width: 580,
       child: SingleChildScrollView(
         child: Form(
           key: form,
-          child: field(
-            result,
-            'Verified result or reply from SSH',
-            limit: 8000,
-            lines: 5,
-          ),
+          child: field(result, widget.label, limit: widget.limit, lines: 5),
         ),
       ),
     ),
@@ -1439,7 +1505,7 @@ class _ReportFormState extends State<ReportForm> {
           if (form.currentState!.validate())
             Navigator.pop(context, result.text.trim());
         },
-        child: const Text('Save report'),
+        child: Text(widget.button),
       ),
     ],
   );

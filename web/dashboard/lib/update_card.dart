@@ -11,6 +11,8 @@ class _UpdateCardState extends State<UpdateCard> {
   Map<String, dynamic>? info;
   String? error;
   bool busy = false;
+  List<Map<String, dynamic>> alphas = [];
+  String? alphaVersion;
   Timer? timer;
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
 
@@ -52,15 +54,15 @@ class _UpdateCardState extends State<UpdateCard> {
     }
   }
 
-  Future<void> install() async {
-    final version = info?['latest'];
+  Future<void> install({bool alpha = false}) async {
+    final version = alpha ? alphaVersion : info?['latest'];
     final epoch = connection.generation;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: Text('Install $version?'),
-        content: const Text(
-          'The dashboard will briefly disconnect. Your projects, agent profiles and credentials are preserved. A backup is kept for recovery. Reload this page after the update completes.',
+        content: Text(
+          '${alpha ? "This is an experimental feature-branch build for testing. " : ""}The dashboard will briefly disconnect. Your projects, agent profiles and credentials are preserved. A backup is kept for recovery. Reload this page after the update completes.',
         ),
         actions: [
           TextButton(
@@ -77,10 +79,39 @@ class _UpdateCardState extends State<UpdateCard> {
     if (confirmed != true || !mounted || epoch != connection.generation) return;
     setState(() => busy = true);
     try {
-      await connection.request('updates/install', {'version': version});
+      await connection.request('updates/install', {
+        'version': version,
+        if (alpha) 'channel': 'alpha',
+        if (alpha) 'confirm_alpha': true,
+      });
       if (mounted) {
         setState(() => info = {...?info, 'state': 'queued'});
         timer ??= Timer.periodic(const Duration(seconds: 5), (_) => check());
+      }
+    } catch (exception) {
+      if (mounted) setState(() => error = exception.toString());
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> loadAlphas() async {
+    if (busy) return;
+    final epoch = connection.generation;
+    setState(() => busy = true);
+    try {
+      final result = await connection.request(
+        'updates/alphas',
+        <String, dynamic>{},
+      );
+      if (mounted && epoch == connection.generation) {
+        setState(() {
+          alphas = (result['releases'] as List).cast<Map<String, dynamic>>();
+          alphaVersion = null;
+          error = alphas.isEmpty
+              ? 'No installable alpha builds are available.'
+              : null;
+        });
       }
     } catch (exception) {
       if (mounted) setState(() => error = exception.toString());
@@ -105,7 +136,7 @@ class _UpdateCardState extends State<UpdateCard> {
           ),
           if (info != null) ...[
             Text(
-              'Installed: ${info!['installed']} · Latest: ${info!['latest']}',
+              'Installed: ${info!['installed']} \u00b7 Latest: ${info!['latest']}',
             ),
             Text('Status: ${info!['state']}'),
             if (info!['check_error'] != null)
@@ -126,6 +157,50 @@ class _UpdateCardState extends State<UpdateCard> {
             if ((info!['notes'] as String? ?? '').isNotEmpty)
               Text(info!['notes'] as String),
           ],
+          const SizedBox(height: 16),
+          const Text('Alpha builds \u2014 feature branch testing'),
+          TextButton(
+            onPressed: busy ? null : loadAlphas,
+            child: const Text('Browse alpha builds'),
+          ),
+          if (alphas.isNotEmpty) ...[
+            DropdownButtonFormField<String>(
+              key: ValueKey(alphaVersion),
+              initialValue: alphaVersion,
+              isExpanded: true,
+              decoration: const InputDecoration(
+                labelText: 'Feature branch alpha build',
+              ),
+              items: alphas
+                  .map(
+                    (release) => DropdownMenuItem<String>(
+                      value: release['version'] as String,
+                      child: Text(
+                        release['version'] as String,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  )
+                  .toList(),
+              onChanged: busy
+                  ? null
+                  : (value) => setState(() => alphaVersion = value),
+            ),
+            if (alphaVersion != null)
+              Text(
+                '${alphas.firstWhere((r) => r['version'] == alphaVersion)['notes']}',
+              ),
+            FilledButton(
+              onPressed:
+                  !busy &&
+                      alphaVersion != null &&
+                      info?['supported'] == true &&
+                      !['queued', 'running'].contains(info?['state'])
+                  ? () => install(alpha: true)
+                  : null,
+              child: const Text('Install selected alpha'),
+            ),
+          ],
           if (error != null) Text(error!),
           Wrap(
             spacing: 12,
@@ -140,7 +215,7 @@ class _UpdateCardState extends State<UpdateCard> {
                         info?['available'] == true &&
                         info?['supported'] == true &&
                         !['queued', 'running'].contains(info?['state'])
-                    ? install
+                    ? () => install()
                     : null,
                 child: const Text('Install update'),
               ),

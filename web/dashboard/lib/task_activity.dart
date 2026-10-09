@@ -49,6 +49,8 @@ String taskNextStep(Map task) {
   if (task['state'] == 'draft') {
     if ((task['assignment'] as Map?)?['state'] == 'queued')
       return 'Queued for the assigned agent; the scheduler starts it when the agent is free.';
+    final detail = (task['availability'] as Map?)?['detail'];
+    if (detail is String && detail.isNotEmpty) return detail;
     if (task['blocking_execution'] is Map)
       return 'The assigned agent is finishing other work. Hand off when its evidence is complete, or queue this task.';
     return 'Ready to launch the assigned agent.';
@@ -101,6 +103,8 @@ const activityLabels = {
   'recover': 'Reply recovered',
   'handoff_started': 'Execution handoff started',
   'handoff_closed': 'Previous execution archived and finished',
+  'rotation_started': 'Startup session rotation started',
+  'rotation_closed': 'Startup session archived for task work',
   'finish_execution': 'Execution finished',
   'assignment_queued': 'Task queued for its agent',
   'assignment_waiting': 'Queued task waiting for its agent',
@@ -121,6 +125,8 @@ String activitySection(Object? action) {
     case 'release':
     case 'handoff_started':
     case 'handoff_closed':
+    case 'rotation_started':
+    case 'rotation_closed':
     case 'finish_execution':
     case 'assignment_queued':
     case 'assignment_waiting':
