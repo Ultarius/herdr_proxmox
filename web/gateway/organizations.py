@@ -637,7 +637,7 @@ class OrganizationStore:
             self.put(db, 'jobs', job)
         if changes.get('state') in ('answered', 'persona_sent', 'needs_attention', 'delivered', 'artifact_ready',
                                     'finished', 'released', 'cancelled', 'completed', 'reported_complete',
-                                    'uncertain', 'waiting_for_members'):
+                                    'uncertain', 'waiting_for_members', 'waiting_for_input'):
             self.jobs_changed.set()
         return job
 
@@ -1133,22 +1133,30 @@ class OrganizationStore:
             # Keep only valid metadata that belongs to the authoritative root pane.
             return pane, workspace if is_workspace_id(workspace) and is_pane_id(pane, workspace) else None
         # Some installed Herdr versions omit a usable root pane in creation
-        # responses. Re-read authoritative records for the exact created cwd.
+        # responses. Herdr reports no cwd or worktree on a workspace, so the
+        # pane directory is the only checkout evidence; re-read it for the
+        # exact created cwd. Rare path: 0.9.3 always returns a root pane.
         response = self.command('workspace', 'list')
         workspaces = response if isinstance(response, list) else response.get('workspaces', [])
-        matches = [w for w in workspaces if isinstance(w, dict) and
-                   (w.get('worktree') or {}).get('checkout_path', w.get('cwd')) and
-                   str(Path((w.get('worktree') or {}).get('checkout_path', w.get('cwd'))).resolve()) == str(Path(project).resolve())]
+        expected = Path(project).resolve()
+        matches = []
+        for workspace in workspaces:
+            if not isinstance(workspace, dict):
+                continue
+            workspace_id = workspace.get('workspace_id') or workspace.get('id')
+            if not is_workspace_id(workspace_id):
+                continue
+            response = self.command('pane', 'list', '--workspace', workspace_id)
+            panes = response if isinstance(response, list) else response.get('panes', [])
+            for candidate in panes:
+                if not isinstance(candidate, dict):
+                    continue
+                directory = candidate.get('cwd') or candidate.get('foreground_cwd')
+                if isinstance(directory, str) and Path(directory).resolve() == expected:
+                    matches.append((workspace_id, candidate.get('pane_id')))
         if len(matches) != 1:
             raise ValueError('Cannot uniquely resolve the created checkout workspace. Inspect its terminal before retrying.')
-        workspace = matches[0].get('workspace_id')
-        if not is_workspace_id(workspace):
-            raise ValueError('Created workspace has an unsupported ID.')
-        response = self.command('pane', 'list', '--workspace', workspace)
-        panes = response if isinstance(response, list) else response.get('panes', [])
-        if len(panes) != 1:
-            raise ValueError('Created workspace must have exactly one pane before agent launch.')
-        pane = panes[0].get('pane_id')
+        workspace, pane = matches[0]
         if not is_pane_id(pane, workspace):
             raise ValueError('Herdr did not return a valid root pane ID for the created workspace.')
         return pane, workspace
@@ -1301,7 +1309,17 @@ class OrganizationStore:
                 if job.get('task_prompt') or job.get('task_id'):
                     from worker_guidance import local_bundle
                     guidance = local_bundle(job.get('worktree_path', project))
-                arguments = launch_arguments(profile) + prepare_permissions(profile, self.path.parent)
+                # Any agent can be asked to save a chat reply: an operator
+                # message, a consultation, or a delegation reply all write under
+                # chat-replies. The launch happens before the chat exists, so
+                # the grant cannot be decided from the job kind here. Only a
+                # group facilitator or a discussion member also writes an
+                # artifact and transcript.
+                output_directories = ['chat-replies']
+                if profile.get('group_id') or job.get('session_purpose') == 'discussion':
+                    output_directories.append('discussion-artifacts')
+                arguments = launch_arguments(profile) + prepare_permissions(
+                    profile, self.path.parent, output_directories=tuple(output_directories))
                 # Native resume uses adapter arguments validated before they were
                 # recorded; free-form command text is never executed here.
                 resume_args = job.get('resume_args')

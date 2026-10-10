@@ -39,7 +39,7 @@ String completionOutcome(Map task) {
   }
 }
 
-String taskNextStep(Map task) {
+String taskNextStep(Map task, {String executor = 'service'}) {
   if (task['automation_error'] != null)
     return 'Automation needs attention: ${task['automation_error']}';
   final acceptance = task['acceptance'] as Map?;
@@ -64,8 +64,22 @@ String taskNextStep(Map task) {
       return 'The assigned agent is finishing other work. Hand off when its evidence is complete, or queue this task.';
     return 'Ready to launch the assigned agent.';
   }
-  if (task['state'] == 'implementing')
+  if (task['state'] == 'implementing') {
+    // "Awaiting a committed candidate" describes an agent that is still
+    // working. When capture is switched off the agent may be long finished, so
+    // say which of the two it is and how to unblock it.
+    if (task['auto_validate'] != true) {
+      if (executor != 'service')
+        return 'Not capturing commits: the durable build service is not installed. '
+            'Install it under Builds & deployments, or capture the candidate from Changes.';
+      return 'Automatic capture is off for this task. Enable it in Automation settings, '
+          'or capture the candidate from Changes.';
+    }
+    if (executor != 'service')
+      return 'Automatic capture is waiting for the durable build service; '
+          'capture the candidate from Changes meanwhile.';
     return 'Implementation in progress; awaiting a committed candidate.';
+  }
   if (task['state'] == 'merged')
     return 'Merged on GitHub. Updating the base and deployment are separate.';
   if (task['state'] == 'closed') return 'Task closed.';

@@ -57,3 +57,29 @@ class PermissionTests(unittest.TestCase):
             self.assertIn('variant: "high"', content)
             self.assertIn('model: "opencode-go/test"', content)
             self.assertIn('permission: {}', content)
+
+    def test_a_run_that_must_save_output_is_granted_it_in_any_mode(self):
+        # The gateway tells a discussion exactly where to write its artifact and
+        # transcript. A read-only meeting with CLI defaults must not stall on an
+        # interactive permission prompt the gateway can never answer.
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            profile = {'id': 'group', 'runtime': 'opencode'}
+            args = prepare_permissions(profile, home / 'outputs', home,
+                                       output_directories=('discussion-artifacts',))
+            self.assertEqual(args, ['--agent', 'herdr-dashboard-group'])
+            rule = json.loads(next(line.split('permission: ', 1)[1]
+                                   for line in (home / '.config/opencode/agents/herdr-dashboard-group.md').read_text().splitlines()
+                                   if line.startswith('permission: ')))
+            self.assertEqual(set(rule['external_directory']),
+                             {str(home / 'outputs' / 'discussion-artifacts' / '**')})
+            # A chat is granted the reply directory instead, not both.
+            prepare_permissions(dict(profile, id='chat'), home / 'outputs', home,
+                                output_directories=('chat-replies',))
+            rule = json.loads(next(line.split('permission: ', 1)[1]
+                                   for line in (home / '.config/opencode/agents/herdr-dashboard-chat.md').read_text().splitlines()
+                                   if line.startswith('permission: ')))
+            self.assertEqual(set(rule['external_directory']),
+                             {str(home / 'outputs' / 'chat-replies' / '**')})
+            # Without an output contract a default profile still writes nothing.
+            self.assertEqual(prepare_permissions(profile, home / 'outputs', home), [])

@@ -26,16 +26,26 @@ def permission_mode(body, runtime):
     return mode
 
 
-def prepare_permissions(profile, output_root, home=None):
+def prepare_permissions(profile, output_root, home=None, output_directories=()):
     mode = permission_mode(profile, profile['runtime'])
     paths = accessible_paths(profile, profile['runtime'])
     variant = bool(profile.get('provider') and profile.get('model') and profile.get('reasoning'))
-    if profile['runtime'] != 'opencode' or (mode == 'default' and not paths and not variant):
+    if profile['runtime'] != 'opencode':
+        return []
+    root = Path(output_root)
+    if mode == 'dashboard_outputs':
+        granted = ('chat-replies', 'discussion-artifacts')
+    else:
+        # A run the gateway tells to save a reply or artifact must be able to
+        # write there whatever mode was chosen. The output path is part of the
+        # protocol, not an optional grant: without it a read-only discussion
+        # stalls on an interactive permission prompt the gateway can never
+        # answer, and the meeting never finalizes.
+        granted = tuple(output_directories)
+    paths = [str(root / folder / '**') for folder in granted] + paths
+    if mode == 'default' and not paths and not variant:
         return []
     name = 'herdr-dashboard-' + profile['id']
-    if mode == 'dashboard_outputs':
-        paths = [str(Path(output_root) / folder / '**')
-                 for folder in ('chat-replies', 'discussion-artifacts')] + paths
     permission = {} if mode == 'default' and not paths else 'allow' if mode == 'full_autonomy' else {
         'external_directory': {pattern: 'allow' for pattern in paths}
     }

@@ -769,7 +769,7 @@ class _TasksPageState extends State<TasksPage> {
           ),
           Text('${taskState(task)} \u00b7 ${task['repository']}'),
           Text('${taskAgentName(task)}'),
-          Text(taskNextStep(task)),
+          Text(taskNextStep(task, executor: executor)),
           if (task['updated_at'] != null)
             Text('Last activity ${task['updated_at']}'),
           TextButton.icon(
@@ -1960,7 +1960,7 @@ class _TasksPageState extends State<TasksPage> {
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 12),
             child: Text(
-              taskNextStep(task),
+              taskNextStep(task, executor: executor),
               style: Theme.of(context).textTheme.titleMedium,
             ),
           ),

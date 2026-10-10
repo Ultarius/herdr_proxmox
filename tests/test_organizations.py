@@ -445,23 +445,57 @@ class OrganizationTests(unittest.TestCase):
             self.store.manage_session(dict(job_id=run['id'], organization_id=run['organization_id'], mode='finish', inspected=True), 'admin')
         self.assertFalse(any(args[:2] == ('pane', 'close') for args, _ in self.calls))
 
+    def test_every_launch_grants_the_chat_reply_directory(self):
+        # Any agent can be asked to save a chat reply, and the launch happens
+        # before that chat exists, so the grant cannot be decided from the job
+        # kind. A `kind == 'chat'` check here is unreachable: chats are handled
+        # by collaboration.execute, not the launch branch.
+        from unittest.mock import patch
+        granted = []
+        def permissions(profile, output_root, home=None, output_directories=()):
+            granted.append(tuple(output_directories))
+            return []
+        with patch('organizations.prepare_permissions', side_effect=permissions):
+            org = self.organization()
+            profile = self.hire(org)
+            self.action('launch', organization_id=org, profile_id=profile)
+            self.drain()
+        self.assertTrue(granted, 'the launch must prepare permissions')
+        self.assertTrue(all('chat-replies' in dirs for dirs in granted), granted)
+
     def test_created_pane_recovers_from_authoritative_checkout_records(self):
         def command(*args, **kwargs):
             if args == ('workspace', 'list'):
-                return {'workspaces': [dict(workspace_id='w42', worktree=dict(checkout_path=str(self.projects)))]}
+                # Herdr reports no cwd or worktree on a workspace, so the pane
+                # directory is the only checkout evidence available.
+                return {'workspaces': [dict(workspace_id='w42', agent_status='idle', label='Agent')]}
             if args == ('pane', 'list', '--workspace', 'w42'):
-                return {'panes': [dict(pane_id='w42:p1')]}
+                return {'panes': [dict(pane_id='w42:p1', cwd=str(self.projects))]}
             self.fail(f'Unexpected command: {args}')
         self.store.command = command
         self.assertEqual(self.store.created_pane({}, str(self.projects)), ('w42:p1', 'w42'))
+
+    def test_created_pane_refuses_an_ambiguous_checkout(self):
+        # Two panes in the created directory cannot identify one root pane.
+        def command(*args, **kwargs):
+            if args == ('workspace', 'list'):
+                return {'workspaces': [dict(workspace_id='w42', agent_status='idle')]}
+            if args == ('pane', 'list', '--workspace', 'w42'):
+                return {'panes': [dict(pane_id='w42:p1', cwd=str(self.projects)),
+                                  dict(pane_id='w42:p2', cwd=str(self.projects))]}
+            self.fail(f'Unexpected command: {args}')
+        self.store.command = command
+        with self.assertRaisesRegex(ValueError, 'uniquely resolve'):
+            self.store.created_pane({}, str(self.projects))
 
     def test_created_pane_accepts_letter_counters_in_both_response_paths(self):
         self.assertEqual(self.store.created_pane(
             {'root_pane': {'pane_id': 'wA:pB'}, 'workspace': {'workspace_id': 'wA'}},
             str(self.projects)), ('wA:pB', 'wA'))
         self.store.command = lambda *args, **kwargs: (
-            {'workspaces': [dict(workspace_id='wB', cwd=str(self.projects))]}
-            if args == ('workspace', 'list') else {'panes': [dict(pane_id='wB:pA')]})
+            {'workspaces': [dict(workspace_id='wB', agent_status='idle')]}
+            if args == ('workspace', 'list')
+            else {'panes': [dict(pane_id='wB:pA', cwd=str(self.projects))]})
         self.assertEqual(self.store.created_pane({}, str(self.projects)), ('wB:pA', 'wB'))
 
     def test_direct_root_pane_normalizes_unusable_workspace_metadata(self):
@@ -475,13 +509,19 @@ class OrganizationTests(unittest.TestCase):
             {'root_pane': {'pane_id': 'wA:pB'}}, str(self.projects)), ('wA:pB', None))
 
     def test_created_pane_rejects_ambiguous_checkout_or_wrong_workspace_pane(self):
-        self.store.command = lambda *args, **kwargs: {'workspaces': [
-            dict(workspace_id='w42', worktree=dict(checkout_path=str(self.projects))),
-            dict(workspace_id='w43', cwd=str(self.projects))]}
+        # Two panes in the created directory cannot identify one root pane.
+        self.store.command = lambda *args, **kwargs: (
+            {'workspaces': [dict(workspace_id='w42', agent_status='idle'),
+                            dict(workspace_id='w43', agent_status='idle')]}
+            if args == ('workspace', 'list')
+            else {'panes': [dict(pane_id=args[3] + ':p1', cwd=str(self.projects))]})
         with self.assertRaisesRegex(ValueError, 'uniquely'):
             self.store.created_pane({}, str(self.projects))
-        self.store.command = lambda *args, **kwargs: ({'workspaces': [dict(workspace_id='w42', worktree=dict(checkout_path=str(self.projects)))]}
-            if args == ('workspace', 'list') else {'panes': [dict(pane_id='w99:p1')]})
+        # A pane whose ID does not belong to its workspace is not a root pane.
+        self.store.command = lambda *args, **kwargs: (
+            {'workspaces': [dict(workspace_id='w42', agent_status='idle')]}
+            if args == ('workspace', 'list')
+            else {'panes': [dict(pane_id='w99:p1', cwd=str(self.projects))]})
         with self.assertRaisesRegex(ValueError, 'valid root pane'):
             self.store.created_pane({}, str(self.projects))
 
@@ -491,9 +531,9 @@ class OrganizationTests(unittest.TestCase):
             if args[:2] == ('workspace', 'create'):
                 return {'type': 'workspace_created'}
             if args == ('workspace', 'list'):
-                return {'workspaces': [dict(workspace_id='wB', worktree=dict(checkout_path=str(self.projects)))]}
+                return {'workspaces': [dict(workspace_id='wB', agent_status='idle')]}
             if args == ('pane', 'list', '--workspace', 'wB'):
-                return {'panes': [dict(pane_id='wB:pA')]}
+                return {'panes': [dict(pane_id='wB:pA', cwd=str(self.projects))]}
             return original(*args, **kwargs)
         self.store.command = command
         org = self.organization()
@@ -707,7 +747,11 @@ class OrganizationTests(unittest.TestCase):
             run = next(j for j in self.store.snapshot()['jobs'] if j['id'] == job_id)
             self.assertEqual(run['state'], 'persona_sent', run['error'])
             call = next(args for args, _ in self.calls if args[:3] == ('agent', 'start', run['alias']))
-            if runtime == 'opencode' and config.get('reasoning'):
+            # Every OpenCode launch selects a dashboard agent file: the
+            # chat-reply grant is part of the protocol, and a permission policy
+            # can only be attached through an agent. Other runtimes take their
+            # model arguments directly.
+            if runtime == 'opencode':
                 expected = expected + ['--agent', 'herdr-dashboard-' + profile_id]
             self.assertEqual(list(call[call.index('--') + 1:]), expected)
             self.assertEqual(run['launch_arguments'], expected)

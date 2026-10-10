@@ -19,7 +19,7 @@ class CoordinatorCreationTests(unittest.TestCase):
         (self.projects / 'repo').mkdir()
         service = IntegrationCoordinator(self.root / 'integration.sqlite3', self.store)
         body = dict(repository='repo', profile_id='new', organization_id=org, enabled=True)
-        with patch('integration_coordinator.project_git.inspect', return_value={'repository': True, 'repository_path': 'repo'}), patch('organizations.prepare_permissions', side_effect=lambda profile, output: prepare_permissions(profile, output, home=self.root / 'home')):
+        with patch('integration_coordinator.project_git.inspect', return_value={'repository': True, 'repository_path': 'repo'}), patch('organizations.prepare_permissions', side_effect=lambda profile, output, output_directories=(): prepare_permissions(profile, output, home=self.root / 'home', output_directories=output_directories)):
             first = service.configure(body)
             self.drain()
             second = service.configure(body)
@@ -58,7 +58,7 @@ class CoordinatorCreationTests(unittest.TestCase):
                                project=str(self.projects / 'repo'), use_worktree=True,
                                permission_mode='dashboard_outputs', persona='imported coordinator')
         service = IntegrationCoordinator(self.root / 'integration.sqlite3', self.store)
-        with patch('integration_coordinator.project_git.inspect', return_value={'repository': True, 'repository_path': 'repo'}), patch('organizations.prepare_permissions', side_effect=lambda profile, output: prepare_permissions(profile, output, home=self.root / 'home')):
+        with patch('integration_coordinator.project_git.inspect', return_value={'repository': True, 'repository_path': 'repo'}), patch('organizations.prepare_permissions', side_effect=lambda profile, output, output_directories=(): prepare_permissions(profile, output, home=self.root / 'home', output_directories=output_directories)):
             config = service.configure(dict(repository='repo', profile_id='new', organization_id=org, enabled=True))
             self.drain()
         service.close()

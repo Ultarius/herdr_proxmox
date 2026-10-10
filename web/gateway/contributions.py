@@ -297,6 +297,7 @@ class Contributions:
                     self.poll_once()
                     self.reap_instances()
                     self.reap_sessions()
+                    self.recover_discussions()
                 except (ValueError, OSError, sqlite3.Error):
                     pass
                 next_housekeeping = time.monotonic() + 60
@@ -1198,6 +1199,94 @@ class Contributions:
                 continue
             except (ValueError, OSError, sqlite3.Error, KeyError, TypeError) as error:
                 self.record_error(task_id, error, 'auto_queue', 'group_auto_queue')
+        # A group-level discussion belongs to no task, so it has no task to hang
+        # its meetings on and would otherwise never be evaluated at all.
+        with closing(self.store.connect()) as db:
+            discussions = [json.loads(row[0]) for row in db.execute(
+                "SELECT data FROM jobs WHERE json_extract(data,'$.kind')='discussion' "
+                "AND json_extract(data,'$.state')='artifact_ready' "
+                "AND json_extract(data,'$.group_id') IN (" + group_placeholders + ") "
+                "AND json_extract(data,'$.proposals') IS NULL ORDER BY rowid DESC LIMIT 20",
+                proposing)]
+        for job in discussions:
+            policy = policies.get(job.get('organization_id')) or dict(AUTOMATION_DEFAULTS)
+            group = groups.get(job.get('group_id')) or {}
+            if policy['paused'] or not group:
+                continue
+            since = (policy.get('auto_queue_since') or policy.get('updated_at') or ''
+                     if policy['auto_queue_proposals']
+                     else group.get('create_tasks_since') or group.get('updated_at') or '')
+            if str(job.get('created_at') or '') < since:
+                self.store.update_job(job['id'], proposals=dict(
+                    at=stamp(), queued=[], drafts=[], skipped={}, created={},
+                    unavailable='Discussion created before automatic follow-up was enabled.'))
+                continue
+            try:
+                self.materialize_discussion(job, policy, 'group_auto_queue',
+                                            queue_allowed=bool(policy['auto_queue_proposals']
+                                                               or group.get('create_tasks') is True))
+            except (ValueError, OSError, sqlite3.Error, KeyError, TypeError):
+                continue
+
+    def materialize_discussion(self, job, policy, actor, queue_allowed=True):
+        """Create follow-up tasks from a discussion that belongs to no task.
+
+        The repository and base come from the assignee's own profile, which is
+        also what the same-repository rule checks, so a group cannot route work
+        into a checkout its assignee does not already work in.
+        """
+        job_id = job['id']
+        if job.get('proposals') is not None:
+            return
+        proposals = self.discussion_proposals(job)
+        queued, drafts, skipped, created = [], [], {}, {}
+        profiles = {p['id']: p for p in self.store.snapshot(live_status=False).get('profiles', [])}
+        for proposal in proposals:
+            profile = profiles.get(proposal['profile_id'])
+            if (not profile or profile.get('archived') or profile.get('ephemeral')
+                    or not profile.get('use_worktree', True)):
+                skipped[proposal['key']] = 'assignee is not an eligible worktree agent'
+                continue
+            try:
+                repository = Path(profile['project']).resolve().relative_to(self.projects).as_posix()
+            except (ValueError, OSError, TypeError):
+                skipped[proposal['key']] = 'assignee is not assigned to a managed repository'
+                continue
+            review = str(proposal.get('needs_review', '')).lower() in ('true', 'yes')
+            wants_queue = queue_allowed and not review
+            if len(queued) + len(drafts) >= policy['max_per_meeting']:
+                skipped[proposal['key']] = 'meeting limit reached'
+                continue
+            if wants_queue:
+                if self.open_work_count(proposal['profile_id']) >= policy['max_open_per_agent']:
+                    skipped[proposal['key']] = 'assignee queue limit reached'
+                    continue
+                if self.auto_created_today(profile['organization_id']) >= policy['daily_cap']:
+                    skipped[proposal['key']] = 'daily automation limit reached'
+                    continue
+            new_id = uuid.uuid5(uuid.NAMESPACE_URL, 'herdr:' + job_id + ':' + proposal['key']).hex
+            try:
+                # base_ref is resolved from the repository, as for a manual task.
+                made = self.perform('create', dict(title=proposal['title'], description=proposal['description'],
+                                                   repository=repository, base_ref='',
+                                                   profile_id=proposal['profile_id']), new_id, actor)
+            except (ValueError, OSError) as error:
+                skipped[proposal['key']] = str(error)[:300]
+                continue
+            made.setdefault('source', {})['discussion'] = dict(
+                job_id=job_id, group_id=job.get('group_id'), proposal_key=proposal['key'],
+                queued=wants_queue, at=stamp())
+            self.save(made, 'proposal_created', actor)
+            if wants_queue:
+                made = self.enqueue_assignment(made, actor)
+                self.save(made, 'assignment_queued', actor)
+                queued.append(proposal['key'])
+            else:
+                drafts.append(proposal['key'])
+            created[proposal['key']] = made['id']
+        self.store.update_job(job_id, proposals=dict(
+            at=stamp(), queued=queued, drafts=drafts, skipped=skipped, created=created,
+            policy={k: policy[k] for k in AUTOMATION_DEFAULTS}))
 
     def materialize_meeting(self, task_id, job_id, policy, actor, queue_allowed=True):
         """Create follow-up tasks from one finalized discussion.
@@ -1627,7 +1716,10 @@ class Contributions:
         launch = next((j for j in jobs if j.get('id') == run_id), {})
         profile_id = launch.get('profile_id')
         for job in jobs:
-            reserved = bool(profile_id and job.get('state') in ('queued', 'running') and
+            # A discussion waiting on an operator decision still owns its
+            # participants: the agent can resume later and would collide with
+            # anything that reused its session.
+            reserved = bool(profile_id and job.get('state') in ('queued', 'running', 'waiting_for_input') and
                             profile_id in job.get('participants', [job.get('profile_id')]))
             if job.get('id') == run_id or not (reserved or self.session_reference(job, run_id)):
                 continue
@@ -1919,6 +2011,21 @@ class Contributions:
         task['profile_id'] = instance['id']
         task['assigned_agent'] = {k: template.get(k) for k in ('id', 'name', 'role', 'runtime')}
         return self.save(task, 'instance_launch', actor)
+
+    def recover_discussions(self):
+        """Finalize interrupted discussions whose verified output is complete.
+
+        A discussion that was blocked, timed out, or interrupted by a restart
+        can still finish correctly. Recovering it is a read that re-checks every
+        prerequisite, so it never resends a prompt and never means "trust these
+        files anyway". Runs in the bounded housekeeping pass, rotating through
+        the interrupted set so a few unresolved discussions cannot starve the
+        rest.
+        """
+        from collaboration import recover_interrupted
+        recovered, self.discussion_recovery_cursor = recover_interrupted(
+            self.store, getattr(self, 'discussion_recovery_cursor', 0))
+        return recovered
 
     def reap_sessions(self):
         """Close finished sessions and reclaim panes orphaned by a restart.

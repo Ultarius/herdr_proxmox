@@ -1594,6 +1594,47 @@ class ContributionTests(unittest.TestCase):
         self.assertEqual(proposals_shown[0]['assignee'], 'Nora')
         self.assertNotEqual(proposals_shown[0]['assignee'], 'worker')
 
+    def test_a_taskless_group_discussion_still_creates_its_follow_ups(self):
+        # A group-level discussion belongs to no task, so nothing hung it on a
+        # task's meetings and it was never evaluated: the proposal was read by
+        # nobody and no draft ever appeared.
+        self.store.snapshot.return_value['profiles'] = [dict(self.profile, name='Nora')]
+        job = dict(id='discussion', kind='discussion', organization_id='org', group_id='review',
+                   state='artifact_ready', created_at=contributions.stamp(),
+                   result='```json\n' + json.dumps({'task_proposals': [
+                       dict(title='Add a regression test', description='Cover the boundary case with checks.',
+                            profile_id='worker', needs_review=False)]}) + '\n```')
+        self.service.materialize_discussion(job, dict(contributions.AUTOMATION_DEFAULTS), 'group_auto_queue',
+                                            queue_allowed=False)
+        marker = self.store.update_job.call_args[1]['proposals']
+        self.assertEqual(len(marker['drafts']), 1)
+        self.assertEqual(marker['skipped'], {})
+        created = self.service.get(marker['created'][marker['drafts'][0]])
+        self.assertEqual(created['state'], 'draft')
+        self.assertEqual(created['repository'], 'repo')
+        self.assertEqual(created['profile_id'], 'worker')
+        self.assertEqual(created['source']['discussion']['group_id'], 'review')
+        # The base is resolved from the repository, exactly as a manual task.
+        self.assertTrue(created['base_ref'])
+        # Evaluating again is a no-op: the marker is the idempotence key.
+        self.store.update_job.reset_mock()
+        self.service.materialize_discussion(dict(job, proposals=marker),
+                                            dict(contributions.AUTOMATION_DEFAULTS), 'group_auto_queue')
+        self.store.update_job.assert_not_called()
+
+    def test_a_taskless_proposal_for_an_unmanaged_assignee_is_skipped(self):
+        self.store.snapshot.return_value['profiles'] = [
+            dict(self.profile, name='Nora', project=str(self.root.parent / 'elsewhere'))]
+        job = dict(id='discussion', kind='discussion', organization_id='org', group_id='review',
+                   state='artifact_ready', created_at=contributions.stamp(),
+                   result='```json\n' + json.dumps({'task_proposals': [
+                       dict(title='Outside', description='Assignee works outside managed projects.',
+                            profile_id='worker')]}) + '\n```')
+        self.service.materialize_discussion(job, dict(contributions.AUTOMATION_DEFAULTS), 'group_auto_queue')
+        marker = self.store.update_job.call_args[1]['proposals']
+        self.assertEqual(marker['drafts'], [])
+        self.assertEqual(list(marker['skipped'].values()), ['assignee is not assigned to a managed repository'])
+
     def test_auto_queue_materializes_qualifying_proposals_with_caps_and_depth(self):
         self.store.snapshot.return_value['organizations'] = [dict(id='org')]
         task = self.candidate()
