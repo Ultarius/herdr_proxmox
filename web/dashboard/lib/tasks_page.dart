@@ -1114,7 +1114,7 @@ class _TasksPageState extends State<TasksPage> {
         ? 'Finished sessions are closed automatically. '
         : '';
     if (policy['auto_queue_proposals'] != true)
-      return '${budgetText}${reapText}Organization-wide follow-up is off. Individual groups may opt in; other proposals stay drafts.';
+      return '${budgetText}${reapText}Organization-wide follow-up is off. Individual groups may opt into queueing; every other finalized proposal stays a draft.';
     final paused = policy['paused'] == true ? 'Paused. ' : '';
     return '$budgetText${reapText}${paused}On: ${policy['max_per_meeting'] ?? 1}/meeting, '
         '${policy['max_open_per_agent'] ?? 2} open per agent, '
@@ -1126,15 +1126,24 @@ class _TasksPageState extends State<TasksPage> {
     final unavailable = '${result['unavailable'] ?? ''}';
     if (unavailable.isNotEmpty) return unavailable;
     final queued = (result['queued'] as List? ?? []).length;
+    final drafts = (result['drafts'] as List? ?? []).length;
+    // Report every distinct reason, not a sample: a meeting that skipped five
+    // proposals for three causes must not look like one that skipped two.
     final reasons = ((result['skipped'] as Map? ?? const {}).values)
         .map((value) => '$value')
         .toSet()
-        .take(2)
         .join('; ');
-    if (queued == 0 && reasons.isEmpty)
+    if (queued == 0 && drafts == 0 && reasons.isEmpty) {
       return 'Automation evaluated this review: no proposals.';
-    return 'Automation: $queued created and queued'
-        '${reasons.isEmpty ? '' : ' \u00b7 kept as drafts: $reasons'}';
+    }
+    final made = [
+      if (queued > 0) '$queued created and queued',
+      if (drafts > 0) '$drafts created as drafts',
+    ].join(', ');
+    // Every proposal was rejected before creation; without a prefix this
+    // would render as a dangling separator followed by the reasons.
+    if (made.isEmpty) return 'Automation: nothing created · $reasons';
+    return 'Automation: $made${reasons.isEmpty ? '' : ' · not created: $reasons'}';
   }
 
   Future<void> editAutomation(Map<String, dynamic> task) async {

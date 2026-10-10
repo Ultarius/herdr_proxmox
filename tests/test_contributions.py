@@ -1525,6 +1525,75 @@ class ContributionTests(unittest.TestCase):
         self.assertEqual(updated['policy']['max_per_meeting'], 2)
         self.assertTrue(updated['policy']['paused'])
 
+    def test_a_proposal_may_assign_an_agent_that_never_attended_the_meeting(self):
+        # Eligibility decides who can be assigned, not presence in the room.
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        task = self.candidate()
+        self.store.snapshot.return_value['profiles'].append(
+            dict(self.profile, id='absent', name='Nora'))
+        self.service.action('automation', dict(request_id='a-1', organization_id='org', auto_queue_proposals=True), 'admin', 'admin')
+        proposals = [dict(title='Hand it to Nora', description='Nora implements this follow-up.', profile_id='absent')]
+        self._meeting(task, proposals)
+        self.service.advance_proposals()
+        origin = self.service.get(task['id'])
+        marker = origin['auto_queue']['meeting']
+        self.assertEqual(marker['skipped'], {})
+        self.assertEqual(len(marker['queued']), 1)
+        created = self.service.get(origin['follow_up_tasks'][marker['queued'][0]])
+        self.assertEqual(created['profile_id'], 'absent')
+        self.assertEqual(created['assignment']['state'], 'queued')
+
+    def test_proposals_cannot_assign_ephemeral_template_instances(self):
+        # An instance profile dies with its task; a follow-up must target the
+        # persistent agent, so automatic materialization and manual acceptance
+        # both reject it even when the repository matches.
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        task = self.candidate()
+        self.store.snapshot.return_value['profiles'].append(
+            dict(self.profile, id='instance', name='Worker instance', ephemeral=True))
+        self.service.action('automation', dict(request_id='a-1', organization_id='org', auto_queue_proposals=True), 'admin', 'admin')
+        proposals = [dict(title='Instance follow-up', description='Must target the persistent agent.', profile_id='instance')]
+        self._meeting(task, proposals)
+        self.service.advance_proposals()
+        origin = self.service.get(task['id'])
+        marker = origin['auto_queue']['meeting']
+        self.assertEqual(marker['queued'], [])
+        self.assertEqual(marker['drafts'], [])
+        self.assertIn('not an eligible worktree agent', ' '.join(marker['skipped'].values()))
+        with self.assertRaisesRegex(ValueError, 'worktree agent'):
+            self.service.action('create', dict(self.body, request_id='create-instance', profile_id='instance'), 'admin', 'admin')
+
+    def test_proposals_are_never_read_from_a_discussion_still_running(self):
+        # A discussion writes its transcript incrementally, so a mid-conversation
+        # read could otherwise turn a partial reply into a task.
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        task = self.candidate()
+        self.service.action('automation', dict(request_id='a-1', organization_id='org', auto_queue_proposals=True), 'admin', 'admin')
+        proposals = [dict(title='Premature', description='Must not be created mid-conversation.', profile_id='worker')]
+        self._meeting(task, proposals, state='running')
+        self.service.advance_proposals()
+        origin = self.service.get(task['id'])
+        self.assertEqual(origin.get('follow_up_tasks'), None)
+        self.assertEqual(self.service.queued_assignments(), [])
+        # It is simply not evaluated yet, not marked as decided.
+        self.assertIsNone((origin.get('auto_queue') or {}).get('meeting'))
+        # Once the artifact is finalized the same meeting produces the task.
+        self._meeting(task, proposals, state='artifact_ready')
+        self.service.advance_proposals()
+        marker = self.service.get(task['id'])['auto_queue']['meeting']
+        self.assertEqual(len(marker['queued']), 1)
+
+    def test_a_proposal_reports_the_agent_name_rather_than_a_raw_id(self):
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        task = self.candidate()
+        self.store.snapshot.return_value['profiles'][0]['name'] = 'Nora'
+        proposals = [dict(title='Add tests', description='Cover the boundary case.', profile_id='worker')]
+        self._meeting(task, proposals)
+        self.service.advance_proposals()
+        proposals_shown = self.service.detail(task['id'])['meeting_results'][0]['proposals']
+        self.assertEqual(proposals_shown[0]['assignee'], 'Nora')
+        self.assertNotEqual(proposals_shown[0]['assignee'], 'worker')
+
     def test_auto_queue_materializes_qualifying_proposals_with_caps_and_depth(self):
         self.store.snapshot.return_value['organizations'] = [dict(id='org')]
         task = self.candidate()
@@ -1583,12 +1652,19 @@ class ContributionTests(unittest.TestCase):
         self.assertEqual(len(marker['queued']), 1)
         created = self.service.get(origin['follow_up_tasks'][marker['queued'][0]])
         self.assertEqual(created['assignment']['state'], 'queued')
-        # Without the group opt-in the same meeting stays draft-only.
+        # Without the group opt-in the same proposal is still created, but as a
+        # draft an operator must start; it never queues on its own.
         self.store.snapshot.return_value['groups'] = [dict(id='review', organization_id='org', name='Project Review')]
         task = self.service.get(task['id'])
         self._meeting(task, proposals, job_id='second')
         self.service.advance_proposals()
-        self.assertNotIn('second', self.service.get(task['id']).get('auto_queue', {}))
+        second = self.service.get(task['id'])['auto_queue']['second']
+        self.assertEqual(second['queued'], [])
+        self.assertEqual(len(second['drafts']), 1)
+        draft = self.service.get(self.service.get(task['id'])['follow_up_tasks'][second['drafts'][0]])
+        self.assertEqual(draft['state'], 'draft')
+        self.assertNotIn('assignment', draft)
+        self.assertNotIn(draft['id'], [q['task_id'] for q in self.service.queued_assignments()])
         # The organization pause still stops group-initiated work.
         self.store.snapshot.return_value['organizations'] = [dict(id='org')]
         self.service.action('automation', dict(request_id='a-1', organization_id='org', paused=True), 'admin', 'admin')
@@ -1613,9 +1689,11 @@ class ContributionTests(unittest.TestCase):
         self.service.advance_proposals()
         marker = self.service.get(task['id'])['auto_queue']['meeting']
         self.assertEqual(len(marker['queued']), 1)
+        # needs_review is honoured as a draft, not discarded.
+        self.assertEqual(len(marker['drafts']), 1)
         reasons = ' '.join(marker['skipped'].values())
-        self.assertIn('operator review', reasons)
         self.assertIn('another repository', reasons)
+        self.assertNotIn('operator review', reasons)
 
     def test_auto_queue_enforces_agent_and_daily_caps_and_replays_policy(self):
         self.store.snapshot.return_value['organizations'] = [dict(id='org')]
@@ -1654,7 +1732,7 @@ class ContributionTests(unittest.TestCase):
         self.service.advance_proposals()
         marker = self.service.get(task['id'])['auto_queue']['old']
         self.assertEqual(marker['queued'], [])
-        self.assertIn('before automatic follow-up', marker['unavailable'])
+        self.assertIn('before the current follow-up window', marker['unavailable'])
 
     def test_worker_reported_follow_up_creates_one_draft_task(self):
         task = self.candidate()

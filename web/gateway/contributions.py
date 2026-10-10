@@ -807,7 +807,14 @@ class Contributions:
 
     @staticmethod
     def discussion_proposals(job):
-        if job.get('state') != 'artifact_ready':
+        """Read proposals from a finalized discussion artifact.
+
+        Only an `artifact_ready` job carries a result, so a proposal can never
+        be read from a conversation still in progress. This stays free of store
+        reads: the dashboard resolves assignee names for display, and the
+        materializer validates eligibility against profiles it already holds.
+        """
+        if not isinstance(job, dict) or job.get('state') != 'artifact_ready':
             return []
         result = job.get('result')
         if not isinstance(result, str) or not result:
@@ -1116,11 +1123,14 @@ class Contributions:
         return dict(policy=policy, active=len(active), meetings=len(meetings), started=started)
 
     def advance_proposals(self):
-        """Materialize qualifying group proposals under the organization policy.
+        """Materialize group proposals into follow-up tasks.
 
-        A meeting qualifies when its organization enables automatic follow-up or
-        its own group opted into creating tasks. Organization limits and the
-        pause switch always apply.
+        Every finalized discussion that reports proposals creates its follow-up
+        tasks. Starting them automatically is the policy decision: an
+        organization that enables follow-up automation, or a group that enables
+        automatic creation, queues the work; everyone else gets drafts that an
+        operator starts explicitly. Organization limits and the pause switch
+        always apply.
         """
         with closing(self.connect()) as db:
             saved = {row[0]: json.loads(row[1]) for row in db.execute('SELECT id, data FROM policies')}
@@ -1128,15 +1138,16 @@ class Contributions:
         groups = {group['id']: group for group in self.store.snapshot(live_status=False).get('groups', [])}
         active = [organization for organization, policy in policies.items()
                   if policy['auto_queue_proposals'] and not policy['paused']]
-        creating = [group_id for group_id, group in groups.items()
-                    if group.get('create_tasks') is True and not group.get('removed_at')
-                    and not policies.get(group.get('organization_id'), AUTOMATION_DEFAULTS)['paused']]
-        if not active and not creating:
+        # Every live group may propose; only these start work unattended.
+        proposing = [group_id for group_id, group in groups.items()
+                     if not group.get('removed_at')
+                     and not policies.get(group.get('organization_id'), AUTOMATION_DEFAULTS)['paused']]
+        if not proposing and not active:
             return
         # Candidate pairs are unmarked meetings only, newest tasks first, so a
         # long history of evaluated reviews cannot starve new ones.
         org_placeholders = ','.join('?' for _ in active) or 'NULL'
-        group_placeholders = ','.join('?' for _ in creating) or 'NULL'
+        group_placeholders = ','.join('?' for _ in proposing) or 'NULL'
         with closing(self.connect()) as db:
             rows = db.execute(
                 "SELECT t.id, json_extract(t.data, '$.organization_id'), json_extract(m.value, '$.job_id'), "
@@ -1147,7 +1158,7 @@ class Contributions:
                 "AND (json_extract(t.data, '$.organization_id') IN (" + org_placeholders + ") "
                 "OR json_extract(m.value, '$.group_id') IN (" + group_placeholders + ")) "
                 "AND json_extract(t.data, '$.auto_queue.\"' || json_extract(m.value, '$.job_id') || '\"') IS NULL "
-                "ORDER BY t.rowid DESC LIMIT 50", [*active, *creating]).fetchall()
+                "ORDER BY t.rowid DESC LIMIT 50", [*active, *proposing]).fetchall()
         seen = set()
         for task_id, organization_id, job_id, meeting_at, group_id in rows:
             policy = policies.get(organization_id) or dict(AUTOMATION_DEFAULTS)
@@ -1157,11 +1168,12 @@ class Contributions:
             group = groups.get(group_id) or {}
             if group and (group.get('organization_id') != organization_id or group.get('removed_at')):
                 continue
-            if not (policy['auto_queue_proposals'] or group.get('create_tasks') is True):
-                continue
+            queue_allowed = bool(policy['auto_queue_proposals'] or group.get('create_tasks') is True)
             since = policy.get('auto_queue_since') or policy.get('updated_at') or ''
             if not policy['auto_queue_proposals']:
-                # A group opt-in evaluates meetings created since enablement.
+                # Draft creation follows the same freshness rule: a group only
+                # materializes discussions from its last configuration onward,
+                # so an upgrade cannot sweep up old history.
                 since = group.get('create_tasks_since') or group.get('updated_at') or ''
             if str(meeting_at or '') < since:
                 # Discussions created before automation was enabled never start
@@ -1171,8 +1183,8 @@ class Contributions:
                         task = self.get(task_id)
                         if (task.get('auto_queue') or {}).get(job_id) is None:
                             task.setdefault('auto_queue', {})[job_id] = dict(
-                                at=stamp(), queued=[], skipped={},
-                                unavailable='Discussion created before automatic follow-up was enabled.',
+                                at=stamp(), queued=[], drafts=[], skipped={},
+                                unavailable='Discussion created before the current follow-up window.',
                                 policy={k: policy[k] for k in AUTOMATION_DEFAULTS})
                             self.save(task, 'auto_queue_checked', 'group_auto_queue')
                 except (Busy, ValueError, OSError, sqlite3.Error):
@@ -1180,14 +1192,24 @@ class Contributions:
                 continue
             try:
                 with self.operation('task:' + task_id, timeout=0):
-                    self.materialize_meeting(task_id, job_id, policy, 'group_auto_queue')
+                    self.materialize_meeting(task_id, job_id, policy, 'group_auto_queue',
+                                             queue_allowed=queue_allowed)
             except Busy:
                 continue
             except (ValueError, OSError, sqlite3.Error, KeyError, TypeError) as error:
                 self.record_error(task_id, error, 'auto_queue', 'group_auto_queue')
 
-    def materialize_meeting(self, task_id, job_id, policy, actor):
-        """Create and queue qualifying proposals from one finalized discussion."""
+    def materialize_meeting(self, task_id, job_id, policy, actor, queue_allowed=True):
+        """Create follow-up tasks from one finalized discussion.
+
+        A finalized discussion that reports proposals always creates the
+        follow-up tasks. Whether they start on their own is the policy decision:
+        with automatic creation enabled they are queued, otherwise each stays a
+        draft that an operator starts explicitly. `needs_review` proposals are
+        always drafts, and limits that bound running work (assignee queue depth,
+        the daily automation cap) only apply to the queued path. A draft does
+        not occupy an agent.
+        """
         task = self.get(task_id)
         if (task.get('auto_queue') or {}).get(job_id) is not None:
             return
@@ -1195,14 +1217,14 @@ class Contributions:
         job = next((j for j in jobs if j.get('id') == job_id), None)
         if not job:
             task.setdefault('auto_queue', {})[job_id] = dict(
-                at=stamp(), queued=[], skipped={}, unavailable='Discussion record unavailable.',
+                at=stamp(), queued=[], drafts=[], skipped={}, unavailable='Discussion record unavailable.',
                 policy={k: policy[k] for k in AUTOMATION_DEFAULTS})
             self.save(task, 'auto_queue_checked', actor)
             return
         if job.get('state') != 'artifact_ready':
-            return  # Evaluate once the discussion finalizes; not marked yet.
+            return  # Evaluate only once the discussion has finalized; not marked yet.
         proposals = self.discussion_proposals(job)
-        queued, skipped = [], {}
+        queued, drafts, skipped = [], [], {}
         depth = ((task.get('source') or {}).get('depth') or 0) + 1
         if depth > policy['max_follow_up_depth']:
             skipped = {p['key']: 'follow-up depth limit reached' for p in proposals}
@@ -1210,27 +1232,29 @@ class Contributions:
             profiles = {p['id']: p for p in self.store.snapshot(live_status=False).get('profiles', [])}
             repository = self.path_for(task)
             for proposal in proposals:
-                if str(proposal.get('needs_review', '')).lower() in ('true', 'yes'):
-                    skipped[proposal['key']] = 'proposal requested operator review'
-                    continue
-                if len(queued) >= policy['max_per_meeting']:
-                    skipped[proposal['key']] = 'meeting limit reached'
-                    continue
                 profile = profiles.get(proposal['profile_id'])
-                if not profile or profile.get('archived') or not profile.get('use_worktree', True):
+                if (not profile or profile.get('archived') or profile.get('ephemeral')
+                        or not profile.get('use_worktree', True)):
                     skipped[proposal['key']] = 'assignee is not an eligible worktree agent'
                     continue
                 if not profile.get('project') or Path(profile['project']).resolve() != repository:
                     skipped[proposal['key']] = 'assignee is assigned to another repository'
                     continue
-                if self.open_work_count(proposal['profile_id']) >= policy['max_open_per_agent']:
-                    skipped[proposal['key']] = 'assignee queue limit reached'
+                review = str(proposal.get('needs_review', '')).lower() in ('true', 'yes')
+                wants_queue = queue_allowed and not review
+                if len(queued) + len(drafts) >= policy['max_per_meeting']:
+                    skipped[proposal['key']] = 'meeting limit reached'
                     continue
-                if self.auto_created_today(task['organization_id']) >= policy['daily_cap']:
-                    skipped[proposal['key']] = 'daily automation limit reached'
-                    continue
+                if wants_queue:
+                    if self.open_work_count(proposal['profile_id']) >= policy['max_open_per_agent']:
+                        skipped[proposal['key']] = 'assignee queue limit reached'
+                        continue
+                    if self.auto_created_today(task['organization_id']) >= policy['daily_cap']:
+                        skipped[proposal['key']] = 'daily automation limit reached'
+                        continue
                 try:
-                    self.perform('proposal', dict(meeting_id=job_id, proposal_key=proposal['key'], queue=True), task_id, actor)
+                    self.perform('proposal', dict(meeting_id=job_id, proposal_key=proposal['key'],
+                                                 queue=wants_queue), task_id, actor)
                 except (ValueError, OSError) as error:
                     skipped[proposal['key']] = str(error)[:300]
                     continue
@@ -1240,12 +1264,12 @@ class Contributions:
                     created = self.get(created_id)
                     created.setdefault('source', {})['auto_queued'] = dict(
                         at=stamp(), meeting_id=job_id, group_id=job.get('group_id'),
-                        policy={k: policy[k] for k in AUTOMATION_DEFAULTS})
+                        queued=wants_queue, policy={k: policy[k] for k in AUTOMATION_DEFAULTS})
                     self.save(created, 'auto_queued', actor)
-                    queued.append(proposal['key'])
+                    (queued if wants_queue else drafts).append(proposal['key'])
         task = self.get(task_id)
         task.setdefault('auto_queue', {})[job_id] = dict(
-            at=stamp(), queued=queued, skipped=skipped,
+            at=stamp(), queued=queued, drafts=drafts, skipped=skipped,
             policy={k: policy[k] for k in AUTOMATION_DEFAULTS})
         self.save(task, 'auto_queue_checked', actor)
 
@@ -1822,8 +1846,8 @@ class Contributions:
             'missing, and propose only necessary follow-up work. Read-only discussion; do not edit, commit, push or deploy. '
             'Do not treat missing validation as passed. In the final action-plan artifact include one fenced json object '
             'with task_proposals: an array (at most 10) of {title, description, profile_id, needs_review}. Each description must include '
-            'acceptance criteria and required checks. Use an existing individual repository worker profile ID from the group '
-            'roster. An empty proposal array is valid. ' + follow_up)
+            'acceptance criteria and required checks. Use an individual repository worker profile ID from the assignable agents '
+            'list in your group instructions; attending this discussion is not required. An empty proposal array is valid. ' + follow_up)
         parts = [
             'Task ' + task['id'] + ': ' + task['title'],
             'Task state: ' + task['state'],
@@ -2106,7 +2130,8 @@ class Contributions:
             base, sha = task_base(repository, requested)
             remote = remote_info(repository)
             profiles = self.store.snapshot(live_status=False)['profiles']
-            profile = next((p for p in profiles if p['id'] == body.get('profile_id') and not p.get('archived')), None)
+            profile = next((p for p in profiles if p['id'] == body.get('profile_id')
+                            and not p.get('archived') and not p.get('ephemeral')), None)
             if not profile or Path(profile['project']).resolve() != repository or not profile.get('use_worktree', True):
                 raise ValueError('Select a worktree agent assigned to this repository.')
             if profile.get('group_id'):
@@ -2293,7 +2318,7 @@ class Contributions:
                     'Read-only discussion; do not edit, commit, push or deploy. '
                     'Do not treat missing validation as passed. Propose only necessary follow-up work; do not recreate existing tasks. '
                     'In the final action-plan artifact include one fenced json object with task_proposals: an array (at most 10) of {title, description, profile_id, needs_review}. '
-                    'Each description must include acceptance criteria and required checks. Use an existing individual repository worker profile ID from the group roster. '
+                    'Each description must include acceptance criteria and required checks. Use an individual repository worker profile ID from the assignable agents list in your group instructions; attending this discussion is not required. '
                     'Also consider one evidence-based improvement that would make similar work easier next time: documentation, tooling or UX. Do not invent work. '
                     'An empty proposal array is valid. ' + follow_up)
                 context = ('Review task ' + task['id'] + ': ' + task['title'] + '\n' + task['description'][:2000] +

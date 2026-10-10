@@ -225,23 +225,29 @@ Use **Discuss with group** on a task to discuss:
 - Duplicate or superseded work.
 - Necessary follow-up tasks.
 
-Your chosen policy is **draft proposals first**. Therefore, a meeting can propose
-work, but it does not independently authorize new implementation.
+A finalized meeting records its proposals as follow-up tasks in the task's
+follow-up list: drafts unless automatic queueing is enabled. The meeting can
+propose work, but it does not independently authorize new implementation.
 
-You review the proposals and choose:
+You review each recorded draft and choose:
 
-- **Create draft**, to record the task for later.
-- **Create and queue**, to approve it and place it into the assignment queue.
+- **Queue** on the proposal to place it into the assignment queue, or
+- open the draft and **Start implementation** when you are ready.
+
+A proposal the meeting did not materialize (for example, a meeting older than
+the current follow-up window) still offers **Create draft** and
+**Create and queue**, which record or approve it on demand.
 
 Where available, automatic group-review settings can request a discussion when
 task evidence changes. That automates review initiation while preserving your
 approval of new work.
 
-An organization can additionally opt into bounded automatic follow-up (task
-**Overview → Automation settings → Organization follow-up automation**).
-Qualifying proposals are then created and queued through the same scheduler,
-subject to per-meeting, per-agent, depth, daily and pause limits. It is off by
-default and never covers publishing, merging or deployment.
+An organization or a single group can additionally opt into bounded automatic
+queueing (task **Overview → Automation settings → Organization follow-up
+automation**, or the group's setting). Qualifying proposals are then created and
+queued through the same scheduler, subject to per-meeting, per-agent, depth,
+daily and pause limits; `needs_review` proposals still wait as drafts. Queueing
+is off by default and never covers publishing, merging or deployment.
 
 ## 10. Complete delivery separately
 

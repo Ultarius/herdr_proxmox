@@ -230,6 +230,52 @@ class CollaborationTests(unittest.TestCase):
         self.assertIn('User message:\nFirst', prompts[0])
         self.assertIn('User message:\nSecond', prompts[1])
 
+    def test_the_group_prompt_states_the_proposal_contract_and_assignable_ids(self):
+        # Without this contract a discussion returns prose and no proposals are
+        # ever produced, and aliases are not the ids the gateway can resolve.
+        group = self.group()
+        # Template instances look like worktree agents but die with their task,
+        # so they must never be offered as follow-up assignees.
+        with self.store.lock, closing(self.store.connect()) as db, db:
+            self.store.put(db, 'profiles', dict(self.store.get(db, 'profiles', self.iris),
+                                                id='instance', name='Iris instance', ephemeral=True))
+        self.action('discuss', organization_id=self.org, group_id=group, prompt='Propose follow-ups')
+        self.drain()
+        for _ in range(3):
+            self.store.advance_discussions()
+            self.drain()
+        prompts = [a[3] for a, _ in self.calls
+                   if a[:2] == ('agent', 'prompt') and 'Discussion directory:' in a[3]]
+        self.assertTrue(prompts)
+        prompt = prompts[0]
+        self.assertIn('task_proposals', prompt)
+        self.assertIn('needs_review', prompt)
+        self.assertIn('empty array', prompt)
+        assignable = json.loads(prompt.split('Assignable repository agents (use these exact ids as profile_id; attending agents are marked true and need not attend this discussion to be assigned): ')[1].split('. ')[0])
+        self.assertEqual({entry['id'] for entry in assignable}, {self.max, self.iris})
+        self.assertTrue(all(entry['name'] for entry in assignable))
+        self.assertTrue(all(entry['attending'] is True for entry in assignable))
+
+    def test_a_proposal_may_name_an_agent_that_did_not_attend(self):
+        # A discussion often happens without the agent that will implement the
+        # follow-up. Attendance must not decide who can be assigned.
+        group = self.group()
+        outsider = self.hire(self.org, 'Nora')
+        meeting = self.action('discuss', organization_id=self.org, group_id=group, prompt='Propose follow-ups')
+        self.drain()
+        for _ in range(3):
+            self.store.advance_discussions()
+            self.drain()
+        prompts = [a[3] for a, _ in self.calls
+                   if a[:2] == ('agent', 'prompt') and 'Discussion directory:' in a[3]]
+        self.assertTrue(prompts)
+        listing = json.loads(prompts[0].split('as profile_id; attending agents are marked true and need not '
+                                              'attend this discussion to be assigned): ')[1].split('. ')[0])
+        ids = {entry['id']: entry['attending'] for entry in listing}
+        self.assertIn(outsider, ids)
+        self.assertFalse(ids[outsider], 'a non-attendee must still be assignable')
+        self.assertEqual(self.job(meeting)['state'], 'artifact_ready')
+
     def test_waiting_batch_does_not_starve_meetings_beyond_twenty(self):
         with self.store.lock, closing(self.store.connect()) as db, db:
             for index in range(21):

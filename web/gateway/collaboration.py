@@ -435,6 +435,26 @@ def execute(store, job):
 
     contexts = [workspace_context(group_run), *(workspace_context(r) for r in job['runs'])]
     roster = '\n'.join(f"{r['profile']['name']} ({r['profile']['role']}): {r['alias']}" for r in job['runs'])
+    # A proposal may name any eligible repository worker, not only an attendee:
+    # a discussion routinely happens without the agent that will implement the
+    # follow-up, so presence never decides assignment. Ephemeral template
+    # instances are excluded because they die with their task; the gateway
+    # still enforces the individual worktree and same-repository rule when the
+    # follow-up task is created.
+    assignable = []
+    with store.lock, closing(store.connect()) as db:
+        for row in db.execute('SELECT data FROM profiles WHERE organization_id=?', (job['organization_id'],)):
+            profile = json.loads(row[0])
+            if (profile.get('ephemeral') or profile.get('group_id') or profile.get('archived')
+                    or not profile.get('use_worktree', True)):
+                continue
+            assignable.append(dict(id=profile['id'], name=profile['name'],
+                                   attending=profile['id'] in {r['profile_id'] for r in job['runs']}))
+    assignable.sort(key=lambda entry: (not entry['attending'], entry['name']))
+    assignee_roster = ('Assignable repository agents (use these exact ids as profile_id; attending agents are '
+                       'marked true and need not attend this discussion to be assigned): '
+                       + json.dumps(assignable, ensure_ascii=False) + '. ') if assignable else (
+                           'No individual repository agent is available, so return an empty task_proposals array. ')
     store.update_job(job['id'], progress='Group agent coordinating members')
     discussion_policy = (
         'This is a read-only advisory discussion: do not modify projects or execute recommended actions. '
@@ -496,6 +516,11 @@ def execute(store, job):
         "within the file size limit. Include actions, evidence, risks, proposed owners and acceptance "
         "criteria only where useful for this task; do not invent requirements or owners. If nothing needs action, "
         "say so. Keep detailed round history in the transcript rather than repeating it in the artifact. "
+        f"Also include one fenced json object in the final artifact with task_proposals: an array (at most 10) of "
+        f"{{title, description, profile_id, needs_review}}. {assignee_roster} "
+        "Each description must include acceptance criteria and required checks. Use only the listed profile IDs. "
+        "Set needs_review=true for anything that changes scope, adds dependencies or touches sensitive areas; those "
+        "stay drafts for an operator. An empty array is a valid and common outcome. "
         f"Also write {transcript} as JSON with a contributions array. Each entry must have "
         "profile_id (from the roster below), name, round (integer 1 to 20), and content (Markdown under 6 KB). "
         f"Profile IDs: {json.dumps({r['alias']: r['profile_id'] for r in job['runs']})}. "

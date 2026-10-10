@@ -151,49 +151,58 @@ require inspection; completed chats and meetings keep their artifacts and
 archived transcripts, so they do not block rotation. The manual close/restart
 path remains available for every other case.
 
-## Automatic follow-up from group reviews
+## Follow-up from group reviews
 
-Group discussions produce draft proposals by default. Follow-up can be enabled
-per organization and per group:
+A finalized task discussion that reports proposals creates its follow-up tasks.
+Whether they start on their own is the policy decision, enabled per organization
+and per group:
 
-- `auto_queue_proposals` (organization, off by default) — qualifying proposals
-  from every group are created and queued without a separate operator click;
-- `create_tasks` (group, off by default) — this group may create and queue
-  qualifying proposals from its own discussions on its own;
-- `max_per_meeting` — how many proposals from one discussion may start;
-- `max_open_per_agent` — queued plus active work allowed per assignee;
-- `max_follow_up_depth` — how many follow-up generations are allowed;
-- `daily_cap` — automatically created tasks per organization per 24 hours;
+- `auto_queue_proposals` (organization, off by default) — created follow-ups
+  from every group are queued without a separate operator click;
+- `create_tasks` (group, off by default) — this group's created follow-ups are
+  queued on its own;
+- `max_per_meeting` — how many proposals from one discussion create a task,
+  queued or draft;
+- `max_open_per_agent` — queued plus active work allowed per assignee, applied
+  only when a follow-up would queue;
+- `max_follow_up_depth` — how many follow-up generations may create tasks;
+- `daily_cap` — automatically queued tasks per organization per 24 hours;
 - `paused` (organization) — kill switch; queued work stays queued and nothing
-  new starts automatically.
+  new is created or started automatically.
 
-A meeting is evaluated when its organization enables automatic follow-up or its
-own group opted into creating tasks. A proposal qualifies only when all of the
-following hold:
+Every task-linked meeting in a live, unpaused group is evaluated once finalized.
+A proposal creates a task only when all of the following hold:
 
 - its discussion is finalized and belongs to a task in review, completion or
   merged or closed state (terminal outcomes may need corrective follow-ups);
-- its assignee is an individual, non-archived worktree agent for the same
-  repository;
-- the follow-up depth, per-meeting, per-agent and daily limits are not exceeded;
-- the proposal did not set `needs_review=true`, which always keeps it a draft.
+- its assignee is an individual, non-archived, non-ephemeral worktree agent for
+  the same repository. Attendance is never a requirement: the discussion prompt
+  lists every eligible repository agent and marks who attended, so work can be
+  handed to an implementer who was not in the conversation;
+- the follow-up depth and per-meeting limits are not exceeded; the per-agent and
+  daily limits apply only when the follow-up would queue.
 
-Qualifying proposals go through the same task creation, assignment queue and
+A proposal that sets `needs_review=true` becomes a draft even when automatic
+queueing is enabled.
+
+Created follow-ups go through the same task creation, assignment queue and
 verified handoff path as manual work. Failures and uncertainty (repository
-unavailable, invalid assignee, capacity) leave the proposal as a draft and record
-the reason on the task. Enabling the policy starts a fresh evaluation window:
-discussions created before it are recorded as evaluated and are never queued
-retroactively. Each evaluation is recorded once per meeting. The group enablement timestamp
-(`create_tasks_since`) changes only when task creation is enabled; ordinary
-group edits preserve it. Disabling and re-enabling starts a new window.
+unavailable, invalid assignee, capacity) create nothing and record the reason
+on the task. Enabling a policy starts a fresh evaluation window: discussions
+created before it are recorded as evaluated and are never created
+retroactively. Each evaluation is recorded once per meeting. The group
+enablement timestamp (`create_tasks_since`) changes only when task creation is
+enabled; ordinary group edits preserve it. Disabling and re-enabling starts a
+new window.
 
 Delivery remains operator-controlled: no automatic publication, merge, base
-update or deployment. Every automatically created task records its source
-meeting, proposal, depth and the policy snapshot in force, appears in activity
-and can have its queued assignment cancelled.
+update or deployment. Every created task records its source meeting, proposal,
+depth, whether it was queued or left as a draft, and the policy snapshot in
+force; it appears in activity and can have its queued assignment cancelled.
 
-When the policy is enabled, the discussion instruction states it explicitly and
-asks agents to propose sparingly, with acceptance criteria and checks.
+When automatic queueing is enabled, the discussion instruction states it
+explicitly and asks agents to propose sparingly, with acceptance criteria and
+checks.
 
 A worker can also report an optional `follow_up` object in its completion
 receipt. It is recorded once per commit as a draft task with recorded depth for
