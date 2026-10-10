@@ -1087,6 +1087,16 @@ class OrganizationStore:
             raise ValueError('Legacy session has no verifiable pane identity; inspect its run.')
         if len([item for item in live if item.get('pane_id') == pane]) != 1:
             raise ValueError('Legacy session pane has ambiguous agent ownership; inspect its run.')
+        response = self.command('pane', 'list', '--workspace', workspace_id)
+        panes = response if isinstance(response, list) else response.get('panes') if isinstance(response, dict) else None
+        if not isinstance(panes, list) or any(not isinstance(item, dict) for item in panes):
+            raise ValueError('Cannot verify legacy session pane inventory.')
+        matches = [item for item in panes if item.get('pane_id') == pane]
+        if len(matches) != 1:
+            raise ValueError('Legacy session pane is absent or ambiguous; inspect its run.')
+        # Herdr reports no cwd or worktree on a workspace, so the pane's own
+        # directory is the authoritative checkout. A workspace-level path is
+        # still preferred if a future version adds one.
         response = self.command('workspace', 'list')
         workspaces = response if isinstance(response, list) else response.get('workspaces') if isinstance(response, dict) else None
         if not isinstance(workspaces, list) or any(not isinstance(item, dict) for item in workspaces):
@@ -1096,18 +1106,13 @@ class OrganizationStore:
             raise ValueError('Legacy session workspace is absent or ambiguous; inspect its run.')
         worktree = owners[0].get('worktree')
         checkout = worktree.get('checkout_path') if isinstance(worktree, dict) else None
-        checkout = checkout or owners[0].get('cwd')
+        checkout = (checkout or owners[0].get('cwd')
+                    or matches[0].get('cwd') or matches[0].get('foreground_cwd'))
         expected = run.get('worktree_path') or run.get('source_project') or run['profile'].get('project')
         if not isinstance(checkout, str) or not checkout or not isinstance(expected, str) or not expected:
             raise ValueError('Legacy session checkout identity is unavailable; inspect its run.')
         if project_directory(self.projects, checkout) != project_directory(self.projects, expected):
             raise ValueError('Legacy session checkout changed; the pane was not closed.')
-        response = self.command('pane', 'list', '--workspace', workspace_id)
-        panes = response if isinstance(response, list) else response.get('panes') if isinstance(response, dict) else None
-        if not isinstance(panes, list) or any(not isinstance(item, dict) for item in panes):
-            raise ValueError('Cannot verify legacy session pane inventory.')
-        if len([item for item in panes if item.get('pane_id') == pane]) != 1:
-            raise ValueError('Legacy session pane is absent or ambiguous; inspect its run.')
         return agent
 
     def check_contract(self):

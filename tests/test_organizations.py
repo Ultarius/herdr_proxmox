@@ -379,12 +379,17 @@ class OrganizationTests(unittest.TestCase):
         self.drain()
         run = self.store.update_job(run_id, agent_session=None)
         self.agents[run['alias']].pop('agent_session', None)
-        inventory = dict(cwd=run['source_project'], panes=[dict(pane_id=run['pane_id'])])
+        inventory = dict(cwd=run['source_project'], panes=None)
         original = self.store.command
         def command(*args, **kwargs):
             if args == ('workspace', 'list'):
-                return {'workspaces': [dict(workspace_id=run['pane_id'].split(':')[0], cwd=inventory['cwd'])]}
+                # Herdr 0.9.3 reports no cwd or worktree on a workspace, so the
+                # pane directory is the only checkout evidence available.
+                return {'workspaces': [dict(workspace_id=run['pane_id'].split(':')[0],
+                                            agent_status='idle', label='Agent')]}
             if args[:2] == ('pane', 'list'):
+                if inventory['panes'] is None:
+                    return {'panes': [dict(pane_id=run['pane_id'], cwd=inventory['cwd'])]}
                 return {'panes': inventory['panes']}
             return original(*args, **kwargs)
         self.store.command = command
