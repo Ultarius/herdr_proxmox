@@ -172,6 +172,88 @@ class OrganizationTests(unittest.TestCase):
         finally:
             server.shutdown(); server.server_close(); thread.join()
 
+    def test_an_orphaned_pane_is_archived_closed_and_reverified_first(self):
+        # After a Herdr restart the pane returns as a shell holding no agent.
+        org = self.organization()
+        profile = self.hire(org)
+        run_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        run = next(j for j in self.store.job_records() if j['id'] == run_id)
+        worktree = run.get('worktree_path') or run.get('source_project')
+        shell = dict(pane_id=run['pane_id'], cwd=worktree, agent_status='unknown')
+
+        original = self.store.command
+        reads = {'panes': 0}
+
+        def inventory(agent_alive):
+            def command(*args, **kwargs):
+                if args[:2] == ('agent', 'list'):
+                    return ([dict(name=run['alias'], pane_id=run['pane_id'], agent_status='idle')]
+                            if agent_alive else [])
+                if args[:2] == ('workspace', 'list'):
+                    return [dict(workspace_id='w1')]
+                if args[:2] == ('pane', 'list'):
+                    reads['panes'] += 1
+                    return [shell]
+                return original(*args, **kwargs)
+            return command
+
+        # The agent is gone but the pane is still a shell in its checkout.
+        self.store.command = inventory(False)
+        try:
+            before = len(self.calls)
+            result = self.store.manage_session(
+                dict(job_id=run_id, organization_id=org, mode='finish', inspected=True,
+                     request_id='orphan-test'), 'admin')
+        finally:
+            self.store.command = original
+        finished = next(j for j in self.store.job_records() if j['id'] == run_id)
+        self.assertEqual(finished['state'], 'finished')
+        self.assertEqual(finished['session_close_status'], 'orphaned')
+        self.assertIsNotNone(finished.get('session_closed_at'))
+        self.assertEqual(result['archive_id'], finished['session_archive_id'])
+        closed = [args for args, _ in self.calls[before:] if args[:2] == ('pane', 'close')]
+        self.assertEqual(len(closed), 1)
+        # The pane is read twice: once to prove it, once after archiving.
+        self.assertGreaterEqual(reads['panes'], 2)
+
+    def test_an_orphaned_pane_that_starts_running_is_left_alone(self):
+        # Archiving takes time; a pane that begins running during capture must
+        # not be closed on the strength of a stale reading.
+        org = self.organization()
+        profile = self.hire(org)
+        run_id = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        run = next(j for j in self.store.job_records() if j['id'] == run_id)
+        worktree = run.get('worktree_path') or run.get('source_project')
+        shell = dict(pane_id=run['pane_id'], cwd=worktree, agent_status='unknown')
+        original = self.store.command
+        phase = {'listed': 0}
+
+        def command(*args, **kwargs):
+            if args[:2] == ('agent', 'list'):
+                return []  # The original agent never comes back.
+            if args[:2] == ('workspace', 'list'):
+                return [dict(workspace_id='w1')]
+            if args[:2] == ('pane', 'list'):
+                phase['listed'] += 1
+                # The second reading shows a live agent now holding the pane.
+                if phase['listed'] > 1:
+                    return [dict(shell, agent_status='working')]
+                return [shell]
+            return original(*args, **kwargs)
+
+        self.store.command = command
+        try:
+            with self.assertRaisesRegex(ValueError, 'changed while its session was archived'):
+                self.store.manage_session(dict(job_id=run_id, organization_id=org, mode='finish',
+                                               inspected=True, request_id='orphan-raced'), 'admin')
+        finally:
+            self.store.command = original
+        self.assertFalse(any(args[:2] == ('pane', 'close') for args, _ in self.calls))
+        left = next(j for j in self.store.job_records() if j['id'] == run_id)
+        self.assertIsNone(left.get('session_closed_at'))
+
     def test_finish_archives_marks_finished_and_frees_the_agent_slot(self):
         org = self.organization()
         profile = self.hire(org)
@@ -451,6 +533,16 @@ class OrganizationTests(unittest.TestCase):
 
     def drain(self):
         self.store.wait_idle(timeout=5)
+
+    def test_hiring_is_blocked_until_the_cli_and_integration_are_ready(self):
+        # Otherwise a new agent silently cannot report state or be resumed.
+        org = self.organization()
+        self.store.runtime_ready = lambda runtime: 'OpenCode has no Herdr integration.'
+        with self.assertRaisesRegex(ValueError, 'no Herdr integration'):
+            self.hire(org, runtime='opencode')
+        self.store.runtime_ready = lambda runtime: None
+        profile = self.hire(org, runtime='opencode')
+        self.assertTrue(profile)
 
     def test_launch_rejects_unconfigured_runtime_before_creating_workspace(self):
         org = self.organization()

@@ -19,6 +19,7 @@ class _CliSetupPageState extends State<CliSetupPage> {
   final terminal = Terminal(maxLines: 2000);
   final paste = TextEditingController();
   List<Map<String, dynamic>> clis = [];
+  Map<String, dynamic>? integrations;
   String? session;
   String? selected;
   String? error;
@@ -61,7 +62,12 @@ class _CliSetupPageState extends State<CliSetupPage> {
       if (mounted &&
           connection.state.connected &&
           epoch == connection.generation) {
-        setState(() => clis = List<Map<String, dynamic>>.from(data['clis']));
+        setState(() {
+          clis = List<Map<String, dynamic>>.from(data['clis']);
+          integrations = data['integrations'] is Map
+              ? Map<String, dynamic>.from(data['integrations'] as Map)
+              : null;
+        });
       }
     } catch (e) {
       showError(e);
@@ -130,6 +136,29 @@ class _CliSetupPageState extends State<CliSetupPage> {
       if (!mounted || epoch != generation || !connection.state.connected) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('${data['detail'] ?? 'Account verified.'}')),
+      );
+      await refresh();
+    } catch (e) {
+      showError(e);
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> installIntegration(String cli) async {
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    final epoch = ++generation;
+    try {
+      final data = await connection.request(
+        'cli-setup/install_integration',
+        {'cli': cli},
+      );
+      if (!mounted || epoch != generation || !connection.state.connected) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${data['detail'] ?? 'Herdr integration installed.'}')),
       );
       await refresh();
     } catch (e) {
@@ -294,6 +323,55 @@ class _CliSetupPageState extends State<CliSetupPage> {
                   label: const Text('Test account'),
                 ),
               ),
+            if (cli['installed'] == true &&
+                (cli['integration'] as Map?)?['current'] == true)
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: Text(
+                  'Herdr integration '
+                  '${(cli['integration'] as Map)['version'] ?? ''} — connected',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: Color(0xff9fd39f),
+                  ),
+                ),
+              ),
+            if (cli['installed'] == true &&
+                (cli['integration'] as Map?)?['current'] != true)
+              Padding(
+                padding: const EdgeInsets.only(top: 16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      (cli['integration'] as Map?)?['installed'] == true
+                          ? 'Herdr integration is outdated, needs repair or could '
+                              'not be verified. Until it is current this agent cannot '
+                              'report working or blocked state, and finished sessions '
+                              'cannot be resumed.'
+                          : 'Herdr integration missing. Without it this agent cannot '
+                              'report working or blocked state, and finished sessions '
+                              'cannot be resumed.',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xffaaaaaa),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      onPressed: busy || session != null
+                          ? null
+                          : () => installIntegration(cli['id'] as String),
+                      icon: const Icon(Icons.extension_outlined, size: 18),
+                      label: Text(
+                        (cli['integration'] as Map?)?['installed'] == true
+                            ? 'Update Herdr integration'
+                            : 'Install Herdr integration',
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             if (session != null && !active)
               const Padding(
                 padding: EdgeInsets.only(top: 8),
@@ -337,6 +415,29 @@ class _CliSetupPageState extends State<CliSetupPage> {
     ),
   );
 
+  String integrationSummary(Map<String, dynamic> summary) {
+    final connected = summary['connected'] ?? 0;
+    final outdated = summary['outdated'] ?? 0;
+    final missing = summary['missing'] ?? 0;
+    final tracked = connected + outdated + missing;
+    if (tracked == 0) return '';
+    if (connected == tracked) {
+      return 'Herdr integration: all $tracked installed agents are connected. '
+          'They report working/blocked state and resume finished sessions.';
+    }
+    String names(String key) => ((summary[key] as List?) ?? const [])
+        .map((name) => '$name')
+        .join(', ');
+    final stale = names('outdated_names');
+    final absent = names('missing_names');
+    final parts = <String>[];
+    if (stale.isNotEmpty) parts.add('outdated: $stale');
+    if (absent.isNotEmpty) parts.add('not installed: $absent');
+    return 'Herdr integration: $connected of $tracked installed agents current'
+        '${parts.isEmpty ? '' : ' — ${parts.join('; ')}'}. '
+        'Agents without a current integration cannot report state or resume sessions.';
+  }
+
   @override
   Widget build(BuildContext context) => JuiceBuilder<DashboardBloc>(
     builder: (context, bloc, status) => Scaffold(
@@ -378,6 +479,18 @@ class _CliSetupPageState extends State<CliSetupPage> {
                 const Text(
                   'Connect your coding agents to their providers. Choose an account below to open its sign-in terminal.',
                 ),
+                if (integrations != null && (integrations!['total'] ?? 0) > 0) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    integrationSummary(integrations!),
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: integrations!['connected'] == integrations!['total']
+                          ? const Color(0xff9fd39f)
+                          : const Color(0xffd8b06a),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 12),
                 LayoutBuilder(
                   builder: (context, constraints) {

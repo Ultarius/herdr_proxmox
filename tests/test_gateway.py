@@ -148,7 +148,12 @@ class GatewayTests(unittest.TestCase):
                 response = json.load(urlopen(Request(base + '/api/snapshot', headers=headers)))
                 self.assertEqual(response['workspaces'][0]['workspace_id'], 'w1')
                 self.assertEqual(response['agents'][0]['name'], 'external-agent')
-                command.side_effect = ValueError('server_not_running')
+                # The stopped snapshot must be recognized from the structured
+                # error code, not from words that no longer appear in the
+                # parsed message.
+                command.side_effect = gateway.HerdrError(
+                    'no herdr server is running at /run/herdr.sock; run `herdr` to start or attach it',
+                    'server_not_running')
                 stopped = json.load(urlopen(Request(base + '/api/snapshot', headers=headers)))
                 self.assertEqual(stopped, {'herdr_server':'stopped', 'workspaces':[], 'agents':[]})
                 with self.assertRaises(HTTPError) as error:

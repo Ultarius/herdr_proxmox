@@ -1110,10 +1110,13 @@ class _TasksPageState extends State<TasksPage> {
         '${policy['daily_session_cap']} starts/day',
     ].join(', ');
     final budgetText = budget.isEmpty ? '' : 'Shared budget: $budget. ';
+    final reapText = policy['reap_finished_sessions'] == true
+        ? 'Finished sessions are closed automatically. '
+        : '';
     if (policy['auto_queue_proposals'] != true)
-      return '${budgetText}Organization-wide follow-up is off. Individual groups may opt in; other proposals stay drafts.';
+      return '${budgetText}${reapText}Organization-wide follow-up is off. Individual groups may opt in; other proposals stay drafts.';
     final paused = policy['paused'] == true ? 'Paused. ' : '';
-    return '$budgetText${paused}On: ${policy['max_per_meeting'] ?? 1}/meeting, '
+    return '$budgetText${reapText}${paused}On: ${policy['max_per_meeting'] ?? 1}/meeting, '
         '${policy['max_open_per_agent'] ?? 2} open per agent, '
         'depth ${policy['max_follow_up_depth'] ?? 1}, '
         '${policy['daily_cap'] ?? 5}/day.';
@@ -1139,6 +1142,8 @@ class _TasksPageState extends State<TasksPage> {
     final policy = _orgPolicy(task);
     var enabled = policy['auto_queue_proposals'] == true;
     var paused = policy['paused'] == true;
+    var reap = policy['reap_finished_sessions'] == true;
+    var reapOrphaned = policy['reap_orphaned_panes'] == true;
     final perMeeting = TextEditingController(
       text: '${policy['max_per_meeting'] ?? 1}',
     );
@@ -1198,6 +1203,25 @@ class _TasksPageState extends State<TasksPage> {
                   _limitField(sessions, 'Max active sessions (organization)'),
                   _limitField(meetings, 'Max active meetings (organization)'),
                   _limitField(starts, 'Daily session starts (organization)'),
+                  SwitchListTile(
+                    value: reap,
+                    onChanged: (value) => update(() => reap = value == true),
+                    title: const Text('Close finished sessions automatically'),
+                    subtitle: const Text(
+                      'Reclaims memory by archiving and closing sessions whose task already finished. They stay resumable from session archives; an agent that is still working is never closed.',
+                    ),
+                  ),
+                  SwitchListTile(
+                    value: reapOrphaned,
+                    onChanged: (value) =>
+                        update(() => reapOrphaned = value == true),
+                    title: const Text(
+                      'Reclaim panes orphaned by a restart',
+                    ),
+                    subtitle: const Text(
+                      'After a Herdr restart, panes can return as plain shells that no agent holds. This closes them once the pane is proven to run nothing and to sit in the recorded checkout. Ambiguous panes are left for you.',
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -1211,6 +1235,8 @@ class _TasksPageState extends State<TasksPage> {
               onPressed: () => Navigator.pop(context, {
                 'auto_queue_proposals': enabled,
                 'paused': paused,
+                'reap_finished_sessions': reap,
+                'reap_orphaned_panes': reapOrphaned,
                 'max_per_meeting': int.tryParse(perMeeting.text.trim()),
                 'max_open_per_agent': int.tryParse(perAgent.text.trim()),
                 'max_follow_up_depth': int.tryParse(depth.text.trim()),

@@ -67,11 +67,14 @@ MAX_ACTIVE_EXECUTIONS = 4
 # and the pause switch. Budget values of 0 keep the legacy behavior.
 AUTOMATION_DEFAULTS = dict(auto_queue_proposals=False, max_per_meeting=1, max_open_per_agent=2,
                            max_follow_up_depth=1, daily_cap=5, paused=False,
-                           max_active_sessions=0, max_active_meetings=0, daily_session_cap=0)
+                           max_active_sessions=0, max_active_meetings=0, daily_session_cap=0,
+                           reap_finished_sessions=False, reap_orphaned_panes=False)
 AUTOMATION_LIMITS = (('max_per_meeting', 0, 10), ('max_open_per_agent', 0, 50),
                      ('max_follow_up_depth', 0, 10), ('daily_cap', 0, 100),
                      ('max_active_sessions', 0, 50), ('max_active_meetings', 0, 10),
                      ('daily_session_cap', 0, 500))
+# Above this many notified tasks, a scoped pass costs more than a full one.
+SCOPED_TASK_LIMIT = 256
 
 
 def stamp():
@@ -198,6 +201,7 @@ class Contributions:
         self.stopped = threading.Event()
         self.thread = None
         self.validation = None
+        self.task_cursors = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self.connect()) as db, db:
             from notifications import schema
@@ -292,6 +296,7 @@ class Contributions:
                 try:
                     self.poll_once()
                     self.reap_instances()
+                    self.reap_sessions()
                 except (ValueError, OSError, sqlite3.Error):
                     pass
                 next_housekeeping = time.monotonic() + 60
@@ -325,10 +330,31 @@ class Contributions:
         if task_ids is not None:
             if not task_ids:
                 return []
-            args = sorted(task_ids)[:256]
-            condition += ' AND id IN (' + ','.join('?' for _ in args) + ')'
+            if len(task_ids) > SCOPED_TASK_LIMIT:
+                # Too many to scope cheaply. Reconcile everything rather than
+                # silently dropping the tail and waiting for the safety pass.
+                task_ids = None
+            else:
+                args = sorted(task_ids)
+                condition += ' AND id IN (' + ','.join('?' for _ in args) + ')'
         with closing(self.connect()) as db:
-            return [row[0] for row in db.execute('SELECT id FROM tasks WHERE ' + condition + ' ORDER BY rowid LIMIT ?', [*args, limit])]
+            total = db.execute('SELECT COUNT(*) FROM tasks WHERE ' + condition, args).fetchone()[0]
+            if not total:
+                return []
+            offset = 0
+            if task_ids is None:
+                # A stable ORDER BY with a fixed LIMIT starves every row past
+                # the first page for as long as those tasks keep matching, so
+                # each pass resumes where the previous one stopped.
+                offset = self.task_cursors.get(condition, 0) % total
+                self.task_cursors[condition] = (offset + limit) % total
+            else:
+                # A scoped pass was told exactly which tasks woke it; honour
+                # them all rather than silently reconciling only the first page.
+                limit = max(limit, len(args))
+            rows = db.execute('SELECT id FROM tasks WHERE ' + condition +
+                              ' ORDER BY rowid LIMIT ? OFFSET ?', [*args, limit, offset]).fetchall()
+            return [row[0] for row in rows]
 
     def automatic_tasks(self, task_ids=None):
         ids = self.select_task_ids("json_extract(data, '$.auto_validate')=1", task_ids)
@@ -1027,7 +1053,7 @@ class Contributions:
         with self.operation('policy:' + organization_id):
             policy = self.policy(organization_id)
             was_enabled = policy['auto_queue_proposals']
-            for key in ('auto_queue_proposals', 'paused'):
+            for key in ('auto_queue_proposals', 'paused', 'reap_finished_sessions', 'reap_orphaned_panes'):
                 if key in body:
                     if not isinstance(body[key], bool):
                         raise ValueError('Invalid automation policy value.')
@@ -1869,6 +1895,54 @@ class Contributions:
         task['profile_id'] = instance['id']
         task['assigned_agent'] = {k: template.get(k) for k in ('id', 'name', 'role', 'runtime')}
         return self.save(task, 'instance_launch', actor)
+
+    def reap_sessions(self):
+        """Close finished sessions and reclaim panes orphaned by a restart.
+
+        Template instances are reaped with their task; general organization
+        sessions are not, so a finished agent can hold its process and pane
+        indefinitely. A Herdr restart additionally leaves panes restored as
+        shells that no run can close. Only executions the same evidence
+        already accepted as finished, and panes proven orphaned by
+        manage_session, are eligible; an idle pane alone never authorizes
+        closure. Both paths archive first, so a reclaimed session stays
+        resumable instead of merely being discarded.
+        """
+        organizations = set()
+        with closing(self.connect()) as db:
+            saved = {row[0]: dict(AUTOMATION_DEFAULTS, **json.loads(row[1]))
+                     for row in db.execute('SELECT id, data FROM policies')}
+        # Read the policies table directly. The dashboard snapshot is limited to
+        # the newest tasks and calls GitHub, so deriving reaping from it would
+        # miss organizations outside that page and spend a network round trip
+        # every housekeeping pass.
+        organizations = {org for org, policy in saved.items()
+                         if policy.get('reap_finished_sessions') or policy.get('reap_orphaned_panes')}
+        if not organizations:
+            return
+        jobs = self.store.snapshot(live_status=False).get('jobs', [])
+        policies = saved
+        for run in [j for j in jobs if j.get('kind') == 'launch' and j.get('organization_id') in organizations
+                    and not j.get('session_closed_at')]:
+            policy = policies.get(run.get('organization_id'), {})
+            finished = run.get('state') == 'finished'
+            if finished and policy.get('reap_finished_sessions'):
+                pass
+            elif run.get('state') == 'persona_sent' and policy.get('reap_orphaned_panes'):
+                pass  # manage_session proves the orphan before closing anything.
+            else:
+                continue
+            try:
+                with self.operation('task:' + str(run.get('task_id') or ''), timeout=0):
+                    self.store.manage_session(dict(mode='finish', job_id=run['id'],
+                                                   organization_id=run['organization_id'],
+                                                   inspected=True), 'task_reaper')
+            except Busy:
+                continue
+            except (ValueError, OSError, sqlite3.Error):
+                # An unverified, absent or still-active session is left for an
+                # operator; reclamation never advances on a failed inspection.
+                continue
 
     def reap_instances(self):
         """Archive and close template instances whose task reached a terminal state."""

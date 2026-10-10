@@ -33,6 +33,9 @@ class Mailbox:
 
     def clear(self):
         # Compatibility with Event consumers: wait already drains atomically.
+        # This must stay a no-op. An Event consumer that waits and then clears
+        # (see IntegrationWatcher) would otherwise spin once anything is
+        # pending, because clearing is the only thing bounding its loop.
         pass
 
     def wait(self, timeout=None):

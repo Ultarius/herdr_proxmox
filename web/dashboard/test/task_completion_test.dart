@@ -643,11 +643,14 @@ void main() {
     await tester.tap(find.text('Edit policy'));
     await tester.pumpAndSettle();
     expect(find.text('Follow-up automation policy'), findsOneWidget);
+    await tester.tap(find.text('Close finished sessions automatically'));
+    await tester.pumpAndSettle();
     await tester.tap(find.text('Save policy'));
     await tester.pumpAndSettle();
     expect(posts.single['organization_id'], 'org');
     expect(posts.single['auto_queue_proposals'], true);
     expect(posts.single['daily_cap'], 5);
+    expect(posts.single['reap_finished_sessions'], true);
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
     await connection.disconnect();

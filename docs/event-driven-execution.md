@@ -23,6 +23,12 @@ A 10-second safety scan still detects file receipts and changes made outside the
 notification path. Housekeeping runs on elapsed time every 60 seconds rather
 than every sixth wakeup. Acceptance deadlines can wake the scheduler earlier.
 
+Scoping is bounded, never lossy. A batch naming more than 256 tasks widens to a
+full scan instead of dropping the tail, and a scoped pass reconciles every task
+it was woken for. Full scans are page-limited for predictable cost, so each pass
+resumes where the last stopped rather than re-reading the same first page; a
+task that keeps matching is therefore never starved behind it.
+
 ## Runtime lifecycle subscription
 
 On Unix hosts the gateway opens the Herdr newline-JSON socket and subscribes to
@@ -46,6 +52,10 @@ Configuration:
 - Windows currently uses periodic checks; named-pipe streaming is not implemented.
 - A runtime that cannot establish a subscription uses periodic checks. A runtime
   that disconnects after establishing one waits for verified recovery.
+- The gate is bounded. Recovery normally completes in seconds; if it has not
+  recovered within five minutes the gateway reports `degraded` and stops
+  blocking, because refusing every launch and prompt indefinitely is a worse
+  failure than acting under per-command identity checks. Reads are never gated.
 
 The notification response includes runtime state, reason and last successful
 snapshot time. Protocol-shaped regression tests cover acknowledgement order,

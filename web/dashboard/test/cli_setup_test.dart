@@ -266,4 +266,115 @@ void main() {
     coordinator.dispose();
     await BlocScope.reset();
   });
+
+  testWidgets('integration banner reports which agents are connected',
+      (tester) async {
+    tester.view.physicalSize = const Size(1200, 1800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final installed = <String, Map<String, dynamic>>{};
+    final connection = DashboardBloc(
+      client: MockClient((request) async {
+        if (request.url.path == '/api/snapshot') {
+          return http.Response('{"workspaces":[],"agents":[]}', 200);
+        }
+        if (request.url.path == '/api/cli-setup') {
+          return http.Response(
+            jsonEncode({
+              'clis': [
+                {
+                  'id': 'opencode',
+                  'name': 'OpenCode',
+                  'installed': true,
+                  'status': 'credentials_detected',
+                  'detail': 'Stored provider credentials detected.',
+                  'integration': {
+                    'installed': true,
+                    'current': true,
+                    'integration': 'opencode',
+                    'version': 'v13',
+                    'expected': '',
+                    'state': 'current',
+                    'detail': 'Herdr integration connected (v13).',
+                  },
+                },
+                {
+                  'id': 'agy',
+                  'name': 'Antigravity',
+                  'installed': true,
+                  'status': 'unknown',
+                  'detail': 'Check authentication in the setup terminal.',
+                  'integration': {
+                    'installed': false,
+                    'integration': 'antigravity-cli',
+                    'version': '',
+                    'expected': '',
+                    'state': 'not_installed',
+                    'detail': 'Install the Herdr integration.',
+                  },
+                },
+                {
+                  'id': 'claude',
+                  'name': 'Claude Code',
+                  'installed': true,
+                  'status': 'configured',
+                  'detail': 'Signed in via claude.ai; run Test account.',
+                  'integration': {
+                    'installed': true,
+                    'current': false,
+                    'integration': 'claude',
+                    'version': 'v3',
+                    'expected': 'v6',
+                    'state': 'outdated',
+                    'detail': 'Herdr integration is outdated (v3 < v6).',
+                  },
+                },
+              ],
+              'integrations': {
+                'connected': 1,
+                'outdated': 1,
+                'missing': 1,
+                'total': 3,
+                'names': ['OpenCode'],
+                'outdated_names': ['Claude Code'],
+                'missing_names': ['Antigravity'],
+              },
+            }),
+            200,
+          );
+        }
+        return http.Response('{}', 200);
+      }),
+    );
+    BlocScope.register<DashboardBloc>(
+      () => connection,
+      lifecycle: BlocLifecycle.permanent,
+    );
+    final loaded =
+        connection.stream.firstWhere((_) => connection.state.refreshed != null);
+    connection.connect('token');
+    await loaded;
+    final coordinator = AppCoordinator();
+    await tester.pumpWidget(MaterialApp.router(routerConfig: coordinator));
+    coordinator.navigate(CliSetupRoute());
+    await tester.pumpAndSettle();
+    expect(find.textContaining('1 of 3 installed agents current'), findsOneWidget);
+    expect(find.textContaining('not installed: Antigravity'), findsOneWidget);
+    expect(installed, isEmpty);
+    await tester.ensureVisible(find.text('Install Herdr integration'));
+    expect(find.text('Install Herdr integration'), findsOneWidget);
+    expect(find.textContaining('Herdr integration v13 — connected'), findsOneWidget);
+    // An outdated integration is installed but not current: it must never be
+    // presented as connected, and must offer a working update action.
+    await tester.ensureVisible(find.text('Update Herdr integration'));
+    expect(find.text('Update Herdr integration'), findsOneWidget);
+    expect(find.text('Herdr integration v3 — connected'), findsNothing);
+    expect(find.textContaining('outdated: Claude Code'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+    await connection.disconnect();
+    coordinator.dispose();
+    await BlocScope.reset();
+  });
 }

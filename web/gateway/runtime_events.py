@@ -11,6 +11,11 @@ EVENTS = ('pane.created', 'pane.updated', 'pane.agent_detected', 'pane.closed',
           'pane.exited', 'pane.moved', 'workspace.created', 'workspace.closed',
           'worktree.created', 'worktree.opened', 'worktree.removed')
 
+# How long a failed recovery may gate terminal mutations. Recovery normally
+# completes in seconds; past this bound the gateway proceeds on its own
+# identity checks rather than refusing to act indefinitely.
+RECOVERY_BOUND = 300.0
+
 
 def socket_path():
     if os.environ.get('HERDR_SOCKET_PATH'):
@@ -28,6 +33,7 @@ class RuntimeEvents:
         self.send_lock = threading.Lock()
         self.subscribed_panes = frozenset()
         self.subscription_started_at = 0
+        self.recovering_since = 0
         self.stopped = threading.Event()
         self.dirty = threading.Event()
         self.generation = 0
@@ -43,16 +49,40 @@ class RuntimeEvents:
     def snapshot(self):
         with self.lock:
             return dict(state=self.state, reason=self.reason, checked_at=self.checked_at,
-                        generation=self.connection_generation)
+                        generation=self.connection_generation,
+                        degraded=self.degraded_locked(),
+                        recovering_for=round(self.recovering_for_locked(), 1))
+
+    def recovering_for_locked(self):
+        if self.state == 'live' or not self.recovering_since:
+            return 0.0
+        return max(0.0, time.monotonic() - self.recovering_since)
+
+    def degraded_locked(self):
+        """True when a failed recovery has stopped gating mutations."""
+        return self.recovering_for_locked() > RECOVERY_BOUND
 
     def guard(self):
+        """Block terminal mutations while agent inventory may be stale.
+
+        Recovery is normally seconds. A permanently unreachable socket would
+        otherwise wedge every launch and prompt forever, which is worse than
+        proceeding: each command still verifies identity, receipts and exact
+        commits before it acts, so a bounded wait degrades into a warning
+        rather than an outage.
+        """
         with self.lock:
-            if self.ever_connected and self.state != 'live':
-                raise ValueError('Runtime state is being reconciled; wait for a fresh session snapshot.')
+            if not self.ever_connected or self.state == 'live':
+                return
+            if self.degraded_locked():
+                return
+            raise ValueError('Runtime state is being reconciled; wait for a fresh session snapshot.')
 
     def invalidate(self, reason, disconnected=False):
         with self.lock:
             self.generation += 1
+            if self.state == 'live' or not self.recovering_since:
+                self.recovering_since = time.monotonic()
             self.state = 'reconciling' if self.ever_connected else 'polling'
             self.reason = reason
             if disconnected:
@@ -131,6 +161,7 @@ class RuntimeEvents:
                 return False
             self.state, self.reason = 'live', 'Runtime subscription and snapshot are current.'
             self.checked_at = time.time()
+            self.recovering_since = 0
         # Existing identity checks remain authoritative before every effect.
         self.hub.publish('runtime')
         return True

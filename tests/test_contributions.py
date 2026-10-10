@@ -16,6 +16,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'web/gateway'))
+from organizations import OrganizationStore
 import contributions
 from contributions import Contributions, remote_info
 from github_api import GitHub, GitHubError
@@ -1909,3 +1910,124 @@ class ContributionTests(unittest.TestCase):
             self.service.reap_instances()
         request = self.store.manage_session.call_args[0][0]
         self.assertEqual((request['mode'], request['job_id']), ('finish', 'run'))
+
+    def enabled(self, reap=True):
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        self.service.set_automation_policy(dict(organization_id='org', reap_finished_sessions=reap), 'admin')
+
+    def test_finished_sessions_are_reaped_only_when_the_policy_opts_in(self):
+        self.service.save(dict(self.task, state='completed'), 'complete', 'admin')
+        jobs = [dict(id='run', kind='launch', state='finished', organization_id='org', profile_id='worker')]
+        self.store.snapshot.return_value['jobs'] = jobs
+        self.service.reap_sessions()
+        self.store.manage_session.assert_not_called()
+        self.enabled()
+        self.service.reap_sessions()
+        request = self.store.manage_session.call_args[0][0]
+        self.assertEqual((request['mode'], request['job_id'], request['inspected']), ('finish', 'run', True))
+        self.assertEqual(self.store.manage_session.call_args[0][1], 'task_reaper')
+
+    def test_a_very_large_notification_batch_is_never_silently_truncated(self):
+        # Scoping is an optimisation; dropping the tail and waiting for the
+        # safety pass would delay real work without saying so.
+        from contributions import SCOPED_TASK_LIMIT
+        condition = "json_extract(data, '$.auto_validate')=1"
+        few = {f'task{i}' for i in range(SCOPED_TASK_LIMIT)}
+        with closing(self.service.connect()) as db, db:
+            db.executemany('INSERT OR REPLACE INTO tasks (id, data) VALUES (?,?)',
+                           [(i, json.dumps(dict(id=i, auto_validate=True))) for i in few])
+        self.assertEqual(len(self.service.select_task_ids(condition, few)), SCOPED_TASK_LIMIT)
+        # One past the limit falls back to a bounded full pass, never a
+        # truncated scoped one, and rotation still reaches the last row.
+        many = few | {'overflow'}
+        with closing(self.service.connect()) as db, db:
+            db.execute('INSERT OR REPLACE INTO tasks (id, data) VALUES (?,?)',
+                       ('overflow', json.dumps(dict(id='overflow', auto_validate=True))))
+        self.assertEqual(len(self.service.select_task_ids(condition, many)), 100)
+        collected = set()
+        for _ in range(4):
+            collected.update(self.service.select_task_ids(condition))
+        self.assertIn('overflow', collected)
+        self.assertEqual(self.service.select_task_ids(condition, set()), [])
+
+    def test_reconciliation_rotates_instead_of_starving_the_tail(self):
+        # A fixed LIMIT with a stable order would never revisit rows past the
+        # first page while those tasks keep matching the condition.
+        from contributions import SCOPED_TASK_LIMIT
+        condition = "json_extract(data, '$.auto_validate')=1"
+        ids = [f'task{i:04d}' for i in range(250)]
+        with closing(self.service.connect()) as db, db:
+            db.executemany('INSERT OR REPLACE INTO tasks (id, data) VALUES (?,?)',
+                           [(i, json.dumps(dict(id=i, auto_validate=True))) for i in ids])
+        seen = set()
+        for _ in range(4):
+            seen.update(self.service.select_task_ids(condition))
+        self.assertEqual(len(seen), 250)
+
+    def test_reaping_finds_organizations_with_no_recent_tasks(self):
+        # Policy lives in its own table; deriving it from the newest page of
+        # tasks would silently skip any organization outside that page.
+        with closing(self.service.connect()) as db, db:
+            db.execute('INSERT OR REPLACE INTO policies (id, data) VALUES (?,?)',
+                       ('quiet-org', json.dumps(dict(reap_orphaned_panes=True))))
+        self.assertFalse(self.service.policy('quiet-org')['reap_finished_sessions'])
+        run = dict(id='run', kind='launch', state='persona_sent', organization_id='quiet-org',
+                   profile_id='worker', pane_id='w1:p1')
+        self.store.snapshot.return_value['jobs'] = [run]
+        self.service.reap_sessions()
+        request = self.store.manage_session.call_args[0][0]
+        self.assertEqual(request['organization_id'], 'quiet-org')
+        # A disabled organization is never touched.
+        self.store.manage_session.reset_mock()
+        self.store.snapshot.return_value['jobs'] = [dict(run, organization_id='other-org')]
+        self.service.reap_sessions()
+        self.store.manage_session.assert_not_called()
+
+    def test_orphaned_pane_is_reaped_only_when_every_proof_holds(self):
+        # Herdr restores panes as shells when native restore does not apply.
+        # Closing the wrong pane destroys real work, so every condition must
+        # hold and ambiguity always leaves the pane alone.
+        root = Path(self.temp.name).resolve()
+        worktree = str(root / 'work')
+        Path(worktree).mkdir()
+        run = dict(pane_id='w1:p1', alias='hire_abc', worktree_path=worktree)
+        shell = dict(pane_id='w1:p1', cwd=worktree, agent_status='unknown')
+        prove = OrganizationStore.orphaned_pane
+        self.assertTrue(prove(run, shell, []))
+        # A live agent holding the pane means it is not an orphan.
+        self.assertFalse(prove(run, shell, [dict(pane_id='w1:p1', name='other')]))
+        # The original alias reappearing means the agent is not actually gone.
+        self.assertFalse(prove(run, shell, [dict(name='hire_abc')]))
+        # A pane that still reports agent state is not a plain shell.
+        self.assertFalse(prove(run, dict(shell, agent_status='idle'), []))
+        self.assertFalse(prove(run, dict(shell, agent_status='working'), []))
+        # A shell sitting anywhere else is not the recorded checkout.
+        self.assertFalse(prove(run, dict(shell, cwd=str(root)), []))
+        self.assertFalse(prove(run, dict(shell, cwd=None), []))
+        self.assertFalse(prove(dict(alias='hire_abc'), shell, []))
+        self.assertFalse(prove(dict(run, pane_id='w9:p9'), shell, []))
+        self.assertFalse(prove(run, dict(shell, pane_id='w2:p1'), []))
+        self.assertFalse(prove(run, None, []))
+
+    def test_reaping_never_closes_unfinished_or_already_closed_sessions(self):
+        self.enabled()
+        self.service.save(dict(self.task, state='completed'), 'complete', 'admin')
+        jobs = [
+            dict(id='busy', kind='launch', state='persona_sent', organization_id='org', profile_id='worker'),
+            dict(id='closed', kind='launch', state='finished', organization_id='org', profile_id='worker',
+                 session_closed_at='now'),
+            dict(id='meeting', kind='discussion', state='running', organization_id='org', profile_id='worker'),
+            dict(id='elsewhere', kind='launch', state='finished', organization_id='other', profile_id='worker'),
+        ]
+        self.store.snapshot.return_value['jobs'] = jobs
+        self.service.reap_sessions()
+        self.store.manage_session.assert_not_called()
+
+    def test_a_refused_reap_is_recorded_as_a_skip_rather_than_an_error(self):
+        self.enabled()
+        self.service.save(dict(self.task, state='completed'), 'complete', 'admin')
+        self.store.snapshot.return_value['jobs'] = [
+            dict(id='run', kind='launch', state='finished', organization_id='org', profile_id='worker')]
+        self.store.manage_session.side_effect = ValueError('Agent is executing work.')
+        self.service.reap_sessions()
+        self.store.manage_session.assert_called_once()

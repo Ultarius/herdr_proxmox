@@ -4,6 +4,8 @@ import subprocess
 import threading
 import time
 
+from herdr_errors import server_not_running
+
 
 class HerdrServer:
     def __init__(self, command):
@@ -15,7 +17,7 @@ class HerdrServer:
             self.command('workspace', 'list', timeout=2)
             return {'state': 'running'}
         except ValueError as error:
-            if 'server_not_running' in str(error):
+            if server_not_running(error):
                 return {'state': 'stopped'}
             raise
 

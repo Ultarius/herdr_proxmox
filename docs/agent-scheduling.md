@@ -268,6 +268,58 @@ starting sessions past the budget; the legacy task execution cap still applies.
 Provider-native state is not restored, and no task assignment grants publication
 or deployment permission.
 
+## Reclaiming finished sessions
+
+A finished task closes its template instance, but a general organization session
+that reaches `finished` keeps its agent process and pane resident until an
+operator closes it. With enough finished work this holds the container's memory
+even though no task is active.
+
+Setting `reap_finished_sessions` (off by default) closes them automatically
+during housekeeping. Only executions already recorded as `finished` are eligible,
+so the task, its candidate and its checkout evidence were verified before; an
+idle pane alone never authorizes closure. Busy agents, queued or running work,
+absent ownership and failed inspections are all left for an operator.
+
+Reclaimed sessions are archived, not discarded: terminal output is preserved,
+native resume is probed, and pane ownership is rechecked immediately before
+closing. A session with a verified reference can still be resumed from its
+archive; one without it falls back to starting with saved context. Inspect any
+session before enabling this if its transcript matters more than its memory.
+
+`reap_orphaned_panes` (also off by default) covers a different case. When the
+Herdr server restarts, pane processes do not survive and Herdr restores the
+layout, so panes can come back as plain shells that no agent holds and that no
+run could otherwise close. A pane is reclaimed only when all of the following
+hold: the run's recorded alias has no live agent, no live agent claims that
+pane, the pane reports no agent state, and the pane's directory resolves to the
+checkout the run was assigned. Anything ambiguous is left for an operator,
+because closing the wrong pane destroys real work. Reclaiming a pane archives
+the run first and records why terminal history is unavailable.
+
+## Agent integrations
+
+Herdr integrations let an agent report working, blocked and idle state and hand
+back a native resume reference. Without them an agent still runs, but it never
+reports a resume reference, so archived sessions can only be continued with
+saved context. The installer provisions an integration for every CLI it
+installs, and the dashboard's CLI page reads `herdr integration status` to show
+whether each agent is connected, outdated or absent. Integration names are not
+always CLI names: Antigravity is `antigravity-cli`.
+
+Herdr reports four states, and only `current` counts as connected. `outdated`
+means the installed version is below the expected one, and `needs repair` means
+a version at or above the expected one that Herdr still considers broken; both
+are installed but neither reports reliably, so the dashboard offers an update
+rather than reporting health.
+
+Adding an agent and launching one both require the runtime's CLI to be
+installed and its Herdr integration to be current. The precondition is checked
+because an agent that cannot report its state or hand back a resume reference
+still starts and works, so the misconfiguration only surfaces later as an
+unrecoverable session. Runtimes outside the supported set are not judged,
+because the gateway cannot verify their readiness.
+
 ## Legacy session closure
 
 Some Herdr versions omit `agent_session`. Their task completion and conversation

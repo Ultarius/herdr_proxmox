@@ -11,6 +11,7 @@ from unittest.mock import Mock
 sys.path.insert(0, str(Path(__file__).parents[1] / 'web/gateway'))
 from notifications import Notifications, OutboxPump, record, schema
 from runtime_events import RuntimeEvents
+import runtime_events
 
 
 class NotificationTests(unittest.TestCase):
@@ -123,6 +124,33 @@ class RuntimeEventTests(unittest.TestCase):
         self.acknowledge()
         self.assertTrue(self.monitor.reconcile())
         self.monitor.guard()
+
+    def test_a_failed_recovery_stops_gating_rather_than_wedging_forever(self):
+        # Blocking permanently would be worse than acting: every command still
+        # verifies identity, receipts and exact commits before it effects
+        # anything, so a failed recovery must degrade into a warning.
+        self.acknowledge()
+        self.assertTrue(self.monitor.reconcile())
+        self.monitor.invalidate('socket removed', disconnected=True)
+        with self.assertRaisesRegex(ValueError, 'reconciled'):
+            self.monitor.guard()
+        self.assertFalse(self.monitor.snapshot()['degraded'])
+        # Recovery still in progress shortly after losing the stream.
+        self.monitor.recovering_since -= 1
+        self.assertFalse(self.monitor.snapshot()['degraded'])
+        with self.assertRaisesRegex(ValueError, 'reconciled'):
+            self.monitor.guard()
+        # Past the bound the gate releases and reports itself degraded.
+        self.monitor.recovering_since -= runtime_events.RECOVERY_BOUND
+        self.assertTrue(self.monitor.snapshot()['degraded'])
+        self.monitor.guard()
+        self.assertGreater(self.monitor.snapshot()['recovering_for'], runtime_events.RECOVERY_BOUND)
+        # A recovered subscription closes the degradation again.
+        self.acknowledge()
+        self.assertTrue(self.monitor.reconcile())
+        self.monitor.guard()
+        self.assertFalse(self.monitor.snapshot()['degraded'])
+        self.assertEqual(self.monitor.snapshot()['recovering_for'], 0)
 
     def test_polling_fallback_and_invalid_snapshot_do_not_claim_live_state(self):
         self.monitor.invalidate('unsupported transport', disconnected=True)

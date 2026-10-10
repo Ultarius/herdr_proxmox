@@ -22,6 +22,9 @@ BASE_TTL = 300
 
 class IntegrationWatcher:
     def __init__(self, root, checkouts, interval=INTERVAL, coordinator=None, wake_event=None):
+        # wake_event may be a threading.Event or a notification Mailbox, which
+        # implements the same set/clear/wait surface. The loop below relies on
+        # wait() draining what it consumed, so Mailbox.clear() stays a no-op.
         self.root = Path(root).resolve()
         self.checkouts = checkouts
         self.coordinator = coordinator

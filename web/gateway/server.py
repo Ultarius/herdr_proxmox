@@ -36,7 +36,7 @@ from updates import Updates
 from validation import ValidationRuns
 from github_api import GitHub, GitHubError
 from contributions import Contributions
-from herdr_errors import HerdrError, is_read_only, parse_error
+from herdr_errors import HerdrError, is_read_only, parse_error, server_not_running
 from notifications import OutboxPump
 from runtime_events import RuntimeEvents
 RUNTIME_EVENTS = None
@@ -430,7 +430,7 @@ class Handler(BaseHTTPRequestHandler):
             except sqlite3.Error:
                 self.reply(503, {'error': 'Dashboard storage is unavailable. Retry after checking the gateway service.'})
             except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
-                if self.path == '/api/snapshot' and isinstance(exc, ValueError) and 'server_not_running' in str(exc):
+                if self.path == '/api/snapshot' and isinstance(exc, ValueError) and server_not_running(exc):
                     self.reply(200, {'herdr_server': 'stopped', 'workspaces': [], 'agents': []})
                     return
                 self.reply(502, {'error': str(exc)[:500]})
@@ -514,7 +514,7 @@ class Handler(BaseHTTPRequestHandler):
         role = getattr(self, 'operator', {}).get('role', 'operator')
         actions = {f'/api/workspaces/{name}': name for name in ('create', 'focus', 'rename')}
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'resolve_delegation', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'retry_discussion', 'cancel_discussion', 'remove_agent', 'remove_group', 'session')}
-        setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close', 'verify')}
+        setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close', 'verify', 'install_integration')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
         if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/knowledge', '/api/updates/install', '/api/updates/check', '/api/updates/alphas', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/guidance', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build', '/api/tasks/policy', '/api/tasks/complete', '/api/tasks/discuss', '/api/tasks/review_policy', '/api/tasks/proposal', '/api/tasks/assignment', '/api/tasks/automation', '/api/tasks/discovery', '/api/tasks/handover', '/api/tasks/consult', '/api/tasks/acceptance'):
             self.reply(404, {'error': 'Unknown endpoint.'})
@@ -692,7 +692,7 @@ def main():
     operators = Operators(Path('/etc/herdr/operators.json'))
     sdk_install = SdkInstall()
     cli_setup = CliSetup()
-    organizations = OrganizationStore(DATABASE, PROJECTS, command, runtime_status=cli_setup.status, model_validator=lambda profile: model_catalog.validate_selection(cli_setup, PROJECTS, profile))
+    organizations = OrganizationStore(DATABASE, PROJECTS, command, runtime_status=cli_setup.status, runtime_ready=cli_setup.ready, model_validator=lambda profile: model_catalog.validate_selection(cli_setup, PROJECTS, profile))
     github = GitHub(DATABASE.parent / 'github.json')
     contributions = Contributions(DATABASE.with_name('tasks.sqlite3'), PROJECTS, organizations, github)
     run_logs = RunLogs(DATABASE.parent / 'run-logs', BIN)

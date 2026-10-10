@@ -35,6 +35,17 @@ install_agents() (
   for command in codex claude opencode agy; do
     runuser -u herdr -- env HOME="$agent_home" PATH="$agent_path" "$agent_home/.local/bin/$command" --version
   done
+  # Herdr integrations let each agent report working/blocked/idle state and a
+  # native resume reference. Without them session archives can only be
+  # continued with saved context, never resumed. Integration names follow
+  # `herdr integration status`, which is not always the CLI name.
+  local integration
+  for integration in codex claude opencode antigravity-cli; do
+    printf 'Installing the Herdr %s integration.\n' "$integration"
+    runuser -u herdr -- env HOME="$agent_home" PATH="$agent_path" \
+      "$agent_home/.local/bin/herdr" integration install "$integration" ||
+      printf 'WARNING: the Herdr %s integration was not installed; resume is unavailable for it.\n' "$integration" >&2
+  done
 )
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

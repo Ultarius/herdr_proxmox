@@ -71,11 +71,12 @@ def launch_arguments(profile):
 
 class OrganizationStore:
     supports_discussion_preparation = True
-    def __init__(self, path, projects, command, runtime_status=None, model_validator=None):
+    def __init__(self, path, projects, command, runtime_status=None, model_validator=None, runtime_ready=None):
         self.path = Path(path)
         self.projects = Path(projects).resolve()
         self.command = command
         self.runtime_status = runtime_status
+        self.runtime_ready = runtime_ready
         self.model_validator = model_validator
         self.lock = threading.RLock()
         # One-way notification only: never call the watcher while holding a
@@ -517,6 +518,12 @@ class OrganizationStore:
                     runtime = text(body, 'runtime')
                     if runtime not in ('codex', 'claude', 'opencode', 'agy'):
                         raise ValueError('Unsupported agent runtime.')
+                    # An agent added against a CLI that cannot report state or
+                    # resume would fail silently much later.
+                    if self.runtime_ready is not None:
+                        problem = self.runtime_ready(runtime)
+                        if problem:
+                            raise ValueError(problem)
                     manager = text(body, 'manager_id', 40, optional=True)
                     visited = {item_id}
                     current = manager
@@ -725,24 +732,27 @@ class OrganizationStore:
                 agent = next((a for a in live if a.get('name') == run['alias']), None)
                 if agent is None:
                     # Require a valid inventory; an absent agent alone cannot identify a pane.
-                    inventory = self.command('workspace', 'list')
-                    workspaces = inventory if isinstance(inventory, list) else inventory.get('workspaces')
-                    if not isinstance(workspaces, list):
-                        raise ValueError('Cannot verify workspace inventory.')
-                    found = False
-                    for workspace in workspaces:
-                        workspace_id = workspace.get('workspace_id') or workspace.get('id')
-                        if not isinstance(workspace_id, str):
-                            raise ValueError('Cannot identify a workspace in the live inventory.')
-                        response = self.command('pane', 'list', '--workspace', workspace_id)
-                        panes = response if isinstance(response, list) else response.get('panes')
-                        if not isinstance(panes, list):
-                            raise ValueError('Cannot verify pane inventory.')
-                        found = found or any(p.get('pane_id') == run.get('pane_id') for p in panes)
-                    if found or not run.get('pane_id'):
+                    pane = self.locate_pane(run)
+                    if pane and self.orphaned_pane(run, pane, live):
+                        # Herdr restores panes as plain shells when native
+                        # restore does not apply. Nothing runs in this pane and
+                        # it sits in the recorded checkout, so it is ours.
+                        saved = archive(self, run, actor, unavailable='The agent process did not survive a Herdr '
+                                        'restart and its pane was restored as a shell. Terminal history cannot be '
+                                        'recovered from the pane; a recorded native resume reference still applies.')
+                        # Archiving probes the agent and reads Git evidence, which
+                        # takes time. Re-prove before closing, exactly as the live
+                        # path rechecks ownership: a pane that started running or
+                        # moved during capture must be left to an operator.
+                        if not self.orphaned_pane(run, self.locate_pane(run), self.live_agents()):
+                            raise ValueError('The pane changed while its session was archived; inspect it before closure.')
+                        self.command('pane', 'close', run['pane_id'], timeout=10)
+                        status = 'orphaned'
+                    elif pane or not run.get('pane_id'):
                         raise ValueError('Original agent is absent but its pane is present or unidentified; inspect ownership before closure.')
-                    saved = archive(self, run, actor, unavailable='Agent and recorded pane were already absent. Terminal history cannot be recovered from them.')
-                    status = 'already_closed'
+                    else:
+                        saved = archive(self, run, actor, unavailable='Agent and recorded pane were already absent. Terminal history cannot be recovered from them.')
+                        status = 'already_closed'
                 else:
                     self.close_identity(run, live=live)
                     output = self.command('agent', 'read', run['alias'], '--source', 'recent-unwrapped', '--lines', '2000', timeout=10)
@@ -995,6 +1005,65 @@ class OrganizationStore:
                 pass
         return parse_resume(agent)
 
+    def live_agents(self):
+        response = self.command('agent', 'list')
+        live = response if isinstance(response, list) else response.get('agents')
+        if not isinstance(live, list) or not all(isinstance(item, dict) for item in live):
+            raise ValueError('Cannot verify live sessions.')
+        return live
+
+    def locate_pane(self, run):
+        """Find this run's recorded pane in a fresh inventory, or None."""
+        if not run.get('pane_id'):
+            return None
+        inventory = self.command('workspace', 'list')
+        workspaces = inventory if isinstance(inventory, list) else inventory.get('workspaces')
+        if not isinstance(workspaces, list):
+            raise ValueError('Cannot verify workspace inventory.')
+        for workspace in workspaces:
+            workspace_id = workspace.get('workspace_id') or workspace.get('id')
+            if not isinstance(workspace_id, str):
+                raise ValueError('Cannot identify a workspace in the live inventory.')
+            response = self.command('pane', 'list', '--workspace', workspace_id)
+            panes = response if isinstance(response, list) else response.get('panes')
+            if not isinstance(panes, list):
+                raise ValueError('Cannot verify pane inventory.')
+            found = next((p for p in panes if p.get('pane_id') == run['pane_id']), None)
+            if found:
+                return found
+        return None
+
+    @staticmethod
+    def orphaned_pane(run, pane, live):
+        """Prove a pane left behind by a dead agent is ours and idle.
+
+        Four independent conditions must hold. Anything ambiguous leaves the
+        pane for an operator: closing the wrong pane destroys real work, so
+        absence of evidence is never treated as evidence.
+        """
+        if not run.get('pane_id') or not isinstance(pane, dict) or pane.get('pane_id') != run['pane_id']:
+            return False
+        # 1. No live agent claims this pane, so nothing runs in it.
+        if any(item.get('pane_id') == run['pane_id'] for item in live if isinstance(item, dict)):
+            return False
+        # 2. No live agent still answers to this run's alias.
+        if any(item.get('name') == run.get('alias') for item in live if isinstance(item, dict)):
+            return False
+        # 3. The pane reports no agent state, so it is a shell rather than a
+        #    session whose reporting integration failed.
+        if pane.get('agent_status') not in (None, '', 'unknown'):
+            return False
+        # 4. It sits in the checkout this run was assigned, which ties the pane
+        #    to the recorded work rather than to unrelated activity.
+        recorded = run.get('worktree_path') or run.get('source_project') or (run.get('profile') or {}).get('project')
+        current = pane.get('cwd') or pane.get('foreground_cwd')
+        if not isinstance(recorded, str) or not isinstance(current, str):
+            return False
+        try:
+            return Path(recorded).resolve() == Path(current).resolve()
+        except OSError:
+            return False
+
     def close_identity(self, run, live=None):
         """Verify pane ownership for closure, including runtimes without session IDs.
 
@@ -1168,6 +1237,10 @@ class OrganizationStore:
                     status = self.runtime_status(profile['runtime'])
                     if status.get('installed') is False or status.get('status') in ('missing', 'not_configured') and profile['runtime'] in ('codex', 'claude'):
                         raise ValueError(f"{profile['name']} uses {profile['runtime']}. Connect this CLI on the CLI accounts page before launching; other CLI accounts do not configure it.")
+                    if self.runtime_ready is not None:
+                        problem = self.runtime_ready(profile['runtime'])
+                        if problem:
+                            raise ValueError(f"{profile['name']} cannot run yet: {problem}")
                 if self.model_validator is not None:
                     self.model_validator(profile)
                 job = self.update_job(job_id, launch_stage='workspace_preparing')

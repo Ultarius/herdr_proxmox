@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import select
 import struct
@@ -17,6 +18,59 @@ import uuid
 COMMANDS = {'codex': ('login', '--device-auth'), 'claude': ('auth', 'login'),
             'opencode': ('auth', 'login'), 'agy': ()}
 NAMES = {'codex': 'Codex', 'claude': 'Claude Code', 'opencode': 'OpenCode', 'agy': 'Antigravity'}
+# Herdr names these integrations differently from our CLI aliases, and the
+# plugin location is where `herdr integration status` reports it. Without the
+# integration an agent never reports a native resume reference, so session
+# archives can only be continued with saved context.
+INTEGRATIONS = {'codex': ('codex', '.codex/herdr-agent-state.sh'),
+                'claude': ('claude', '.claude/hooks/herdr-agent-state.sh'),
+                'opencode': ('opencode', '.config/opencode/plugins/herdr-agent-state.js'),
+                'agy': ('antigravity-cli', '.gemini/config/hooks/herdr-agent-state.sh')}
+
+
+def parse_integration_status(text):
+    """Read `herdr integration status` lines.
+
+    Herdr prints `<name>: <state> (<path>)`, where the state is one of
+    `not installed`, `current (v13)`, `legacy`, `outdated (v3 < v5)` or
+    `needs repair (v5)`. A qualifier such as `(experimental)` decorates the
+    name. Only the state and versions are kept; nothing else is echoed.
+    """
+    entries = {}
+    for line in str(text or '').splitlines():
+        line = line.strip()
+        if not line or ':' not in line:
+            continue
+        name, _, rest = line.partition(':')
+        name = name.split('(')[0].strip().lower()
+        if not name:
+            continue
+        rest = rest.strip()
+        # The last parenthesised group is normally the plugin path. A state
+        # that omits it still carries its version in the only group present.
+        groups = re.findall(r'\(([^()]*)\)', rest)
+        head = (rest[:rest.rfind('(')] if groups else rest).strip().lower()
+        if head.startswith('not installed'):
+            detail = ''
+        elif len(groups) > 1:
+            detail = groups[0].strip()
+        elif groups and head.startswith(('current', 'outdated', 'needs repair')):
+            detail = groups[0].strip()
+        else:
+            detail = ''
+        if head.startswith('not installed'):
+            entries[name] = dict(state='not_installed', version='', expected='')
+        elif head.startswith('needs repair'):
+            entries[name] = dict(state='needs_repair', version=detail[:40], expected='')
+        elif head.startswith('outdated'):
+            installed, _, expected = detail.partition('<')
+            entries[name] = dict(state='outdated', version=installed.strip()[:40],
+                                 expected=expected.strip()[:40])
+        elif head.startswith('current'):
+            entries[name] = dict(state='current', version=detail[:40], expected='')
+        else:
+            entries[name] = dict(state='unknown', version='', expected='')
+    return entries
 
 
 class SetupSession:
@@ -125,14 +179,151 @@ class CliSetup:
         self.sessions = {}
         self.lock = threading.RLock()
         self.stopped = threading.Event()
+        self.integration_checked = 0
+        self.integration_state = {}
         threading.Thread(target=self._reap, daemon=True).start()
 
     def binary(self, name):
         return self.home / '.local/bin' / name
 
+    def herdr(self):
+        return self.home / '.local/bin' / 'herdr'
+
+    def ready(self, name):
+        """Why this CLI cannot run agents yet, or None when it is ready.
+
+        An agent whose Herdr integration is absent or outdated still starts,
+        but it never reports working/blocked state and never hands back a
+        resume reference, so the session becomes unrecoverable without any
+        visible failure. That misconfiguration is cheaper to prevent here than
+        to diagnose from a lost conversation later.
+        """
+        if name not in COMMANDS:
+            return None  # Runtimes outside this allowlist are not ours to judge.
+        if not os.access(self.binary(name), os.X_OK):
+            return NAMES[name] + ' is not installed. Install the CLI before adding an agent.'
+        integration = self.integration(name)
+        if not integration.get('installed'):
+            return (NAMES[name] + ' has no Herdr integration, so its sessions cannot report '
+                    'state or be resumed. Install it on the CLI accounts page first.')
+        if not integration.get('current'):
+            if integration['state'] == 'unverified':
+                return (NAMES[name] + ' has a Herdr integration whose version could not be verified. '
+                        'Run `herdr integration status` before adding an agent.')
+            shown = integration['version'] or 'legacy'
+            return (NAMES[name] + ' has a Herdr integration that is '
+                    + ('outdated (' + shown + ' < ' + (integration.get('expected') or 'current') + ')'
+                       if integration['state'] == 'outdated' else 'in need of repair')
+                    + '. Update it on the CLI accounts page before adding an agent.')
+        return None
+
+    def integration_status(self, refresh=False):
+        """Parse `herdr integration status` once and cache it briefly.
+
+        One command covers every agent, so the four CLI cards share a single
+        bounded call instead of spawning one each.
+        """
+        with self.lock:
+            if not refresh and time.monotonic() - self.integration_checked < 10:
+                return self.integration_state
+            state = {}
+            try:
+                probe = subprocess.run([str(self.herdr()), 'integration', 'status'],
+                                       capture_output=True, text=True, timeout=15,
+                                       env={**os.environ, 'HOME': str(self.home), 'TERM': 'dumb',
+                                            'NO_COLOR': '1',
+                                            'PATH': str(self.home / '.local/bin') + ':/usr/local/bin:/usr/bin:/bin'})
+                if probe.returncode == 0:
+                    state = parse_integration_status(probe.stdout)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                state = {}
+            # Cache the outcome either way: a failed probe must not re-run on
+            # every card render.
+            self.integration_state, self.integration_checked = state, time.monotonic()
+            return state
+
+    def integration(self, name):
+        """Report whether this CLI's Herdr integration is connected.
+
+        An agent only reports working/blocked state and a native resume
+        reference through its official integration, so a missing one silently
+        disables session resume.
+        """
+        herdr_name, relative = INTEGRATIONS[name]
+        result = {'installed': False, 'current': False, 'integration': herdr_name,
+                  'version': '', 'expected': '', 'state': '',
+                  'detail': 'Install the Herdr integration so this agent can report its state and resume sessions.'}
+        if not os.access(self.binary(name), os.X_OK):
+            return result
+        entry = self.integration_status().get(herdr_name)
+        if entry is None:
+            # `herdr integration status` is the authority; fall back to the
+            # plugin path it prints when the command itself is unavailable.
+            try:
+                installed = (self.home / relative).exists()
+            except OSError:
+                return result
+            return {**result, 'installed': installed,
+                    'state': 'unverified',
+                    'detail': ('Herdr integration is present but its version could not be verified. '
+                               'Run `herdr integration status` before adding agents.' if installed
+                               else result['detail'])}
+        state = entry['state']
+        installed = state != 'not_installed'
+        current = state == 'current'
+        version = entry['version']
+        detail = result['detail']
+        if current:
+            detail = 'Herdr integration connected' + ((' (' + version + ')') if version else '') + '.'
+        elif state == 'outdated':
+            detail = ('Herdr integration is outdated (' + (version or 'legacy') +
+                      ' < ' + (entry['expected'] or 'current') +
+                      '); update it to restore current behavior.')
+        elif state == 'needs_repair':
+            detail = ('Herdr integration needs repair' + ((' (' + version + ')') if version else '') +
+                      '; reinstall it to restore reporting.')
+        elif installed:
+            detail = 'Herdr integration reported an unknown state; inspect it in the setup terminal.'
+        return {**result, 'installed': installed, 'current': current, 'version': version,
+                'expected': entry['expected'], 'state': state, 'detail': detail}
+
+    def install_integration(self, name):
+        """Install this CLI's Herdr integration. Bounded, allowlisted, no secrets."""
+        if name not in INTEGRATIONS:
+            raise ValueError('Unsupported CLI.')
+        if not os.access(self.binary(name), os.X_OK):
+            raise ValueError('CLI is not installed.')
+        env = {**os.environ, 'HOME': str(self.home), 'TERM': 'dumb', 'NO_COLOR': '1',
+               'PATH': str(self.home / '.local/bin') + ':/usr/local/bin:/usr/bin:/bin'}
+        try:
+            probe = subprocess.run([str(self.herdr()), 'integration', 'install', INTEGRATIONS[name][0]],
+                                   capture_output=True, text=True, timeout=120, env=env,
+                                   cwd=str(self.home))
+        except subprocess.TimeoutExpired:
+            raise ValueError('Herdr did not finish installing the integration in 120 seconds; '
+                             'run it in the setup terminal to see why.') from None
+        except OSError:
+            raise ValueError('Herdr CLI is unavailable; install the LXC agent runtimes first.') from None
+        # Re-read the authoritative status rather than trusting the exit code.
+        state = self.integration_status(refresh=True).get(INTEGRATIONS[name][0])
+        if not state or state['state'] in ('not_installed', 'unknown'):
+            detail = ' '.join((probe.stdout + probe.stderr).split())[:300]
+            raise ValueError('Herdr did not install the integration' + (': ' + detail if detail else '') + '.')
+        result = self.integration(name)
+        if not result['installed']:
+            raise ValueError('Herdr reports this integration as not installed; inspect the setup terminal.')
+        if not result['current']:
+            # Installed but still outdated is not a working integration, and
+            # reporting it as success would leave agents silently unverified.
+            raise ValueError('Herdr installed the integration but it is still '
+                             + ('outdated' if result['state'] == 'outdated' else 'not current')
+                             + '. Update Herdr and retry; agents stay blocked until it is current.')
+        return result
+
     def status(self, name):
         result = {'id': name, 'name': NAMES[name], 'installed': os.access(self.binary(name), os.X_OK),
-                  'status': 'unknown', 'detail': 'Check authentication in the setup terminal.'}
+                  'status': 'unknown', 'detail': 'Check authentication in the setup terminal.',
+                  'integration': self.integration(name)}
         if not result['installed']:
             return {**result, 'status': 'missing', 'detail': 'Run the LXC installer to install this CLI.'}
         try:
@@ -206,8 +397,22 @@ class CliSetup:
                 'detail': 'Claude Code answered: ' + ' '.join(reply.split())[:200]}
 
     def snapshot(self):
+        # One `herdr integration status` call backs every card; the per-CLI
+        # reports below only read its cached result.
+        self.integration_status()
         with ThreadPoolExecutor(max_workers=4) as pool:
-            return {'clis': list(pool.map(self.status, COMMANDS))}
+            clis = list(pool.map(self.status, COMMANDS))
+        connected = [c['name'] for c in clis
+                     if c.get('installed') and (c.get('integration') or {}).get('current')]
+        outdated = [c['name'] for c in clis
+                    if c.get('installed') and (c.get('integration') or {}).get('state') in ('outdated', 'needs_repair')]
+        missing = [c['name'] for c in clis
+                   if c.get('installed') and not (c.get('integration') or {}).get('installed')]
+        # Disjoint buckets: current, outdated/needs-repair, or absent.
+        return {'clis': clis, 'integrations': {'connected': len(connected), 'outdated': len(outdated),
+                                               'missing': len(missing), 'total': len(clis),
+                                               'names': connected, 'outdated_names': outdated,
+                                               'missing_names': missing}}
 
     def action(self, action, body):
         if not isinstance(body, dict):
@@ -217,6 +422,13 @@ class CliSetup:
             if not isinstance(name, str) or name not in COMMANDS:
                 raise ValueError('Unsupported CLI.')
             return self.verify(name)
+        if action == 'install_integration':
+            name = body.get('cli')
+            if not isinstance(name, str) or name not in COMMANDS:
+                raise ValueError('Unsupported CLI.')
+            if sys.platform != 'linux':
+                raise ValueError('Herdr integrations are installed on the Linux LXC gateway.')
+            return {'cli': name, **self.install_integration(name)}
         with self.lock:
             if action == 'start':
                 name = body.get('cli')

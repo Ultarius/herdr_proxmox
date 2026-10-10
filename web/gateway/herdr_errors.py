@@ -68,6 +68,15 @@ def is_read_only(args):
     return tuple(args[:2]) in READ_ONLY
 
 
+def server_not_running(error):
+    """True when a Herdr failure means nothing is listening on the API socket.
+
+    The structured code is authoritative; the message fragment only covers
+    callers that carry raw CLI text instead of a parsed error.
+    """
+    return getattr(error, 'code', '') == 'server_not_running' or 'server_not_running' in str(error)
+
+
 def parse_resume(agent):
     """Read resume facts without trusting free-form command text.
 
