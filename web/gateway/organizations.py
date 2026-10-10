@@ -14,6 +14,7 @@ import uuid
 
 from project_files import project_directory
 from permissions import accessible_paths, permission_mode, prepare_permissions
+from session_ownership import active, reserves
 from herdr_ids import is_pane_id, is_workspace_id
 from herdr_errors import HerdrError, delivery_for, parse_completion, parse_resume, preview as preview_text
 
@@ -422,9 +423,9 @@ class OrganizationStore:
                 raise ValueError('Remove this agent from these groups first: ' + ', '.join(names))
         jobs = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs WHERE organization_id=?', (org_id,))]
         profile_id = profile['id'] if profile else None
-        if any(job['state'] in ('queued', 'running') and
+        if any(active(job) and
                ((table == 'groups' and job.get('group_id') == item['id']) or
-                (profile_id and profile_id in job.get('participants', [job.get('profile_id')]))) for job in jobs):
+                (profile_id and reserves(job, profile_id))) for job in jobs):
             raise ValueError('Wait for active work to finish before removing this entry.')
         runs = [job for job in jobs if profile_id and job['kind'] == 'launch' and
                 job.get('profile_id') == profile_id and job['state'] not in ('released', 'finished')]
@@ -566,8 +567,8 @@ class OrganizationStore:
                         if sender['id'] == profile['id']:
                             raise ValueError('Select two different agents.')
                         participants = {sender['id'], profile['id']}
-                        if any(j['state'] in ('queued', 'running') and participants.intersection(j.get('participants', [j.get('profile_id')])) for j in jobs):
-                            raise ValueError('An agent already has a queued or running task. Wait for it to finish.')
+                        if any(reserves(j, sender['id']) or reserves(j, profile['id']) for j in jobs):
+                            raise ValueError('An agent already has queued or running task work. Wait for it to finish.')
                         runs = {}
                         for p in (sender, profile):
                             runs[p['id']] = next((j for j in reversed(jobs) if j['kind'] == 'launch' and j['profile_id'] == p['id'] and j['state'] == 'persona_sent'), None)
@@ -582,7 +583,7 @@ class OrganizationStore:
                     submitted = item['id']
                 elif action in ('release', 'report', 'resolve_delegation'):
                     item = self.get(db, 'jobs', text(body, 'job_id', 40), org_id)
-                    if item['state'] in ('queued', 'running'):
+                    if active(item):
                         raise ValueError('Wait for the running job to finish.')
                     if action == 'resolve_delegation':
                         if item['kind'] != 'delegate' or item['state'] not in ('delivered', 'reported_complete', 'needs_attention', 'uncertain', 'completed', 'cancelled'):
@@ -601,6 +602,15 @@ class OrganizationStore:
                     elif action == 'release':
                         if item['kind'] != 'launch':
                             raise ValueError('Only run bindings can be released.')
+                        # The binding itself is persona_sent; what matters is
+                        # whether another job still owns it. A blocked or
+                        # running discussion must not have its participants
+                        # detached, which would leave it unfinalizable forever.
+                        others = [json.loads(row['data']) for row in
+                                  db.execute('SELECT data FROM jobs WHERE organization_id=?', (org_id,))]
+                        if any(j['id'] != item['id'] and reserves(j, item.get('profile_id'))
+                               for j in others):
+                            raise ValueError('A discussion or meeting still owns this session; resolve it before releasing.')
                         item['state'] = 'released'
                     else:
                         if item['kind'] != 'delegate' or item['state'] not in ('delivered', 'reported_complete'):
@@ -687,9 +697,10 @@ class OrganizationStore:
                     raise ValueError('Select a completed launch binding.')
                 if mode == 'restart' and run['state'] != 'persona_sent':
                     raise ValueError('Restart only the currently bound session.')
-                if any(j['state'] in ('queued', 'running') and run['profile_id'] in
-                       j.get('participants', [j.get('profile_id')]) for j in self.job_records()):
-                    raise ValueError('Wait for queued or running agent work.')
+                # Applies to every mode: a discussion that still owns this
+                # binding must not have it closed, finished or restarted.
+                if any(reserves(j, run['profile_id']) for j in self.job_records()):
+                    raise ValueError('A discussion or meeting still owns this session; resolve it before changing it.')
                 if run.get('session_closed_at') and mode in ('close', 'finish'):
                     return {'id': run['id'], 'status': 'already_closed', 'archive_id': run.get('session_archive_id')}
             from session_archives import archive, read, context
@@ -825,8 +836,7 @@ class OrganizationStore:
                 raise ValueError('Guidance recovery requires one unchanged worker session.')
             if not runs[0].get('worktree_path'):
                 raise ValueError('Guidance recovery requires an isolated worker worktree, not a shared checkout.')
-            if any(j['state'] in ('queued', 'running') and profile_id in
-                   j.get('participants', [j.get('profile_id')]) for j in jobs):
+            if any(reserves(j, profile_id) for j in jobs):
                 raise ValueError('Wait for queued or running worker jobs before repairing guidance.')
             if any(pid != profile_id and Path(path).resolve() == Path(checkout).resolve()
                    for pid, _, _, path in self.active_checkouts()):
@@ -855,8 +865,7 @@ class OrganizationStore:
                 if job['state'] not in ('answered', 'uncertain', 'needs_attention'):
                     raise ValueError('Only answered or interrupted worker jobs can be recovered.')
                 jobs = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs')]
-                if any(j['state'] in ('queued', 'running') and profile_id in
-                       j.get('participants', [j.get('profile_id')]) for j in jobs):
+                if any(reserves(j, profile_id) for j in jobs):
                     raise ValueError('Wait for queued or running worker jobs before recovering.')
             from collaboration import current_run
             if not job.get('runs'):
@@ -897,8 +906,7 @@ class OrganizationStore:
                 if job['state'] not in ('uncertain', 'needs_attention'):
                     raise ValueError('Only interrupted chat replies can be repaired.')
                 jobs = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs ORDER BY rowid')]
-                if any(j['state'] in ('queued', 'running') and profile_id in
-                       j.get('participants', [j.get('profile_id')]) for j in jobs):
+                if any(reserves(j, profile_id) for j in jobs):
                     raise ValueError('Wait for this agent\'s queued or running work before repairing.')
                 runs = [j for j in jobs if j['kind'] == 'launch' and j.get('profile_id') == profile_id and j['state'] not in ('released', 'finished')]
             if mode == 'recover':

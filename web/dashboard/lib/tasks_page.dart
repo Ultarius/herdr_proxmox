@@ -723,7 +723,34 @@ class _TasksPageState extends State<TasksPage> {
                       : 'No development tasks yet.',
                 ),
               ),
-            for (final task in tasks) _summary(task),
+            for (final task in tasks.where((t) => t['state'] != 'draft'))
+              _summary(task),
+            // Drafts are proposals waiting on an operator, not work in flight.
+            // Grouping them keeps the active list readable when a group has
+            // proposed several follow-ups.
+            if (tasks.any((t) => t['state'] == 'draft')) ...[
+              const SizedBox(height: 8),
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Row(
+                  children: [
+                    Text(
+                      'Drafts (${tasks.where((t) => t['state'] == 'draft').length})',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        'Proposed work that has not started. Open one to start it.',
+                        style: TextStyle(fontSize: 12, color: Color(0xffaaaaaa)),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              for (final task in tasks.where((t) => t['state'] == 'draft'))
+                _summary(task),
+            ],
             DiscoveryPanel(coordinator: widget.coordinator),
           ],
         )

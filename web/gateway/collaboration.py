@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import uuid
 from organizations import now, text
+from session_ownership import active as session_active, reserves as session_reserves
 from permissions import accessible_paths, permission_mode, prepare_permissions
 from herdr_errors import HerdrError, parse_completion
 
@@ -175,7 +176,18 @@ def action(store, db, name, body, org):
         job = json.loads(row['data'])
         if name == 'discuss' and job['id'] == group_run['id']:
             continue
-        if name != 'discuss' and job['state'] in ('queued', 'running') and ids.intersection(job.get('participants', [job.get('profile_id')])):
+        if not ids.intersection(job.get('participants', [job.get('profile_id')])):
+            continue
+        if name == 'input':
+            # Typing a key into a blocked agent is the operator's answer to the
+            # decision that holds its reservation, not new work. Without this
+            # exception a blocked discussion could never be resolved through
+            # the dashboard. Interrupting an agent that is actually working is
+            # still refused.
+            if job.get('state') in ('queued', 'running'):
+                raise ValueError('An agent already has queued or running task work. Wait for it to finish.')
+            continue
+        if name != 'discuss' and session_active(job):
             raise ValueError('An agent already has a queued or running task. Wait for it to finish.')
     item = dict(id=uuid.uuid4().hex, organization_id=org_id,
                 kind=name if name in ('chat', 'input') else 'discussion', participants=list(ids), runs=runs,
@@ -431,7 +443,7 @@ def finalize_discussion(store, job_id, actor):
     with closing(store.connect()) as db:
         others = [json.loads(row[0]) for row in
                   db.execute('SELECT data FROM jobs WHERE organization_id=?', (org_id,))]
-    if any(other['id'] != job_id and other.get('state') in ('queued', 'running')
+    if any(other['id'] != job_id and session_reserves(other)
            and participants.intersection(other.get('participants', [other.get('profile_id')]))
            for other in others):
         raise ValueError('Wait for other work using these agents before finalizing this discussion.')

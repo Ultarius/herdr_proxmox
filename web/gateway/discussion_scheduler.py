@@ -5,6 +5,7 @@ import uuid
 import threading
 
 from organizations import now
+from session_ownership import ACTIVE_JOB_STATES, active as session_active
 
 
 class Waiting(ValueError):
@@ -70,10 +71,14 @@ def prepare_locked(store, job_id):
             if other['id'] == job_id or not set(ids).intersection(other.get('participants', [other.get('profile_id')])):
                 continue
             if other['kind'] == 'discussion':
-                if other.get('state') in ('queued', 'running', 'waiting_for_members') and (
-                        (other.get('created_at', ''), other['id']) < (job.get('created_at', ''), job['id']) or other['state'] == 'running'):
+                # Ordering, not ownership: a waiting meeting has not acquired
+                # its members yet, but an earlier one still goes first. A
+                # blocked discussion holds them now, so it blocks regardless.
+                if (other.get('state') in ACTIVE_JOB_STATES or other.get('state') == 'waiting_for_members') and (
+                        other['state'] in ('running', 'waiting_for_input')
+                        or (other.get('created_at', ''), other['id']) < (job.get('created_at', ''), job['id'])):
                     raise Waiting('Waiting for an earlier discussion involving these members')
-            elif other['kind'] != 'launch' and other['state'] in ('queued', 'running'):
+            elif other['kind'] != 'launch' and session_active(other):
                 raise Waiting('Waiting for active ' + other['kind'] + ' work')
         selected = {}
         controller = store.contributions

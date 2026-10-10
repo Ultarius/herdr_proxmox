@@ -26,6 +26,7 @@ from project_files import project_directory
 import project_git
 from repository_lock import repository_lock
 from herdr_errors import HerdrError, format_handover, parse_handover
+from session_ownership import active as session_active, reserves as session_reserves
 MAX_INSTANCES_PER_TEMPLATE = 2
 
 SHA = re.compile(r'[a-f0-9]{40}|[a-f0-9]{64}')
@@ -382,9 +383,8 @@ class Contributions:
                     if run['state'] == 'persona_sent':
                         from collaboration import current_run
                         current_run(self.store, run)
-                        if any(j['state'] in ('queued', 'running') and task['profile_id'] in
-                               j.get('participants', [j.get('profile_id')]) for j in runs):
-                            raise ValueError('Awaiting queued or running agent work.')
+                    if any(session_reserves(j, task['profile_id']) for j in runs):
+                        raise ValueError('Awaiting queued or running agent work.')
                     with repository_lock(path):
                         if project_git.git(path, 'symbolic-ref', '--short', 'HEAD').strip() != task['branch']:
                             raise ValueError('Task branch changed; inspect before continuing.')
@@ -460,7 +460,7 @@ class Contributions:
                     if evidence.get('target') != head or evidence.get('state') != 'complete' or evidence.get('required_checks_verified') is not True:
                         continue
                     jobs = self.store.snapshot(live_status=False).get('jobs', [])
-                    if any(j.get('state') in ('queued', 'running') and task['profile_id'] in j.get('participants', [j.get('profile_id')]) for j in jobs):
+                    if any(session_reserves(j, task['profile_id']) for j in jobs):
                         continue
                     run = next((j for j in jobs if j.get('id') == task.get('run_id')), None)
                     if run and run.get('alias'):
@@ -1153,7 +1153,11 @@ class Contributions:
             rows = db.execute(
                 "SELECT t.id, json_extract(t.data, '$.organization_id'), json_extract(m.value, '$.job_id'), "
                 "json_extract(m.value, '$.at'), json_extract(m.value, '$.group_id') FROM tasks t, json_each(t.data, '$.meetings') m "
-                "WHERE json_extract(t.data, '$.state') IN ('review_ready','completed','merged','closed') "
+                # Every task state, including the open ones: a discussion about
+                # work in progress proposes follow-ups just as a review of a
+                # finished task does, and the taskless path excludes anything
+                # carrying a task id, so excluding these would orphan them.
+                "WHERE json_extract(t.data, '$.state') IN ('draft','implementing','review_ready','published','pr_open','completed','merged','closed') "
                 "AND json_type(t.data, '$.meetings') = 'array' "
                 "AND json_extract(m.value, '$.job_id') IS NOT NULL "
                 "AND (json_extract(t.data, '$.organization_id') IN (" + org_placeholders + ") "
@@ -1201,10 +1205,15 @@ class Contributions:
                 self.record_error(task_id, error, 'auto_queue', 'group_auto_queue')
         # A group-level discussion belongs to no task, so it has no task to hang
         # its meetings on and would otherwise never be evaluated at all.
+        # Discussions that do belong to a task are excluded: the task-linked
+        # path already materializes them, and the two paths use different
+        # deterministic ids, so processing both would create the same proposal
+        # twice.
         with closing(self.store.connect()) as db:
             discussions = [json.loads(row[0]) for row in db.execute(
                 "SELECT data FROM jobs WHERE json_extract(data,'$.kind')='discussion' "
                 "AND json_extract(data,'$.state')='artifact_ready' "
+                "AND json_extract(data,'$.task_id') IS NULL "
                 "AND json_extract(data,'$.group_id') IN (" + group_placeholders + ") "
                 "AND json_extract(data,'$.proposals') IS NULL ORDER BY rowid DESC LIMIT 20",
                 proposing)]

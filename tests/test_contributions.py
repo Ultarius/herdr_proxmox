@@ -1622,6 +1622,62 @@ class ContributionTests(unittest.TestCase):
                                             dict(contributions.AUTOMATION_DEFAULTS), 'group_auto_queue')
         self.store.update_job.assert_not_called()
 
+    def test_a_discussion_about_an_open_task_still_creates_its_follow_up(self):
+        # The task-linked query required a finished host task, and the taskless
+        # query excludes anything carrying a task id, so a discussion about a
+        # draft or implementing task fell outside both paths and created
+        # nothing at all.
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        task = self.service.save(dict(self.task, state='implementing'), 'test', 'admin')
+        self.assertEqual(self.service.get(task['id'])['state'], 'implementing')
+        self.service.action('automation', dict(request_id='a-1', organization_id='org',
+                                               auto_queue_proposals=True), 'admin', 'admin')
+        proposals = [dict(title='Follow up early', description='Proposed while the host is open.',
+                          profile_id='worker')]
+        self._meeting(task, proposals)
+        self.service.advance_proposals()
+        origin = self.service.get(task['id'])
+        marker = origin['auto_queue']['meeting']
+        self.assertEqual(len(marker['queued']), 1)
+        created = self.service.get(origin['follow_up_tasks'][marker['queued'][0]])
+        self.assertEqual(created['source']['task_id'], task['id'])
+        # Exactly once: a second pass must not create another.
+        before = len(self.service.snapshot()['tasks'])
+        self.service.advance_proposals()
+        self.assertEqual(len(self.service.snapshot()['tasks']), before)
+
+    def test_a_task_linked_discussion_is_not_evaluated_by_the_taskless_path(self):
+        # A discussion that belongs to a task carries a group id too, so both
+        # paths selected it. Their deterministic ids use different namespaces,
+        # so the same proposal became two drafts.
+        import sqlite3 as _sqlite3
+        org_db = _sqlite3.connect(self.root / 'organizations.sqlite3')
+        self.addCleanup(org_db.close)
+        with org_db:
+            org_db.execute('CREATE TABLE jobs (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, data TEXT NOT NULL)')
+            for job in (dict(id='linked', kind='discussion', organization_id='org', group_id='review',
+                             task_id='task-1', state='artifact_ready', created_at=contributions.stamp()),
+                        dict(id='free', kind='discussion', organization_id='org', group_id='review',
+                             state='artifact_ready', created_at=contributions.stamp())):
+                org_db.execute('INSERT INTO jobs VALUES (?,?,?)', (job['id'], 'org', json.dumps(job)))
+
+        class KeepOpen:
+            """The caller closes what connect() returns; this one is reused."""
+            def __getattr__(self, name):
+                return getattr(org_db, name)
+            def close(self):
+                pass
+
+        self.store.connect = KeepOpen
+        self.store.snapshot.return_value['groups'] = [
+            dict(id='review', organization_id='org', name='Review', create_tasks=True,
+                 updated_at='2000-01-01T00:00:00+00:00')]
+        seen = []
+        with patch.object(self.service, 'materialize_discussion',
+                          side_effect=lambda job, policy, actor, queue_allowed=True: seen.append(job['id'])):
+            self.service.advance_proposals()
+        self.assertEqual(seen, ['free'])
+
     def test_a_taskless_proposal_for_an_unmanaged_assignee_is_skipped(self):
         self.store.snapshot.return_value['profiles'] = [
             dict(self.profile, name='Nora', project=str(self.root.parent / 'elsewhere'))]

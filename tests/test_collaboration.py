@@ -389,6 +389,75 @@ class CollaborationTests(unittest.TestCase):
         self.assertEqual(recovered['state'], 'artifact_ready')
         self.assertEqual((recovered.get('completion') or {}).get('state'), 'legacy_verified')
 
+    def test_a_blocked_discussion_prevents_releasing_its_participants(self):
+        # The generic release action checked only queued/running, so it could
+        # detach a binding a blocked discussion still owned, leaving that
+        # discussion permanently unfinalizable and its reservation gone.
+        group = self.group()
+        self.block_discussion = True
+        meeting = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        job = self.job(meeting)
+        self.assertEqual(job['state'], 'waiting_for_input')
+        run = self.job(job['group_run']['id'])
+        with self.assertRaisesRegex(ValueError, 'still owns this session'):
+            self.action('release', organization_id=self.org, job_id=run['id'])
+        self.assertEqual(self.job(run['id'])['state'], 'persona_sent')
+        # Once the decision is made and the discussion finalizes, the binding
+        # is released by completion rather than by the generic action.
+        self.agents[run['alias']]['agent_status'] = 'idle'
+        self.assertIn(meeting, recover_interrupted(self.store)[0])
+        self.assertEqual(self.job(meeting)['state'], 'artifact_ready')
+
+    def test_a_blocked_discussion_prevents_closing_or_restarting_its_participants(self):
+        # The reservation check sat under an unconditional raise inside the
+        # restart branch, so close, finish and restart had no protection at all.
+        group = self.group()
+        self.block_discussion = True
+        meeting = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        job = self.job(meeting)
+        self.assertEqual(job['state'], 'waiting_for_input')
+        # An idle member is protected only by the reservation, which is exactly
+        # the case that succeeded while the check was unreachable.
+        member = self.job(job['runs'][0]['id'])
+        self.agents[member['alias']]['agent_status'] = 'idle'
+        for mode in ('close', 'finish', 'restart'):
+            with self.assertRaisesRegex(ValueError, 'still owns this session'):
+                self.store.manage_session(dict(request_id=uuid.uuid4().hex, organization_id=self.org,
+                                               job_id=member['id'], mode=mode, inspected=True), 'admin')
+        self.assertEqual(self.job(member['id'])['state'], 'persona_sent')
+        self.assertFalse(any(a[:2] == ('pane', 'close') for a, _ in self.calls))
+
+    def test_an_operator_can_answer_a_blocked_agent_without_starting_work(self):
+        # Input is the audited answer to the decision holding the reservation,
+        # not new work. Refusing it made the state unresolvable from the UI.
+        group = self.group()
+        self.block_discussion = True
+        meeting = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        job = self.job(meeting)
+        self.assertEqual(job['state'], 'waiting_for_input')
+        facilitator = self.job(job['group_run']['id'])
+        result = self.action('input', organization_id=self.org, profile_id=facilitator['profile_id'], key='enter')
+        self.assertTrue(result)
+        # An agent that is actually working is still protected.
+        self.store.update_job(meeting, state='running')
+        with self.assertRaisesRegex(ValueError, 'queued or running task work'):
+            self.action('input', organization_id=self.org, profile_id=facilitator['profile_id'], key='enter')
+
+    def test_a_blocked_discussion_blocks_a_new_meeting_with_the_same_members(self):
+        group = self.group()
+        self.block_discussion = True
+        first = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        self.assertEqual(self.job(first)['state'], 'waiting_for_input')
+        self.block_discussion = False
+        second = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        # The second meeting waits rather than reusing reserved participants.
+        self.assertNotEqual(self.job(second)['state'], 'artifact_ready')
+
     def test_waiting_batch_does_not_starve_meetings_beyond_twenty(self):
         with self.store.lock, closing(self.store.connect()) as db, db:
             for index in range(21):
@@ -680,7 +749,11 @@ class CollaborationTests(unittest.TestCase):
         other = self.organization('Other')
         with self.assertRaises(ValueError):
             inspect(other)
-        self.action('release', organization_id=self.org, job_id=job['runs'][0]['id'])
+        # A live discussion owns its participants, so releasing one is refused.
+        with self.assertRaisesRegex(ValueError, 'still owns this session'):
+            self.action('release', organization_id=self.org, job_id=job['runs'][0]['id'])
+        # Inspection still handles a binding that is gone, however it went.
+        self.store.update_job(job['runs'][0]['id'], state='released')
         self.assertEqual(inspect()['streams'][1]['status'], 'unavailable')
 
     def test_group_paths_are_saved_in_facilitator_policy(self):

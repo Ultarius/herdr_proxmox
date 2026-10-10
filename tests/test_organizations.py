@@ -445,6 +445,27 @@ class OrganizationTests(unittest.TestCase):
             self.store.manage_session(dict(job_id=run['id'], organization_id=run['organization_id'], mode='finish', inspected=True), 'admin')
         self.assertFalse(any(args[:2] == ('pane', 'close') for args, _ in self.calls))
 
+    def test_only_states_that_hold_sessions_count_as_owners(self):
+        # One predicate is shared by release, removal, task launch, meeting
+        # admission, integration work and finalization. Getting it wrong in one
+        # place is how a blocked discussion lost its participants.
+        from session_ownership import active, reserves
+        self.assertTrue(active(dict(state='queued')))
+        self.assertTrue(active(dict(state='running')))
+        self.assertTrue(active(dict(state='waiting_for_input')))
+        # A meeting waiting to acquire its members does not hold them.
+        self.assertFalse(active(dict(state='waiting_for_members')))
+        for terminal in ('artifact_ready', 'cancelled', 'completed', 'finished', 'released', 'answered'):
+            self.assertFalse(active(dict(state=terminal)), terminal)
+        self.assertFalse(active(None))
+        held = dict(state='waiting_for_input', participants=['a', 'b'])
+        self.assertTrue(reserves(held))
+        self.assertTrue(reserves(held, 'a'))
+        self.assertFalse(reserves(held, 'c'))
+        # A job with no participant list reserves the profile it was created for.
+        self.assertTrue(reserves(dict(state='running', profile_id='a'), 'a'))
+        self.assertFalse(reserves(dict(state='running', profile_id='a'), 'b'))
+
     def test_every_launch_grants_the_chat_reply_directory(self):
         # Any agent can be asked to save a chat reply, and the launch happens
         # before that chat exists, so the grant cannot be decided from the job

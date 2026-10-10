@@ -9,6 +9,7 @@ import sqlite3
 import threading
 
 import project_git
+from session_ownership import reserves as session_reserves
 from blockers import TOOLCHAIN, label as blocker_label, normalize as normalize_blocker
 
 # An approval is a point-in-time decision. It expires, and its exact checkout
@@ -481,8 +482,7 @@ class IntegrationCoordinator:
         run = next((j for j in reversed(runs) if not run_id or j['id'] == run_id), None)
         if run is None:
             return None
-        if any(j['state'] in ('queued', 'running') and
-               profile_id in j.get('participants', [j.get('profile_id')]) for j in jobs):
+        if any(session_reserves(j, profile_id) for j in jobs):
             return None
         try:
             self.store.identity(run)
