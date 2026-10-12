@@ -32,12 +32,19 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
   bool loading = false;
   bool sending = false;
   bool showDraft = false;
+  bool followOutput = true;
+  bool scrollingToBottom = false;
   final consoleScroll = ScrollController();
   final detailsScroll = ScrollController();
 
   @override
   void initState() {
     super.initState();
+    consoleScroll.addListener(() {
+      if (!scrollingToBottom && consoleScroll.hasClients) {
+        followOutput = consoleScroll.position.extentAfter <= 1;
+      }
+    });
     subscription = connection.stream.listen((_) {
       if (!connection.state.connected) {
         setState(() {
@@ -52,6 +59,15 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
       }
     });
     refresh();
+  }
+
+  void followLatestOutput() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !followOutput || !consoleScroll.hasClients) return;
+      scrollingToBottom = true;
+      consoleScroll.jumpTo(consoleScroll.position.maxScrollExtent);
+      scrollingToBottom = false;
+    });
   }
 
   @override
@@ -103,6 +119,7 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
         inspection = Map<String, dynamic>.from(result);
         error = null;
       });
+      followLatestOutput();
     } catch (e) {
       if (mounted && epoch == connection.generation) {
         setState(() {

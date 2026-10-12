@@ -6,6 +6,7 @@ import 'package:http/testing.dart';
 import 'package:juice/juice.dart';
 import 'package:herdr_dashboard/agent_console_page.dart';
 import 'package:herdr_dashboard/agent_attention.dart';
+import 'package:herdr_dashboard/agent_status_indicator.dart';
 import 'package:herdr_dashboard/org_chart.dart';
 import 'package:herdr_dashboard/routes.dart';
 import 'package:herdr_dashboard/dashboard_bloc.dart';
@@ -135,6 +136,10 @@ void main() {
     );
     await tester.pumpAndSettle();
     expect(find.text('(attention required)'), findsOneWidget);
+    expect(
+      tester.getCenter(find.byType(AgentStatusIndicator)).dx,
+      lessThan(tester.getRect(find.text('Backend Developer')).left),
+    );
     await tester.tap(find.text('Backend Developer'));
     await tester.pumpAndSettle();
     expect(find.byType(AgentConsolePage), findsOneWidget);
@@ -242,7 +247,11 @@ void main() {
             .maxScrollExtent,
         greaterThan(0),
       );
-      await tester.drag(consoleScrollable, const Offset(0, -250));
+      expect(
+        tester.state<ScrollableState>(consoleScrollable).position.extentAfter,
+        0,
+      );
+      await tester.drag(consoleScrollable, const Offset(0, 250));
       await tester.pumpAndSettle();
       final scrollOffset = tester
           .state<ScrollableState>(consoleScrollable)
@@ -255,6 +264,21 @@ void main() {
         tester.state<ScrollableState>(consoleScrollable).position.pixels,
         scrollOffset,
       );
+      output += '\nNew output while reading earlier work';
+      await tester.pump(const Duration(seconds: 2));
+      await tester.pumpAndSettle();
+      expect(
+        tester.state<ScrollableState>(consoleScrollable).position.pixels,
+        scrollOffset,
+      );
+      final position = tester
+          .state<ScrollableState>(consoleScrollable)
+          .position;
+      position.jumpTo(position.maxScrollExtent);
+      output += '\nFollowing newest output again';
+      await tester.pump(const Duration(seconds: 2));
+      await tester.pumpAndSettle();
+      expect(position.extentAfter, 0);
       // A narrow, short viewport also contains the terminal and permission panel.
       tester.view.physicalSize = const Size(390, 600);
       await tester.pumpAndSettle();

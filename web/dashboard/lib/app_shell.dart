@@ -396,20 +396,18 @@ class _AppShellState extends State<AppShell> {
               dense: true,
               selected: widget.section == 'agent:${profile['id']}',
               contentPadding: const EdgeInsets.symmetric(horizontal: 10),
-              leading: const Icon(Icons.smart_toy_outlined, size: 16),
+              leading: AgentStatusIndicator(
+                activity: agentActivity(
+                  profile['id'] as String,
+                  connection.state.agents,
+                ),
+              ),
               title: Row(
                 children: [
                   Flexible(
                     child: Text(
                       '${profile['name']}',
                       style: const TextStyle(fontSize: 12),
-                    ),
-                  ),
-                  const SizedBox(width: 6),
-                  AgentStatusIndicator(
-                    activity: agentActivity(
-                      profile['id'] as String,
-                      connection.state.agents,
                     ),
                   ),
                 ],
