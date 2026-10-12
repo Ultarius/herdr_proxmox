@@ -2,6 +2,15 @@ import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'organization_bloc.dart';
 
+Duration agentConsoleRefreshInterval(String? status) => switch (status) {
+  'working' ||
+  'running' ||
+  'busy' ||
+  'thinking' => const Duration(milliseconds: 250),
+  'idle' || 'done' => const Duration(seconds: 5),
+  _ => const Duration(seconds: 2),
+};
+
 class AgentConsolePage extends StatefulWidget {
   const AgentConsolePage({super.key, required this.id});
   final String id;
@@ -43,7 +52,6 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
       }
     });
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 2), (_) => refresh());
   }
 
   @override
@@ -57,6 +65,7 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
 
   Future<void> refresh() async {
     if (loading || sending || !connection.state.connected) return;
+    timer?.cancel();
     loading = true;
     final epoch = connection.generation;
     try {
@@ -103,6 +112,12 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
       }
     } finally {
       loading = false;
+      if (mounted && connection.state.connected) {
+        timer = Timer(
+          agentConsoleRefreshInterval(inspection?['status'] as String?),
+          refresh,
+        );
+      }
     }
   }
 
@@ -266,7 +281,7 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
                     ),
                   const Tooltip(
                     message:
-                        'Refreshes every 2 seconds. Shows retained terminal output; earlier work may be omitted.',
+                        'Refreshes every 0.25 seconds while working, every 5 seconds while idle, and every 2 seconds while awaiting attention. Retained output may omit earlier work.',
                     child: Icon(Icons.info_outline, size: 18),
                   ),
                   IconButton(

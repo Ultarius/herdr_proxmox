@@ -157,12 +157,14 @@ void main() {
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
       var status = 'blocked';
+      var inspections = 0;
       var output = 'Access requested: /project/private';
       Map<String, dynamic>? sent;
       final connection = DashboardBloc(
         client: MockClient((request) async {
           final path = request.url.path;
           if (path == '/api/organizations/inspect') {
+            inspections++;
             expect(jsonDecode(request.body)['profile_id'], 'backend');
             return http.Response(
               jsonEncode({
@@ -265,6 +267,20 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text(output), findsOneWidget);
       expect(find.text('Requires attention'), findsNothing);
+      final workingInspections = inspections;
+      await tester.pump(const Duration(milliseconds: 250));
+      await tester.pumpAndSettle();
+      expect(inspections, greaterThan(workingInspections));
+      status = 'idle';
+      await tester.pump(const Duration(milliseconds: 250));
+      await tester.pumpAndSettle();
+      final idleInspections = inspections;
+      await tester.pump(const Duration(seconds: 4));
+      await tester.pumpAndSettle();
+      expect(inspections, idleInspections);
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pumpAndSettle();
+      expect(inspections, idleInspections + 1);
       await connection.disconnect();
       await tester.pumpAndSettle();
       expect(find.text('Running build'), findsNothing);
