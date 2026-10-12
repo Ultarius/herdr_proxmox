@@ -766,7 +766,10 @@ class _OrganizationPageState extends State<OrganizationPage> {
                           ),
                           agents: connection.state.agents,
                           jobs: jobs.toList(),
-                          onSelect: (profile) => hire(org, profile),
+                          onSelect: (profile) => widget.coordinator.navigate(
+                            AgentConsoleRoute(profile['id'] as String),
+                          ),
+                          onConfigure: (profile) => hire(org, profile),
                         ),
                       if (view == 'team') ...[
                         Text(

@@ -1,6 +1,9 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'ui_colors.dart';
+import 'agent_attention.dart';
 
 class ChartLayout {
   ChartLayout(List<Map<String, dynamic>> profiles) {
@@ -48,6 +51,7 @@ class OrgChart extends StatefulWidget {
     required this.onSelect,
     this.groups = const [],
     this.onSelectGroup,
+    this.onConfigure,
   });
   final List<Map<String, dynamic>> profiles;
   final List<Map<String, dynamic>> groups;
@@ -55,6 +59,7 @@ class OrgChart extends StatefulWidget {
   final List<Map<String, dynamic>> agents;
   final List<Map<String, dynamic>> jobs;
   final void Function(Map<String, dynamic>) onSelect;
+  final void Function(Map<String, dynamic>)? onConfigure;
   @override
   State<OrgChart> createState() => _OrgChartState();
 }
@@ -62,6 +67,14 @@ class OrgChart extends StatefulWidget {
 class _OrgChartState extends State<OrgChart> {
   final transform = TransformationController();
   String fitted = '';
+  bool disabledContextMenu = false;
+  void restoreContextMenu() {
+    if (disabledContextMenu) {
+      disabledContextMenu = false;
+      BrowserContextMenu.enableContextMenu();
+    }
+  }
+
   Color activity(Map<String, dynamic> profile) {
     final run = widget.jobs
         .where(
@@ -71,14 +84,19 @@ class _OrgChartState extends State<OrgChart> {
               j['state'] != 'released',
         )
         .firstOrNull;
-    final agent = run == null
-        ? null
-        : widget.agents
-              .where(
-                (a) =>
-                    a['pane_id'] == run['pane_id'] && a['name'] == run['alias'],
-              )
-              .firstOrNull;
+    final agent =
+        widget.agents
+            .where((a) => a['profile_id'] == profile['id'])
+            .firstOrNull ??
+        (run == null
+            ? null
+            : widget.agents
+                  .where(
+                    (a) =>
+                        a['pane_id'] == run['pane_id'] &&
+                        a['name'] == run['alias'],
+                  )
+                  .firstOrNull);
     return switch (agent?['agent_status']) {
       'working' => const Color(0xff3a93ff),
       'blocked' => const Color(0xffeebc32),
@@ -89,6 +107,7 @@ class _OrgChartState extends State<OrgChart> {
 
   @override
   void dispose() {
+    restoreContextMenu();
     transform.dispose();
     super.dispose();
   }
@@ -122,7 +141,7 @@ class _OrgChartState extends State<OrgChart> {
               ? 0
               : 40 + (widget.groups.length / columns).ceil() * 110),
     );
-    return Container(
+    final chart = Container(
       height: (MediaQuery.sizeOf(context).height - 240).clamp(300, 650),
       clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
@@ -265,7 +284,7 @@ class _OrgChartState extends State<OrgChart> {
                             left: layout.positions[profile['id']]!.dx,
                             top: layout.positions[profile['id']]!.dy,
                             width: 188,
-                            height: 88,
+                            height: 108,
                             child: Material(
                               color: Theme.of(context).colorScheme.surface,
                               shape: RoundedRectangleBorder(
@@ -277,6 +296,9 @@ class _OrgChartState extends State<OrgChart> {
                               child: InkWell(
                                 borderRadius: BorderRadius.circular(9),
                                 onTap: () => widget.onSelect(profile),
+                                onSecondaryTap: widget.onConfigure == null
+                                    ? null
+                                    : () => widget.onConfigure!(profile),
                                 child: Padding(
                                   padding: const EdgeInsets.all(12),
                                   child: Row(
@@ -350,6 +372,18 @@ class _OrgChartState extends State<OrgChart> {
                                                 ),
                                               ],
                                             ),
+                                            if (agentRequiresAttention(
+                                              profile['id'] as String,
+                                              widget.agents,
+                                            ))
+                                              const Text(
+                                                '! requires attention !',
+                                                style: TextStyle(
+                                                  fontSize: 9,
+                                                  color: Color(0xffeebc32),
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                              ),
                                           ],
                                         ),
                                       ),
@@ -398,7 +432,7 @@ class _OrgChartState extends State<OrgChart> {
                 left: 18,
                 bottom: 14,
                 child: Text(
-                  'Drag to pan · Scroll to zoom · Select an agent or group',
+                  'Drag to pan · Scroll to zoom · Click: console · Right click: configure',
                   style: TextStyle(fontSize: 10, color: secondaryTextColor),
                 ),
               ),
@@ -406,6 +440,16 @@ class _OrgChartState extends State<OrgChart> {
           );
         },
       ),
+    );
+    return MouseRegion(
+      onEnter: (_) {
+        if (kIsWeb && BrowserContextMenu.enabled) {
+          disabledContextMenu = true;
+          BrowserContextMenu.disableContextMenu();
+        }
+      },
+      onExit: (_) => restoreContextMenu(),
+      child: chart,
     );
   }
 }
@@ -424,7 +468,7 @@ class _Connections extends CustomPainter {
       final parent = positions[profile['manager_id']],
           child = positions[profile['id']];
       if (parent == null || child == null || parent.dy >= child.dy) continue;
-      final start = parent + const Offset(94, 88),
+      final start = parent + const Offset(94, 108),
           end = child + const Offset(94, 0);
       final middle = (start.dy + end.dy) / 2;
       canvas.drawPath(

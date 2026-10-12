@@ -10,6 +10,22 @@ import 'project_explorer_page.dart';
 import 'builds_page.dart';
 import 'tasks_page.dart';
 import 'knowledge_page.dart';
+import 'agent_console_page.dart';
+
+class AgentConsoleRoute extends AppRoute {
+  AgentConsoleRoute(this.id);
+  final String id;
+  @override
+  List<Object?> get props => [id];
+  @override
+  Uri toUri() => Uri(path: '/agents/$id');
+  @override
+  Widget build(AppCoordinator coordinator, BuildContext context) => AppShell(
+    coordinator: coordinator,
+    section: 'agent:$id',
+    child: AgentConsolePage(key: ValueKey(id), id: id),
+  );
+}
 
 class KnowledgeRoute extends AppRoute {
   KnowledgeRoute([this.organizationId = '']);
@@ -192,6 +208,8 @@ class AppCoordinator extends Coordinator<AppRoute> {
 
   @override
   AppRoute parseRouteFromUri(Uri uri) {
+    if (uri.pathSegments.length == 2 && uri.pathSegments.first == 'agents')
+      return AgentConsoleRoute(uri.pathSegments[1]);
     if (uri.pathSegments.length == 2 && uri.pathSegments.first == 'groups')
       return GroupRoute(uri.pathSegments[1]);
     if (uri.pathSegments.length == 2 && uri.pathSegments.first == 'tasks')

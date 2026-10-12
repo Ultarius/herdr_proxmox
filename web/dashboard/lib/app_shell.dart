@@ -4,6 +4,7 @@ import 'dashboard_bloc.dart';
 import 'integration.dart';
 import 'routes.dart';
 import 'app_theme.dart';
+import 'agent_attention.dart';
 
 class AppShell extends StatefulWidget {
   const AppShell({
@@ -35,6 +36,7 @@ class _AppShellState extends State<AppShell> {
   void initState() {
     super.initState();
     subscription = connection.stream.listen((_) {
+      if (mounted) setState(() {});
       load();
       if (noticeGeneration != connection.generation)
         pollNotices(announce: false);
@@ -392,13 +394,14 @@ class _AppShellState extends State<AppShell> {
           for (final profile in profiles)
             ListTile(
               dense: true,
+              selected: widget.section == 'agent:${profile['id']}',
               contentPadding: const EdgeInsets.symmetric(horizontal: 10),
               leading: const Icon(Icons.smart_toy_outlined, size: 16),
               title: Text(
-                '${profile['name']}',
+                '${profile['name']}${agentRequiresAttention(profile['id'] as String, connection.state.agents) ? ' (requires attention)' : ''}',
                 style: const TextStyle(fontSize: 12),
               ),
-              onTap: () => navigate(OrganizationRoute()),
+              onTap: () => navigate(AgentConsoleRoute(profile['id'] as String)),
             ),
           heading('GROUPS'),
           if (groups.isEmpty)
@@ -703,6 +706,8 @@ class _AppShellState extends State<AppShell> {
                                 child: Text(
                                   widget.section.startsWith('group:')
                                       ? 'Discussion group'
+                                      : widget.section.startsWith('agent:')
+                                      ? 'Agent console'
                                       : widget.section == 'organization'
                                       ? 'Organization'
                                       : widget.section == 'dashboard'

@@ -40,9 +40,21 @@ a drawer while the organization rail stays visible.
 
 The **Chart** view uses saved manager relationships to draw the hierarchy. Drag
 to pan, zoom with the controls or wheel, and use **Fit** to frame the team. Select
-an agent card to edit its persona. **Team** contains the roster and launch controls;
+an agent card with the left mouse button to open its console; right click to
+configure its persona. **Team** contains the roster and launch controls;
 **Runs** contains launch/delegation history. Status dots reflect matching live
 Herdr run bindings, with gray indicating no matching status.
+
+The agent menu also opens the console (`/agents/<profile-id>`). Blocked live
+agents show **requires attention** beside their menu name and on their chart
+card. The console refreshes retained terminal output every two seconds and
+shows the runtime's permission or question prompt. Use arrows/Tab to select
+Allow or Reject in that prompt, then confirm the selected response; Escape
+cancels where supported. These are runtime terminal controls, so the selected
+option must be reviewed before confirming. The gateway records response
+delivery and the operator, and rejects a console response if its inspected
+prompt changed, the agent stopped being blocked, or its conversation was
+replaced. Retained output is bounded and may omit earlier work.
 
 Launch creates a separate workspace/root pane, waits for the shell, then starts
 a unique Herdr alias and sends the saved organization instructions and persona

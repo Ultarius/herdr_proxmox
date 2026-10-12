@@ -18,6 +18,12 @@ from herdr_errors import HerdrError, parse_completion
 DISCUSSION_WAIT_SECONDS = 7200
 
 
+def console_token(run, output):
+    """Bind a terminal response to the conversation and visible prompt reviewed."""
+    return hashlib.sha256(json.dumps([run['id'], run.get('agent_session'), output],
+                                     sort_keys=True).encode()).hexdigest()
+
+
 def active_run(store, db, organization_id, profile_id):
     store.get(db, 'profiles', profile_id, organization_id)
     jobs = [json.loads(row['data']) for row in db.execute('SELECT data FROM jobs WHERE organization_id=?', (organization_id,))]
@@ -176,6 +182,7 @@ def action(store, db, name, body, org):
             if path.is_file() and not path.is_symlink() and path.stat().st_size <= 40000:
                 draft = path.read_text(encoding='utf-8', errors='replace')[:40000]
         return {'output': output['output'], 'status': status, 'reply_draft': draft,
+                'console_token': console_token(runs[0], output['output']) if status == 'blocked' else None,
                 'reply_job_id': current['id'] if current else None}
 
     ids = set(group['members']) if name == 'discuss' else {run['profile_id'] for run in runs}
@@ -214,6 +221,11 @@ def action(store, db, name, body, org):
             raise ValueError('Unsupported terminal key.')
         item.update(profile_id=runs[0]['profile_id'], key=key, actor=str(body.get('_actor') or 'administrator')[:120],
                     decision_job_id=decision_job)
+        if 'console_token' in body:
+            token = text(body, 'console_token', 64)
+            if len(token) != 64 or any(c not in '0123456789abcdef' for c in token):
+                raise ValueError('Invalid console inspection token.')
+            item['console_token'] = token
     elif name == 'chat':
         item.update(profile_id=runs[0]['profile_id'], prompt=text(body, 'prompt', 8000),
                     wait_seconds=wait_seconds(body), integration_event=body.get('integration_event'))
@@ -647,6 +659,14 @@ def execute(store, job):
             with store.lock, closing(store.connect()) as db:
                 owner = store.get(db, 'jobs', job['decision_job_id'], job['organization_id'])
             run = verify_decision_input(store, owner, run)
+        if job.get('console_token'):
+            state = store.agent_state(run)
+            if state['status'] != 'blocked':
+                raise ValueError('Agent is no longer blocked; inspect the console again.')
+            output = store.command('agent', 'read', run['alias'], '--source', 'visible', '--lines', '160', timeout=2)
+            if console_token(run, output['output']) != job['console_token']:
+                raise ValueError('Console prompt changed; review the request again before responding.')
+            current_run(store, run, ready=False)
         store.command('agent', 'send-keys', run['alias'], job['key'])
         current_run(store, run, ready=False)
         store.update_job(job['id'], state='input_sent')
