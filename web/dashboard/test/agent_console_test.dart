@@ -124,16 +124,24 @@ void main() {
     connection.connect('token');
     await connected;
     final coordinator = AppCoordinator();
-    await tester.pumpWidget(MaterialApp.router(routerConfig: coordinator));
+    await tester.pumpWidget(
+      MaterialApp.router(
+        routerConfig: coordinator,
+        builder: (context, child) => MediaQuery(
+          data: MediaQuery.of(context).copyWith(disableAnimations: true),
+          child: child!,
+        ),
+      ),
+    );
     await tester.pumpAndSettle();
-    expect(find.text('Backend Developer (requires attention)'), findsOneWidget);
-    await tester.tap(find.text('Backend Developer (requires attention)'));
+    expect(find.text('(attention required)'), findsOneWidget);
+    await tester.tap(find.text('Backend Developer'));
     await tester.pumpAndSettle();
     expect(find.byType(AgentConsolePage), findsOneWidget);
     blocked = false;
     await connection.send(DashboardCommand('refresh', null, true));
     await tester.pumpAndSettle();
-    expect(find.text('Backend Developer (requires attention)'), findsNothing);
+    expect(find.text('(attention required)'), findsNothing);
     expect(find.text('Backend Developer'), findsOneWidget);
     await tester.pumpWidget(const SizedBox.shrink());
     await connection.disconnect();

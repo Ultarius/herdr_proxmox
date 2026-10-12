@@ -4,7 +4,7 @@ import 'dashboard_bloc.dart';
 import 'integration.dart';
 import 'routes.dart';
 import 'app_theme.dart';
-import 'agent_attention.dart';
+import 'agent_status_indicator.dart';
 
 class AppShell extends StatefulWidget {
   const AppShell({
@@ -397,10 +397,34 @@ class _AppShellState extends State<AppShell> {
               selected: widget.section == 'agent:${profile['id']}',
               contentPadding: const EdgeInsets.symmetric(horizontal: 10),
               leading: const Icon(Icons.smart_toy_outlined, size: 16),
-              title: Text(
-                '${profile['name']}${agentRequiresAttention(profile['id'] as String, connection.state.agents) ? ' (requires attention)' : ''}',
-                style: const TextStyle(fontSize: 12),
+              title: Row(
+                children: [
+                  Flexible(
+                    child: Text(
+                      '${profile['name']}',
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  AgentStatusIndicator(
+                    activity: agentActivity(
+                      profile['id'] as String,
+                      connection.state.agents,
+                    ),
+                  ),
+                ],
               ),
+              subtitle:
+                  agentActivity(
+                        profile['id'] as String,
+                        connection.state.agents,
+                      ) ==
+                      'attention'
+                  ? const Text(
+                      '(attention required)',
+                      style: TextStyle(fontSize: 10, color: Color(0xffffa14d)),
+                    )
+                  : null,
               onTap: () => navigate(AgentConsoleRoute(profile['id'] as String)),
             ),
           heading('GROUPS'),
