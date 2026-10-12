@@ -214,6 +214,43 @@ void main() {
       expect(sent?['key'], 'enter');
       expect(sent?['console_token'], 'reviewed-prompt');
       expect(find.text('Terminal response: input_sent'), findsOneWidget);
+      output = List.generate(
+        200,
+        (index) => 'Build output line $index',
+      ).join('\n');
+      await tester.pump(const Duration(seconds: 2));
+      await tester.pumpAndSettle();
+      final viewport = find.byKey(const ValueKey('agent-console-viewport'));
+      final consoleScrollable = find
+          .descendant(of: viewport, matching: find.byType(Scrollable))
+          .first;
+      expect(tester.getRect(viewport).bottom, lessThanOrEqualTo(1200));
+      expect(
+        tester
+            .state<ScrollableState>(consoleScrollable)
+            .position
+            .maxScrollExtent,
+        greaterThan(0),
+      );
+      await tester.drag(consoleScrollable, const Offset(0, -250));
+      await tester.pumpAndSettle();
+      final scrollOffset = tester
+          .state<ScrollableState>(consoleScrollable)
+          .position
+          .pixels;
+      expect(scrollOffset, greaterThan(0));
+      await tester.pump(const Duration(seconds: 2));
+      await tester.pumpAndSettle();
+      expect(
+        tester.state<ScrollableState>(consoleScrollable).position.pixels,
+        scrollOffset,
+      );
+      // A narrow, short viewport also contains the terminal and permission panel.
+      tester.view.physicalSize = const Size(390, 600);
+      await tester.pumpAndSettle();
+      expect(tester.getRect(viewport).bottom, lessThanOrEqualTo(600));
+      expect(tester.getSize(viewport).height, greaterThan(0));
+      expect(tester.takeException(), isNull);
       status = 'working';
       output = 'Running build';
       await tester.pump(const Duration(seconds: 2));

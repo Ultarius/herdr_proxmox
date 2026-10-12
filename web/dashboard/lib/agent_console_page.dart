@@ -22,6 +22,9 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
   String? inputJob;
   bool loading = false;
   bool sending = false;
+  bool showDraft = false;
+  final consoleScroll = ScrollController();
+  final detailsScroll = ScrollController();
 
   @override
   void initState() {
@@ -47,6 +50,8 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
   void dispose() {
     timer?.cancel();
     subscription?.cancel();
+    consoleScroll.dispose();
+    detailsScroll.dispose();
     super.dispose();
   }
 
@@ -149,99 +154,162 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
           !awaitingInput &&
           bloc.state.connected &&
           inspection?['console_token'] != null;
-      return ListView(
-        padding: const EdgeInsets.all(28),
-        children: [
-          Text(
-            '${profile?['name'] ?? 'Agent'} console',
-            style: Theme.of(context).textTheme.headlineLarge,
-          ),
-          if (profile != null)
-            Text('${profile!['role']} · ${profile!['runtime']}'),
-          const SizedBox(height: 12),
-          if (!bloc.state.connected)
-            const Text('Connect on the dashboard first.'),
-          if (error != null) SelectableText(error!),
-          if (responseError != null) SelectableText(responseError!),
-          if (delivery != null) ...[
-            Text('Terminal response: ${delivery['state']}'),
-            if ('${delivery['error'] ?? ''}'.isNotEmpty)
-              Text('${delivery['error']}'),
-          ],
-          if (blocked)
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Requires attention',
-                      style: Theme.of(context).textTheme.titleLarge,
-                    ),
-                    const Text(
-                      'Review the request in the console below. Use the arrow or Tab keys to select Allow or Reject in the runtime prompt, then confirm the selected response. Escape cancels where supported by the runtime.',
-                    ),
-                    const SizedBox(height: 12),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
+      final hasDraft = '${inspection?['reply_draft'] ?? ''}'.isNotEmpty;
+      return LayoutBuilder(
+        builder: (context, constraints) => Padding(
+          padding: EdgeInsets.all(constraints.maxWidth < 600 ? 12 : 20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxHeight: (constraints.maxHeight - 40) * .55,
+                ),
+                child: Scrollbar(
+                  controller: detailsScroll,
+                  child: SingleChildScrollView(
+                    controller: detailsScroll,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        for (final key in ['up', 'down', 'tab', 'shift+tab'])
-                          OutlinedButton(
-                            onPressed: canRespond ? () => sendKey(key) : null,
-                            child: Text(key),
+                        Text(
+                          '${profile?['name'] ?? 'Agent'} console',
+                          style: Theme.of(context).textTheme.headlineSmall,
+                        ),
+                        if (profile != null)
+                          Text('${profile!['role']} · ${profile!['runtime']}'),
+                        const SizedBox(height: 12),
+                        if (!bloc.state.connected)
+                          const Text('Connect on the dashboard first.'),
+                        if (error != null) SelectableText(error!),
+                        if (responseError != null)
+                          SelectableText(responseError!),
+                        if (delivery != null) ...[
+                          Text('Terminal response: ${delivery['state']}'),
+                          if ('${delivery['error'] ?? ''}'.isNotEmpty)
+                            Text('${delivery['error']}'),
+                        ],
+                        if (blocked)
+                          Card(
+                            child: Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'Requires attention',
+                                    style: Theme.of(
+                                      context,
+                                    ).textTheme.titleLarge,
+                                  ),
+                                  const Text(
+                                    'Select Allow or Reject in the console prompt, then confirm. Escape cancels where supported.',
+                                  ),
+                                  const SizedBox(height: 12),
+                                  Wrap(
+                                    spacing: 8,
+                                    runSpacing: 8,
+                                    children: [
+                                      for (final key in [
+                                        'up',
+                                        'down',
+                                        'tab',
+                                        'shift+tab',
+                                      ])
+                                        OutlinedButton(
+                                          onPressed: canRespond
+                                              ? () => sendKey(key)
+                                              : null,
+                                          child: Text(key),
+                                        ),
+                                      FilledButton(
+                                        onPressed: canRespond
+                                            ? () => sendKey('enter')
+                                            : null,
+                                        child: const Text(
+                                          'Confirm selected Allow / Reject',
+                                        ),
+                                      ),
+                                      OutlinedButton(
+                                        onPressed: canRespond
+                                            ? () => sendKey('esc')
+                                            : null,
+                                        child: const Text(
+                                          'Cancel request (Esc)',
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
                           ),
-                        FilledButton(
-                          onPressed: canRespond ? () => sendKey('enter') : null,
-                          child: const Text('Confirm selected Allow / Reject'),
-                        ),
-                        OutlinedButton(
-                          onPressed: canRespond ? () => sendKey('esc') : null,
-                          child: const Text('Cancel request (Esc)'),
-                        ),
                       ],
                     ),
-                  ],
+                  ),
                 ),
               ),
-            ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Live console · ${inspection?['status'] ?? 'unavailable'}',
+                    ),
+                  ),
+                  if (hasDraft)
+                    TextButton(
+                      onPressed: () => setState(() => showDraft = !showDraft),
+                      child: Text(
+                        showDraft ? 'Live console' : 'Current reply draft',
+                      ),
+                    ),
+                  const Tooltip(
+                    message:
+                        'Refreshes every 2 seconds. Shows retained terminal output; earlier work may be omitted.',
+                    child: Icon(Icons.info_outline, size: 18),
+                  ),
+                  IconButton(
+                    tooltip: 'Refresh console',
+                    onPressed: sending ? null : refresh,
+                    icon: const Icon(Icons.refresh),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
               Expanded(
-                child: Text(
-                  'Live console · ${inspection?['status'] ?? 'unavailable'}',
+                child: Container(
+                  key: const ValueKey('agent-console-viewport'),
+                  clipBehavior: Clip.antiAlias,
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.surfaceContainerLow,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Scrollbar(
+                    controller: consoleScroll,
+                    thumbVisibility: true,
+                    child: SingleChildScrollView(
+                      controller: consoleScroll,
+                      child: Align(
+                        alignment: Alignment.topLeft,
+                        child: SelectableText(
+                          showDraft && hasDraft
+                              ? '${inspection!['reply_draft']}'
+                              : '${inspection?['output'] ?? 'No live session output available.'}',
+                          style: const TextStyle(
+                            fontFamily: 'RobotoMono',
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
                 ),
-              ),
-              IconButton(
-                tooltip: 'Refresh console',
-                onPressed: sending ? null : refresh,
-                icon: const Icon(Icons.refresh),
               ),
             ],
           ),
-          const Text(
-            'Refreshes every 2 seconds. Shows retained terminal output; earlier work may be omitted.',
-          ),
-          const SizedBox(height: 8),
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: Theme.of(context).colorScheme.surfaceContainerLow,
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: SelectableText(
-              '${inspection?['output'] ?? 'No live session output available.'}',
-              style: const TextStyle(fontFamily: 'RobotoMono', fontSize: 13),
-            ),
-          ),
-          if ('${inspection?['reply_draft'] ?? ''}'.isNotEmpty) ...[
-            const SizedBox(height: 16),
-            const Text('Current reply draft'),
-            SelectableText('${inspection!['reply_draft']}'),
-          ],
-        ],
+        ),
       );
     },
   );
