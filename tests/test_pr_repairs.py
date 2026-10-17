@@ -554,6 +554,73 @@ class RepairTests(unittest.TestCase):
             self.service.action('publish', dict(request_id='early-publish', task_id=self.task['id'],
                 head_sha=self.task['head_sha']), 'admin', 'admin')
 
+    def validated_update(self):
+        self.validation_fixture()
+        self.validate()
+        pr_repairs.advance(self.service)
+        self.run['state'] = 'persona_sent'
+        head = self.resolve()
+        self.advance()
+        task = self.service.get(self.task['id'])
+        task['publishing_repository'] = 'contributor/repo'
+        task['builds'] = {head: dict(target=head, state='complete', required_checks_verified=True)}
+        self.service.save(task, 'validated', 'test')
+        self.advance()
+        self.assertEqual(self.service.get(task['id'])['pr_repair']['state'], 'ready')
+        return head
+
+    def test_http_publish_updated_branch_before_first_pr_and_replay(self):
+        head = self.validated_update()
+        gateway = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        gateway.token = 'a' * 48
+        gateway.contributions = self.service
+        gateway.operators = SimpleNamespace(identify=lambda token: None)
+        thread = threading.Thread(target=gateway.serve_forever, daemon=True)
+        thread.start()
+        try:
+            payload = json.dumps(dict(request_id='publish-updated', task_id=self.task['id'], head_sha=head)).encode()
+            request = Request('http://127.0.0.1:' + str(gateway.server_port) + '/api/tasks/publish', data=payload,
+                              headers={'Authorization': 'Bearer ' + gateway.token})
+            with patch.object(self.service, 'remote_head', side_effect=[None, head]) as remote, \
+                    patch('contributions.push') as push:
+                for _ in range(2):
+                    with urlopen(request, timeout=5) as response:
+                        self.assertEqual(response.status, 200)
+                        result = json.load(response)
+                    self.assertEqual(result['state'], 'published')
+                    self.assertEqual(result['publish']['head_sha'], head)
+                    self.assertEqual(result['publish']['repository'], 'contributor/repo')
+                    self.assertEqual(result['pr_repair']['state'], 'published')
+                    self.assertNotIn('pull', result)
+                self.assertEqual(remote.call_count, 2)
+                push.assert_called_once()
+                self.assertEqual(push.call_args.args[-1], 'contributor/repo')
+        finally:
+            gateway.shutdown()
+            gateway.server_close()
+            thread.join(timeout=2)
+
+    def test_updated_branch_already_pushed_reconciles_and_can_open_first_draft_pr(self):
+        head = self.validated_update()
+        with patch.object(self.service, 'remote_head', return_value=head), patch('contributions.push') as push:
+            task = self.service.action('publish', dict(request_id='reconcile-updated-push',
+                task_id=self.task['id'], head_sha=head), 'admin', 'admin')
+            push.assert_not_called()
+            self.assertEqual(task['state'], 'published')
+            self.assertNotIn('pull', task)
+            preview = fixtures.contributions.pull_preview(task)
+            pull = self.pull_data(task)
+            pull['head']['repo']['full_name'] = 'contributor/repo'
+            self.api.find_pull.return_value = []
+            self.api.request.side_effect = [dict(name='main'), pull]
+            result = self.service.action('pull', dict(request_id='first-updated-pr', task_id=task['id'],
+                head_sha=head, reviewed=True, title=preview['title'], body=preview['body']), 'admin', 'admin')
+        self.assertEqual(result['state'], 'pr_open')
+        self.assertEqual(result['pull']['head_sha'], head)
+        payload = self.api.request.call_args.args[2]
+        self.assertEqual(payload['head'], 'contributor:' + task['branch'])
+        self.assertTrue(payload['draft'])
+
     def test_validated_repair_updates_the_existing_fork_branch_and_pr(self):
         self.task['publishing_repository'] = 'contributor/repo'
         self.task['publish']['repository'] = 'contributor/repo'

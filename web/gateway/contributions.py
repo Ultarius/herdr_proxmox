@@ -3119,8 +3119,14 @@ class Contributions:
             # A task that already has a pull request stays in its pull state.
             task['state'] = 'pr_open' if task.get('pull') else 'published'
             if (task.get('pr_repair') or {}).get('candidate') == head:
-                task['pr_repair'].update(state='published', message='Repaired candidate published to the existing PR branch; refresh GitHub conflict status.')
-                task['pull'].update(mergeable=None, mergeable_state='unknown')
+                # Validation updates also run before the first PR exists. The
+                # branch push is complete in that case; PR creation is the next
+                # action, not a prerequisite for recording publication.
+                task['pr_repair'].update(state='published', message=(
+                    'Repaired candidate published to the existing PR branch; refresh GitHub conflict status.'
+                    if task.get('pull') else 'Updated candidate branch published; review and open its draft PR.'))
+                if task.get('pull'):
+                    task['pull'].update(mergeable=None, mergeable_state='unknown')
         elif action == 'pull':
             published = task.get('publish', {}).get('head_sha')
             # Two related guards that must not be merged. This one defaults a
