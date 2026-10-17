@@ -187,7 +187,7 @@ class OrganizationTests(unittest.TestCase):
         server = gateway.ThreadingHTTPServer(('127.0.0.1', 0), gateway.Handler)
         server.token = 'admin-token'
         server.organizations = self.store
-        server.operators = SimpleNamespace(identify=lambda token: dict(name='viewer', role='operator') if token == 'operator-token' else None)
+        server.operators = SimpleNamespace(identify_digest=lambda digest: dict(name='viewer', role='operator') if digest == gateway.token_digest('operator-token') else None)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:

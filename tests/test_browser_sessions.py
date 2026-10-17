@@ -93,7 +93,7 @@ class BrowserSessionTests(unittest.TestCase):
             return urlopen(Request(self.base + '/api/projects/git', data=body,
                                    headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'}))
         self.server.operators = Mock()
-        self.server.operators.identify.side_effect = lambda token: ({'name': 'kit', 'role': 'operator'} if token == 'worker-token' else None)
+        self.server.operators.identify_digest.side_effect = lambda digest: ({'name': 'kit', 'role': 'operator'} if digest == token_digest('worker-token') else None)
         with self.assertRaises(HTTPError) as error:
             post('worker-token')
         self.assertEqual(error.exception.code, 400)
@@ -186,3 +186,9 @@ class BrowserSessionTests(unittest.TestCase):
             self.assertFalse(json.load(self.request('/api/session', Cookie=cookie))['authenticated'])
             master = json.load(self.request('/api/session', 'POST', Authorization='Bearer secret', Origin=self.base))
             self.assertEqual((master['operator'], master['role']), ('dashboard', 'admin'))
+
+    def test_sessions_retain_only_token_digests(self):
+        self.assertEqual(self.request('/api/session', 'POST', Authorization='Bearer secret', Origin=self.base).status, 200)
+        stored = [entry[1] for entry in self.server.sessions.entries.values()]
+        self.assertEqual(stored, [token_digest('secret')])
+        self.assertNotIn('secret', stored)

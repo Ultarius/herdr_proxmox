@@ -1936,7 +1936,7 @@ class ContributionTests(unittest.TestCase):
         gateway.token = 'a' * 48
         gateway.github = self.api
         gateway.contributions = self.service
-        gateway.operators = SimpleNamespace(identify=lambda token: None)
+        gateway.operators = SimpleNamespace(identify_digest=lambda digest: None)
         thread = threading.Thread(target=gateway.serve_forever, daemon=True)
         thread.start()
         base = 'http://127.0.0.1:' + str(gateway.server_port)
@@ -2108,7 +2108,7 @@ class ContributionTests(unittest.TestCase):
         gateway.token = 'a' * 48
         gateway.github = self.api
         gateway.contributions = self.service
-        gateway.operators = SimpleNamespace(identify=lambda token: dict(name='viewer', role='operator') if token == 'viewer' else None)
+        gateway.operators = SimpleNamespace(identify_digest=lambda digest: dict(name='viewer', role='operator') if digest == server.token_digest('viewer') else None)
         thread = threading.Thread(target=gateway.serve_forever, daemon=True)
         thread.start()
         base = 'http://127.0.0.1:' + str(gateway.server_port)
@@ -2168,7 +2168,7 @@ class ContributionTests(unittest.TestCase):
         gateway.token = 'a' * 48
         gateway.github = self.api
         gateway.contributions = self.service
-        gateway.operators = SimpleNamespace(identify=lambda token: dict(name='admin', role='admin'))
+        gateway.operators = SimpleNamespace(identify_digest=lambda digest: dict(name='admin', role='admin'))
         thread = threading.Thread(target=gateway.serve_forever, daemon=True)
         thread.start()
         base = 'http://127.0.0.1:' + str(gateway.server_port)

@@ -343,7 +343,7 @@ class RepairTests(unittest.TestCase):
         gateway = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
         gateway.token = 'a' * 48
         gateway.contributions = self.service
-        gateway.operators = SimpleNamespace(identify=lambda token: None)
+        gateway.operators = SimpleNamespace(identify_digest=lambda digest: None)
         thread = threading.Thread(target=gateway.serve_forever, daemon=True)
         thread.start()
         try:
@@ -368,7 +368,7 @@ class RepairTests(unittest.TestCase):
         gateway = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
         gateway.token = 'a' * 48
         gateway.contributions = self.service
-        gateway.operators = SimpleNamespace(identify=lambda token: None)
+        gateway.operators = SimpleNamespace(identify_digest=lambda digest: None)
         thread = threading.Thread(target=gateway.serve_forever, daemon=True)
         thread.start()
         try:
