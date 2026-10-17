@@ -149,7 +149,11 @@ extension _Canvas on _TaskWorkflowState {
       [
         el('title', [
           text(
-            '${link.from} → ${link.to}: ${link.kind == 'follow-up' ? 'recorded follow-up' : 'waiting on execution'}',
+            '${link.from} → ${link.to}: ${link.kind == 'release-membership'
+                ? '${link.state} ${link.reason}'
+                : link.kind == 'follow-up'
+                ? 'recorded follow-up'
+                : 'waiting on execution'}',
           ),
         ]),
         el(
@@ -170,6 +174,7 @@ extension _Canvas on _TaskWorkflowState {
         'data-from': link.from,
         'data-to': link.to,
         'data-kind': link.kind,
+        if (link.kind == 'release-membership') 'data-edge': link.state,
         if (link.kind == 'follow-up' && fromFinished) 'data-edge': 'finished',
         if (active) 'data-emphasis': '',
         if (highlighted.isNotEmpty && !active) 'data-dim': '',
@@ -194,7 +199,7 @@ extension _Canvas on _TaskWorkflowState {
     return el(
       'div',
       [
-        if (tasks.isEmpty)
+        if (boxes.isEmpty)
           el('div', [
             el('span', [icon('workflow')], classes: 'empty__icon'),
             el('p', [
@@ -237,11 +242,20 @@ extension _Canvas on _TaskWorkflowState {
                             ? a.y.compareTo(b.y)
                             : a.column.compareTo(b.column),
                       ))
-                    node(
-                      tasks.firstWhere((task) => _id(task) == box.id),
-                      box,
-                      highlighted,
-                    ),
+                    if (box.kind == 'release')
+                      releaseNode(
+                        component.releases.firstWhere(
+                          (release) => 'release:${release['id']}' == box.id,
+                        ),
+                        box,
+                        highlighted,
+                      )
+                    else
+                      node(
+                        tasks.firstWhere((task) => _id(task) == box.id),
+                        box,
+                        highlighted,
+                      ),
                 ],
                 classes: 'task-wf-stage',
                 attributes: {
@@ -269,7 +283,7 @@ extension _Canvas on _TaskWorkflowState {
             '--wf-content-h:${contentHeight}px;--wf-zoom:$zoom;--wf-scroll-x:${scrollX}px;',
         if (scrollX <= 0) 'data-scroll-start': '',
         if (drag != null) 'data-panning': '',
-        if (tasks.isEmpty) 'data-empty': '',
+        if (boxes.isEmpty) 'data-empty': '',
       },
       events: {
         'scroll': (event) {

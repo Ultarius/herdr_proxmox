@@ -41,6 +41,29 @@ BASH = usable_bash()
 
 
 class ValidationRunTests(unittest.TestCase):
+    def test_full_service_queue_is_a_typed_capacity_wait(self):
+        from unittest.mock import Mock
+        from build_queue import BuildQueueBusy
+        self.runs.queue = Mock()
+        self.runs.queue.enqueue.side_effect = BuildQueueBusy('Build queue is full.')
+        with patch('toolchain_policy.resolve_committed', return_value=dict(toolchains=[])), \
+                patch('validation.threading.Thread') as thread:
+            with self.assertRaises(validation.ValidationBusy):
+                self.runs.submit({'id': 'a' * 64})
+        thread.assert_not_called()
+        self.assertEqual(self.runs._history(), [])
+
+    def test_frozen_policy_without_plan_cannot_drift_before_execution(self):
+        policy = dict(toolchains=[], declarations={}, lockfiles={}, checks=[])
+        self.runs.lookup = lambda identifier: dict(id=identifier, repository='source', path='source',
+            target=self.target, frozen_policy_digest='previous-policy', frozen_plan_digest=None)
+        with patch('toolchain_policy.resolve_committed', return_value=policy), \
+                patch('check_runner.run_scripts') as scripts:
+            run = self.submit_and_wait()
+        self.assertEqual(run['state'], 'error')
+        self.assertEqual(run['blocker'], 'policy_changed')
+        scripts.assert_not_called()
+
     def test_busy_gateway_refuses_before_starting_a_run(self):
         with patch.object(self.runs, 'running', return_value=[{'state': 'running'}]), \
                 patch('validation.threading.Thread') as thread:

@@ -23,6 +23,7 @@ import time
 import project_git
 from project_files import project_directory
 import toolchain_policy
+from build_queue import BuildQueueBusy
 COMMANDS = ('scripts/validate.sh', 'scripts/build-web.sh')
 BASH = 'bash'
 EVENT_ID = re.compile(r'[a-f0-9]{64}')
@@ -236,7 +237,10 @@ class ValidationRuns:
                                      for entry in approved['toolchains']) or 'none'
                 run['policy_digest'] = toolchain_policy.digest(approved)
                 run['plan_digest'] = approved.get('plan_digest')
-                run, created = self.queue.enqueue(run, toolchain=toolchain, retry=body.get('retry', False))
+                try:
+                    run, created = self.queue.enqueue(run, toolchain=toolchain, retry=body.get('retry', False))
+                except BuildQueueBusy as error:
+                    raise ValidationBusy(str(error)) from error
                 if not created:
                     return run
             folder = self.root / run['id']
@@ -259,8 +263,12 @@ class ValidationRuns:
             # The policy is resolved from the approved checkout, never from the
             # candidate: a candidate must not redefine the rules that judge it.
             policy = toolchain_policy.resolve_committed(checkout)
-            if (run.get('frozen_plan_digest') and (run['frozen_plan_digest'] != policy.get('plan_digest')
-                    or run.get('frozen_policy_digest') != toolchain_policy.digest(policy))):
+            # Releases may freeze a legacy policy without an environment-plan
+            # digest. That policy still binds execution; a plan-bound session
+            # must provide matching plan and policy digests together.
+            if ((run.get('frozen_plan_digest') and (run['frozen_plan_digest'] != policy.get('plan_digest')
+                    or run.get('frozen_policy_digest') != toolchain_policy.digest(policy)))
+                    or (run.get('frozen_policy_digest') and run['frozen_policy_digest'] != toolchain_policy.digest(policy))):
                 run['blocker'] = 'policy_changed'
                 raise ValueError('The approved environment differs from the session policy; inspect and relaunch under the approved plan.')
             if run.get('policy_digest') and run['policy_digest'] != toolchain_policy.digest(policy):

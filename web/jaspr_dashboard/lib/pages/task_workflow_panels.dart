@@ -300,6 +300,16 @@ extension _Panels on _TaskWorkflowState {
             sample('follow-up', 'Recorded follow-up'),
             sample('finished', 'Follow-up of done or merged work'),
             sample('execution-wait', 'Waiting on another task execution'),
+            if (component.releases.isNotEmpty) ...[
+              sample(
+                'release-pending',
+                'Selected for release; awaiting incorporation',
+              ),
+              sample(
+                'release-incorporated',
+                'Incorporated into release; separate from main',
+              ),
+            ],
           ],
           classes: 'legend',
           attributes: {'role': 'list'},

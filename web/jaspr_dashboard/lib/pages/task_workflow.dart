@@ -12,6 +12,7 @@ part 'task_workflow_layout.dart';
 part 'task_workflow_panels.dart';
 part 'task_workflow_inspector.dart';
 part 'task_workflow_canvas.dart';
+part 'task_workflow_releases.dart';
 
 /// Summary order: finished work first, then what is closest to finishing.
 const _progressOrder = [
@@ -65,9 +66,18 @@ class TaskWorkflow extends StatefulComponent {
     this.executor = 'unavailable',
     this.loading = false,
     this.initialView = 'workflow',
+    this.releases = const [],
+    this.onReleaseAction,
+    this.releaseBusy = false,
+    this.onLoadReleaseHistory,
   });
   final List<Map<String, dynamic>> tasks;
   final List<Map<String, dynamic>> profiles;
+  final List<Map<String, dynamic>> releases;
+  final void Function(String, Map<String, dynamic>)? onReleaseAction;
+  final bool releaseBusy;
+  final Future<Map<String, dynamic>> Function(String, String?, int?)?
+  onLoadReleaseHistory;
 
   /// Live agent activity by profile id (working, idle, attention, offline),
   /// from the dashboard snapshot. Null when the host has no live state.
@@ -86,6 +96,17 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
   late String view = component.initialView == 'list' ? 'list' : 'workflow';
   String repository = '', status = '', validation = '', agent = '';
   String? selected, hovered;
+  bool creatingRelease = false;
+  String newReleaseName = '', newReleaseRepository = '', newReleaseCut = '';
+  String repairProfile = '';
+  String exclusionReason = '';
+  String? historyRelease;
+  List<Map<String, dynamic>> retainedRevisions = [];
+  Map<String, dynamic>? retainedRelease;
+  int? historyBefore;
+  int historyRequest = 0;
+  bool historyLoading = false;
+  String? historyError;
   bool hideMerged = false, lanes = true, panel = false, compact = false;
   double zoom = 1;
   ({double x, double y, double left, double top, int id})? drag;
@@ -123,10 +144,34 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
   @override
   void didUpdateComponent(TaskWorkflow old) {
     super.didUpdateComponent(old);
-    if (!component.tasks.any((task) => _id(task) == selected)) selected = null;
+    if (creatingRelease) {
+      final created = component.releases
+          .where(
+            (release) =>
+                release['version'] == newReleaseName &&
+                release['repository'] == newReleaseRepository &&
+                !old.releases.any(
+                  (previous) => previous['id'] == release['id'],
+                ),
+          )
+          .firstOrNull;
+      if (created != null) {
+        selected = 'release:${created['id']}';
+        creatingRelease = false;
+        newReleaseName = '';
+      }
+    }
+    if (!component.tasks.any((task) => _id(task) == selected) &&
+        !component.releases.any(
+          (release) => 'release:${release['id']}' == selected,
+        ))
+      selected = null;
     if (!component.tasks.any(
-      (task) => '${task['repository'] ?? ''}' == repository,
-    ))
+          (task) => '${task['repository'] ?? ''}' == repository,
+        ) &&
+        !component.releases.any(
+          (release) => release['repository'] == repository,
+        ))
       repository = '';
     if (!component.tasks.any((task) => _agent(task) == agent)) agent = '';
   }
@@ -215,6 +260,10 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
   void chooseTask(String? id, {bool reveal = false}) {
     setState(() {
       selected = id;
+      creatingRelease = false;
+      historyRelease = null;
+      retainedRelease = null;
+      historyRequest++;
       if (id != null) panel = true;
     });
     if (reveal && id != null) scheduleMicrotask(() => _reveal(id));
@@ -230,7 +279,7 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
     );
     area.scrollTop = math.max(
       0,
-      (box.y + nodeH / 2) * zoom - area.clientHeight / 2,
+      (box.y + boxHeight(box) / 2) * zoom - area.clientHeight / 2,
     );
   }
 
@@ -306,13 +355,7 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
     final tasks = shown;
     layoutGraph(tasks);
     final highlighted = emphasis;
-    final repositories =
-        component.tasks
-            .map((task) => '${task['repository'] ?? ''}')
-            .where((name) => name.isNotEmpty)
-            .toSet()
-            .toList()
-          ..sort();
+    final repositories = releaseRepositories;
     return el('section', [
       el('div', [
         el(
@@ -345,6 +388,21 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
         ),
         if (view == 'workflow')
           el('div', [
+            if (component.onReleaseAction != null)
+              button(
+                'New release candidate',
+                () => setState(() {
+                  creatingRelease = true;
+                  selected = null;
+                  panel = true;
+                  newReleaseRepository = repository.isNotEmpty
+                      ? repository
+                      : (repositories.firstOrNull ?? '');
+                }),
+                small: true,
+                iconName: 'rocket',
+                disabled: component.releaseBusy,
+              ),
             switchControl(
               'Lanes by agent',
               lanes,

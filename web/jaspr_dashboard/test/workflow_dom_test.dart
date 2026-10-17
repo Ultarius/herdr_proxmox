@@ -18,8 +18,13 @@ class _Host extends StatefulComponent {
 
 class _HostState extends State<_Host> {
   List<Map<String, dynamic>> tasks = [];
+  List<Map<String, dynamic>> releases = [];
+  final releaseActions = <Map<String, dynamic>>[];
+  Future<Map<String, dynamic>> Function(String, String?, int?)? historyLoader;
   final opened = <String>[];
   void replace(List<Map<String, dynamic>> rows) => setState(() => tasks = rows);
+  void replaceReleases(List<Map<String, dynamic>> rows) =>
+      setState(() => releases = rows);
   @override
   void initState() {
     super.initState();
@@ -29,6 +34,10 @@ class _HostState extends State<_Host> {
   @override
   Component build(BuildContext context) => TaskWorkflow(
     tasks: tasks,
+    releases: releases,
+    onLoadReleaseHistory: historyLoader,
+    onReleaseAction: (action, body) =>
+        releaseActions.add({'action': action, ...body}),
     profiles: const [
       {'id': 'worker', 'name': 'Actual worker'},
       {'id': 'reviewer', 'name': 'Independent reviewer'},
@@ -128,6 +137,342 @@ void main() {
   tearDown(() {
     binding.detachRootComponent();
     web.document.getElementById('workflow-test')!.textContent = '';
+  });
+
+  Map<String, dynamic> release({String state = 'collecting'}) => {
+    'id': 'release-one',
+    'version': 'alpha.15',
+    'repository': 'repo',
+    'state': state,
+    'edit_version': 4,
+    'planned_cut_at': '2026-10-20',
+    'counts': {'selected': 2, 'incorporated': 1, 'blocked': 0},
+    'members': [
+      {
+        'task_id': 'origin',
+        'title': 'Task origin',
+        'candidate_sha': 'a' * 40,
+        'state': 'incorporated',
+        'integration_sha': 'c' * 40,
+      },
+      {
+        'task_id': 'follow',
+        'title': 'Task follow',
+        'candidate_sha': 'b' * 40,
+        'state': 'pending',
+      },
+    ],
+  };
+
+  test(
+    'release membership includes every member and preserves provenance semantics',
+    () async {
+      state.replace([
+        row('origin'),
+        row('follow', source: {'task_id': 'origin'}),
+      ]);
+      state.replaceReleases([release()]);
+      await settle();
+      final edges = nodes('[data-kind="release-membership"]').toList();
+      expect(edges, hasLength(2));
+      expect(edges.map((edge) => edge.getAttribute('data-from')).toSet(), {
+        'origin',
+        'follow',
+      });
+      expect(nodes('[data-kind="follow-up"]'), hasLength(1));
+      expect(nodes('[data-sample="release-incorporated"]'), hasLength(1));
+      expect(
+        edges.where((edge) => edge.getAttribute('data-edge') == 'incorporated'),
+        hasLength(1),
+      );
+      final card = nodes('[data-release="release-one"]').single;
+      expect(card.textContent, contains('1 of 2 incorporated'));
+      expect(card.textContent, contains('2026-10-20'));
+      expect(
+        card.getBoundingClientRect().left,
+        greaterThan(task('follow').getBoundingClientRect().left),
+      );
+      card.click();
+      await settle();
+      expect(nodes('[data-release-member]'), hasLength(2));
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('does not mean merged into main'),
+      );
+    },
+  );
+
+  test(
+    'release inspector sends the exact revision and keyboard follows membership',
+    () async {
+      final frozen = release(state: 'ready')
+        ..['revision'] = {
+          'digest': 'manifest-digest',
+          'base_sha': 'd' * 40,
+          'policy_digest': 'policy-digest',
+        }
+        ..['resulting_sha'] = 'e' * 40
+        ..['publication'] = {
+          'destination': 'fork/repo',
+          'branch': 'herdr/release-one',
+        };
+      state.replace([row('origin'), row('follow')]);
+      state.replaceReleases([frozen]);
+      await settle();
+      key(task('origin'), 'ArrowRight');
+      await settle();
+      expect(
+        nodes(
+          '[data-release="release-one"]',
+        ).single.getAttribute('aria-pressed'),
+        'true',
+      );
+      await click('Publish verified release branch');
+      expect(
+        state.releaseActions.last,
+        containsPair('revision', 'manifest-digest'),
+      );
+      expect(state.releaseActions.last, containsPair('head_sha', 'e' * 40));
+      key(nodes('[data-release="release-one"]').single, 'ArrowLeft');
+      await settle();
+      expect(task('origin').getAttribute('aria-pressed'), 'true');
+    },
+  );
+
+  test(
+    'filtering tasks keeps release counts and hidden members visible in inspector',
+    () async {
+      state.replace([row('origin', state: 'merged'), row('follow')]);
+      state.replaceReleases([release()]);
+      await settle();
+      (nodes('label')
+                  .firstWhere((node) => node.textContent == 'Hide merged')
+                  .querySelector('input')
+              as web.HTMLInputElement)
+          .click();
+      await settle();
+      expect(nodes('[data-node="origin"]'), isEmpty);
+      expect(
+        nodes('[data-release="release-one"]').single.textContent,
+        contains('1 of 2 incorporated'),
+      );
+      expect(nodes('[data-kind="release-membership"]'), hasLength(1));
+      nodes('[data-release="release-one"]').single.click();
+      await settle();
+      expect(nodes('[data-release-member]'), hasLength(2));
+      state.replace([]);
+      await settle();
+      expect(nodes('[data-release="release-one"]'), hasLength(1));
+      expect(nodes('[data-release-member]'), hasLength(2));
+    },
+  );
+
+  test(
+    'task membership is an explicit action and release creation is click based',
+    () async {
+      state.replace([row('origin'), row('follow')]);
+      state.replaceReleases([release()]);
+      await settle();
+      task('origin').click();
+      await settle();
+      await click('Remove from alpha.15');
+      expect(state.releaseActions.last, containsPair('task_id', 'origin'));
+      expect(state.releaseActions.last, containsPair('included', false));
+      await click('New release candidate');
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('New release candidate'),
+      );
+      expect(
+        nodes('button')
+            .firstWhere(
+              (node) => node.textContent == 'Create release candidate',
+            )
+            .hasAttribute('disabled'),
+        isTrue,
+      );
+    },
+  );
+
+  test('failed combined checks have an explicit retry action', () async {
+    final failed = release(state: 'validation_failed')
+      ..['revision'] = {'digest': 'frozen-manifest', 'generation': 1};
+    state.replaceReleases([failed]);
+    await settle();
+    nodes('[data-release="release-one"]').single.click();
+    await settle();
+    await click('Re-run combined checks');
+    expect(state.releaseActions.last, containsPair('action', 'retry'));
+    expect(
+      state.releaseActions.last,
+      containsPair('revision', 'frozen-manifest'),
+    );
+    expect(
+      nodes(
+        'button',
+      ).where((node) => node.textContent == 'Resume inspected release'),
+      isEmpty,
+    );
+  });
+
+  test('release-only repositories are selectable during creation', () async {
+    state.replace([]);
+    state.replaceReleases([release()..['repository'] = 'archived-project']);
+    await settle();
+    await click('New release candidate');
+    final select =
+        nodes('.task-wf-inspector select').single as web.HTMLSelectElement;
+    expect(select.value, 'archived-project');
+    expect(select.options.length, 1);
+    expect(
+      (select.options.item(0)! as web.HTMLOptionElement).value,
+      'archived-project',
+    );
+  });
+
+  test('release spacing and keyboard reveal use release dimensions', () async {
+    state.replace([
+      for (var index = 0; index < 20; index++) row('task-$index'),
+    ]);
+    state.replaceReleases([
+      for (final id in ['release-a', 'release-b'])
+        release()
+          ..['id'] = id
+          ..['members'] = [
+            {'task_id': 'task-10', 'candidate_sha': 'a' * 40},
+          ],
+    ]);
+    await settle();
+    final first = nodes('[data-release="release-a"]').single;
+    final second = nodes('[data-release="release-b"]').single;
+    final firstTop = double.parse(first.style.top.replaceAll('px', ''));
+    final secondTop = double.parse(second.style.top.replaceAll('px', ''));
+    expect(secondTop - firstTop, 152);
+    key(task('task-10'), 'ArrowRight');
+    await settle();
+    final viewport = nodes('.task-wf-viewport').single;
+    final expected = (firstTop + 68 - viewport.clientHeight / 2).clamp(
+      0,
+      viewport.scrollHeight - viewport.clientHeight,
+    );
+    expect(viewport.scrollTop, closeTo(expected, 1));
+  });
+
+  test(
+    'retained revisions page and open read-only evidence without current actions',
+    () async {
+      final current = release(state: 'ready')
+        ..['revision'] = {'digest': 'c' * 64, 'generation': 3};
+      final archived = release(state: 'ready')
+        ..['revision'] = {
+          'digest': 'a' * 64,
+          'generation': 1,
+          'base_sha': 'd' * 40,
+        }
+        ..['publication'] = {
+          'destination': 'historic-fork/repo',
+          'branch': 'historic-branch',
+        }
+        ..['validation'] = {
+          'run_id': 'historic-build',
+          'state': 'complete',
+          'required_checks_verified': true,
+          'checks': [
+            {
+              'name': 'Combined regression suite',
+              'status': 'passed',
+              'detail': 'Verified old artifact',
+            },
+          ],
+        };
+      final requests = <(String, String?, int?)>[];
+      state.historyLoader = (id, revision, before) async {
+        requests.add((id, revision, before));
+        if (revision != null) return {'release': archived, 'read_only': true};
+        if (before != null)
+          return {
+            'revisions': [
+              {'digest': 'a' * 64, 'generation': 1, 'state': 'ready'},
+            ],
+          };
+        return {
+          'revisions': [
+            {
+              'digest': 'c' * 64,
+              'generation': 3,
+              'state': 'ready',
+              'current': true,
+            },
+          ],
+          'next_before': 3,
+        };
+      };
+      state.replaceReleases([current]);
+      await settle();
+      nodes('[data-release="release-one"]').single.click();
+      await settle();
+      await click('Inspect retained revisions');
+      await click('Load older revisions');
+      expect(requests.last, ('release-one', null, 3));
+      await click('Revision 1 · Ready for publication');
+      expect(requests.last, ('release-one', 'a' * 64, null));
+      final inspector = nodes('.task-wf-inspector').single;
+      expect(
+        inspector.textContent,
+        contains('Retained revision 1 · read-only evidence'),
+      );
+      expect(inspector.textContent, contains('historic-fork/repo'));
+      expect(inspector.textContent, contains('historic-build'));
+      expect(inspector.textContent, contains('Combined regression suite'));
+      expect(inspector.textContent, contains('Verified old artifact'));
+      expect(nodes('[data-release-member]'), hasLength(2));
+      expect(
+        nodes('button').where(
+          (node) => node.textContent == 'Publish verified release branch',
+        ),
+        isEmpty,
+      );
+      expect(
+        nodes('button').where((node) => node.textContent == 'Revise selection'),
+        isEmpty,
+      );
+      await click('Back to retained revisions');
+      await click('Return to current release');
+      expect(
+        nodes('button').where(
+          (node) => node.textContent == 'Publish verified release branch',
+        ),
+        hasLength(1),
+      );
+      expect(state.releaseActions, isEmpty);
+    },
+  );
+
+  test('late history responses cannot replace another selection', () async {
+    final pending = Completer<Map<String, dynamic>>();
+    state.historyLoader = (_, _, _) => pending.future;
+    state.replace([row('origin')]);
+    state.replaceReleases([release()]);
+    await settle();
+    nodes('[data-release="release-one"]').single.click();
+    await settle();
+    await click('Inspect retained revisions');
+    task('origin').click();
+    await settle();
+    pending.complete({
+      'revisions': [
+        {'digest': 'old', 'generation': 99, 'state': 'ready'},
+      ],
+    });
+    await settle();
+    expect(
+      nodes('.task-wf-inspector').single.textContent,
+      contains('Task origin'),
+    );
+    expect(
+      nodes('.task-wf-inspector').single.textContent,
+      isNot(contains('Revision 99')),
+    );
   });
 
   test(

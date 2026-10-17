@@ -150,9 +150,21 @@ def fork_publication(task):
     return publishing_repository(task).lower() != task['github_repository'].lower()
 
 
-def push(repository, branch, sha, github, publishing):
-    if not BRANCH.fullmatch(branch) or not SHA.fullmatch(sha):
-        raise ValueError('Only a task branch and full reviewed commit may be published.')
+def push(repository, branch, sha, github, publishing, *, release_lookup=None):
+    if not isinstance(branch, str) or not isinstance(sha, str) or not SHA.fullmatch(sha):
+        raise ValueError('Only a task branch and full reviewed commit, or a recorded release run, may be published.')
+    if not BRANCH.fullmatch(branch):
+        release_branch = re.fullmatch(r'herdr/release-([a-f0-9]{32})-r([1-9][0-9]*)', branch)
+        if not release_branch:
+            raise ValueError('Only a task branch and full reviewed commit, or a recorded release run, may be published.')
+        if release_lookup is None:
+            raise ValueError('Release publication requires a recorded release run.')
+        run = release_lookup(release_branch[1])
+        if (run.get('id') != release_branch[1] or run.get('state') != 'publishing'
+                or run.get('branch') != branch or run.get('resulting_sha') != sha
+                or (run.get('publication') or {}).get('destination') != publishing
+                or (run.get('revision') or {}).get('generation') != int(release_branch[2])):
+            raise ValueError('Publication does not match the recorded release run and reviewed commit.')
     if not isinstance(publishing, str) or not REPOSITORY.fullmatch(publishing):
         raise ValueError('Invalid publishing repository.')
     if sys.platform == 'win32':
@@ -362,6 +374,8 @@ class Contributions:
         self.knowledge.sync_jobs()
         from discovery import Discovery
         self.discovery = Discovery(self)
+        from release_candidates import ReleaseCandidates
+        self.releases = ReleaseCandidates(self)
 
     def connect(self):
         from notifications import Connection
@@ -394,10 +408,12 @@ class Contributions:
 
 
     def start(self):
+        self.releases.start()
         self.thread = threading.Thread(target=self.poll, daemon=True, name='contribution-status')
         self.thread.start()
 
     def close(self):
+        self.releases.close()
         self.stopped.set()
         self.mailbox.set()  # Wake this consumer without clearing another's signal.
         if self.thread:
@@ -1684,12 +1700,27 @@ class Contributions:
             raise ValueError('Task not found.')
         return json.loads(row[0])
 
+    def task_records(self, identifiers, db=None):
+        """Read selected tasks in bounded batches on a single connection."""
+        if db is None:
+            with closing(self.connect()) as connection:
+                return self.task_records(identifiers, connection)
+        identifiers = list(set(identifiers))
+        tasks = {}
+        for start in range(0, len(identifiers), 500):
+            batch = identifiers[start:start + 500]
+            rows = db.execute('SELECT id,data FROM tasks WHERE id IN (' + ','.join('?' for _ in batch) + ')', batch)
+            tasks.update((identifier, json.loads(data)) for identifier, data in rows)
+        return tasks
+
     def build_event(self, event_id):
         with closing(self.connect()) as db:
             row = db.execute('SELECT data FROM build_events WHERE id=?', (event_id,)).fetchone()
-        return json.loads(row[0]) if row else None
+        return json.loads(row[0]) if row else self.releases.event(event_id)
 
     def record_build(self, event_id, summary):
+        if self.releases.record_validation(event_id, summary):
+            return True
         event = self.build_event(event_id)
         if not event:
             return False
@@ -1834,7 +1865,8 @@ class Contributions:
         if role != 'admin':
             automation = {organization: {k: v for k, v in policy.items() if k in AUTOMATION_DEFAULTS}
                           for organization, policy in automation.items()}
-        return dict(tasks=tasks, github=github, executor=executor, automation=automation)
+        return dict(tasks=tasks, releases=self.releases.snapshot({task['id']: task for task in tasks}),
+                    github=github, executor=executor, automation=automation)
 
     def awaiting_candidate(self, task, common_dirs=None):
         """Whether an agent has committed and only the capture step remains.

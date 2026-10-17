@@ -362,6 +362,18 @@ class Handler(BaseHTTPRequestHandler):
                 except (ValueError, OSError) as error:
                     self.reply(400, {'error': str(error)[:500]})
                 return
+            if urlsplit(self.path).path == '/api/releases/revisions':
+                query = parse_qs(urlsplit(self.path).query)
+                try:
+                    before = (query.get('before') or [None])[0]
+                    self.reply(200, self.server.contributions.releases.history(
+                        (query.get('id') or [''])[0], revision=(query.get('revision') or [None])[0],
+                        before=int(before) if before is not None else None))
+                except sqlite3.Error:
+                    self.reply(503, {'error': 'Release history storage is unavailable.'})
+                except (ValueError, OSError) as error:
+                    self.reply(400, {'error': str(error)[:500]})
+                return
             if self.path.startswith('/api/validation/artifact?'):
                 query = parse_qs(urlsplit(self.path).query)
                 self.validation_artifact((query.get('id') or [''])[0], (query.get('kind') or ['static'])[0])
@@ -577,6 +589,8 @@ class Handler(BaseHTTPRequestHandler):
         actions['/api/organizations/templates/library'] = 'template_library'
         environment_actions = {f'/api/projects/environment/{name}': name for name in ('plan', 'select', 'prepare', 'cancel', 'authorize-restore')}
         actions.update(environment_actions)
+        release_actions = {f'/api/releases/{name}': name for name in ('create', 'membership', 'freeze', 'revise', 'retry', 'resume', 'repair', 'exclude', 'publish')}
+        actions.update(release_actions)
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'resolve_delegation', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'retry_discussion', 'cancel_discussion', 'remove_agent', 'remove_group', 'session', 'realign_discussion_session')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close', 'verify', 'install_integration')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
@@ -599,6 +613,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(body, dict):
                     raise ValueError('Expected a JSON object.')
                 self.reply(200, self.server.organizations.team_plan(body))
+            elif self.path in release_actions:
+                self.reply(200, self.server.contributions.releases.action(release_actions[self.path], body, actor, role))
             elif self.path in environment_actions:
                 if role != 'admin':
                     raise ValueError('Only an administrator can prepare project environments.')

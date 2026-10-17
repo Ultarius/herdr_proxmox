@@ -165,6 +165,25 @@
    execution waits (warning, dashed). Dimmed lines drop opacity (no text). */
 .task-wf-edges { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
 .task-wf-edge { --task-edge: var(--color-edge); transition: opacity var(--duration-base) var(--ease-standard); }
+.task-wf-edge[data-kind="release-membership"] { --task-edge: var(--color-accent); }
+.task-wf-edge[data-kind="release-membership"] .task-wf-edge-line { stroke-dasharray: 5 4; }
+.task-wf-edge[data-edge="incorporated"] { --task-edge: var(--color-success); }
+.task-wf-edge[data-edge="incorporated"] .task-wf-edge-line { stroke-dasharray: none; }
+.task-wf-edge[data-edge="blocked"] { --task-edge: var(--color-danger); }
+.task-wf-edge[data-edge="excluded"] { opacity: .45; }
+.wf-release { border-style: dashed; gap: 5px; }
+.wf-release > .status { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-release__progress { display: flex; gap: 2px; width: 100%; height: 6px; }
+.wf-release__progress > span { flex: 1; background: var(--color-accent); border-radius: 2px; }
+.wf-release__progress > [data-member-state="incorporated"] { background: var(--color-success); }
+.wf-release__progress > [data-member-state="blocked"] { background: var(--color-danger); }
+.wf-release__progress > [data-member-state="excluded"] { background: var(--color-text-tertiary); }
+.wf-edge[data-sample="release-pending"] { --sample: var(--color-accent); }
+.wf-edge[data-sample="release-pending"] .wf-edge__line { stroke-dasharray: 4 3; }
+.wf-edge[data-sample="release-incorporated"] { --sample: var(--color-success); }
+.wf-release__count, .wf-release__cut { font-size: 11px; display: flex; align-items: center; gap: 4px; }
+.wf-release__member { padding-block: var(--space-2); border-bottom: 1px solid var(--color-border); overflow-wrap: anywhere; }
+.wf-release__member .mono { font-size: var(--text-xs-size); }
 .task-wf-edge-line { fill: none; stroke: var(--task-edge); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .task-wf-edge-head { fill: var(--task-edge); }
 .task-wf-edge[data-edge="finished"] { --task-edge: var(--color-success); }

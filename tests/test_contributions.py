@@ -430,6 +430,95 @@ class GitHubTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which('git'), 'Git required')
 class ContributionTests(unittest.TestCase):
+    def test_release_notifications_skip_noop_and_audit_only_saves_but_keep_progress(self):
+        releases = self.service.releases
+        created = releases.action('create', dict(request_id='notify-release', repository='repo', version='alpha.15'), 'admin', 'admin')
+        def count():
+            with closing(self.service.connect()) as db:
+                return db.execute("SELECT COUNT(*) FROM notification_outbox WHERE topic='release'").fetchone()[0]
+        before = count()
+        release = releases.get(created['id'])
+        releases.save(release)
+        release['audit'].append(dict(action='inspection', actor='admin'))
+        releases.save(release)
+        self.assertEqual(count(), before)
+        releases.action('membership', dict(request_id='notify-membership', id=release['id'], edit_version=release['edit_version'],
+            task_id=self.task['id'], included=True), 'admin', 'admin')
+        self.assertEqual(count(), before + 1)
+
+    def test_release_http_routes_enforce_admin_and_replay_requests(self):
+        gateway = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        gateway.token = 'a' * 48
+        gateway.contributions = self.service
+        gateway.operators = SimpleNamespace(identify=lambda token: dict(name='viewer', role='operator') if token == 'viewer' else None)
+        thread = threading.Thread(target=gateway.serve_forever, daemon=True)
+        thread.start()
+        endpoint = 'http://127.0.0.1:' + str(gateway.server_port)
+        payload = json.dumps(dict(request_id='http-release-create', repository='repo', version='alpha.15')).encode()
+        try:
+            with self.assertRaises(HTTPError) as denied:
+                urlopen(Request(endpoint + '/api/releases/create', data=payload))
+            self.assertEqual(denied.exception.code, 401)
+            with self.assertRaises(HTTPError) as denied:
+                urlopen(Request(endpoint + '/api/releases/create', data=payload, headers={'Authorization': 'Bearer viewer'}))
+            self.assertEqual(denied.exception.code, 400)
+            headers = {'Authorization': 'Bearer ' + gateway.token}
+            first = json.load(urlopen(Request(endpoint + '/api/releases/create', data=payload, headers=headers)))
+            replay = json.load(urlopen(Request(endpoint + '/api/releases/create', data=payload, headers=headers)))
+            self.assertEqual(first, replay)
+            snapshot = json.load(urlopen(Request(endpoint + '/api/tasks', headers=headers)))
+            self.assertEqual(snapshot['releases'][0]['id'], first['id'])
+            self.assertEqual(snapshot['releases'][0]['state'], 'collecting')
+            history_path = '/api/releases/revisions?id=' + first['id']
+            with self.assertRaises(HTTPError) as denied:
+                urlopen(endpoint + history_path)
+            self.assertEqual(denied.exception.code, 401)
+            history = json.load(urlopen(Request(endpoint + history_path, headers={'Authorization': 'Bearer viewer'})))
+            self.assertEqual(history['revisions'], [])
+            retained = self.service.releases.get(first['id'])
+            retained.update(state='blocked', revision=dict(digest='d' * 64, generation=1, release_id=first['id'],
+                members=[], base_sha=self.base, policy_digest='e' * 64))
+            self.service.releases.save(retained)
+            detail = json.load(urlopen(Request(endpoint + history_path + '&revision=' + 'd' * 64,
+                headers={'Authorization': 'Bearer viewer'})))
+            self.assertTrue(detail['read_only'])
+            self.assertEqual(detail['release']['revision']['digest'], 'd' * 64)
+            with self.assertRaises(HTTPError) as invalid:
+                urlopen(Request(endpoint + history_path + '&before=invalid', headers=headers))
+            self.assertEqual(invalid.exception.code, 400)
+        finally:
+            gateway.shutdown()
+            gateway.server_close()
+            thread.join(timeout=2)
+
+    def test_release_results_route_without_becoming_task_builds_and_emit_notifications(self):
+        task = self.candidate()
+        policy = dict(toolchains=[], declarations={}, lockfiles={}, checks=[])
+        task['builds'] = {task['head_sha']: dict(target=task['head_sha'], state='complete',
+            required_checks_verified=True, policy_digest=toolchain_policy.digest(policy))}
+        self.service.save(task, 'verified', 'admin')
+        releases = self.service.releases
+        created = releases.action('create', dict(request_id='release-create', repository='repo', version='alpha.15'), 'admin', 'admin')
+        selected = releases.action('membership', dict(request_id='release-member', id=created['id'], edit_version=created['edit_version'],
+            task_id=task['id'], included=True), 'admin', 'admin')
+        with patch('toolchain_policy.resolve_committed', return_value=policy):
+            frozen = releases.action('freeze', dict(request_id='release-freeze', id=selected['id'],
+                edit_version=selected['edit_version']), 'admin', 'admin')
+            self.service.validation = MagicMock()
+            self.service.validation.snapshot.return_value = dict(runs=[])
+            releases.advance(frozen['id'])
+            releases.advance(frozen['id'])
+        waiting = releases.get(frozen['id'])
+        event = waiting['validation_event']
+        self.assertEqual(self.service.build_event(event['id']), event)
+        self.assertTrue(self.service.record_build(event['id'], dict(target=waiting['resulting_sha'], state='complete',
+            required_checks_verified=True, policy_digest=toolchain_policy.digest(policy))))
+        self.assertEqual(releases.get(frozen['id'])['state'], 'ready')
+        self.assertNotIn(waiting['resulting_sha'], self.service.get(task['id'])['builds'])
+        self.assertEqual(self.service.snapshot()['releases'][0]['counts']['incorporated'], 1)
+        with closing(self.service.connect()) as db:
+            self.assertGreater(db.execute("SELECT COUNT(*) FROM notification_outbox WHERE topic='release'").fetchone()[0], 0)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

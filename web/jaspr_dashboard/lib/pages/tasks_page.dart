@@ -113,6 +113,7 @@ class TasksPage extends StatefulComponent {
 class _TasksPageState extends State<TasksPage> {
   DashboardBloc get connection => dashboardConnection;
   List<Map<String, dynamic>> tasks = [];
+  List<Map<String, dynamic>> releases = [];
   Map<String, dynamic> github = {};
   String executor = 'unavailable';
   String section = 'Overview';
@@ -150,6 +151,7 @@ class _TasksPageState extends State<TasksPage> {
         generation = connection.generation;
         setState(() {
           tasks = [];
+          releases = [];
           github = {};
           error = null;
           readError = null;
@@ -251,6 +253,7 @@ class _TasksPageState extends State<TasksPage> {
             readError = detailError;
           }
           github = Map<String, dynamic>.from(data['github'] ?? {});
+          releases = List<Map<String, dynamic>>.from(data['releases'] ?? []);
           executor = '${data['executor'] ?? 'unavailable'}';
         });
       }
@@ -293,6 +296,54 @@ class _TasksPageState extends State<TasksPage> {
     } finally {
       if (mounted) setState(() => busy = false);
     }
+  }
+
+  Future<void> releaseAct(String action, Map<String, dynamic> body) async {
+    if (busy || !admin) return;
+    final epoch = connection.generation;
+    final selection = 'release:$action:$body';
+    final request = requests.putIfAbsent(
+      selection,
+      () => 'release-${requestId()}',
+    );
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      await connection.request('releases/$action', {
+        ...body,
+        'request_id': request,
+      });
+      if (!mounted || epoch != connection.generation) return;
+      requests.remove(selection);
+      if (pending != null) await pending;
+      if (mounted && epoch == connection.generation) await refresh();
+    } catch (e) {
+      if (mounted && epoch == connection.generation)
+        setState(() => error = '$e');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<Map<String, dynamic>> loadReleaseHistory(
+    String id,
+    String? revision,
+    int? before,
+  ) async {
+    final epoch = connection.generation;
+    final query = Uri(
+      queryParameters: {
+        'id': id,
+        if (revision != null) 'revision': revision,
+        if (before != null) 'before': '$before',
+      },
+    ).query;
+    final result = await connection.request('releases/revisions?$query');
+    if (epoch != connection.generation)
+      throw StateError('Connection changed; reopen release history.');
+    return Map<String, dynamic>.from(result);
   }
 
   Future<void> configure() async {
@@ -1118,6 +1169,10 @@ class _TasksPageState extends State<TasksPage> {
         ], classes: 'task-page__empty'),
       TaskWorkflow(
         tasks: tasks,
+        releases: releases,
+        onReleaseAction: admin ? releaseAct : null,
+        releaseBusy: busy,
+        onLoadReleaseHistory: loadReleaseHistory,
         initialView: component.initialView,
         profiles: [
           for (final profile

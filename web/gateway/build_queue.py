@@ -7,6 +7,10 @@ import sqlite3
 import time
 
 
+class BuildQueueBusy(ValueError):
+    """Capacity was refused before a durable build was enqueued."""
+
+
 class BuildQueue:
     def __init__(self, root):
         self.root = Path(root)
@@ -35,7 +39,7 @@ class BuildQueue:
                     return data, False
                 previous = data
             if db.execute("SELECT 1 FROM builds WHERE state IN ('queued','running')").fetchone():
-                raise ValueError('Build queue is full. Wait for the current build to finish.')
+                raise BuildQueueBusy('Build queue is full. Wait for the current build to finish.')
             data = dict(run, state='queued', check_policy=policy, toolchain_pin=toolchain,
                         attempt=previous['attempt'] + 1 if previous else 1,
                         event_ids=previous['event_ids'] if previous else [run['event_id']])

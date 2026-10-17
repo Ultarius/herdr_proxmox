@@ -17,6 +17,11 @@ extension _Inspector on _TaskWorkflowState {
 
   /// Template inspector: the workflow overview, or one task's recorded facts.
   Component inspector() {
+    if (creatingRelease) return releaseCreateInspector();
+    final release = component.releases
+        .where((item) => 'release:${item['id']}' == selected)
+        .firstOrNull;
+    if (release != null) return releaseInspector(release);
     final task = component.tasks
         .where((task) => _id(task) == selected)
         .firstOrNull;
@@ -69,7 +74,11 @@ extension _Inspector on _TaskWorkflowState {
             .firstOrNull?['name'] ??
         reviewer;
     final related = links
-        .where((link) => link.from == selected || link.to == selected)
+        .where(
+          (link) =>
+              link.kind != 'release-membership' &&
+              (link.from == selected || link.to == selected),
+        )
         .toList();
     final owner = _agent(task), activity = _activity(owner);
     String relation(_Link link) => link.kind == 'follow-up'
@@ -165,6 +174,7 @@ extension _Inspector on _TaskWorkflowState {
                 term('Updated', task['updated_at']),
             ], classes: 'dl'),
           ]),
+          releaseMembership(task),
           section('Recorded relationships', [
             if (related.isEmpty)
               el('p', [
