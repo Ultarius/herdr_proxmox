@@ -1715,6 +1715,11 @@ class Contributions:
         task['updated_at'] = stamp()
         entry = dict(action=action, actor=actor, at=task['updated_at'],
                      state=task['state'], head_sha=task.get('head_sha'))
+        if action == 'delivery_superseded' and task.get('delivery_history'):
+            previous = task['delivery_history'][-1]
+            entry.update(previous_sha=previous.get('sha'), delivery_chat_id=previous.get('chat_id'),
+                detail='Previous delivery report superseded for ' + str(previous.get('sha')) +
+                       ('. Inspection chat retained for audit: ' + str(previous['chat_id']) if previous.get('chat_id') else ''))
         if (action.startswith('pr_repair_') or action.startswith('validation_update_')) and task.get('pr_repair'):
             repair = task['pr_repair']
             entry.update(repair_id=repair['id'], repair_state=repair['state'],

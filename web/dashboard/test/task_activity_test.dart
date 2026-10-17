@@ -1,7 +1,73 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:juice/juice.dart';
 import 'package:herdr_dashboard/task_activity.dart';
 
 void main() {
+  testWidgets(
+    'superseded chat reference is visible without expanding raw audit',
+    (tester) async {
+      final entry = {
+        'action': 'delivery_superseded',
+        'actor': 'gateway',
+        'at': 'now',
+        'head_sha': 'b' * 40,
+        'previous_sha': 'a' * 40,
+        'delivery_chat_id': 'inspection-old',
+      };
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SingleChildScrollView(
+              child: TaskActivity(
+                task: {
+                  'audit': [entry],
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(
+        find.textContaining('Superseded aaaaaaaa · chat inspection-old'),
+        findsOneWidget,
+      );
+      expect(find.text('$entry'), findsNothing);
+    },
+  );
+
+  test(
+    'a previous candidate delivery error does not replace current publication',
+    () {
+      final task = {
+        'state': 'published',
+        'head_sha': 'current',
+        'await_verification': true,
+        'publish': {'head_sha': 'current'},
+        'builds': {
+          'current': {
+            'state': 'complete',
+            'target': 'current',
+            'required_checks_verified': true,
+          },
+        },
+        'delivery_workflow': {
+          'sha': 'previous',
+          'state': 'attention',
+          'error': 'Old failure',
+        },
+      };
+      expect(
+        taskNextStep(task),
+        'Branch published; open a draft pull request.',
+      );
+      (task['delivery_workflow'] as Map)['sha'] = 'current';
+      expect(
+        taskNextStep(task),
+        contains('Delivery needs attention: Old failure'),
+      );
+    },
+  );
+
   test(
     'delivery states retain the agent and do not claim review readiness',
     () {

@@ -523,6 +523,119 @@ class ContributionTests(unittest.TestCase):
         self.store.snapshot.return_value['jobs'].append(dict(id='feedback', kind='chat', state='answered',
             profile_id='worker', runs=[run], result=json.dumps(result), delivery=dict(stage='reply_verified')))
 
+    def test_delivery_attention_for_previous_candidate_is_preserved_and_superseded(self):
+        import task_delivery
+        task, _, _ = self._delivery_task(publish=False)
+        previous = dict(sha=self.base, state='attention', error='Previous candidate failed validation',
+            agent_report=dict(summary='Previous candidate inspection'), feedback_prompt='old frozen prompt',
+            notification_pending=True, notification_retry_after=0, remote_check_after=10**12)
+        task['delivery_workflow'] = previous
+        task['delivery_repair_count'] = 2
+        self.service.save(task, 'old-delivery', 'test')
+        with patch('collaboration.current_run'), patch('contributions.push') as push:
+            task_delivery.advance(self.service)
+        current = self.service.get(task['id'])
+        self.assertEqual(current['delivery_history'][0]['agent_report'], previous['agent_report'])
+        self.assertEqual(current['delivery_history'][0]['superseded_by'], task['head_sha'])
+        self.assertEqual(current['delivery_workflow']['sha'], task['head_sha'])
+        self.assertEqual(current['delivery_workflow']['state'], 'waiting_agent')
+        self.assertNotIn('old frozen prompt', self.store.action.call_args.args[1]['prompt'])
+        self.assertEqual(current['delivery_repair_count'], 2)
+        self.assertTrue(task_delivery.pending(current))
+        push.assert_not_called()
+
+    def test_current_candidate_attention_still_requires_inspection(self):
+        import task_delivery
+        task, _, _ = self._delivery_task(publish=False)
+        task['delivery_workflow'] = dict(sha=task['head_sha'], state='attention', error='Current failure')
+        self.service.save(task, 'current-attention', 'test')
+        task_delivery.advance(self.service)
+        current = self.service.get(task['id'])
+        self.assertEqual(current['delivery_workflow']['error'], 'Current failure')
+        self.assertNotIn('delivery_history', current)
+        self.store.action.assert_not_called()
+
+    def test_superseded_delivery_history_excludes_replay_payloads_and_tracks_late_chat(self):
+        import task_delivery
+        task, run, _ = self._delivery_task(publish=False)
+        previous = dict(sha=self.base, state='waiting_agent', chat_id='old-inspection', error='e' * 40000,
+            feedback_prompt='x' * 40000, packet={'payload': 'y' * 40000}, notification_pending=True,
+            agent_report=dict(sha=self.base, summary='Old inspection', extra='z' * 40000))
+        task['delivery_history'] = [dict(previous) for _ in range(5)]
+        task['delivery_workflow'] = previous
+        self.service.save(task, 'previous-inspection', 'test')
+        old_chat = dict(id='old-inspection', state='queued', kind='chat', runs=[run])
+        self.store.snapshot.return_value['jobs'].append(old_chat)
+        self.store.action.return_value = dict(id='new-inspection')
+        with patch('collaboration.current_run'):
+            task_delivery.advance(self.service)
+            current = self.service.get(task['id'])
+            self.assertEqual(len(current['delivery_history']), 5)
+            for entry in current['delivery_history']:
+                self.assertNotIn('feedback_prompt', entry)
+                self.assertNotIn('packet', entry)
+                self.assertNotIn('notification_pending', entry)
+                self.assertNotIn('extra', entry['agent_report'])
+                self.assertEqual(entry['error'], 'e' * 2000)
+            self.assertEqual(current['delivery_history'][-1]['chat_id'], 'old-inspection')
+            activity = next(entry for entry in current['audit'] if entry['action'] == 'delivery_superseded')
+            self.assertEqual(activity['delivery_chat_id'], 'old-inspection')
+            self.assertIn('old-inspection', activity['detail'])
+            self.assertEqual(current['delivery_workflow']['chat_id'], 'new-inspection')
+            old_chat.update(state='answered', result=json.dumps(dict(sha=self.base, outcome='reviewed', summary='Late old reply')),
+                            delivery=dict(stage='reply_verified'))
+            self.store.snapshot.return_value['jobs'].append(dict(id='new-inspection', state='queued', kind='chat', runs=[run]))
+            task_delivery.advance(self.service)
+        current = self.service.get(task['id'])
+        self.assertEqual(current['delivery_workflow']['state'], 'waiting_agent')
+        self.assertEqual(current['delivery_workflow']['sha'], task['head_sha'])
+        self.assertNotIn('agent_report', current['delivery_workflow'])
+        self.assertTrue(task_delivery.pending(current))
+
+    def test_task_capture_cannot_enter_during_delivery_publication(self):
+        import task_delivery
+        task, _, _ = self._delivery_task()
+        entered, release = threading.Event(), threading.Event()
+        remote, errors = [None], []
+
+        def blocked_push(*args):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError('Publication was not released by the test.')
+            remote[0] = task['head_sha']
+
+        def deliver():
+            try:
+                task_delivery.advance(self.service)
+            except BaseException as error:
+                errors.append(error)
+
+        operation = self.service.operation
+
+        @contextmanager
+        def nonblocking(key, **kwargs):
+            with operation(key, timeout=0):
+                yield
+
+        with patch('collaboration.current_run'), patch.object(self.service, 'remote_head', side_effect=lambda _: remote[0]), \
+                patch('contributions.push', side_effect=blocked_push):
+            worker = threading.Thread(target=deliver, daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(timeout=5))
+                with patch.object(self.service, 'operation', side_effect=nonblocking):
+                    with self.assertRaises(contributions.Busy):
+                        self.service.action('candidate', dict(request_id='capture-while-publishing',
+                            task_id=task['id']), 'admin', 'admin')
+            finally:
+                release.set()
+                worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        saved = self.service.get(task['id'])
+        self.assertEqual(saved['head_sha'], task['head_sha'])
+        self.assertEqual(saved['delivery_workflow']['state'], 'waiting_agent')
+
     def assert_inherited_publication(self, fork=False):
         import task_delivery
         destination = 'contributor/repo' if fork else 'owner/repo'
@@ -875,6 +988,44 @@ class ContributionTests(unittest.TestCase):
             self.assertEqual(persisted['head_sha'], candidate)
             self.assertEqual(persisted['delivery_repair_count'], 1)
             self.assertEqual(persisted['builds'][candidate]['state'], 'queued')
+
+    def test_delivery_repair_recovers_after_candidate_capture_without_superseding_its_flow(self):
+        import task_delivery
+        task, run, _ = self._delivery_task(publish=False, build_state='failed', verified=False)
+        with patch('collaboration.current_run'):
+            task_delivery.advance(self.service)
+            tree = Path(task['worktree'])
+            (tree / 'file').write_text('fixed implementation\n')
+            self.git('add', 'file', path=tree)
+            self.git('commit', '-m', 'fix checks', path=tree)
+            candidate = self.git('rev-parse', 'HEAD', path=tree).strip()
+            self._receipt(task, commit=candidate)
+            self._delivery_reply(task, run, outcome='repaired', candidate=candidate)
+            original = self.service.perform
+
+            def captured_then_interrupted(action, *args, **kwargs):
+                result = original(action, *args, **kwargs)
+                if action == 'candidate':
+                    raise RuntimeError('restart after capture')
+                return result
+
+            with patch.object(self.service, 'perform', side_effect=captured_then_interrupted):
+                with self.assertRaisesRegex(RuntimeError, 'restart after capture'):
+                    task_delivery.advance(self.service)
+            saved = self.service.get(task['id'])
+            self.assertEqual(saved['head_sha'], candidate)
+            self.assertEqual(saved['delivery_workflow']['sha'], task['head_sha'])
+            self.assertNotEqual(saved['head_sha'], saved['delivery_workflow']['sha'])
+            self.assertEqual(saved['delivery_workflow']['state'], 'accepting_repair')
+            self.service.validation.submit.return_value = dict(id='new-build', state='queued')
+            task_delivery.advance(self.service)
+        saved = self.service.get(task['id'])
+        self.assertEqual(saved['delivery_workflow']['state'], 'waiting_verification')
+        self.assertEqual(saved['delivery_workflow']['sha'], candidate)
+        self.assertEqual(saved['delivery_repair_count'], 1)
+        self.assertEqual(saved['builds'][candidate]['state'], 'queued')
+        self.assertNotIn('delivery_history', saved)
+        self.assertFalse(any(entry['action'] == 'delivery_superseded' for entry in saved['audit']))
 
     def test_delivery_enable_rejects_invalid_live_publication_preflight_without_saving_policy(self):
         task, _, _ = self._delivery_task(publish=False)

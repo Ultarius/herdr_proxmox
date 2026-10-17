@@ -465,6 +465,33 @@ state inspected areas and omissions before concluding that no refactor is needed
 
 ## Automatic verification and draft PR delivery
 
+Delivery inspection belongs to an exact candidate SHA. When a new candidate
+supersedes an older inspection, the previous report is retained in bounded
+delivery history and its frozen prompt and notification retries are not reused.
+The current candidate requires fresh verification and inspection; prior failures
+do not reset the task's automatic repair budget. An attention report for the
+current SHA continues to require operator inspection.
+
+History retains at most five compact reports (candidate, state, error, agent
+summary, failure stage and superseding candidate/time), with an optional chat ID
+for audit. Frozen prompts, packets and retry state are excluded. A superseded
+inspection chat remains in organization job history and may finish normally;
+it is not cancelled while delivery is uncertain. Its late reply cannot update
+the new candidate's flow, which references its own chat ID. The supersession
+activity also records the old chat ID so operators can locate that job.
+The activity subtitle displays the superseded candidate and chat ID without
+opening the raw audit records. Existing history is compacted on its next
+supersession; read-only polls do not rewrite saved task data.
+
+Task API actions and the delivery scheduler share a per-task reentrant lock in
+the gateway process. It covers publication and PR creation through result
+recording, so a supported capture action cannot change the recorded candidate
+mid-request. A later candidate starts fresh preflight and delivery after that
+critical section. External Git edits are outside this task lock; exact-SHA
+publication and checkout checks remain required. `accepting_repair` is different:
+it is a persisted recovery checkpoint spanning candidate capture, and must resume
+that transition after a crash rather than being treated as a superseded report.
+
 Clicking **Validate latest commit** also checks whether protected validation
 files differ because the task predates the approved upstream. If the task did
 not edit protected files, that click authorizes one saved branch-update job for

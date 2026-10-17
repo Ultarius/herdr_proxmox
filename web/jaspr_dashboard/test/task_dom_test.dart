@@ -188,6 +188,72 @@ void main() {
       : {'workspaces': [], 'agents': []};
 
   test(
+    'superseded inspection chat is visible in the activity subtitle',
+    () async {
+      final task = publishedTask()
+        ..['audit'] = [
+          {
+            'action': 'delivery_superseded',
+            'actor': 'gateway',
+            'at': 'now',
+            'head_sha': 'b' * 40,
+            'previous_sha': 'a' * 40,
+            'delivery_chat_id': 'inspection-old',
+          },
+        ];
+      await mount(
+        const TasksPage(taskId: 'task'),
+        (request) => taskResponse(request, task),
+      );
+      await click('Activity & agents');
+      expect(
+        elements('.timeline__time').any(
+          (element) => element.textContent!.contains(
+            'Superseded aaaaaaaa · chat inspection-old',
+          ),
+        ),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'published candidate ignores old delivery attention and offers its draft PR',
+    () async {
+      final task = publishedTask()
+        ..['await_verification'] = true
+        ..['builds'] = {
+          'b' * 40: {
+            'state': 'complete',
+            'target': 'b' * 40,
+            'required_checks_verified': true,
+          },
+        }
+        ..['delivery_workflow'] = {
+          'sha': 'a' * 40,
+          'state': 'attention',
+          'error': 'OLD CANDIDATE FAILURE',
+        };
+      await mount(
+        const TasksPage(taskId: 'task'),
+        (request) => taskResponse(request, task),
+      );
+      final text = web.document.getElementById('task-dom-test')!.textContent!;
+      expect(
+        text,
+        isNot(contains('Delivery needs attention: OLD CANDIDATE FAILURE')),
+      );
+      expect(text, contains('Branch published; open a draft pull request.'));
+      expect(
+        elements(
+          '.task-detail__next .task-detail__actions button',
+        ).any((e) => e.textContent!.contains('Review draft PR')),
+        isTrue,
+      );
+    },
+  );
+
+  test(
     'validate latest commit authorizes an update and shows saved progress',
     () async {
       final task = publishedTask()..['state'] = 'review_ready';

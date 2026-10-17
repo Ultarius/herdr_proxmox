@@ -2223,6 +2223,21 @@ class _TasksPageState extends State<TasksPage> {
     }
     if (target == null || ['closed', 'completed'].contains(task['state']))
       return const SizedBox.shrink();
+    if (task['state'] == 'published' &&
+        task['pull'] == null &&
+        (task['publish'] as Map?)?['head_sha'] == target) {
+      return FilledButton.icon(
+        onPressed: admin && !busy && github['configured'] == true
+            ? () => previewPull(task)
+            : null,
+        icon: const Icon('rate_review'),
+        label: Text(
+          needsPrAuthentication(github, task['github_repository'] as String?)
+              ? 'Configure PR authentication'
+              : 'Review draft PR',
+        ),
+      );
+    }
     if (evidence?['state'] == 'complete') {
       final verified =
           evidence?['target'] == target &&
