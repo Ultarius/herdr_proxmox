@@ -188,6 +188,51 @@ void main() {
       : {'workspaces': [], 'agents': []};
 
   test(
+    'validate latest commit authorizes an update and shows saved progress',
+    () async {
+      final task = publishedTask()..['state'] = 'review_ready';
+      await mount(const TasksPage(taskId: 'task'), (request) {
+        if (request.url.path.endsWith('/tasks/build')) {
+          task['pr_repair'] = {
+            'kind': 'validation_update',
+            'state': 'queued',
+            'message': 'Updating task branch before validation',
+            'candidate': 'abcdef0123456789abcdef0123456789abcdef01',
+            'policy_files': ['.github/workflows/ci.yml'],
+          };
+          return task;
+        }
+        return taskResponse(request, task);
+      });
+      await click('Validate latest commit');
+      final request = posts.singleWhere(
+        (post) => post['path'] == '/api/tasks/build',
+      );
+      expect(request['update_branch'], isTrue);
+      expect(request['target'], task['head_sha']);
+      expect(
+        elements(
+          'button',
+        ).any((e) => e.textContent!.contains('View branch update')),
+        isTrue,
+      );
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('Updating task branch before validation'),
+      );
+      await click('View branch update');
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('Updated candidate:'),
+      );
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('Upstream validation files: .github/workflows/ci.yml'),
+      );
+    },
+  );
+
+  test(
     'capture and validation can be enabled independently with the gateway executor',
     () async {
       final task = <String, dynamic>{

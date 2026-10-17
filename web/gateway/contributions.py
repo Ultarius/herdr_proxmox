@@ -1032,7 +1032,7 @@ class Contributions:
             return False
         if approved.get('plan_digest') and task.get('run_id'):
             try:
-                frozen = self.frozen_environment(task)
+                frozen = pr_repairs.validation_binding(task) or self.frozen_environment(task)
             except (OSError, ValueError, sqlite3.Error):
                 return False
             if (not frozen or frozen.get('plan_digest') != evidence.get('plan_digest')
@@ -1715,7 +1715,7 @@ class Contributions:
         task['updated_at'] = stamp()
         entry = dict(action=action, actor=actor, at=task['updated_at'],
                      state=task['state'], head_sha=task.get('head_sha'))
-        if action.startswith('pr_repair_') and task.get('pr_repair'):
+        if (action.startswith('pr_repair_') or action.startswith('validation_update_')) and task.get('pr_repair'):
             repair = task['pr_repair']
             entry.update(repair_id=repair['id'], repair_state=repair['state'],
                          detail=str(repair.get('message') or '')[:2000],
@@ -3205,8 +3205,14 @@ class Contributions:
                 raise ValueError('Capture a candidate or refresh a merged PR before building.')
             if body.get('target') != target:
                 raise ValueError('Build selection changed; review the exact resulting commit.')
+            if body.get('update_branch') is True and actor != 'pr_repair_scheduler' and task['state'] != 'merged':
+                update = pr_repairs.queue_validation_update(self, task, actor)
+                if update is not None:
+                    return update
             if (task.get('pr_repair') or {}).get('candidate') == target and task['pr_repair'].get('state') == 'validation_failed':
-                task['pr_repair'].update(state='validating', message='Retrying validation of the repaired candidate.')
+                task['pr_repair'].update(state='validating', message=(
+                    'Retrying validation of the updated branch.' if pr_repairs.validation_update(task)
+                    else 'Retrying validation of the repaired candidate.'))
             try:
                 project_git.git(repository, 'cat-file', '-e', target + '^{commit}')
             except ValueError:
@@ -3215,7 +3221,10 @@ class Contributions:
             event = dict(id=event_id, task_id=task['id'], repository=task['repository'], path=task['repository'], target=target)
             approved = toolchain_policy.resolve_committed(repository)
             if approved.get('plan_digest') and task.get('run_id'):
-                frozen = self.frozen_environment(task) or {}
+                transition = pr_repairs.validation_binding(task)
+                frozen = transition or self.frozen_environment(task) or {}
+                if transition:
+                    event['policy_transition'] = dict(transition)
                 event.update(frozen_plan_digest=frozen.get('plan_digest') or 'unavailable',
                              frozen_policy_digest=frozen.get('digest') or 'unavailable')
                 event_id = hashlib.sha256((event_id + ':' + task['run_id'] + ':' + event['frozen_plan_digest']).encode()).hexdigest()

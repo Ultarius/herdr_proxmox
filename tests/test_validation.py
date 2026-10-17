@@ -41,6 +41,14 @@ BASH = usable_bash()
 
 
 class ValidationRunTests(unittest.TestCase):
+    def test_busy_gateway_refuses_before_starting_a_run(self):
+        with patch.object(self.runs, 'running', return_value=[{'state': 'running'}]), \
+                patch('validation.threading.Thread') as thread:
+            with self.assertRaises(validation.ValidationBusy):
+                self.runs.submit({'id': 'a' * 64})
+        thread.assert_not_called()
+        self.assertEqual(self.records, [])
+
     def test_candidate_cannot_replace_the_approved_validation_script(self):
         original = self.target
         (self.repository / 'scripts/build-web.sh').write_text('#!/bin/sh\necho checks-disabled\n')

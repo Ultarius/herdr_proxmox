@@ -180,6 +180,7 @@ const activityLabels = {
   'publication': 'Publication destination recorded',
   'complete': 'Task marked done',
   'discuss': 'Group review requested',
+  'validation_update_queued': 'Task branch update queued before validation',
   'review_policy': 'Automatic group review policy changed',
   'proposal': 'Follow-up draft created',
   'proposal_accepted': 'Discussion proposal accepted',

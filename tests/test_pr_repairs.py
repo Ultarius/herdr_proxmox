@@ -1,11 +1,12 @@
 """Conflict repair tests: real Git histories, simulated agent sessions and GitHub."""
 import json
+import copy
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.request import Request, urlopen
 
 import test_contributions as fixtures
@@ -58,6 +59,298 @@ class RepairTests(unittest.TestCase):
     def request(self, **body):
         return self.service.action('repair', dict(request_id='repair-request', task_id=self.task['id'],
             head_sha=self.task['head_sha'], **body), 'admin', 'admin')
+
+    def validation_fixture(self):
+        self.service.validation = Mock()
+        self.service.validation.submit.return_value = dict(id='validation-run', state='queued', checks=[])
+        workflow = self.repo / '.github/workflows/ci.yml'
+        workflow.parent.mkdir(parents=True, exist_ok=True)
+        workflow.write_text('name: approved upstream checks\n')
+        self.git('add', '.')
+        self.git('commit', '-m', 'upstream validation policy')
+        self.upstream = self.git('rev-parse', 'HEAD').strip()
+        self.git('update-ref', 'refs/remotes/origin/main', self.upstream)
+        self.task.update(state='review_ready')
+        self.task.pop('pull', None)
+        self.task.pop('publish', None)
+        self.service.save(self.task, 'fixture', 'admin')
+
+    def validate(self, request='validate-update', **body):
+        return self.service.action('build', dict(request_id=request, task_id=self.task['id'],
+            target=self.task['head_sha'], update_branch=True, **body), 'admin', 'admin')
+
+    def test_validation_update_queues_without_a_pr_and_adopts_dispatch_after_restart(self):
+        self.validation_fixture()
+        task = self.validate()
+        self.assertEqual(task['pr_repair']['kind'], 'validation_update')
+        self.assertIn('queued for the assigned agent', task['action_message'])
+        self.assertNotIn('action_message', self.service.get(task['id']))
+        again = self.validate(request='another-validation-click')
+        self.assertEqual(task['pr_repair']['id'], again['pr_repair']['id'])
+        pr_repairs.advance(self.service)
+        calls = self.store.manage_session.call_count
+        self.assertEqual(calls, 2)
+        prompt = self.store.manage_session.call_args.args[0]['task_prompt']
+        self.assertIn(self.upstream, prompt)
+        self.assertIn('Protected validation files must match', prompt)
+        task = self.service.get(task['id'])
+        task['pr_repair']['state'] = 'starting'  # Lost response after handover.
+        self.service.save(task, 'restart', 'test')
+        pr_repairs.advance(self.service)
+        self.assertEqual(self.store.manage_session.call_count, calls)
+        self.assertEqual(self.service.get(task['id'])['pr_repair']['state'], 'running')
+        self.api.request.assert_not_called()
+
+    def test_validation_update_captures_and_validates_exact_result_with_gateway_executor(self):
+        self.validation_fixture()
+        self.validate()
+        pr_repairs.advance(self.service)
+        self.run['state'] = 'persona_sent'
+        head = self.resolve()
+        self.advance()
+        task = self.service.get(self.task['id'])
+        self.assertEqual(task['head_sha'], head)
+        self.assertEqual(task['base_sha'], self.upstream)
+        self.assertEqual(task['state'], 'review_ready')
+        self.assertEqual(task['pr_repair']['state'], 'validating')
+        self.service.validation.snapshot.return_value = {'executor': 'gateway'}
+        with patch.object(self.service, 'perform', wraps=self.service.perform) as perform:
+            self.advance()
+        self.assertEqual(perform.call_args.args[:2], ('build', {'target': head}))
+        self.assertEqual(self.store.manage_session.call_count, 2)
+        task = self.service.get(task['id'])
+        task['builds'][head] = dict(target=head, state='complete', required_checks_verified=True)
+        self.service.save(task, 'validated', 'test')
+        self.advance()
+        task = self.service.get(task['id'])
+        self.assertEqual(task['pr_repair']['state'], 'ready')
+        self.assertNotIn('pull', task)
+
+    def test_gateway_capacity_waits_and_retries_without_inspecting_or_relaunching_the_agent(self):
+        from validation import ValidationBusy
+        self.validation_fixture()
+        self.validate()
+        pr_repairs.advance(self.service)
+        self.run['state'] = 'persona_sent'
+        head = self.resolve()
+        self.advance()
+        self.service.validation.submit.side_effect = [ValidationBusy('Already running'),
+            dict(id='validation-run', state='running', checks=[])]
+        self.advance()
+        task = self.service.get(self.task['id'])
+        self.assertEqual(task['pr_repair']['state'], 'validating')
+        self.assertIn('Waiting for the current validation', task['pr_repair']['message'])
+        self.assertNotIn(head, task.get('builds', {}))
+        self.advance()
+        task = self.service.get(task['id'])
+        self.assertEqual(task['builds'][head]['state'], 'running')
+        self.assertEqual(self.store.manage_session.call_count, 2)
+
+    def test_cancelled_validation_releases_the_wait_for_an_explicit_retry(self):
+        self.validation_fixture()
+        self.validate()
+        pr_repairs.advance(self.service)
+        self.run['state'] = 'persona_sent'
+        head = self.resolve()
+        self.advance()
+        task = self.service.get(self.task['id'])
+        task['builds'] = {head: dict(target=head, state='cancelled')}
+        self.service.save(task, 'cancelled-validation', 'test')
+        self.advance()
+        self.assertEqual(self.service.get(task['id'])['pr_repair']['state'], 'validation_failed')
+        self.task['head_sha'] = head
+        self.validate(request='retry-after-cancelled-validation')
+        self.service.validation.submit.assert_called_once()
+        self.assertEqual(self.store.manage_session.call_count, 2)
+
+    def test_background_validation_does_not_authorize_an_agent_update(self):
+        self.validation_fixture()
+        self.service.perform('build', {'target': self.task['head_sha']}, self.task['id'], 'automatic_task_policy')
+        self.assertNotIn('pr_repair', self.service.get(self.task['id']))
+        self.store.manage_session.assert_not_called()
+        self.service.validation.submit.assert_called_once()
+
+    def test_cancelled_undispatched_update_can_be_requested_by_a_new_click(self):
+        self.validation_fixture()
+        first = self.validate()['pr_repair']['id']
+        self.service.action('repair', dict(request_id='cancel-update', task_id=self.task['id'], mode='cancel'), 'admin', 'admin')
+        second = self.validate(request='validate-after-cancellation')['pr_repair']['id']
+        self.assertNotEqual(first, second)
+        self.store.manage_session.assert_not_called()
+
+    def test_failed_update_validation_can_retry_checks_without_another_agent_turn(self):
+        self.validation_fixture()
+        self.validate()
+        pr_repairs.advance(self.service)
+        self.run['state'] = 'persona_sent'
+        head = self.resolve()
+        self.advance()
+        task = self.service.get(self.task['id'])
+        task['pr_repair']['state'] = 'validation_failed'
+        self.service.save(task, 'failed-validation', 'test')
+        self.task['head_sha'] = head
+        self.validate(request='retry-updated-checks')
+        self.assertEqual(self.service.get(task['id'])['pr_repair']['state'], 'validating')
+        self.assertEqual(self.store.manage_session.call_count, 2)
+
+    def test_validation_update_refuses_task_authored_policy_changes(self):
+        self.validation_fixture()
+        tree = Path(self.task['worktree'])
+        (tree / '.github/workflows').mkdir(parents=True)
+        (tree / '.github/workflows/ci.yml').write_text('name: weaker task checks\n')
+        self.git('add', '.', path=tree)
+        self.git('commit', '-m', 'task policy edit', path=tree)
+        self.task['head_sha'] = self.git('rev-parse', 'HEAD', path=tree).strip()
+        self.service.save(self.task, 'fixture', 'admin')
+        with self.assertRaisesRegex(ValueError, 'task changed protected policy'):
+            self.validate()
+        self.store.manage_session.assert_not_called()
+
+    def test_validation_update_stops_if_upstream_moves_before_dispatch(self):
+        self.validation_fixture()
+        self.validate()
+        self.git('update-ref', 'refs/remotes/origin/main', self.base)
+        pr_repairs.advance(self.service)
+        task = self.service.get(self.task['id'])
+        self.assertEqual(task['pr_repair']['state'], 'needs_attention')
+        self.assertIn('upstream changed', task['pr_repair']['message'])
+        self.store.manage_session.assert_not_called()
+
+    def test_validation_update_stops_if_upstream_moves_before_acceptance(self):
+        self.validation_fixture()
+        self.validate()
+        pr_repairs.advance(self.service)
+        self.run['state'] = 'persona_sent'
+        self.resolve()
+        self.git('update-ref', 'refs/remotes/origin/main', self.base)
+        self.advance()
+        task = self.service.get(self.task['id'])
+        self.assertEqual(task['pr_repair']['state'], 'needs_attention')
+        self.assertIn('upstream changed', task['pr_repair']['message'])
+        self.assertEqual(task['head_sha'], self.task['head_sha'])
+
+    def test_validation_update_explains_a_checkout_that_lags_the_task_base(self):
+        self.validation_fixture()
+        workflow = self.repo / '.github/workflows/ci.yml'
+        workflow.write_text('name: moved upstream checks\n')
+        self.git('add', '.github/workflows/ci.yml')
+        self.git('commit', '-m', 'upstream policy move')
+        moved = self.git('rev-parse', 'HEAD').strip()
+        self.git('update-ref', 'refs/remotes/origin/main', moved)
+        self.git('reset', '-q', '--hard', self.upstream)
+        result = self.validate()
+        self.assertIn('approved checkout', result['action_message'])
+        self.assertNotIn('pr_repair', self.service.get(self.task['id']))
+        self.store.manage_session.assert_not_called()
+
+    def test_checkout_mismatch_does_not_claim_ahead_checkout_is_behind(self):
+        self.validation_fixture()
+        (self.repo / 'unrelated').write_text('approved checkout ahead of fetched branch\n')
+        self.git('add', 'unrelated')
+        self.git('commit', '-m', 'ahead checkout')
+        result = self.validate()
+        self.assertIn('does not match', result['action_message'])
+        self.assertNotIn('behind', result['action_message'])
+        self.assertNotIn('pr_repair', self.service.get(self.task['id']))
+        self.store.manage_session.assert_not_called()
+
+    def test_inspected_validation_update_can_resume_after_a_prelaunch_blocker(self):
+        self.validation_fixture()
+        self.validate()
+        source = Path(self.task['worktree']) / 'file'
+        original = source.read_bytes()
+        source.write_text('unfinished work\n')
+        pr_repairs.advance(self.service)
+        task = self.service.get(self.task['id'])
+        self.assertEqual(task['pr_repair']['state'], 'needs_attention')
+        self.store.manage_session.assert_not_called()
+        source.write_bytes(original)
+        self.service.action('repair', dict(request_id='inspected-update', task_id=self.task['id'],
+            mode='retry', inspected=True), 'admin', 'admin')
+        pr_repairs.advance(self.service)
+        self.assertEqual(self.service.get(task['id'])['pr_repair']['state'], 'running')
+        self.assertEqual(self.store.manage_session.call_count, 2)
+
+    def test_validation_transition_is_bound_to_the_receipted_candidate_and_preserves_session_policy(self):
+        self.validation_fixture()
+        import toolchain_policy
+        approved = dict(toolchain_policy.resolve_committed(self.repo), plan_digest='approved-plan')
+        frozen = dict(digest='original-agent-policy', plan_digest='original-plan')
+        with patch('pr_repairs.toolchain_policy.resolve_committed', return_value=approved), \
+                patch.object(self.service, 'frozen_environment', return_value=frozen):
+            self.validate()
+            pr_repairs.advance(self.service)
+            self.run['state'] = 'persona_sent'
+            head = self.resolve()
+            self.advance()
+            task = self.service.get(self.task['id'])
+            transition = pr_repairs.validation_binding(task)
+            self.assertEqual(transition['candidate'], head)
+            self.assertEqual(transition['approved_sha'], self.upstream)
+            self.assertEqual(transition['plan_digest'], 'approved-plan')
+            self.advance()
+            event_id = self.service.validation.submit.call_args.args[0]['id']
+            event = self.service.build_event(event_id)
+            self.assertEqual(event['frozen_plan_digest'], 'approved-plan')
+            self.assertEqual(event['policy_transition'], transition)
+            self.assertEqual(frozen['digest'], 'original-agent-policy')
+            with patch('toolchain_policy.evidence_matches', return_value=True):
+                self.assertTrue(self.service.policy_matches(task, dict(
+                    plan_digest='approved-plan', policy_digest=transition['digest'])))
+            changed = copy.deepcopy(task)
+            changed['head_sha'] = 'a' * 40
+            self.assertIsNone(pr_repairs.validation_binding(changed))
+            changed = copy.deepcopy(task)
+            changed['completion_receipt']['commit'] = 'b' * 40
+            self.assertIsNone(pr_repairs.validation_binding(changed))
+
+    def test_validation_transition_does_not_adopt_policy_moved_after_candidate_capture(self):
+        self.validation_fixture()
+        import toolchain_policy
+        approved = dict(toolchain_policy.resolve_committed(self.repo), plan_digest='approved-plan')
+        moved = dict(approved, plan_digest='different-plan')
+        captured = False
+        perform = self.service.perform
+
+        def capture_then_move(*args, **kwargs):
+            nonlocal captured
+            result = perform(*args, **kwargs)
+            if args[0] == 'candidate':
+                captured = True
+            return result
+
+        with patch('pr_repairs.toolchain_policy.resolve_committed',
+                   side_effect=lambda _: moved if captured else approved), \
+                patch.object(self.service, 'perform', side_effect=capture_then_move):
+            self.validate()
+            pr_repairs.advance(self.service)
+            self.run['state'] = 'persona_sent'
+            self.resolve()
+            self.advance()
+        self.assertTrue(captured)
+        transition = pr_repairs.validation_binding(self.service.get(self.task['id']))
+        self.assertEqual(transition['digest'], toolchain_policy.digest(approved))
+        self.assertEqual(transition['plan_digest'], 'approved-plan')
+
+    def test_validation_update_rejects_agent_policy_edits_after_merge(self):
+        self.validation_fixture()
+        self.validate()
+        pr_repairs.advance(self.service)
+        self.run['state'] = 'persona_sent'
+        self.resolve()
+        tree = Path(self.task['worktree'])
+        (tree / '.github/workflows/ci.yml').write_text('name: weakened during repair\n')
+        self.git('add', '.', path=tree)
+        self.git('commit', '-m', 'policy mutation', path=tree)
+        head = self.git('rev-parse', 'HEAD', path=tree).strip()
+        receipt = tree / '.ci-cache/herdr-guidance' / ('task-' + self.task['id']) / 'receipt.json'
+        data = json.loads(receipt.read_text())
+        receipt.write_text(json.dumps(dict(data, commit=head)))
+        self.advance()
+        task = self.service.get(self.task['id'])
+        self.assertEqual(task['pr_repair']['state'], 'needs_attention')
+        self.assertIn('explicit review', task['pr_repair']['message'])
+        self.assertEqual(task['head_sha'], self.task['head_sha'])
 
     def start(self):
         self.request()

@@ -34,6 +34,10 @@ HISTORY = 20
 ARTIFACT_LIMIT = 256 * 1024 * 1024
 
 
+class ValidationBusy(ValueError):
+    """Gateway capacity refused submission before any validation was started."""
+
+
 def stamp():
     return datetime.now(timezone.utc).isoformat()
 
@@ -209,13 +213,15 @@ class ValidationRuns:
             raise ValueError('Retry must be a boolean.')
         with self.lock:
             if self.running() and self.queue is None:
-                raise ValueError('Validation is already running. Wait for it to finish.')
+                raise ValidationBusy('Validation is already running. Wait for it to finish.')
             run = dict(id=secrets.token_hex(16), event_id=event['id'], repository=event.get('repository'),
                        target=target, path=event.get('path'), actor=actor, state='running',
                        started_at=stamp(), finished_at=None, exit_code=None, command=None, note='')
             run['task_id'] = event.get('task_id') or event.get('job_id')
             run['frozen_plan_digest'] = event.get('frozen_plan_digest')
             run['frozen_policy_digest'] = event.get('frozen_policy_digest')
+            if event.get('policy_transition'):
+                run['policy_transition'] = event['policy_transition']
             # Preserve provenance without turning an event waiver into a pass.
             if event.get('state') == 'validation_waived':
                 run['validation_waiver'] = dict(event_id=event['id'], approval=event.get('operator_approval'),

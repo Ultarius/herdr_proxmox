@@ -465,6 +465,29 @@ state inspected areas and omissions before concluding that no refactor is needed
 
 ## Automatic verification and draft PR delivery
 
+Clicking **Validate latest commit** also checks whether protected validation
+files differ because the task predates the approved upstream. If the task did
+not edit protected files, that click authorizes one saved branch-update job for
+its assigned worktree agent, even before a PR exists. The job pins both commits,
+keeps a recovery snapshot, merges without rewriting history, captures a verified
+completion receipt and validates the resulting commit. It uses the configured
+validation executor; a durable build service is not required for this manual flow.
+Both dashboards show branch-update progress in task activity. Publication remains
+a separate action.
+
+The approved checkout must match the fetched task base branch. This operation
+does not advance the shared checkout or approve new policy rules. Task-authored
+policy edits, policy edits made while resolving conflicts, ambiguous decisions,
+changed upstream approval and uncertain sessions stop for inspection. Restarts
+adopt the saved session instead of sending another prompt. A failed validation
+can retry checks, but cannot recursively launch another branch-update agent.
+Background validation alone does not authorize this repair.
+
+After the verified merge, an exact-candidate policy transition records the
+operator, pinned upstream, repair identity and approved policy digest for
+independent validation. The repair session's original frozen policy is retained;
+the transition cannot be reused for another candidate or completion receipt.
+
 In a task's **Automation settings**, administrators can independently enable
 **Automatically capture completed candidates** and **Automatically validate
 captured candidates**. Capture checks the completion receipt, task session,

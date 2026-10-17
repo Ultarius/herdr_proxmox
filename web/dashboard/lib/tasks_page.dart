@@ -1970,7 +1970,11 @@ class _TasksPageState extends State<TasksPage> {
       return OutlinedButton.icon(
         onPressed: () => setState(() => section = 'Activity & agents'),
         icon: const Icon(Icons.build_outlined),
-        label: const Text('View conflict repair'),
+        label: Text(
+          repair?['kind'] == 'validation_update'
+              ? 'View branch update'
+              : 'View conflict repair',
+        ),
       );
     }
     final target = task['merge_sha'] ?? task['head_sha'];
@@ -2228,7 +2232,11 @@ class _TasksPageState extends State<TasksPage> {
       );
     return FilledButton.icon(
       onPressed: admin && !busy
-          ? () => act('build', {'task_id': task['id'], 'target': target})
+          ? () => act('build', {
+              'task_id': task['id'],
+              'target': target,
+              'update_branch': true,
+            })
           : null,
       icon: const Icon(Icons.fact_check),
       label: const Text('Validate latest commit'),
@@ -2785,10 +2793,12 @@ class _TasksPageState extends State<TasksPage> {
     if (!taskHasPrConflicts(task) && repair == null)
       return const SizedBox.shrink();
     final state = '${repair?['state'] ?? ''}';
+    final updating = repair?['kind'] == 'validation_update';
     final agent = taskAgentName(task, fallback: 'the assigned agent');
     final terminal = ['merged', 'closed', 'completed'].contains(task['state']);
     final canStart =
         !terminal &&
+        !updating &&
         taskHasPrConflicts(task) &&
         (repair == null ||
             [
@@ -2812,7 +2822,7 @@ class _TasksPageState extends State<TasksPage> {
                       (repair == null ||
                           ['cancelled', 'obsolete'].contains(state))
                   ? 'PR #${task['pull']?['number']} has merge conflicts'
-                  : 'Conflict repair · ${state.replaceAll('_', ' ')}',
+                  : '${updating ? 'Branch update' : 'Conflict repair'} · ${state.replaceAll('_', ' ')}',
               style: Theme.of(context).textTheme.titleMedium,
             ),
             const SizedBox(height: 8),
@@ -2821,16 +2831,22 @@ class _TasksPageState extends State<TasksPage> {
             ),
             Text('Assigned agent: $agent'),
             SelectableText(
-              'PR branch: ${task['branch']}\nPublish to: ${task['publishing_repository'] ?? task['github_repository']}\nPR target: ${task['github_repository']}',
+              'Task branch: ${task['branch']}\nPublish to: ${task['publishing_repository'] ?? task['github_repository']}\nPR target: ${task['github_repository']}',
             ),
             const Text(
-              'Repair keeps the existing PR branch. The agent commits locally; publication and merging remain separate actions.',
+              'The agent updates the existing task branch and commits locally. Publication and merging remain separate actions.',
             ),
             if (repair?['candidate'] != null)
-              SelectableText('Repaired candidate: ${repair?['candidate']}'),
+              SelectableText(
+                '${updating ? 'Updated candidate' : 'Repaired candidate'}: ${repair?['candidate']}',
+              ),
+            if ((repair?['policy_files'] as List? ?? []).isNotEmpty)
+              SelectableText(
+                'Upstream validation files: ${(repair?['policy_files'] as List).join(', ')}',
+              ),
             if (repair?['upstream_sha'] != null)
               SelectableText(
-                'Upstream commit for this repair: ${repair?['upstream_sha']}',
+                '${updating ? 'Upstream commit for this update' : 'Upstream commit for this repair'}: ${repair?['upstream_sha']}',
               ),
             const SizedBox(height: 12),
             Wrap(
@@ -2856,7 +2872,11 @@ class _TasksPageState extends State<TasksPage> {
                             'mode': 'cancel',
                           })
                         : null,
-                    child: const Text('Cancel queued repair'),
+                    child: Text(
+                      updating
+                          ? 'Cancel queued update'
+                          : 'Cancel queued repair',
+                    ),
                   ),
                 if (state == 'queued' ||
                     state == 'monitoring_unavailable' ||
@@ -2879,24 +2899,36 @@ class _TasksPageState extends State<TasksPage> {
                             'inspected': true,
                           })
                         : null,
-                    child: const Text('Recheck inspected repair'),
+                    child: Text(
+                      updating
+                          ? 'Recheck inspected update'
+                          : 'Recheck inspected repair',
+                    ),
                   ),
                 if (state == 'validating' || state == 'validation_failed')
                   OutlinedButton(
                     onPressed: () =>
                         setState(() => section = 'Checks & builds'),
-                    child: const Text('Inspect repair validation'),
+                    child: Text(
+                      updating
+                          ? 'Inspect update validation'
+                          : 'Inspect repair validation',
+                    ),
                   ),
                 if (state == 'ready')
                   FilledButton(
                     onPressed: admin && !busy ? () => review(task) : null,
-                    child: const Text('Review and publish repaired candidate'),
+                    child: Text(
+                      updating
+                          ? 'Review and publish updated candidate'
+                          : 'Review and publish repaired candidate',
+                    ),
                   ),
                 OutlinedButton(
                   onPressed: admin && !busy
                       ? () => act('refresh', {'task_id': task['id']})
                       : null,
-                  child: const Text('Refresh PR status'),
+                  child: Text(updating ? 'Refresh task' : 'Refresh PR status'),
                 ),
               ],
             ),
@@ -3023,7 +3055,11 @@ class _TasksPageState extends State<TasksPage> {
         build is Map && ['queued', 'running'].contains(build['state']);
     return OutlinedButton(
       onPressed: admin && !busy && !running
-          ? () => act('build', {'task_id': task['id'], 'target': target})
+          ? () => act('build', {
+              'task_id': task['id'],
+              'target': target,
+              'update_branch': true,
+            })
           : null,
       child: Text(
         task['state'] == 'merged'
