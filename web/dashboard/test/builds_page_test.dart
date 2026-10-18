@@ -80,6 +80,10 @@ void main() {
                     'target': 'exact-sha',
                     'command': 'scripts/build-web.sh',
                     'artifact_error': 'Retention limit',
+                    'timings': {
+                      'workspace': {'duration_ms': 123, 'status': 'complete'},
+                      'checks': {'duration_ms': 456, 'status': 'complete'},
+                    },
                   },
                 ],
               }),
@@ -112,6 +116,13 @@ void main() {
       expect(find.textContaining('Retention limit'), findsOneWidget);
       expect(find.text('Download log'), findsOneWidget);
       expect(find.text('Download static artifact'), findsNothing);
+      final timings = find.text('Recorded phase timings');
+      await tester.ensureVisible(timings);
+      await tester.pumpAndSettle();
+      await tester.tap(timings);
+      await tester.pumpAndSettle();
+      expect(find.text('workspace: 123 ms · complete'), findsOneWidget);
+      expect(find.text('checks: 456 ms · complete'), findsOneWidget);
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
       await connection.disconnect();

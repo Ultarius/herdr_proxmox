@@ -12,7 +12,61 @@ distinguish them. Eligibility snapshots reuse loaded tasks and batch missing
 records on one connection. Notifications omit unchanged and audit-only saves,
 while retaining real incorporation progress.
 
+## Plans from group discussions
+
+Enable **Create release plans from group discussions automatically** in the
+organization automation settings. It defaults off, requires an administrator,
+and applies to discussions created after enabling it. Existing finalized
+discussions are not reprocessed. Pausing automatic follow-up also prevents new
+plans. Task queueing, candidate capture and validation retain their own grants
+and limits; a release plan does not start a draft task.
+
+The final discussion artifact may include an explicit plan in the same JSON
+object as its proposals:
+
+```json
+{
+  "task_proposals": [
+    {"ref": "api", "title": "Implement API", "description": "Acceptance criteria and checks", "profile_id": "worker", "needs_review": false},
+    {"ref": "tests", "title": "Test API", "description": "Acceptance criteria and checks", "profile_id": "worker", "needs_review": true}
+  ],
+  "release_plan": {"name": "alpha.15", "task_refs": ["api", "tests"]}
+}
+```
+
+References must identify 1–10 successfully materialized proposals from that
+discussion, each with one unique `ref`. All selected tasks must belong to the
+discussion organization and the same repository, derived from their assigned
+profiles. Herdr never infers membership from prose, titles, follow-up links or
+other tasks in the repository. Invalid, ambiguous, skipped or cross-repository
+selections create no release; the discussion records an explanatory outcome.
+A conflicting existing release name is refused rather than modified.
+
+Both standalone and task-linked discussions use this path. Release creation and
+initial membership commit together under a deterministic organization/discussion
+identity. A restart before the separate discussion marker is saved reuses that
+release without overwriting later operator edits. The plan retains its group,
+discussion, artifact digest, proposal and task provenance. Recovery can report
+an already-created plan after the grant is disabled, but refuses a changed
+finalized artifact. The discussion's Artifacts panel shows
+creation or refusal and links to the board.
+
+Planned tasks appear immediately, including drafts without a commit. While the
+release is collecting, automatic members follow the latest captured task head
+only after required checks pass for that exact SHA. A changed or no-longer-verified
+head clears the selection until its checks pass. This tracking belongs to the
+created plan; disabling creation affects new plans. Removing a planned member
+and adding it manually switches it to explicit commit selection.
+
+**Freeze and integrate** remains an explicit operator action, disabled while a
+member has no selected candidate. Freeze rechecks every SHA against the current
+approved policy and stops all automatic selection updates. Integration and
+publication receive no permission from the discussion plan.
+
 ## Freeze and integrate
+
+Read-only repository questions and retained validation phase timings are
+documented in [Repository questions and operation measurements](repository-queries.md).
 
 **Freeze and integrate** pins the configured base commit, each selected candidate
 SHA in selection order, approved environment policy and manifest digest. The

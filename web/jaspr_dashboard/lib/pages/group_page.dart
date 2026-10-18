@@ -888,6 +888,19 @@ class _GroupPageState extends State<GroupPage> {
         card(
           'Discussion artifact',
           [
+            if (job['release_plan_outcome'] is Map) ...[
+              note(
+                job['release_plan_outcome']['state'] == 'created'
+                    ? 'Release plan ${job['release_plan_outcome']['version']} created. Planned tasks appear on the workflow board.'
+                    : 'Release plan not created: ${job['release_plan_outcome']['reason']}',
+              ),
+              button(
+                'View workflow board',
+                () => navigate('/tasks'),
+                small: true,
+                iconName: 'rocket',
+              ),
+            ],
             pre(job['result']),
             row([
               if (job['task_id'] != null)

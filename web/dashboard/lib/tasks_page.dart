@@ -2,6 +2,7 @@ import 'discovery_panel.dart';
 import 'routes.dart';
 import 'task_activity.dart';
 import 'task_timeline.dart';
+import 'task_revisions.dart';
 import 'artifact_download.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
@@ -2736,6 +2737,7 @@ class _TasksPageState extends State<TasksPage> {
             if (task['merge_sha'] != null)
               SelectableText('Merged result: ${task['merge_sha']}'),
             const SizedBox(height: 12),
+            TaskRevisions(task: task),
             TaskTimeline(
               task: task,
               onSelect: (sha) => showCommit(task, sha),

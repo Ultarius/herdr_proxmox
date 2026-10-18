@@ -3,6 +3,7 @@ from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 import copy
 import json
+import random
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -92,6 +93,213 @@ class ReleaseCandidateTests(unittest.TestCase):
         for identifier in tasks:
             release = self.action('membership', release, task_id=identifier, included=True)
         return self.action('freeze', release)
+
+    def discussion_plan(self, *identifiers, job_id='discussion', **changes):
+        for identifier in identifiers:
+            self.tasks[identifier].setdefault('organization_id', 'org')
+        refs = [str(index) for index in range(len(identifiers))]
+        job = dict(id=job_id, organization_id='org', group_id='group', state='artifact_ready', created_at='2026-10-18')
+        proposals = [dict(ref=ref, key=ref) for ref in refs]
+        plan = dict(name='alpha.15', task_refs=refs)
+        plan.update(changes)
+        return self.releases.from_discussion(job, dict(release_plan=plan), proposals,
+            dict(zip(refs, identifiers)), dict(auto_create_releases=True), 'group_auto_queue')
+
+    def test_capture_refusal_does_not_stop_active_release_processing(self):
+        release = self.action('create', repository='repo', version='worker-survival')
+        release['state'] = 'integrating'
+        self.releases.save(release)
+        for error in (ValueError('plan unavailable'), ReleaseChanged('plan changed')):
+            with self.subTest(error=error):
+                self.releases.stopped.clear()
+                with patch.object(self.releases, 'capture_planned_candidates', side_effect=error), \
+                        patch.object(self.releases, 'advance') as advance, \
+                        patch.object(self.releases.wake, 'wait', side_effect=lambda _: self.releases.stopped.set()):
+                    self.releases.poll()
+                advance.assert_called_once_with(release['id'])
+
+    def test_unchanged_planned_capture_never_claims_the_sqlite_writer(self):
+        identifier = self.task()
+        result = self.discussion_plan(identifier)
+        self.releases.capture_planned_candidates()
+        before = self.releases.get(result['id'])
+        statements = []
+        connect = self.service.connect
+        def traced():
+            db = connect()
+            db.set_trace_callback(statements.append)
+            return db
+        with patch.object(self.service, 'connect', side_effect=traced):
+            self.releases.capture_planned_candidates()
+        self.assertNotIn('BEGIN IMMEDIATE', statements)
+        self.assertFalse(any(sql.startswith(('INSERT', 'UPDATE', 'DELETE')) for sql in statements))
+        self.assertEqual(self.releases.get(result['id'])['record_version'], before['record_version'])
+
+    def test_planned_capture_rechecks_evidence_after_read_only_preflight(self):
+        identifier = self.task()
+        result = self.discussion_plan(identifier)
+        before = self.releases.get(result['id'])
+        read = self.service.task_records
+        calls = []
+        def raced(identifiers, db=None):
+            calls.append(True)
+            if len(calls) == 2:
+                self.tasks[identifier]['builds'].clear()
+            return read(identifiers, db)
+        with patch.object(self.service, 'task_records', side_effect=raced):
+            self.releases.capture_planned_candidates()
+        after = self.releases.get(result['id'])
+        self.assertIsNone(after['members'][0]['candidate_sha'])
+        self.assertEqual(after['record_version'], before['record_version'])
+
+    def test_freeze_retains_managed_revision_identity_alongside_exact_sha(self):
+        identifier = self.task()
+        self.tasks[identifier]['candidate_revision'] = 'a' * 64
+        release = self.action('create', version='managed.alpha', repository='repo')
+        release = self.action('membership', release, task_id=identifier, included=True)
+        frozen = self.action('freeze', release)
+        member = frozen['revision']['members'][0]
+        self.assertEqual(member['task_revision_id'], 'a' * 64)
+        self.assertEqual(member['candidate_sha'], self.tasks[identifier]['head_sha'])
+
+    def test_seeded_capture_restart_and_late_evidence_sequences_preserve_frozen_shas(self):
+        identifier = self.task()
+        original = self.tasks[identifier]['head_sha']
+        evidence = copy.deepcopy(self.tasks[identifier]['builds'][original])
+        for seed in range(6):
+            with self.subTest(seed=seed):
+                randomizer = random.Random(seed)
+                self.tasks[identifier]['head_sha'] = original
+                self.tasks[identifier]['builds'] = {original: copy.deepcopy(evidence)}
+                result = self.discussion_plan(identifier, job_id='discussion-' + str(seed), name='alpha.' + str(seed))
+                for _ in range(16):
+                    event = randomizer.choice(('advance', 'pass', 'late', 'restart', 'capture'))
+                    task = self.tasks[identifier]
+                    if event == 'advance':
+                        task['head_sha'] = self.base if task['head_sha'] == original else original
+                    elif event == 'pass':
+                        task['builds'][task['head_sha']] = dict(evidence, target=task['head_sha'])
+                    elif event == 'late':
+                        old = self.base if task['head_sha'] == original else original
+                        task['builds'][old] = dict(evidence, target=old)
+                    elif event == 'restart':
+                        self.releases = ReleaseCandidates(self.service)
+                    else:
+                        self.releases.capture_planned_candidates()
+                        recorded = task['builds'].get(task['head_sha'], {})
+                        selected = self.releases.get(result['id'])['members'][0]['candidate_sha']
+                        self.assertEqual(selected, task['head_sha'] if recorded.get('required_checks_verified') else None)
+                task['builds'][task['head_sha']] = dict(evidence, target=task['head_sha'])
+                self.releases.capture_planned_candidates()
+                frozen = self.action('freeze', self.releases.get(result['id']))
+                pinned = copy.deepcopy(frozen['revision'])
+                task['head_sha'] = self.base if task['head_sha'] == original else original
+                task['builds'][task['head_sha']] = dict(evidence, target=task['head_sha'])
+                self.releases = ReleaseCandidates(self.service)
+                self.releases.capture_planned_candidates()
+                self.assertEqual(self.releases.get(result['id'])['revision'], pinned)
+
+    def test_planned_candidates_follow_only_verified_heads_and_stop_at_freeze(self):
+        identifier = self.task()
+        result = self.discussion_plan(identifier)
+        release = self.releases.get(result['id'])
+        self.assertIsNone(release['members'][0]['candidate_sha'])
+        self.releases.capture_planned_candidates()
+        captured = self.releases.get(result['id'])
+        first = self.tasks[identifier]['head_sha']
+        self.assertEqual(captured['members'][0]['candidate_sha'], first)
+        self.assertGreater(captured['edit_version'], release['edit_version'])
+        # A new head invalidates the automatic selection until its own checks pass.
+        self.tasks[identifier]['head_sha'] = self.base
+        self.releases.capture_planned_candidates()
+        self.assertIsNone(self.releases.get(result['id'])['members'][0]['candidate_sha'])
+        self.tasks[identifier]['builds'][self.base] = dict(target=first, state='complete', required_checks_verified=True)
+        self.releases.capture_planned_candidates()
+        self.assertIsNone(self.releases.get(result['id'])['members'][0]['candidate_sha'])
+        self.tasks[identifier]['head_sha'] = first
+        self.releases.capture_planned_candidates()
+        frozen = self.action('freeze', self.releases.get(result['id']))
+        self.assertEqual(frozen['revision']['members'][0]['candidate_sha'], first)
+        self.tasks[identifier]['head_sha'] = self.base
+        self.releases.capture_planned_candidates()
+        self.assertEqual(self.releases.get(result['id'])['revision'], frozen['revision'])
+
+    def test_planned_candidate_capture_rejects_stale_operator_selection_and_noop_saves(self):
+        identifier = self.task()
+        result = self.discussion_plan(identifier)
+        before = self.releases.get(result['id'])
+        self.releases.capture_planned_candidates()
+        captured = self.releases.get(result['id'])
+        self.releases.capture_planned_candidates()
+        self.assertEqual(self.releases.get(result['id'])['record_version'], captured['record_version'])
+        with self.assertRaisesRegex(ValueError, 'selection changed'):
+            self.releases.action('freeze', dict(id=before['id'], edit_version=before['edit_version'],
+                request_id='stale-planned-freeze'), 'operator', 'admin')
+        # Replaying the original discussion cannot restore a member removed by an operator.
+        self.action('membership', captured, task_id=identifier, included=False)
+        self.discussion_plan(identifier)
+        self.assertEqual(self.releases.get(result['id'])['members'], [])
+
+    def test_discussion_plan_refusals_are_explanatory_and_never_modify_other_releases(self):
+        identifier = self.task()
+        job = dict(id='discussion', organization_id='org', state='artifact_ready')
+        proposals = [dict(ref='work', key='key')]
+        created = dict(key=identifier)
+        self.tasks[identifier]['organization_id'] = 'org'
+        def propose(plan, policy=None, items=None, mapping=None):
+            return self.releases.from_discussion(job, dict(release_plan=plan), items or proposals,
+                created if mapping is None else mapping,
+                dict(auto_create_releases=True) if policy is None else policy, 'group_auto_queue')
+        valid = dict(name='alpha.15', task_refs=['work'])
+        for plan in ([], dict(name='../bad', task_refs=['work']), dict(name='alpha.15', task_refs=[]),
+                     dict(name='alpha.15', task_refs=['work', 'work']), dict(name='alpha.15', task_refs=['absent'])):
+            with self.subTest(plan=plan):
+                self.assertEqual(propose(plan)['state'], 'not_created')
+        self.assertEqual(propose(valid, policy={})['state'], 'not_created')
+        self.assertEqual(propose(valid, policy=dict(auto_create_releases=True, paused=True))['state'], 'not_created')
+        self.assertEqual(propose(valid, items=proposals * 2)['state'], 'not_created')
+        self.assertEqual(propose(valid, mapping={})['state'], 'not_created')
+        self.tasks[identifier]['organization_id'] = 'other'
+        self.assertIn('organization', propose(valid)['reason'])
+        self.assertEqual(self.releases.snapshot(), [])
+        self.tasks[identifier]['organization_id'] = 'org'
+        manual = self.action('create', repository='repo', version='alpha.15')
+        self.assertIn('already exists', propose(valid)['reason'])
+        self.assertEqual(self.releases.get(manual['id'])['members'], [])
+
+    def test_discussion_plan_cannot_span_repositories(self):
+        first, second = self.task('first'), self.task('second')
+        self.tasks[second]['repository'] = 'other-repo'
+        result = self.discussion_plan(first, second)
+        self.assertEqual(result['state'], 'not_created')
+        self.assertIn('one repository', result['reason'])
+        self.assertEqual(self.releases.snapshot(), [])
+
+    def test_discussion_release_receipt_survives_disabled_permission_but_refuses_artifact_drift(self):
+        identifier = self.task()
+        result = self.discussion_plan(identifier)
+        recovered = self.releases.from_discussion(
+            dict(id='discussion', organization_id='org', state='artifact_ready'),
+            dict(release_plan=dict(name='alpha.15', task_refs=['0'])), [], {}, {}, 'group_auto_queue')
+        self.assertEqual(recovered, result)
+        changed = self.discussion_plan(identifier, name='alpha.16')
+        self.assertEqual(changed['state'], 'not_created')
+        self.assertIn('artifact changed', changed['reason'])
+        self.assertEqual(self.releases.get(result['id'])['version'], 'alpha.15')
+        self.assertEqual(len(self.releases.snapshot()), 1)
+
+    def test_revising_a_discussion_release_retains_automatic_membership_and_provenance(self):
+        identifier = self.task()
+        result = self.discussion_plan(identifier)
+        self.releases.capture_planned_candidates()
+        frozen = self.action('freeze', self.releases.get(result['id']))
+        frozen['state'] = 'blocked'
+        self.releases.save(frozen)
+        revised = self.action('revise', frozen)
+        self.assertEqual(revised['source']['job_id'], 'discussion')
+        self.assertEqual(revised['organization_id'], 'org')
+        self.assertEqual(revised['members'][0]['selection'], 'automatic')
+        self.assertNotIn('revision', revised)
 
     def test_request_replay_and_stale_selection_are_checked(self):
         body = dict(request_id='same-request', repository='repo', version='alpha.15')

@@ -263,6 +263,8 @@ class _OrganizationAutomationState extends State<OrganizationAutomation> {
 /// Display labels for the stored policy keys (shared with the edit form).
 const automationLabels = <String, String>{
   'auto_queue_proposals': 'Automatically queue qualifying follow-ups',
+  'auto_create_releases':
+      'Create release plans from group discussions automatically',
   'paused': 'Pause automatic follow-up',
   'reap_finished_sessions':
       'Archive and close finished idle sessions automatically',
@@ -291,6 +293,7 @@ Future<Json?> editOrganizationAutomation(
 }) async {
   final defaults = <String, dynamic>{
     'auto_queue_proposals': false,
+    'auto_create_releases': false,
     'paused': false,
     'auto_validate': false,
     'auto_capture': policy['auto_capture'] ?? policy['auto_validate'] ?? false,
@@ -334,6 +337,7 @@ Future<Json?> editOrganizationAutomation(
     submit: save == null ? null : (values) => save(normalized(values)),
     flags: {
       'auto_queue_proposals',
+      'auto_create_releases',
       'paused',
       'reap_finished_sessions',
       'reap_orphaned_panes',
@@ -346,6 +350,9 @@ Future<Json?> editOrganizationAutomation(
       'auto_prepare_agent',
     },
     extra: (v) => [
+      note(
+        'Release planning applies to new discussions with an explicit named plan. Planned tasks join the board before completion; their candidate follows the latest captured commit only after required checks pass. Task queueing, capture and validation use their own settings. Freezing, integration and publication remain explicit actions.',
+      ),
       note(
         'Managed SDK preparation uses trusted providers. Agent-assisted preparation is a separate opt-in for Node.js: a dedicated session can download and run installers in its allocation, and its provenance remains an unverified claim. This shares the service account and is not a sandbox. Locked Dependency restoration requires its own permission and can execute project build code. Native check approval is separate: build and test commands can restore dependencies and execute project code. Unsupported requirements stop the launch; disabling preparation does not silently resume a waiting launch.',
       ),

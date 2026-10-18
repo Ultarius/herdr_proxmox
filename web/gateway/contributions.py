@@ -80,7 +80,7 @@ AUTOMATION_DEFAULTS = dict(auto_queue_proposals=False, max_per_meeting=1, max_op
                            # including every proposal-created one — started
                            # manual, so capture, validation and publication were
                            # clicked through one task at a time.
-                           auto_capture=False, auto_validate=False, auto_publish=False,
+                           auto_capture=False, auto_validate=False, auto_publish=False, auto_create_releases=False,
                            auto_prepare=False, auto_prepare_checks=False, auto_prepare_agent=False, auto_prepare_restore=False)
 AUTOMATION_LIMITS = (('max_per_meeting', 0, 10), ('max_open_per_agent', 0, 50),
                      ('max_follow_up_depth', 0, 10), ('daily_cap', 0, 100),
@@ -376,6 +376,8 @@ class Contributions:
         self.discovery = Discovery(self)
         from release_candidates import ReleaseCandidates
         self.releases = ReleaseCandidates(self)
+        from task_commits import TaskCommits
+        self.commits = TaskCommits(self)
 
     def connect(self):
         from notifications import Connection
@@ -980,6 +982,21 @@ class Contributions:
                     continue
 
     @staticmethod
+    def discussion_artifact(job):
+        """Only a finalized artifact can propose tasks or a release plan."""
+        if not isinstance(job, dict) or job.get('state') != 'artifact_ready':
+            return {}
+        result = job.get('result')
+        if not isinstance(result, str) or not result:
+            return {}
+        match = re.search(r'```json\s*(.*?)\s*```', result, re.DOTALL)
+        try:
+            data = json.loads(match[1] if match else result)
+        except (ValueError, TypeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
     def discussion_proposals(job):
         """Read proposals from a finalized discussion artifact.
 
@@ -988,16 +1005,7 @@ class Contributions:
         reads: the dashboard resolves assignee names for display, and the
         materializer validates eligibility against profiles it already holds.
         """
-        if not isinstance(job, dict) or job.get('state') != 'artifact_ready':
-            return []
-        result = job.get('result')
-        if not isinstance(result, str) or not result:
-            return []
-        match = re.search(r'```json\s*(.*?)\s*```', result, re.DOTALL)
-        try:
-            data = json.loads(match[1] if match else result)
-        except (ValueError, TypeError):
-            return []
+        data = Contributions.discussion_artifact(job)
         proposals = data.get('task_proposals', []) if isinstance(data, dict) else []
         if not isinstance(proposals, list):
             return []
@@ -1298,7 +1306,7 @@ class Contributions:
             was_enabled = policy['auto_queue_proposals']
             previous = dict(policy)
             for key in ('auto_queue_proposals', 'paused', 'reap_finished_sessions', 'reap_orphaned_panes',
-                        'auto_capture', 'auto_validate', 'auto_publish', 'auto_prepare', 'auto_prepare_checks', 'auto_prepare_agent', 'auto_prepare_restore'):
+                        'auto_capture', 'auto_validate', 'auto_publish', 'auto_create_releases', 'auto_prepare', 'auto_prepare_checks', 'auto_prepare_agent', 'auto_prepare_restore'):
                 if key in body:
                     if not isinstance(body[key], bool):
                         raise FieldValidationError('Invalid automation policy value.', [key])
@@ -1332,6 +1340,8 @@ class Contributions:
                 # Enabling starts a fresh window: discussions created earlier are
                 # never queued retroactively.
                 policy['auto_queue_since'] = stamp()
+            if policy['auto_create_releases'] and not previous['auto_create_releases']:
+                policy['auto_create_releases_since'] = stamp()
             policy.update(updated_at=stamp(), updated_by=actor)
             with closing(self.connect()) as db, db:
                 db.execute('INSERT OR REPLACE INTO policies VALUES (?,?)', (organization_id, json.dumps(policy)))
@@ -1611,8 +1621,10 @@ class Contributions:
             else:
                 drafts.append(proposal['key'])
             created[proposal['key']] = made['id']
+        release = self.releases.from_discussion(job, self.discussion_artifact(job), proposals, created, policy, actor)
         self.store.update_job(job_id, proposals=dict(
             at=stamp(), queued=queued, drafts=drafts, skipped=skipped, created=created, deferred=deferred,
+            release=release,
             policy={k: policy[k] for k in AUTOMATION_DEFAULTS}))
 
     def materialize_meeting(self, task_id, job_id, policy, actor, queue_allowed=True):
@@ -1688,8 +1700,11 @@ class Contributions:
                     deferred[proposal['key']] = queue_reason
                 (queued if wants_queue else drafts).append(proposal['key'])
         task = self.get(task_id)
+        created = {proposal['key']: task.get('follow_up_tasks', {}).get(proposal['key']) for proposal in proposals}
+        release = self.releases.from_discussion(job, self.discussion_artifact(job), proposals, created, policy, actor)
         task.setdefault('auto_queue', {})[job_id] = dict(
             at=stamp(), queued=queued, drafts=drafts, skipped=skipped, deferred=deferred,
+            release=release,
             policy={k: policy[k] for k in AUTOMATION_DEFAULTS})
         self.save(task, 'auto_queue_checked', actor)
 
@@ -1909,6 +1924,9 @@ class Contributions:
             raise ValueError('Select a valid task.')
         task = self.get(task_id)
         # The frozen dispatch payload is server-side retry state, not evidence.
+        task['managed_revisions'] = self.commits.revisions(task_id, limit=10)
+        for revision in task['managed_revisions']['revisions']:
+            revision['file_count'] = len(revision.pop('files', []))
         task.pop('outcome_request', None)
         if task.get('acceptance'):
             task['acceptance'] = {k: v for k, v in task['acceptance'].items() if k != 'request'}
@@ -2314,9 +2332,23 @@ class Contributions:
                 prompt = ('Follow-up of task ' + origin['id'] + ': ' + origin['title'] +
                           '\nRecorded completion: ' + str(origin.get('completion', {}).get('reason', 'unavailable'))[:500] +
                           '\n\n' + prompt)
+        query_command = ' '.join(shlex.quote(str(value)) for value in (
+            sys.executable, Path(__file__).parent / 'repository_queries.py', '--projects', self.projects,
+            '--repository', task['repository'], '--tasks-db', self.path, '--task-id', task['id'], '--kind', 'status'))
         return (prompt +
-                '\nWork only in your assigned task branch. Implement, run required checks, and commit your changes. '
-                'Commit using git -c user.name=Herdr-Agent -c user.email=agent@herdr.local commit. Never infer the operator identity or change global Git config. '
+                '\nFor recorded task state or required-check evidence, use the bounded read-only query helper: `' + query_command +
+                '`. Replace status with evidence for recorded checks; diff/history/ancestry require full commit SHAs via --revision, and diff/ancestry also require --base. '
+                'This uses existing filesystem access and no dashboard credentials. If unavailable, report the exact failure; do not widen access or search for credentials. '
+                'Recorded evidence is not fresh approval to publish.\n' +
+                '\nWork only in your assigned task branch. Implement and run required checks. Submit explicit changed files through Herdr managed commits: '
+                '`' + shlex.quote(sys.executable) + ' {{HERDR_TASK_COMMIT_HELPER}}' +
+                ' --context {{HERDR_TASK_CONTEXT}} --request-file {{HERDR_TASK_REVISION_REQUEST}} --parent FULL_EXPECTED_HEAD_SHA --message "Describe the change" --file path/to/file` '
+                '(repeat --file for every changed or deleted file). Use this provided ignored request path. '
+                'Run the helper from the assigned checkout root; file paths are repository-relative. '
+                'The request file captures immutable bytes; retry the same file after an uncertain response. Change its filename for a new revision. '
+                'Do not stage or run git commit yourself, change global Git config, or fall back to direct commits if submission fails. '
+                'Never infer the operator identity; Herdr supplies author and committer metadata. '
+                'Herdr preserves working files; inspect remaining edits and use the returned full SHA in the completion receipt. '
                 'Never push, open a pull request, update the shared checkout or deploy. '
                 'Before implementing, verify whether the requested behavior and its checks already exist at the recorded base; if the task is already satisfied, prove it with the checks and use the no_changes receipt instead of manufacturing a commit. '
                 'When complete, write JSON to {{HERDR_TASK_RECEIPT}} with outcome=complete, commit=the full HEAD SHA, run_id={{HERDR_TASK_RUN}}, token={{HERDR_TASK_TOKEN}}, and tests as an array of actual check results. Write it last after committing. '
@@ -3095,6 +3127,8 @@ class Contributions:
                 task.update(head_sha=head, diff=diff[:65536], diff_truncated=len(diff) > 65536,
                             diff_stat=project_git.git(path, 'diff', '--stat', task['base_sha'], head, '--')[:12000],
                             state='review_ready', candidate_changed=bool(task.get('pull') and task['pull']['head_sha'] != head))
+                revision = self.commits.for_commit(task['id'], head)
+                task['candidate_revision'] = revision['id'] if revision else None
         elif action == 'publication':
             if task.get('auto_publish'):
                 raise ValueError('Disable automatic publication before changing its destination.')
@@ -3262,6 +3296,8 @@ class Contributions:
                 raise ValueError('Fetch this repository in Project explorer before building the merged result.') from None
             event_id = hashlib.sha256(('task:' + task['id'] + ':' + target).encode()).hexdigest()
             event = dict(id=event_id, task_id=task['id'], repository=task['repository'], path=task['repository'], target=target)
+            if target == task.get('head_sha') and task.get('candidate_revision'):
+                event['task_revision_id'] = task['candidate_revision']
             approved = toolchain_policy.resolve_committed(repository)
             if approved.get('plan_digest') and task.get('run_id'):
                 transition = pr_repairs.validation_binding(task)

@@ -68,6 +68,12 @@ class ReleaseCandidates:
             except (OSError, sqlite3.Error):
                 self.wake.wait(2)
                 continue
+            try:
+                self.capture_planned_candidates()
+            except (ValueError, OSError, sqlite3.Error):
+                # A refused/stale plan cannot kill the worker or starve
+                # already-frozen releases of integration and callbacks.
+                pass
             for identifier in identifiers:
                 if self.stopped.is_set():
                     break
@@ -78,6 +84,132 @@ class ReleaseCandidates:
                     # refusals are recorded by advance while holding its claim.
                     pass
             self.wake.wait(2)
+
+    def from_discussion(self, job, artifact, proposals, created, policy, actor):
+        """Record an explicit plan, never infer membership from discussion prose.
+
+        The caller owns the organization proposal-budget lock. A deterministic
+        identity plus one transaction covers a crash before the discussion's
+        processing marker is saved in the separate jobs store.
+        """
+        plan = artifact.get('release_plan')
+        if plan is None:
+            return None
+        outcome = dict(state='not_created')
+        identifier = uuid.uuid5(uuid.NAMESPACE_URL,
+                               'herdr:discussion-release:' + digest([job['organization_id'], job['id']])).hex
+        artifact_digest = digest(artifact)
+        def recorded(existing):
+            release = json.loads(existing[0])
+            if release.get('source', {}).get('artifact_digest') != artifact_digest:
+                return dict(outcome, reason='The finalized discussion artifact changed after its release plan was recorded.')
+            return dict(state='created', id=identifier, version=release['version'])
+        # A durable receipt is still true if permission was disabled between
+        # creation and the separate job marker. Recovery performs no new effect.
+        with closing(self.service.connect()) as db:
+            existing = db.execute('SELECT data FROM release_candidates WHERE id=?', (identifier,)).fetchone()
+        if existing:
+            return recorded(existing)
+        if (job.get('state') != 'artifact_ready' or policy.get('paused')
+                or not policy.get('auto_create_releases')):
+            return dict(outcome, reason='Automatic release planning is disabled or paused.')
+        if str(job.get('created_at') or '') < policy.get('auto_create_releases_since', ''):
+            return dict(outcome, reason='Discussion predates automatic release planning.')
+        if not isinstance(plan, dict):
+            return dict(outcome, reason='release_plan must be an object.')
+        version = plan.get('name')
+        if not isinstance(version, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', version):
+            return dict(outcome, reason='Release plan needs a name of up to 64 letters, digits, dots or hyphens.')
+        refs = plan.get('task_refs')
+        if (not isinstance(refs, list) or not 1 <= len(refs) <= 10
+                or any(not isinstance(ref, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', ref) for ref in refs)
+                or len(set(refs)) != len(refs)):
+            return dict(outcome, reason='Release plan needs 1–10 unique task_refs from its task proposals.')
+        selected = []
+        for ref in refs:
+            matches = [proposal for proposal in proposals if proposal.get('ref') == ref]
+            if len(matches) != 1 or not created.get(matches[0]['key']):
+                return dict(outcome, reason='Every release task_ref must identify one successfully created proposal: ' + ref)
+            selected.append((ref, matches[0]['key'], created[matches[0]['key']]))
+        with closing(self.service.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            existing = db.execute('SELECT data FROM release_candidates WHERE id=?', (identifier,)).fetchone()
+            if existing:
+                return recorded(existing)
+            tasks = self.service.task_records([item[2] for item in selected], db)
+            if any(task_identifier not in tasks or tasks[task_identifier].get('organization_id') != job['organization_id']
+                   for _, _, task_identifier in selected):
+                return dict(outcome, reason='Release tasks must belong to the discussion organization.')
+            repositories = {task['repository'] for task in tasks.values()}
+            if len(repositories) != 1:
+                return dict(outcome, reason='A release plan must select tasks from exactly one repository.')
+            repository = next(iter(repositories))
+            if db.execute("SELECT 1 FROM release_candidates WHERE json_extract(data, '$.repository')=? "
+                          "AND json_extract(data, '$.version')=? COLLATE NOCASE", (repository, version)).fetchone():
+                return dict(outcome, reason='A release with this name already exists; it was not changed.')
+            release = dict(id=identifier, repository=repository, organization_id=job['organization_id'],
+                           version=version, planned_cut_at=None, state='collecting', generation=0, edit_version=0,
+                           created_at=stamp(), actor=actor,
+                           source=dict(kind='discussion', job_id=job['id'], group_id=job.get('group_id'),
+                                       task_id=job.get('task_id'), artifact_digest=artifact_digest),
+                           members=[dict(task_id=task_id, title=tasks[task_id]['title'], candidate_sha=None,
+                                         selection='automatic', proposal_ref=ref, proposal_key=key)
+                                    for ref, key, task_id in selected],
+                           audit=[dict(action='discussion_release_created', actor=actor, at=stamp())])
+            self.save(release, db)
+        self.wake.set()
+        return dict(state='created', id=identifier, version=version)
+
+    def capture_planned_candidates(self):
+        """Follow checked task heads only while collecting; frozen SHAs never move.
+
+        A read snapshot avoids a writer claim on unchanged passes. Actual
+        changes are rechecked in the task database's writer transaction, so a task
+        update or operator freeze cannot race the recorded candidate selection.
+        Freeze still verifies the exact SHA against the current approved policy.
+        """
+        identifiers = []
+        with closing(self.service.connect()) as db, db:
+            db.execute('BEGIN')
+            releases = [json.loads(row[0]) for row in db.execute(
+                "SELECT data FROM release_candidates WHERE json_extract(data, '$.state')='collecting' "
+                "AND json_extract(data, '$.source.kind')='discussion'")]
+            for release in releases:
+                members = [member for member in release['members'] if member.get('selection') == 'automatic']
+                tasks = self.service.task_records([member['task_id'] for member in members], db)
+                if self.planned_changes(release, members, tasks):
+                    identifiers.append(release['id'])
+        for identifier in identifiers:
+            with closing(self.service.connect()) as db, db:
+                db.execute('BEGIN IMMEDIATE')
+                release = self.get(identifier, db)
+                if release['state'] != 'collecting':
+                    continue
+                members = [member for member in release['members'] if member.get('selection') == 'automatic']
+                tasks = self.service.task_records([member['task_id'] for member in members], db)
+                changes = self.planned_changes(release, members, tasks)
+                if changes:
+                    for member, sha in changes:
+                        member['candidate_sha'] = sha
+                    release['edit_version'] += 1
+                    self.save(release, db)
+
+    @staticmethod
+    def planned_changes(release, members, tasks):
+        changes = []
+        for member in members:
+            task = tasks.get(member['task_id'], {})
+            sha = task.get('head_sha')
+            evidence = task.get('builds', {}).get(sha, {})
+            if (task.get('repository') != release['repository']
+                    or task.get('organization_id') != release.get('organization_id')
+                    or not re.fullmatch('[a-f0-9]{40}|[a-f0-9]{64}', str(sha))
+                    or evidence.get('target') != sha or evidence.get('state') != 'complete'
+                    or evidence.get('required_checks_verified') is not True):
+                sha = None
+            if sha != member.get('candidate_sha'):
+                changes.append((member, sha))
+        return changes
 
     def snapshot(self, tasks=None):
         with closing(self.service.connect()) as db:
@@ -148,7 +280,8 @@ class ReleaseCandidates:
                 sha = member.get('candidate_sha')
                 evidence = task.get('builds', {}).get(sha, {})
                 if not sha:
-                    reason = 'Capture a task candidate before freezing.'
+                    reason = ('Waiting for a captured candidate with passing required checks.'
+                              if member.get('selection') == 'automatic' else 'Capture a task candidate before freezing.')
                 elif sha != task.get('head_sha'):
                     reason = 'Candidate changed. Remove and add this task to review its new SHA.'
                 elif evidence.get('target') != sha or evidence.get('state') != 'complete' or evidence.get('required_checks_verified') is not True:
@@ -272,7 +405,8 @@ class ReleaseCandidates:
                     # Retain the entire previous run in release_revisions. A new
                     # revision never rewrites its evidence, branch or repair.
                     release = {k: release[k] for k in ('id', 'repository', 'version', 'planned_cut_at', 'record_version',
-                               'generation', 'edit_version', 'created_at', 'actor', 'audit')}
+                               'generation', 'edit_version', 'created_at', 'actor', 'audit', 'source', 'organization_id')
+                               if k in release}
                     release.update(state='collecting', members=members)
                 else:
                     if body.get('revision') != (release.get('revision') or {}).get('digest'):
@@ -341,7 +475,12 @@ class ReleaseCandidates:
             from pr_repairs import protected_changes
             if protected_changes(repository, base, sha, policy):
                 raise ValueError(task['title'] + ': protected policy differs from the approved base; review and update the task.')
-            members.append(dict(member))
+            frozen_member = dict(member)
+            if task.get('candidate_revision'):
+                frozen_member['task_revision_id'] = task['candidate_revision']
+            else:
+                frozen_member.pop('task_revision_id', None)
+            members.append(frozen_member)
         generation = release['generation'] + 1
         revision = dict(release_id=release['id'], generation=generation, repository=release['repository'],
                         base_ref=base_ref, base_sha=base, policy_digest=toolchain_policy.digest(policy),
@@ -492,7 +631,10 @@ class ReleaseCandidates:
             else:
                 if actual != revision['base_sha']:
                     raise ValueError('Release branch moved before worktree creation.')
-            project_git.git(repository, '-c', 'core.hooksPath=' + str(hooks), 'worktree', 'add', '--detach', str(tree), revision['base_sha'], timeout=60)
+            from operation_metrics import measured
+            with measured('workspace.prepare') as timing:
+                project_git.git(repository, '-c', 'core.hooksPath=' + str(hooks), 'worktree', 'add', '--detach', str(tree), revision['base_sha'], timeout=60)
+            release['workspace_preparation_timing'] = timing
         if tree.is_symlink():
             raise ValueError('Integration worktree cannot be a symbolic link.')
         directories = project_git.git(tree, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip()

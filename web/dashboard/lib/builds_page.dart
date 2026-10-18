@@ -463,6 +463,17 @@ class _BuildsPageState extends State<BuildsPage> {
                     'The originating integration event has a validation waiver. Build checks retain their actual results.',
                   ),
                 Text('${run['command'] ?? 'Preparing validation'}'),
+                if (run['timings'] is Map)
+                  ExpansionTile(
+                    title: const Text('Recorded phase timings'),
+                    children: [
+                      for (final entry in (run['timings'] as Map).entries)
+                        if (entry.value is Map)
+                          Text(
+                            '${entry.key}: ${entry.value['duration_ms']} ms · ${entry.value['status']}',
+                          ),
+                    ],
+                  ),
                 if (run['checks'] is List)
                   for (final check in run['checks'] as List)
                     if (check is Map)

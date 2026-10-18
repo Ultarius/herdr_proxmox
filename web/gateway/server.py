@@ -37,6 +37,8 @@ from sdk_install import SdkInstall
 from build_service_install import BuildServiceInstall
 from request_validation import FieldValidationError
 import project_analysis
+from repository_queries import RepositoryQueries
+from operation_metrics import METRICS, query_measurement
 import project_toolchains
 import toolchain_policy
 from environment_preparation import EnvironmentPreparation
@@ -170,6 +172,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Cache-Control', 'no-store')
+        if self.command == 'GET' and getattr(self, 'read_metrics', None) is not None:
+            self.send_header('X-Herdr-Git-Calls', str(self.read_metrics['git_calls']))
         if cookie is not None:
             self.send_header('Set-Cookie', cookie)
         self.send_header('Content-Length', str(len(payload)))
@@ -270,6 +274,10 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
+        with query_measurement('http.read') as self.read_metrics:
+            self._do_GET()
+
+    def _do_GET(self):
         if self.path == '/api/session':
             if not self.same_origin():
                 return
@@ -353,6 +361,17 @@ class Handler(BaseHTTPRequestHandler):
                 except (ValueError, OSError) as error:
                     self.reply(400, {'error': str(error)[:500]})
                 return
+            if urlsplit(self.path).path == '/api/tasks/revisions':
+                query = parse_qs(urlsplit(self.path).query)
+                try:
+                    if set(query) - {'id', 'before'} or any(len(values) != 1 for values in query.values()):
+                        raise ValueError('Invalid revision history query.')
+                    before = query.get('before', [None])[0]
+                    self.reply(200, self.server.contributions.commits.revisions(query.get('id', [''])[0],
+                        int(before) if before is not None else None))
+                except (ValueError, OSError, sqlite3.Error) as error:
+                    self.reply(400, {'error': str(error)[:500]})
+                return
             if self.path.startswith('/api/tasks/detail?'):
                 query = parse_qs(urlsplit(self.path).query)
                 try:
@@ -380,6 +399,30 @@ class Handler(BaseHTTPRequestHandler):
                 return
             # A query string means an exact-match allowlist cannot admit this, so
             # it is routed here beside the other parameterised reads.
+            if urlsplit(self.path).path == '/api/projects/query':
+                query = parse_qs(urlsplit(self.path).query)
+                try:
+                    body = {key: values[0] for key, values in query.items()}
+                    if any(len(values) != 1 for values in query.values()):
+                        raise ValueError('Query fields must appear once.')
+                    if 'limit' in body:
+                        body['limit'] = int(body['limit'])
+                    service = getattr(self.server, 'repository_queries', None)
+                    if service is None:
+                        self.reply(503, {'error': 'Repository queries are unavailable.'})
+                        return
+                    self.reply(200, service.query(body))
+                except sqlite3.Error:
+                    self.reply(503, {'error': 'Repository evidence storage is unavailable.'})
+                except (ValueError, OSError) as error:
+                    self.reply(400, {'error': str(error)[:500]})
+                return
+            if urlsplit(self.path).path == '/api/diagnostics/performance':
+                if self.operator['role'] != 'admin':
+                    self.reply(403, {'error': 'Only an administrator can inspect performance diagnostics.'})
+                else:
+                    self.reply(200, METRICS.snapshot())
+                return
             if self.path.startswith('/api/projects/analysis?'):
                 query = parse_qs(urlsplit(self.path).query)
                 try:
@@ -528,6 +571,23 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def do_POST(self):
+        if self.path == '/api/tasks/submit':
+            # A task-scoped session credential grants commit submission only.
+            # It cannot call dashboard actions, publish or approve policy edits.
+            if not self.same_origin():
+                return
+            try:
+                from task_commits import MAX_REQUEST
+                size = int(self.headers.get('Content-Length', '0'))
+                if not 0 < size <= MAX_REQUEST:
+                    raise ValueError('Invalid task revision request size.')
+                body = json.loads(self.rfile.read(size))
+                self.reply(200, self.server.contributions.commits.submit(body))
+            except (ValueError, OSError) as error:
+                self.reply(400, {'error': str(error)[:500]})
+            except sqlite3.Error:
+                self.reply(503, {'error': 'Task revision storage is unavailable; retry the same captured request.'})
+            return
         if self.path in ('/api/session', '/api/session/logout'):
             if not self.same_origin():
                 return
@@ -868,6 +928,7 @@ def main():
         overrides=organizations.project_toolchains,
         toolchains=lambda: sdk_install.snapshot().get('toolchains') or {},
         catalog=toolchain_policy.catalog)
+    queries = RepositoryQueries(PROJECTS, tasks=contributions, analysis=analysis)
     # Approval, readiness and provisioning all read the same resolved report;
     # two views of one project's requirement is how they drift apart.
     coordinator.effective_requirements = lambda repository: analysis.effective(repository)
@@ -898,7 +959,7 @@ def main():
     RUNTIME_EVENTS.start()
     contributions.start()
     try:
-        serve_gateway(bind, 8787, policy, token, {'github': github, 'contributions': contributions, 'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator, 'operators': operators, 'sdk_install': sdk_install, 'build_service_install': build_service_install, 'validation': validation, 'analysis': analysis, 'environments': environments}, cookie_secure=secure_setting == '1')
+        serve_gateway(bind, 8787, policy, token, {'github': github, 'contributions': contributions, 'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator, 'operators': operators, 'sdk_install': sdk_install, 'build_service_install': build_service_install, 'validation': validation, 'analysis': analysis, 'environments': environments, 'repository_queries': queries}, cookie_secure=secure_setting == '1')
     finally:
         try:
             environments.close()

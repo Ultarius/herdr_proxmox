@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shlex
 import sqlite3
 import subprocess
 import threading
@@ -600,6 +601,7 @@ class OrganizationStore:
                                     reason='' if manual_task else ((outcome.get('skipped') or {}).get(key) or
                                     (outcome.get('deferred') or {}).get(key) or outcome.get('unavailable', ''))))
             job['proposal_details'] = details
+            job['release_plan_outcome'] = outcome.get('release')
         return data
 
     def project(self, value):
@@ -1645,8 +1647,11 @@ class OrganizationStore:
                     # Never fall back to the shared checkout after a Git/Herdr failure.
                     from repository_lock import repository_lock
                     with repository_lock(project):
-                        created = self.command('worktree', 'create', '--cwd', project, '--branch', branch,
-                                               '--path', str(checkout), '--label', profile['name'], '--no-focus', timeout=120)
+                        from operation_metrics import measured
+                        with measured('workspace.prepare') as timing:
+                            created = self.command('worktree', 'create', '--cwd', project, '--branch', branch,
+                                                   '--path', str(checkout), '--label', profile['name'], '--no-focus', timeout=120)
+                        self.update_job(job_id, workspace_preparation_timing=timing)
                         if job.get('start_sha'):
                             # Pin only this new, clean checkout before starting any
                             # agent. Never reset an existing or live task checkout.
@@ -1667,7 +1672,7 @@ class OrganizationStore:
                 self.wait_for_shell(pane)
                 if job.get('task_prompt') or job.get('task_id'):
                     from worker_guidance import local_bundle
-                    guidance = local_bundle(job.get('worktree_path', project))
+                    guidance = local_bundle(job.get('worktree_path') or job.get('source_project') or project)
                 # Any agent can be asked to save a chat reply: an operator
                 # message, a consultation, or a delegation reply all write under
                 # chat-replies. The launch happens before the chat exists, so
@@ -1737,6 +1742,10 @@ class OrganizationStore:
                     if receipt_directory.is_symlink():
                         raise ValueError('Task receipt directory must not be a symlink.')
                     receipt_directory.mkdir(exist_ok=True)
+                    from task_commit_client import write_private
+                    write_private(receipt_directory / 'commit-context.json', dict(
+                        task_id=job['task_id'], run_id=job['id'], token=job['completion_token'],
+                        checkout_root=str(Path(job.get('worktree_path') or job.get('source_project') or project).resolve())))
                     prompt += ('\nTask completion protocol for this session: after authorized work is committed, write JSON to ' +
                                (receipt_directory / 'receipt.json').as_posix() +
                                ' with outcome=complete, commit=full HEAD SHA, run_id=' + job['id'] +
@@ -1746,7 +1755,9 @@ class OrganizationStore:
                     deployed = (Path(__file__).parent / 'skills/herdr-worktree-integration').resolve().as_posix()
                     task_prompt = job['task_prompt'].replace(deployed, guidance.as_posix())
                     if job.get('task_id'):
-                        task_prompt = task_prompt.replace('{{HERDR_TASK_RECEIPT}}', (receipt_directory / 'receipt.json').as_posix()).replace('{{HERDR_TASK_RUN}}', job['id']).replace('{{HERDR_TASK_TOKEN}}', job['completion_token'])
+                        task_prompt = task_prompt.replace('{{HERDR_TASK_RECEIPT}}', (receipt_directory / 'receipt.json').as_posix()).replace('{{HERDR_TASK_RUN}}', job['id']).replace('{{HERDR_TASK_TOKEN}}', job['completion_token']).replace('{{HERDR_TASK_CONTEXT}}', shlex.quote((receipt_directory / 'commit-context.json').as_posix()))
+                        task_prompt = task_prompt.replace('{{HERDR_TASK_COMMIT_HELPER}}', shlex.quote((guidance / 'task_commit_client.py').as_posix()))
+                        task_prompt = task_prompt.replace('{{HERDR_TASK_REVISION_REQUEST}}', shlex.quote((receipt_directory / ('revision-' + job['id'] + '-1.json')).as_posix()))
                     prompt += '\n\nAssigned task (start now in this checkout):\n' + task_prompt
                 environment_binding = job.get('environment_binding') or {}
                 environment_notice = ('\nInteractive SDK activation is unavailable: ' + environment_binding['reason']

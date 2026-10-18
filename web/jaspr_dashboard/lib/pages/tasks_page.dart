@@ -4,6 +4,7 @@ import '../services.dart';
 import 'discovery_panel.dart';
 import 'task_activity.dart';
 import 'task_timeline.dart';
+import 'task_revisions.dart';
 import 'task_workflow.dart';
 import 'task_clipboard.dart';
 import 'task_list.dart';
@@ -2983,6 +2984,7 @@ class _TasksPageState extends State<TasksPage> {
               ui.card(
                 'Commit history',
                 [
+                  TaskRevisions(task: task),
                   TaskTimeline(
                     task: task,
                     onSelect: (sha) => showCommit(task, sha),

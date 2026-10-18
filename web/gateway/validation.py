@@ -251,12 +251,15 @@ class ValidationRuns:
         return dict(run)
 
     def _execute(self, run, folder):
+        from operation_metrics import measured
         worktree = folder / 'tree'
         log_path = folder / 'log.txt'
         lines, state, exit_code = [], 'error', None
         try:
             checkout = self._checkout(run['path'])
-            self._worktree(checkout, worktree, run['target'])
+            timings = run.setdefault('timings', {})
+            with measured('workspace.prepare') as timings['workspace']:
+                self._worktree(checkout, worktree, run['target'])
             head = project_git.git(worktree, 'rev-parse', 'HEAD').strip()
             if head != run['target']:
                 raise ValueError('The worktree does not match the exact target commit.')
@@ -288,8 +291,9 @@ class ValidationRuns:
                 run['blocker'] = 'environment_unavailable' if policy.get('blockers') else 'validation_unapproved'
                 raise ValueError('; '.join([*policy.get('blockers', []), *policy.get('validation_blockers', [])]))
             from environment_execution import materialize_execution_policy
-            execution_policy, restores = materialize_execution_policy(policy, worktree, folder / 'environment',
-                authorized=policy.get('restore_authorized') is True)
+            with measured('execution.prepare') as timings['environment']:
+                execution_policy, restores = materialize_execution_policy(policy, worktree, folder / 'environment',
+                    authorized=policy.get('restore_authorized') is True)
             if restores:
                 run['environment_restores'] = restores
                 self._write(folder, run)
@@ -313,9 +317,12 @@ class ValidationRuns:
             def evidence(checks):
                 run['checks'] = checks
                 self._write(folder, run)
-            checks, exit_code, timed_out = run_scripts(worktree, commands, folder,
-                self.timeout, BASH, OUTPUT_LIMIT, changed=evidence,
-                environment=(None if policy.get('plan_digest') else toolchain_policy.environment(policy)))
+            with measured('validation.checks') as timings['checks']:
+                checks, exit_code, timed_out = run_scripts(worktree, commands, folder,
+                    self.timeout, BASH, OUTPUT_LIMIT, changed=evidence,
+                    environment=(None if policy.get('plan_digest') else toolchain_policy.environment(policy)))
+                if exit_code != 0 or timed_out:
+                    timings['checks']['status'] = 'failed'
             # Repository scripts can report subchecks, but cannot certify that
             # they left the requested commit and tracked source unchanged.
             checks.extend(self._integrity_checks(worktree, run['target']))
@@ -362,6 +369,7 @@ class ValidationRuns:
                                    policy_digest=run.get('policy_digest'), plan_digest=run.get('plan_digest'),
                                    toolchain_evidence=run.get('toolchain_evidence'),
                                    environment_restores=run.get('environment_restores'),
+                                   timings=run.get('timings', {}),
                                    policy_changes=run.get('policy_changes'),
                                    blocker=run.get('blocker'), note=run.get('note'),
                                    finished_at=run.get('finished_at'),

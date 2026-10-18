@@ -61,8 +61,11 @@ def configure(store, job, frozen, pane, workspace):
     caches = store.path.parent / 'agent-environments' / job['id']
     checkout = job.get('worktree_path') or job.get('source_project') or frozen['checkout']
     from environment_execution import materialize_execution_policy
-    policy, restores = materialize_execution_policy(frozen.get('policy') or dict(toolchains=[]), checkout, caches,
-        authorized=(frozen.get('policy') or {}).get('restore_authorized') is True)
+    from operation_metrics import measured
+    with measured('execution.prepare') as timing:
+        policy, restores = materialize_execution_policy(frozen.get('policy') or dict(toolchains=[]), checkout, caches,
+            authorized=(frozen.get('policy') or {}).get('restore_authorized') is True)
+    store.update_job(job['id'], environment_preparation_timing=timing)
     runtime = dict(frozen, policy=policy)
     if restores:
         store.update_job(job['id'], environment_restores=restores, execution_toolchain_policy=runtime)

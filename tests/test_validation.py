@@ -137,6 +137,9 @@ class ValidationRunTests(unittest.TestCase):
         self.assertFalse((self.runs.root / run['id'] / 'tree').exists())
         event_id, summary = self.records[0]
         self.assertEqual((event_id, summary['run_id'], summary['state']), ('a' * 64, run['id'], 'complete'))
+        self.assertEqual(set(run['timings']), {'workspace', 'environment', 'checks'})
+        self.assertTrue(all(item['status'] == 'complete' and item['duration_ms'] >= 0 for item in run['timings'].values()))
+        self.assertEqual(summary['timings'], run['timings'])
         self.assertEqual(self.runs.snapshot()['running'], 0)
 
     @unittest.skipUnless(BASH, 'a POSIX bash is unavailable')
@@ -146,6 +149,7 @@ class ValidationRunTests(unittest.TestCase):
         with patch.object(validation, 'BASH', BASH):
             run = self.submit_and_wait()
         self.assertEqual((run['state'], run['exit_code']), ('failed', 3))
+        self.assertEqual(run['timings']['checks']['status'], 'failed')
         _, content = self.runs.log(run['id'])
         self.assertIn('broken', content)
         self.assertIn('status 3', content)

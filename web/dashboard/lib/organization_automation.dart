@@ -185,6 +185,7 @@ Future<Map<String, dynamic>?> editOrganizationAutomation(
   Map<String, dynamic> policy,
 ) async {
   var enabled = policy['auto_queue_proposals'] == true;
+  var autoCreateReleases = policy['auto_create_releases'] == true;
   var paused = policy['paused'] == true;
   var reap = policy['reap_finished_sessions'] == true;
   var reapOrphaned = policy['reap_orphaned_panes'] == true;
@@ -247,6 +248,17 @@ Future<Map<String, dynamic>?> editOrganizationAutomation(
                       title: const Text('Pause automatic follow-up'),
                       subtitle: const Text(
                         'Queued work stays queued; nothing new starts automatically.',
+                      ),
+                    ),
+                    SwitchListTile(
+                      value: autoCreateReleases,
+                      onChanged: (value) =>
+                          update(() => autoCreateReleases = value == true),
+                      title: const Text(
+                        'Create release plans from group discussions automatically',
+                      ),
+                      subtitle: const Text(
+                        'New discussions may create named plans with unfinished tasks. Task execution uses its own settings; freezing, integration and publication remain explicit.',
                       ),
                     ),
                     _limitField(perMeeting, 'Max per meeting', 10),
@@ -353,6 +365,7 @@ Future<Map<String, dynamic>?> editOrganizationAutomation(
                 if (form.currentState?.validate() != true) return;
                 Navigator.pop(context, {
                   'auto_queue_proposals': enabled,
+                  'auto_create_releases': autoCreateReleases,
                   'paused': paused,
                   'reap_finished_sessions': reap,
                   'reap_orphaned_panes': reapOrphaned,

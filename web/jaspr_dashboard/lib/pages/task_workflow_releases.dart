@@ -328,7 +328,11 @@ extension _Releases on _TaskWorkflowState {
           ),
         if ('${release['error'] ?? ''}'.isNotEmpty)
           notice(release['error'], error: true),
-        section('Frozen selection', [
+        if (release['source']?['kind'] == 'discussion')
+          notice(
+            'Planned from group discussion ${release['source']['job_id']}. While collecting, automatic members follow their latest captured candidate after required checks pass. Freeze pins the selection.',
+          ),
+        section(revision == null ? 'Release plan' : 'Frozen selection', [
           el('dl', [
             term('Repository', release['repository']),
             term('Selected', members.length),
@@ -370,7 +374,9 @@ extension _Releases on _TaskWorkflowState {
                   () => component.onOpenTask('${member['task_id']}'),
                   small: true,
                 ),
-                badge('${member['state'] ?? 'Selected'}'),
+                badge(
+                  '${member['state'] ?? (member['selection'] == 'automatic' && member['candidate_sha'] == null ? 'Planned · awaiting checks' : 'Selected')}',
+                ),
                 el('p', [
                   text(
                     'Candidate ${member['candidate_sha'] ?? 'not captured'}',
@@ -420,7 +426,10 @@ extension _Releases on _TaskWorkflowState {
                 'Freeze and integrate ${members.length} tasks',
                 () => releaseAction('freeze', release),
                 primary: true,
-                disabled: component.releaseBusy || members.isEmpty,
+                disabled:
+                    component.releaseBusy ||
+                    members.isEmpty ||
+                    members.any((member) => member['candidate_sha'] == null),
               ),
             if (release['state'] == 'validation_failed')
               button(

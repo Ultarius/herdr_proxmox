@@ -1002,6 +1002,12 @@ def execute(store, job):
         "Each description must include acceptance criteria and required checks. Use only the listed profile IDs. "
         "Set needs_review=true for anything that changes scope, adds dependencies or touches sensitive areas; those "
         "stay drafts for an operator. An empty array is a valid and common outcome. "
+        "Only when the discussion explicitly calls for a named release, optionally include release_plan in that SAME json object: "
+        '{"name":"alpha.15","task_refs":["api","tests"]}. Give each referenced task_proposal a unique '
+        '"ref" (1–40 letters, digits, underscores or hyphens). Select 1–10 proposals from this discussion, '
+        "all assigned to the same repository. Do not invent a release name, add unrelated existing tasks, or infer dependencies from membership. "
+        "Herdr creates this collecting plan only if the organization enables automatic release planning; it does not authorize "
+        "starting draft tasks, freezing, integrating or publishing. Omit release_plan when no release was requested. "
         f"Also write {transcript} as JSON with a contributions array. Each entry must have "
         f"profile_id (from the roster below), name, round (integer 1 to {MAX_ROUNDS}), and content (Markdown). "
         f"Budget at most {transcript_contribution_budget(len(job['runs']))} UTF-8 bytes per contribution, "

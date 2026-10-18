@@ -95,7 +95,8 @@ class CollaborationTests(unittest.TestCase):
         parsed = Contributions.discussion_proposals(job)
         job['proposals'] = dict(drafts=[parsed[0]['key']], queued=[],
             created={parsed[0]['key']: 'created-task'}, skipped={parsed[1]['key']: 'meeting limit reached'},
-            deferred={parsed[0]['key']: 'daily automation limit reached'})
+            deferred={parsed[0]['key']: 'daily automation limit reached'},
+            release=dict(state='created', id='release-id', version='alpha.15'))
         with closing(self.store.connect()) as db, db:
             self.store.put(db, 'jobs', job)
         history = self.store.history(dict(group_id=group_id))
@@ -104,6 +105,8 @@ class CollaborationTests(unittest.TestCase):
         self.assertEqual(details[0]['task_id'], 'created-task')
         self.assertEqual(details[0]['reason'], 'daily automation limit reached')
         self.assertEqual(details[1]['reason'], 'meeting limit reached')
+        self.assertEqual(next(j for j in history['jobs'] if j['id'] == job['id'])['release_plan_outcome'],
+                         job['proposals']['release'])
         self.assertNotIn('proposal_details', self.job(job['id']))
 
     def test_history_resolves_task_linked_proposal_outcomes_from_parent_task(self):
@@ -720,6 +723,9 @@ class CollaborationTests(unittest.TestCase):
         self.assertIn('task_proposals', prompt)
         self.assertIn('needs_review', prompt)
         self.assertIn('empty array', prompt)
+        self.assertIn('release_plan', prompt)
+        self.assertIn('task_refs', prompt)
+        self.assertIn('does not authorize', prompt)
         assignable = json.loads(prompt.split('Assignable repository agents (use these exact ids as profile_id; attending agents are marked true and need not attend this discussion to be assigned): ')[1].split('. ')[0])
         self.assertEqual({entry['id'] for entry in assignable}, {self.max, self.iris})
         self.assertTrue(all(entry['name'] for entry in assignable))

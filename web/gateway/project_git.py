@@ -13,6 +13,7 @@ import tempfile
 import json
 from project_files import project_directory
 from repository_lock import common_directory, repository_lock
+from operation_metrics import measured
 
 
 def git(path, *arguments, timeout=15, index_file=None, output_limit=1_000_000):
@@ -29,6 +30,11 @@ def git(path, *arguments, timeout=15, index_file=None, output_limit=1_000_000):
 
 
 def _git(path, *arguments, timeout=15, index_file=None, output_limit=1_000_000):
+    with measured('git.command'):
+        return _run_git(path, *arguments, timeout=timeout, index_file=index_file, output_limit=output_limit)
+
+
+def _run_git(path, *arguments, timeout=15, index_file=None, output_limit=1_000_000):
     environment = dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_OPTIONAL_LOCKS='0')
     for key in list(environment):
         if key.startswith('GIT_') and key not in ('GIT_TERMINAL_PROMPT', 'GIT_OPTIONAL_LOCKS'):

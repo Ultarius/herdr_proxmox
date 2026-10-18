@@ -203,6 +203,56 @@ void main() {
   );
 
   test(
+    'discussion plans show unfinished membership and enable freeze after checked capture',
+    () async {
+      final member = <String, dynamic>{
+        'task_id': 'origin',
+        'title': 'Task origin',
+        'selection': 'automatic',
+        'candidate_sha': null,
+        'eligibility_reason':
+            'Waiting for a captured candidate with passing required checks.',
+      };
+      final planned = release()
+        ..['source'] = {'kind': 'discussion', 'job_id': 'discussion-one'}
+        ..['members'] = [member]
+        ..['counts'] = {'selected': 1, 'incorporated': 0};
+      state.replace([row('origin')]);
+      state.replaceReleases([planned]);
+      await settle();
+      expect(nodes('[data-kind="release-membership"]'), hasLength(1));
+      nodes('[data-release="release-one"]').single.click();
+      await settle();
+      final inspector = nodes('.task-wf-inspector').single;
+      expect(inspector.textContent, contains('discussion-one'));
+      expect(inspector.textContent, contains('Planned · awaiting checks'));
+      expect(inspector.textContent, contains('Release plan'));
+      web.HTMLButtonElement freezeButton() =>
+          nodes('button').singleWhere(
+                (button) =>
+                    button.textContent == 'Freeze and integrate 1 tasks',
+              )
+              as web.HTMLButtonElement;
+      expect(freezeButton().disabled, isTrue);
+      state.replaceReleases([
+        {
+          ...planned,
+          'edit_version': 5,
+          'members': [
+            {...member, 'candidate_sha': 'a' * 40},
+          ],
+        },
+      ]);
+      await settle();
+      expect(freezeButton().disabled, isFalse);
+      freezeButton().click();
+      await settle();
+      expect(state.releaseActions.last, containsPair('action', 'freeze'));
+      expect(state.releaseActions.last, containsPair('edit_version', 5));
+    },
+  );
+
+  test(
     'release inspector sends the exact revision and keyboard follows membership',
     () async {
       final frozen = release(state: 'ready')

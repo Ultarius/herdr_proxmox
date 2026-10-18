@@ -1712,7 +1712,13 @@ class ContributionTests(unittest.TestCase):
         self.assertNotIn(resource.read_text(encoding='utf-8').strip(), prompt)
         self.assertNotIn('## Merge procedure', prompt)
         self.assertIn('Never push', arguments['task_prompt'])
-        self.assertIn('user.name=Herdr-Agent', prompt)
+        self.assertIn('{{HERDR_TASK_COMMIT_HELPER}}', prompt)
+        self.assertIn(contributions.shlex.quote(sys.executable), prompt)
+        self.assertNotIn('`python3 ', prompt)
+        self.assertIn('--context {{HERDR_TASK_CONTEXT}}', prompt)
+        self.assertIn('--parent FULL_EXPECTED_HEAD_SHA', prompt)
+        self.assertIn('assigned checkout root; file paths are repository-relative', prompt)
+        self.assertNotIn('user.name=Herdr-Agent', prompt)
         self.assertIn('Never infer the operator identity', prompt)
         self.assertEqual(project_git.configured_base(self.repo), self.task['base_ref'])
         self.assertEqual(launched['state'], 'implementing')
@@ -3077,6 +3083,82 @@ class ContributionTests(unittest.TestCase):
                     result='```json\n' + json.dumps({'task_proposals': [
                         dict(title='Follow up ' + str(i), description='Acceptance criteria and required checks.',
                              profile_id='worker', needs_review=False) for i in range(count)]}) + '\n```')
+
+    def release_proposal_job(self, job_id='release-discussion'):
+        job = self.taskless_proposal_job(job_id, count=2)
+        artifact = self.service.discussion_artifact(job)
+        for index, proposal in enumerate(artifact['task_proposals']):
+            proposal['ref'] = 'work-' + str(index)
+        artifact['release_plan'] = dict(name='alpha.16', task_refs=['work-1', 'work-0'])
+        job['result'] = '```json\n' + json.dumps(artifact) + '\n```'
+        return job
+
+    def test_discussion_release_plans_attach_drafts_in_explicit_order_without_starting_them(self):
+        job = self.release_proposal_job()
+        self.service.materialize_discussion(job, dict(contributions.AUTOMATION_DEFAULTS, auto_create_releases=True),
+                                            'group_auto_queue', queue_allowed=False)
+        marker = self.store.update_job.call_args.kwargs['proposals']
+        release = self.service.releases.get(marker['release']['id'])
+        self.assertEqual([member['proposal_ref'] for member in release['members']], ['work-1', 'work-0'])
+        self.assertEqual(release['state'], 'collecting')
+        self.assertEqual(release['source']['job_id'], job['id'])
+        self.assertEqual(len(self.service.releases.snapshot()), 1)
+        for member in release['members']:
+            self.assertIsNone(member['candidate_sha'])
+            self.assertEqual(member['selection'], 'automatic')
+            task = self.service.get(member['task_id'])
+            self.assertEqual(task['state'], 'draft')
+            self.assertNotIn('assignment', task)
+        self.assertNotIn(self.task['id'], [member['task_id'] for member in release['members']])
+
+    def test_discussion_release_policy_is_separate_from_task_queueing_and_has_a_freshness_window(self):
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        self.assertFalse(self.service.policy('org')['auto_create_releases'])
+        with self.assertRaisesRegex(ValueError, 'administrator'):
+            self.service.action('automation', dict(request_id='release-policy-denied', organization_id='org',
+                auto_create_releases=True), 'reader', 'operator')
+        with self.assertRaisesRegex(ValueError, 'policy value'):
+            self.service.set_automation_policy(dict(organization_id='org', auto_create_releases='true'), 'admin')
+        job = self.release_proposal_job()
+        job['created_at'] = '2000-01-01T00:00:00+00:00'
+        policy = self.service.set_automation_policy(dict(organization_id='org', auto_create_releases=True), 'admin')['policy']
+        self.assertIn('auto_create_releases_since', policy)
+        self.service.materialize_discussion(job, policy, 'group_auto_queue', queue_allowed=False)
+        self.assertEqual(self.service.releases.snapshot(), [])
+        self.assertIn('predates', self.store.update_job.call_args.kwargs['proposals']['release']['reason'])
+        # Unrelated policy edits do not move the release-planning window.
+        updated = self.service.set_automation_policy(dict(organization_id='org', daily_cap=6), 'admin')['policy']
+        self.assertEqual(updated['auto_create_releases_since'], policy['auto_create_releases_since'])
+
+    def test_discussion_release_recovers_after_release_commit_before_job_marker(self):
+        job = self.release_proposal_job()
+        policy = dict(contributions.AUTOMATION_DEFAULTS, auto_create_releases=True)
+        self.store.update_job.side_effect = RuntimeError('crash before marker')
+        with self.assertRaisesRegex(RuntimeError, 'crash before marker'):
+            self.service.materialize_discussion(job, policy, 'group_auto_queue', queue_allowed=False)
+        first = self.service.releases.get(self.service.releases.snapshot()[0]['id'])
+        self.store.update_job.side_effect = None
+        self.service.materialize_discussion(job, policy, 'group_auto_queue', queue_allowed=False)
+        marker = self.store.update_job.call_args.kwargs['proposals']
+        self.assertEqual(marker['release']['id'], first['id'])
+        self.assertEqual(len(self.service.releases.snapshot()), 1)
+        self.assertEqual(len(self.service.snapshot()['tasks']), 3)
+        self.assertEqual(self.service.releases.get(first['id'])['members'], first['members'])
+
+    def test_task_linked_discussion_creates_only_its_explicit_release_members(self):
+        job = self.release_proposal_job()
+        job['task_id'] = self.task['id']
+        self.store.snapshot.return_value['jobs'] = [job]
+        host = self.service.get(self.task['id'])
+        host['meetings'] = [dict(job_id=job['id'], group_id=job['group_id'])]
+        self.service.save(host, 'discussion', 'admin')
+        self.service.materialize_meeting(self.task['id'], job['id'],
+            dict(contributions.AUTOMATION_DEFAULTS, auto_create_releases=True), 'group_auto_queue', queue_allowed=False)
+        host = self.service.get(self.task['id'])
+        release = self.service.releases.get(host['auto_queue'][job['id']]['release']['id'])
+        self.assertEqual(release['source']['task_id'], self.task['id'])
+        self.assertEqual({member['task_id'] for member in release['members']}, set(host['follow_up_tasks'].values()))
+        self.assertNotIn(self.task['id'], [member['task_id'] for member in release['members']])
 
     def manual_proposal_job(self, **changes):
         job = self.taskless_proposal_job('a' * 32, count=2)
