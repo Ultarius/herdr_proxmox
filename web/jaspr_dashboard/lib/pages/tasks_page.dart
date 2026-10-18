@@ -1,3 +1,5 @@
+import 'dart:convert';
+import 'package:herdr_dashboard_state/task_execution.dart';
 import 'native_task_ui.dart';
 import '../navigation.dart';
 import '../services.dart';
@@ -122,6 +124,7 @@ class _TasksPageState extends State<TasksPage> {
   String? localTaskId;
   String? get selectedId => component.taskId ?? localTaskId;
   String? error;
+  Map<String, String>? releaseFailure;
   // A failed list read must not erase an action failure, and vice versa.
   String? readError;
   bool busy = false;
@@ -145,8 +148,9 @@ class _TasksPageState extends State<TasksPage> {
       if (!mounted) return;
       if (connection.state.connected != connected)
         setState(() => connected = connection.state.connected);
-      // Agent activity drives the live rings only; rebuild when it changes.
-      final live = '${activity}';
+      // A session can change task/run while remaining Working. Rebuild for
+      // both the session signal and its verified task binding.
+      final live = jsonEncode([activity, taskExecutions]);
       if (live != liveActivity) setState(() => liveActivity = live);
       if (generation != connection.generation) {
         generation = connection.generation;
@@ -310,6 +314,7 @@ class _TasksPageState extends State<TasksPage> {
     setState(() {
       busy = true;
       error = null;
+      releaseFailure = null;
     });
     try {
       final result = await connection.request('releases/$action', {
@@ -330,8 +335,18 @@ class _TasksPageState extends State<TasksPage> {
         );
       }
     } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = '$e');
+      if (mounted && epoch == connection.generation) {
+        final message = '$e'.replaceFirst(RegExp(r'^Exception: '), '');
+        setState(() {
+          error = message;
+          releaseFailure = {
+            'id': '${body['id']}',
+            'action': action,
+            'message': message,
+          };
+        });
+        await refresh();
+      }
     } finally {
       if (mounted) setState(() => busy = false);
     }
@@ -1182,6 +1197,7 @@ class _TasksPageState extends State<TasksPage> {
         releases: releases,
         onReleaseAction: admin ? releaseAct : null,
         releaseBusy: busy,
+        releaseFailure: releaseFailure,
         onLoadReleaseHistory: loadReleaseHistory,
         initialView: component.initialView,
         groups: [
@@ -1197,6 +1213,7 @@ class _TasksPageState extends State<TasksPage> {
             if (profile is Map<String, dynamic>) profile,
         ],
         activity: activity,
+        taskExecutions: taskExecutions,
         onOpenTask: openTask,
         executor: executor,
         loading: refreshing,
@@ -1205,7 +1222,7 @@ class _TasksPageState extends State<TasksPage> {
           stateLabel: taskState,
           onOpen: openTask,
           executor: executor,
-          activity: activity,
+          taskExecutions: taskExecutions,
         ),
       ),
       DiscoveryPanel(coordinator: component.coordinator),
@@ -1218,6 +1235,14 @@ class _TasksPageState extends State<TasksPage> {
       if (agent['profile_id'] != null)
         '${agent['profile_id']}': activityFor(agent),
   };
+
+  Map<String, Map<String, dynamic>> get taskExecutions => taskExecutionBindings(
+    connection.state.agents,
+    available:
+        connection.state.connected &&
+        connection.state.error == null &&
+        connection.state.serverStatus != 'stopped',
+  );
 
   Future<void> openTask(String id) async {
     if (component.coordinator != null) {

@@ -391,12 +391,42 @@ class ReleaseCandidateTests(unittest.TestCase):
         release = self.action('membership', release, task_id=identifier, included=True)
         original = self.tasks[identifier]['head_sha']
         self.tasks[identifier]['head_sha'] = 'b' * 40
-        with self.assertRaisesRegex(ValueError, 'candidate changed'):
+        with self.assertRaisesRegex(ValueError, 'candidate changed') as refused:
             self.action('freeze', release)
+        self.assertIn(self.tasks[identifier]['title'], str(refused.exception))
+        self.assertIn(original[:12], str(refused.exception))
+        self.assertIn(('b' * 40)[:12], str(refused.exception))
+        self.assertIn('Selected changes', str(refused.exception))
         self.tasks[identifier]['head_sha'] = original
         self.tasks[identifier]['builds'][original]['required_checks_verified'] = False
         with self.assertRaisesRegex(ValueError, 'required checks must pass'):
             self.action('freeze', release)
+
+    def test_changed_selection_is_explicit_reviewed_and_order_preserving(self):
+        first, second = self.task('first'), self.task('second')
+        release = self.action('create', repository='repo', version='selection-review')
+        for identifier in (first, second):
+            release = self.action('membership', release, task_id=identifier, included=True)
+        selected = release['members'][0]['candidate_sha']
+        reviewed = 'b' * 40
+        self.tasks[first]['head_sha'] = reviewed
+        presented = self.releases.present(copy.deepcopy(self.releases.get(release['id'])))
+        self.assertTrue(presented['members'][0]['candidate_changed'])
+        self.assertEqual(presented['members'][0]['current_candidate_sha'], reviewed)
+        self.assertEqual(self.releases.get(release['id'])['members'][0]['candidate_sha'], selected)
+        for previous, candidate in (('f' * 40, reviewed), (selected, 'a' * 40)):
+            with self.assertRaisesRegex(ValueError, 'reviewed candidate changed again'):
+                self.action('membership', release, task_id=first, included=True,
+                    previous_candidate_sha=previous, candidate_sha=candidate)
+            self.assertEqual(self.releases.get(release['id'])['members'][0]['candidate_sha'], selected)
+        updated = self.action('membership', release, task_id=first, included=True,
+            previous_candidate_sha=selected, candidate_sha=reviewed)
+        self.assertEqual([member['task_id'] for member in updated['members']], [first, second])
+        self.assertEqual(updated['members'][0]['candidate_sha'], reviewed)
+        self.assertFalse(updated['members'][0]['candidate_changed'])
+        self.assertEqual(updated['state'], 'collecting')
+        with self.assertRaisesRegex(ValueError, 'required checks must pass'):
+            self.action('freeze', updated)
 
     def test_two_independent_changes_integrate_without_touching_project(self):
         first, second = self.task('first'), self.task('second')

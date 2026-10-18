@@ -619,6 +619,9 @@ class OrganizationStore:
         result = []
         for agent in agents:
             item = dict(agent)
+            # These are gateway-owned bindings, never assertions from agent list.
+            for key in ('run_id', 'task_id', 'profile_id', 'group_id', 'display_name', 'entity_type'):
+                item.pop(key, None)
             for run in by_alias.get(agent.get('name'), []):
                 if run['kind'] != 'launch' or run['state'] not in ('running', 'persona_sent', 'needs_attention') or run.get('alias') != agent.get('name'):
                     continue
@@ -634,9 +637,21 @@ class OrganizationStore:
                 except ValueError:
                     continue
                 item.update(display_name=profile['name'], entity_type='group' if profile.get('group_id') else 'agent',
-                            profile_id=profile['id'], group_id=profile.get('group_id'))
+                            profile_id=profile['id'], group_id=profile.get('group_id'),
+                            run_id=run['id'], task_id=run.get('task_id'))
                 break
             result.append(item)
+        claims = {}
+        for item in result:
+            if item.get('task_id'):
+                claims.setdefault(item['task_id'], []).append(item)
+        for entries in claims.values():
+            if len(entries) > 1:
+                # Preserve verified session labels, but refuse ambiguous task
+                # attribution. This does not stop or reassign either session.
+                for item in entries:
+                    item.pop('task_id', None)
+                    item.pop('run_id', None)
         return result
 
     def remove(self, db, action, body, org_id):

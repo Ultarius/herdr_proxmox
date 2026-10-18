@@ -43,6 +43,18 @@ again to review its new selection before freezing. The durable build queue
 already distinguishes policies for the same commit, so a new approved policy
 can create a fresh run without discarding the older result.
 
+While collecting, when a selected task captures a different candidate, release details name the
+changed tasks and link to their rows in **Selected changes**. Each row marks
+**Candidate changed** and shows both the selected and current full SHAs. Use
+**Open task and validation** to inspect the update, then **Review updated
+selection** and **Use reviewed candidate** to replace only that selection.
+This requires the same release edit version, previous selected SHA and current
+reviewed SHA; a change during review refuses the replacement. Member order is
+preserved. Selection updates do not waive validation or freeze a release, and
+frozen revisions remain immutable. A failed release action is also displayed
+inside its release details; task-level errors no longer require guessing which
+selected change was meant.
+
 ## Plans from group discussions
 
 Enable **Create release plans from group discussions automatically** in the

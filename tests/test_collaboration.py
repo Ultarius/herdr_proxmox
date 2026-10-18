@@ -1568,6 +1568,46 @@ class CollaborationTests(unittest.TestCase):
         self.store.update_job(run['id'], state='released', agent_session=run['agent_session'])
         self.assertNotIn('display_name', self.store.label_agents([agent])[0])
 
+    def test_live_task_binding_requires_the_verified_launch_conversation(self):
+        self.group()
+        run = next(j for j in self.store.job_records()
+                   if j['kind'] == 'launch' and j.get('profile_id') == self.max)
+        self.store.update_job(run['id'], task_id='current-task')
+        agent = dict(self.agents[run['alias']], agent_status='working')
+        labeled = self.store.label_agents([agent])[0]
+        self.assertEqual(labeled['task_id'], 'current-task')
+        self.assertEqual(labeled['run_id'], run['id'])
+        self.assertEqual(labeled['profile_id'], self.max)
+        self.assertNotIn('completion_token', labeled)
+        for changed in (dict(agent, pane_id='other:p1'),
+                        dict(agent, agent_session={'value': 'replacement'})):
+            # Even raw agent metadata cannot assert the gateway's task binding.
+            changed.update(task_id='current-task', run_id=run['id'], profile_id=self.iris,
+                group_id='forged-group', display_name='Forged name', entity_type='group')
+            refused = self.store.label_agents([changed])[0]
+            for field in ('task_id', 'run_id', 'profile_id', 'group_id', 'display_name', 'entity_type'):
+                self.assertNotIn(field, refused)
+        unknown = dict(name='unverified', pane_id='unknown:p1', profile_id=self.max,
+            group_id='forged-group', display_name='Max', entity_type='agent')
+        self.assertEqual(self.store.label_agents([unknown])[0], dict(name='unverified', pane_id='unknown:p1'))
+        self.store.update_job(run['id'], state='released')
+        self.assertNotIn('task_id', self.store.label_agents([agent])[0])
+
+    def test_duplicate_live_task_claims_are_suppressed_until_a_later_snapshot(self):
+        self.group()
+        runs = [j for j in self.store.job_records() if j['kind'] == 'launch'
+                and j.get('profile_id') in (self.max, self.iris)]
+        for run in runs:
+            self.store.update_job(run['id'], task_id='same-task')
+        agents = [self.agents[run['alias']] for run in runs]
+        labeled = self.store.label_agents(agents)
+        self.assertEqual({item['profile_id'] for item in labeled}, {self.max, self.iris})
+        self.assertTrue(all('task_id' not in item and 'run_id' not in item for item in labeled))
+        self.store.update_job(runs[0]['id'], state='released')
+        remaining = next(item for item in self.store.label_agents(agents) if item.get('task_id'))
+        self.assertEqual(remaining['task_id'], 'same-task')
+        self.assertEqual(remaining['run_id'], runs[1]['id'])
+
     def test_group_creation_and_messages_reuse_real_agent_binding(self):
         group_id = self.group()
         group = next(g for g in self.store.snapshot()['groups'] if g['id'] == group_id)

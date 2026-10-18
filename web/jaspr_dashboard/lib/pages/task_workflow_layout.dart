@@ -1,11 +1,11 @@
 part of 'task_workflow.dart';
 
-// Graph sizes (Phase 2 workflow viewer): compact 184 × 96 cards (104 with
-// lanes off, when the foot also holds the assignee tile), 32px column gaps,
+// Graph sizes: 184 × 128 cards (136 with lanes off, when the foot also holds
+// the assignee tile), including space for live work phases, 32px column gaps,
 // a 120px lane header column (48px on phones) and 12px stage padding.
 const _nodeW = 184.0;
-const _nodeH = 96.0;
-const _nodeHTile = 104.0;
+const _nodeH = 128.0;
+const _nodeHTile = 136.0;
 const _releaseH = 136.0;
 const _releaseGap = 16.0;
 const _colGap = 32.0;

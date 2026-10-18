@@ -346,12 +346,14 @@ class ReleaseCandidates:
                     member['eligibility_reason'] = 'Task is no longer available.'
                     continue
                 sha = member.get('candidate_sha')
+                member['current_candidate_sha'] = task.get('head_sha')
+                member['candidate_changed'] = bool(sha and sha != task.get('head_sha'))
                 evidence = task.get('builds', {}).get(sha, {})
                 if not sha:
                     reason = ('Waiting for a captured candidate with passing required checks.'
                               if member.get('selection') == 'automatic' else 'Capture a task candidate before freezing.')
                 elif sha != task.get('head_sha'):
-                    reason = 'Candidate changed. Remove and add this task to review its new SHA.'
+                    reason = 'Candidate changed. Review the selected and current commits before updating this release selection.'
                 elif evidence.get('target') != sha or evidence.get('state') != 'complete' or evidence.get('required_checks_verified') is not True:
                     reason = 'Required checks have not passed for this selected commit.'
                 else:
@@ -476,11 +478,24 @@ class ReleaseCandidates:
                     members = release['members']
                     if type(body.get('included')) is not bool:
                         raise ValueError('Choose whether to include this task.')
+                    reviewed = body.get('candidate_sha')
+                    previous_index = next((i for i, m in enumerate(members) if m['task_id'] == task['id']), None)
+                    if reviewed is not None:
+                        from contributions import SHA
+                        if (body['included'] is not True or not SHA.fullmatch(str(reviewed))
+                                or previous_index is None
+                                or members[previous_index].get('candidate_sha') != body.get('previous_candidate_sha')
+                                or task.get('head_sha') != reviewed):
+                            raise ValueError(task['title'] + ': the reviewed candidate changed again. Refresh and review the selected and current commits.')
                     members[:] = [member for member in members if member['task_id'] != task['id']]
                     if body['included']:
                         if len(members) >= 100:
                             raise ValueError('A release can select at most 100 tasks.')
-                        members.append(dict(task_id=task['id'], title=task['title'], candidate_sha=task.get('head_sha')))
+                        updated = dict(task_id=task['id'], title=task['title'], candidate_sha=task.get('head_sha'))
+                        if reviewed is not None:
+                            members.insert(previous_index, updated)
+                        else:
+                            members.append(updated)
                 elif action == 'assembly':
                     from release_assembly import configure
                     configure(self, release, body)
@@ -575,8 +590,14 @@ class ReleaseCandidates:
             if task is None:
                 raise ValueError('A selected task is no longer available.')
             sha = member.get('candidate_sha')
-            if task['repository'] != release['repository'] or not SHA.fullmatch(str(sha)) or task.get('head_sha') != sha:
-                raise ValueError('A selected task candidate changed. Remove and add it again to review the new SHA.')
+            if task['repository'] != release['repository']:
+                raise ValueError(task['title'] + ': this task belongs to another repository. Remove it from this release.')
+            if not SHA.fullmatch(str(sha)):
+                raise ValueError(task['title'] + ': no valid candidate is selected. Capture a candidate, then review this release selection.')
+            if task.get('head_sha') != sha:
+                raise ValueError(task['title'] + ' [' + task['id'][:8] + ']: selected candidate changed '
+                    + str(sha or 'not captured')[:12] + ' → ' + str(task.get('head_sha') or 'not captured')[:12]
+                    + '. Open this release’s Selected changes, review this task, then update its selection before freezing.')
             evidence = task.get('builds', {}).get(sha, {})
             if (evidence.get('target') != sha or evidence.get('state') != 'complete'
                     or evidence.get('required_checks_verified') is not True):

@@ -22,7 +22,8 @@ extension _Canvas on _TaskWorkflowState {
         : blocking != null && _open(task)
         ? ('waiting', 'hourglass')
         : null;
-    final owner = _agent(task);
+    final work = _work(task);
+    final workActivity = work?.activity;
     return el(
       'button',
       [
@@ -54,7 +55,7 @@ extension _Canvas on _TaskWorkflowState {
               _name(task),
               role: _role(task),
               size: 'xs',
-              live: _activity(owner) == 'working',
+              live: workActivity == 'working',
             ),
           badge(_state(task), tone: _tone(task)),
           if (flag != null)
@@ -65,6 +66,11 @@ extension _Canvas on _TaskWorkflowState {
               attributes: {'data-flag': flag.$1, 'title': message},
             ),
         ], classes: 'wf-node__foot task-wf-node-foot'),
+        if (work != null)
+          el('span', [
+            _dot(workActivity!),
+            text(work.label),
+          ], classes: 'wf-node__activity'),
       ],
       classes: 'task-wf-node wf-node',
       attributes: {
@@ -73,13 +79,14 @@ extension _Canvas on _TaskWorkflowState {
         'data-node': id,
         'data-state': '${task['state']}',
         'data-tone': _tone(task),
+        if (work != null) 'data-work': workActivity!,
         if (links.any((link) => link.to == id)) 'data-in': '',
         if (links.any((link) => link.from == id)) 'data-out': '',
         'aria-pressed': '${selected == id}',
         'aria-label':
-            '${task['title']}. ${_state(task)}. ${_name(task)}. $message',
+            '${task['title']}. ${_state(task)}. ${_name(task)}. ${work == null ? '' : '${work.label}. '}$message',
         'title':
-            '$id · ${task['repository'] ?? 'Repository not recorded'}\n$message',
+            '$id · ${task['repository'] ?? 'Repository not recorded'}\n${work == null ? '' : '${work.label}\n'}$message',
         if (highlighted.isNotEmpty && !highlighted.contains(id)) 'data-dim': '',
         if (highlighted.contains(id)) 'data-emphasis': '',
         'style': 'left:${box.x}px;top:${box.y}px;',

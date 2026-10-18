@@ -19,6 +19,8 @@ class _Host extends StatefulComponent {
 class _HostState extends State<_Host> {
   List<Map<String, dynamic>> tasks = [];
   List<Map<String, dynamic>> releases = [];
+  Map<String, String>? activity;
+  Map<String, Map<String, dynamic>> taskExecutions = {};
   final releaseActions = <Map<String, dynamic>>[];
   Future<Map<String, dynamic>> Function(String, String?, int?)? historyLoader;
   final opened = <String>[];
@@ -27,6 +29,11 @@ class _HostState extends State<_Host> {
   void replace(List<Map<String, dynamic>> rows) => setState(() => tasks = rows);
   void replaceReleases(List<Map<String, dynamic>> rows) =>
       setState(() => releases = rows);
+  void live(String activity, Map<String, Map<String, dynamic>> bindings) =>
+      setState(() {
+        this.activity = {'worker': activity};
+        taskExecutions = bindings;
+      });
   @override
   void initState() {
     super.initState();
@@ -39,6 +46,8 @@ class _HostState extends State<_Host> {
       : TaskWorkflow(
           tasks: tasks,
           releases: releases,
+          activity: activity,
+          taskExecutions: taskExecutions,
           onLoadReleaseHistory: historyLoader,
           onReleaseAction: (action, body) =>
               releaseActions.add({'action': action, ...body}),
@@ -173,6 +182,86 @@ void main() {
       },
     ],
   };
+
+  test(
+    'changed selections link to exact rows and require a fresh SHA review',
+    () async {
+      final selected = release();
+      final old = 'a' * 40, current = 'd' * 40, newer = 'e' * 40;
+      selected['members'] = [
+        for (final m in selected['members'] as List)
+          Map<String, dynamic>.from(m),
+      ];
+      final member = (selected['members'] as List).first as Map;
+      member['candidate_changed'] = true;
+      member['current_candidate_sha'] = current;
+      state.replace([
+        row('origin')..['head_sha'] = current,
+        row('follow')..['head_sha'] = 'b' * 40,
+      ]);
+      state.replaceReleases([selected]);
+      await settle();
+      task('release:release-one').click();
+      await settle();
+      expect(
+        nodes(
+          '[data-candidate-changed]',
+        ).single.getAttribute('data-release-member'),
+        'origin',
+      );
+      final rowElement = nodes('[data-release-member=origin]').single;
+      expect(rowElement.textContent, contains('Selected candidate $old'));
+      expect(rowElement.textContent, contains('Current candidate $current'));
+      expect(
+        nodes('button')
+            .firstWhere((b) => b.textContent == 'Freeze and integrate 2 tasks')
+            .hasAttribute('disabled'),
+        true,
+      );
+      await click('Review change: Task origin');
+      expect(web.document.activeElement, rowElement);
+      await click('Review updated selection');
+      expect(state.releaseActions, isEmpty);
+      member['current_candidate_sha'] = newer;
+      state.replaceReleases([Map<String, dynamic>.from(selected)]);
+      await settle();
+      final confirm = nodes(
+        'button',
+      ).firstWhere((b) => b.textContent == 'Use reviewed candidate');
+      expect(confirm.hasAttribute('disabled'), true);
+      confirm.click();
+      expect(state.releaseActions, isEmpty);
+      await click('Review updated selection');
+      await click('Use reviewed candidate');
+      expect(state.releaseActions.single, {
+        'action': 'membership',
+        'id': 'release-one',
+        'edit_version': 4,
+        'task_id': 'origin',
+        'included': true,
+        'previous_candidate_sha': old,
+        'candidate_sha': newer,
+      });
+      member['candidate_sha'] = newer;
+      member['candidate_changed'] = false;
+      selected['edit_version'] = 5;
+      state.replaceReleases([Map<String, dynamic>.from(selected)]);
+      await settle();
+      expect(nodes('[data-candidate-changed]'), isEmpty);
+      expect(
+        nodes(
+          'button',
+        ).where((b) => b.textContent!.startsWith('Review change:')),
+        isEmpty,
+      );
+      expect(
+        nodes('button')
+            .firstWhere((b) => b.textContent == 'Freeze and integrate 2 tasks')
+            .hasAttribute('disabled'),
+        false,
+      );
+    },
+  );
 
   test(
     'release inspector shows task owners and explicitly requests group advice',
@@ -917,6 +1006,134 @@ void main() {
         web.document.getElementById('workflow-test')!.textContent,
         isNot(contains('alpha.15')),
       );
+    },
+  );
+
+  test(
+    'live repair identifies exactly one task and preserves its PR lifecycle',
+    () async {
+      final repair = row('repair', state: 'pr_open')
+        ..['title'] = 'Add delivery contract tests'
+        ..['run_id'] = 'repair-run'
+        ..['pr_repair'] = {'state': 'running', 'kind': 'validation_update'};
+      state.replace([
+        row('unrelated', state: 'pr_open')..['run_id'] = 'old-run',
+        repair,
+        row('another', state: 'pr_open')..['run_id'] = 'another-run',
+      ]);
+      state.live('working', {
+        'repair': {
+          'task_id': 'repair',
+          'run_id': 'repair-run',
+          'profile_id': 'worker',
+          'activity': 'working',
+        },
+      });
+      await settle();
+      expect(nodes('.task-wf-node[data-work=working]').single, task('repair'));
+      expect(
+        task('repair').textContent,
+        contains('Resolving conflicts · running checks'),
+      );
+      expect(task('repair').textContent, contains('Pull request open'));
+      expect(task('unrelated').querySelector('.wf-node__activity'), isNull);
+      final chip = nodes('.agent-chip[data-agent=worker]').single;
+      expect(chip.getAttribute('data-current-task'), 'repair');
+      expect(chip.textContent, contains('Add delivery contract tests'));
+      expect(chip.title, contains('Resolving conflicts'));
+      final line = task(
+        'repair',
+      ).querySelector('.wf-node__activity')!.getBoundingClientRect();
+      expect(
+        line.bottom,
+        lessThanOrEqualTo(task('repair').getBoundingClientRect().bottom),
+      );
+      (nodes('label')
+                  .firstWhere((node) => node.textContent == 'Lanes by agent')
+                  .querySelector('input')
+              as web.HTMLInputElement)
+          .click();
+      await settle();
+      expect(task('repair').querySelector('[data-live=true]'), isNotNull);
+      expect(task('unrelated').querySelector('[data-live=true]'), isNull);
+      expect(task('another').querySelector('[data-live=true]'), isNull);
+      task('unrelated').click();
+      await settle();
+      expect(task('repair').hasAttribute('data-dim'), true);
+      expect(
+        web.window.getComputedStyle(task('repair')).borderLeftColor,
+        web.window
+            .getComputedStyle(
+              task('repair').querySelector('.wf-node__activity')!,
+            )
+            .color,
+      );
+    },
+  );
+
+  test(
+    'stale runs, another task and idle sessions cannot claim live task work',
+    () async {
+      state.replace([
+        row('repair', state: 'pr_open')
+          ..['run_id'] = 'current-run'
+          ..['pr_repair'] = {'state': 'running'},
+      ]);
+      final bound = <String, dynamic>{
+        'task_id': 'repair',
+        'run_id': 'current-run',
+        'profile_id': 'worker',
+        'activity': 'working',
+      };
+      for (final wrong in [
+        {...bound, 'run_id': 'previous-run'},
+        {...bound, 'task_id': 'another'},
+        {...bound, 'profile_id': 'another-worker'},
+        {...bound, 'activity': 'idle'},
+      ]) {
+        state.live('working', {'repair': wrong});
+        await settle();
+        expect(nodes('.task-wf-node[data-work]'), isEmpty);
+        expect(nodes('.agent-chip[data-current-task]'), isEmpty);
+      }
+      state.live('working', {});
+      await settle();
+      expect(nodes('.task-wf-node[data-work]'), isEmpty);
+      expect(
+        nodes('.agent-chip[data-agent=worker]').single.textContent,
+        contains('Active task unavailable'),
+      );
+      state.live('attention', {
+        'repair': {...bound, 'activity': 'attention'},
+      });
+      await settle();
+      expect(task('repair').getAttribute('data-work'), 'attention');
+      expect(task('repair').textContent, contains('Needs attention'));
+      expect(nodes('.task-wf-node[data-work=working]'), isEmpty);
+    },
+  );
+
+  test(
+    'agent chip retains the current task name when filters hide its card',
+    () async {
+      state.replace([
+        row('repair', state: 'implementing')..['run_id'] = 'current-run',
+        row('visible', state: 'pr_open'),
+      ]);
+      state.live('working', {
+        'repair': {
+          'task_id': 'repair',
+          'run_id': 'current-run',
+          'profile_id': 'worker',
+          'activity': 'working',
+        },
+      });
+      await settle();
+      await choose('Task state', 'pr_open');
+      expect(nodes('.task-wf-node[data-work]'), isEmpty);
+      final chip = nodes('.agent-chip[data-agent=worker]').single;
+      expect(chip.textContent, contains('Task repair (hidden by filters)'));
+      expect(chip.getAttribute('data-current-task'), 'repair');
     },
   );
 

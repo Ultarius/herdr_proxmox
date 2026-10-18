@@ -22,6 +22,110 @@ List<Map<String, dynamic>> releaseMembers(Map release) => [
 ];
 
 extension _Releases on _TaskWorkflowState {
+  Object? currentCandidate(Map member) {
+    if (member.containsKey('current_candidate_sha'))
+      return member['current_candidate_sha'];
+    final task = component.tasks
+        .where((task) => task['id'] == member['task_id'])
+        .firstOrNull;
+    return task?['head_sha'] ?? member['work']?['head_sha'];
+  }
+
+  bool candidateChanged(Map member) => member['candidate_changed'] is bool
+      ? member['candidate_changed'] == true
+      : member['candidate_sha'] != null &&
+            currentCandidate(member) != null &&
+            member['candidate_sha'] != currentCandidate(member);
+
+  String memberElementId(Map release, Map member) =>
+      '$instance-release-${release['id']}-member-${member['task_id']}';
+
+  void revealMember(Map release, Map member) {
+    final element =
+        web.document.getElementById(memberElementId(release, member))
+            as web.HTMLElement?;
+    element?.scrollIntoView(
+      web.ScrollIntoViewOptions(block: 'center', inline: 'nearest'),
+    );
+    element?.focus(web.FocusOptions(preventScroll: true));
+  }
+
+  List<Component> selectionUpdate(Map release, Map member) {
+    final current = currentCandidate(member);
+    final preview = selectionPreview;
+    final reviewing =
+        preview?['release_id'] == release['id'] &&
+        preview?['task_id'] == member['task_id'];
+    final stale =
+        reviewing &&
+        (preview?['candidate_sha'] != current ||
+            preview?['previous_candidate_sha'] != member['candidate_sha'] ||
+            preview?['edit_version'] != release['edit_version']);
+    return [
+      button(
+        'Review updated selection',
+        () => update(
+          () => selectionPreview = {
+            'release_id': release['id'],
+            'task_id': member['task_id'],
+            'previous_candidate_sha': member['candidate_sha'],
+            'candidate_sha': current,
+            'edit_version': release['edit_version'],
+          },
+        ),
+        small: true,
+        disabled: component.releaseBusy || current == null,
+      ),
+      if (reviewing)
+        el(
+          'div',
+          [
+            el('p', [
+              text(
+                'Use this reviewed commit in the release? Required checks must pass before freezing.',
+              ),
+            ]),
+            el('p', [
+              text('Replace ${preview?['previous_candidate_sha']}'),
+            ], classes: 'mono'),
+            el('p', [
+              text('With ${preview?['candidate_sha']}'),
+            ], classes: 'mono'),
+            if (stale)
+              notice(
+                'The candidate or release selection changed again. Review the updated selection before continuing.',
+                error: true,
+              ),
+            button(
+              'Use reviewed candidate',
+              () => releaseAction('membership', release, {
+                'task_id': member['task_id'],
+                'included': true,
+                'candidate_sha': preview?['candidate_sha'],
+                'previous_candidate_sha': preview?['previous_candidate_sha'],
+                'edit_version': preview?['edit_version'],
+              }),
+              primary: true,
+              disabled:
+                  component.releaseBusy ||
+                  stale ||
+                  preview?['candidate_sha'] == null,
+            ),
+            button(
+              'Cancel selection update',
+              () => update(() => selectionPreview = null),
+              small: true,
+            ),
+          ],
+          classes: 'wf-release__selection-review',
+          attributes: {
+            'role': 'group',
+            'aria-label': 'Review candidate replacement',
+          },
+        ),
+    ];
+  }
+
   Component memberWork(Map member) {
     final live = component.tasks
         .where((t) => t['id'] == member['task_id'])
@@ -646,6 +750,13 @@ extension _Releases on _TaskWorkflowState {
     final revision = release['revision'] as Map?;
     final validation = release['validation'] as Map?;
     final canAct = component.onReleaseAction != null && !historical;
+    final showChanges =
+        !historical &&
+        (release['state'] == 'collecting' ||
+            release['continuous']?['enabled'] == true);
+    final changed = !showChanges
+        ? <Map<String, dynamic>>[]
+        : members.where(candidateChanged).toList();
     return el('aside', [
       el('header', [
         el('h2', [
@@ -669,6 +780,24 @@ extension _Releases on _TaskWorkflowState {
             () => loadHistory(release),
             small: true,
           ),
+        if (!historical && component.releaseFailure?['id'] == release['id'])
+          notice(
+            'Last release action could not complete: ${component.releaseFailure?['message']}',
+            error: true,
+          ),
+        if (changed.isNotEmpty)
+          section('Selection needs review', [
+            notice(
+              '${changed.length} selected ${changed.length == 1 ? 'task has' : 'tasks have'} changed candidates. Review the selected and current commits in Selected changes before freezing.',
+              error: true,
+            ),
+            for (final member in changed)
+              button(
+                'Review change: ${member['title'] ?? member['task_id']}',
+                () => revealMember(release, member),
+                small: true,
+              ),
+          ]),
         if ('${release['error'] ?? ''}'.isNotEmpty)
           notice(release['error'], error: true),
         if ('${release['assembly_notice'] ?? ''}'.isNotEmpty)
@@ -733,12 +862,25 @@ extension _Releases on _TaskWorkflowState {
                 badge(
                   '${member['state'] ?? (member['selection'] == 'automatic' && member['candidate_sha'] == null ? 'Planned · awaiting checks' : 'Selected')}',
                 ),
+                if (showChanges && candidateChanged(member))
+                  badge('Candidate changed', tone: 'warning'),
                 if (!historical) memberWork(member),
                 el('p', [
                   text(
-                    'Candidate ${member['candidate_sha'] ?? 'not captured'}',
+                    '${showChanges && candidateChanged(member) ? 'Selected candidate' : 'Candidate'} ${member['candidate_sha'] ?? 'not captured'}',
                   ),
                 ], classes: 'mono'),
+                if (showChanges && candidateChanged(member)) ...[
+                  el('p', [
+                    text(
+                      'Current candidate ${currentCandidate(member) ?? 'not captured'}',
+                    ),
+                  ], classes: 'mono'),
+                  if (canAct &&
+                      (release['state'] == 'collecting' ||
+                          release['continuous']?['enabled'] == true))
+                    ...selectionUpdate(release, member),
+                ],
                 if (member['integration_sha'] != null)
                   el('p', [
                     text('Incorporated at ${member['integration_sha']}'),
@@ -759,7 +901,16 @@ extension _Releases on _TaskWorkflowState {
                   ),
               ],
               classes: 'wf-release__member',
-              attributes: {'data-release-member': '${member['task_id']}'},
+              attributes: {
+                'data-release-member': '${member['task_id']}',
+                'role': 'group',
+                'aria-label':
+                    'Selected change: ${member['title'] ?? member['task_id']}',
+                'id': memberElementId(release, member),
+                'tabindex': '-1',
+                if (showChanges && candidateChanged(member))
+                  'data-candidate-changed': 'true',
+              },
             ),
         ]),
         section('Combined validation', [
@@ -804,6 +955,7 @@ extension _Releases on _TaskWorkflowState {
                 disabled:
                     component.releaseBusy ||
                     members.isEmpty ||
+                    changed.isNotEmpty ||
                     members.any((member) => member['candidate_sha'] == null),
               ),
             if (release['state'] == 'assembled')

@@ -149,6 +149,7 @@ extension _Panels on _TaskWorkflowState {
       List<Component> meta, {
       required bool pressed,
       required void Function() onClick,
+      String? currentWork,
       Map<String, String> attributes = const {},
     }) => el(
       'button',
@@ -157,6 +158,8 @@ extension _Panels on _TaskWorkflowState {
         el('span', [
           el('span', [text(name)], classes: 'agent-chip__name'),
           el('span', meta, classes: 'agent-chip__meta'),
+          if (currentWork != null)
+            el('span', [text(currentWork)], classes: 'agent-chip__current'),
         ], classes: 'agent-chip__text'),
       ],
       classes: 'agent-chip task-wf-agent',
@@ -185,6 +188,22 @@ extension _Panels on _TaskWorkflowState {
               final first = tasks.firstWhere((task) => _agent(task) == owner);
               final count = tasks.where((task) => _agent(task) == owner).length;
               final activity = _activity(owner);
+              final activeTasks = component.tasks
+                  .where((task) => _agent(task) == owner && _work(task) != null)
+                  .toList();
+              final current = activeTasks.length == 1
+                  ? activeTasks.single
+                  : null;
+              final hidden =
+                  current != null &&
+                  !tasks.any((task) => _id(task) == _id(current));
+              final currentWork = current != null
+                  ? '${shortSha(_id(current))} · ${current['title']}${hidden ? ' (hidden by filters)' : ''}'
+                  : activeTasks.length > 1
+                  ? '${activeTasks.length} active tasks'
+                  : activity == 'working'
+                  ? 'Active task unavailable in this view'
+                  : null;
               return chip(
                 roleTile(
                   _name(first),
@@ -208,14 +227,25 @@ extension _Panels on _TaskWorkflowState {
                   ], classes: 'agent-chip__task'),
                 ],
                 pressed: agent == owner,
-                attributes: {'data-agent': owner},
+                currentWork: currentWork,
+                attributes: {
+                  'data-agent': owner,
+                  if (current != null) 'data-current-task': _id(current),
+                  if (currentWork != null)
+                    'title':
+                        '$currentWork${current == null ? '' : '\n${_work(current)?.label}'}',
+                },
                 onClick: () {
                   update(() {
                     agent = agent == owner ? '' : owner;
                     selected = null;
                   });
                   final box = boxes
-                      .where((box) => box.agent == owner)
+                      .where(
+                        (box) => current != null && !hidden
+                            ? box.id == _id(current)
+                            : box.agent == owner,
+                      )
                       .firstOrNull;
                   if (box != null) scheduleMicrotask(() => _reveal(box.id));
                 },

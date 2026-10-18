@@ -824,6 +824,100 @@ void main() {
     });
   });
 
+  testWidgets(
+    'live work in the Flutter list belongs only to the matching task run',
+    (tester) async {
+      tester.view.physicalSize = const Size(1280, 1800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      var status = 'working', run = 'current-run';
+      final tasks = [
+        {
+          'id': 'current',
+          'title': 'Current task',
+          'state': 'pr_open',
+          'repository': 'repo',
+          'profile_id': 'worker',
+          'run_id': 'current-run',
+          'pr_repair': {'state': 'running'},
+        },
+        {
+          'id': 'other',
+          'title': 'Other task',
+          'state': 'pr_open',
+          'repository': 'repo',
+          'profile_id': 'worker',
+          'run_id': 'old-run',
+        },
+      ];
+      final connection = DashboardBloc(
+        client: MockClient(
+          (request) async => http.Response(
+            jsonEncode(
+              request.url.path.endsWith('/tasks')
+                  ? {'tasks': tasks, 'github': {}}
+                  : {
+                      'workspaces': [],
+                      'agents': [
+                        {
+                          'task_id': 'current',
+                          'run_id': run,
+                          'profile_id': 'worker',
+                          'agent_status': status,
+                        },
+                      ],
+                    },
+            ),
+            200,
+          ),
+        ),
+      );
+      await withDashboardConnection(tester, connection, () async {
+        BlocScope.register<DashboardBloc>(() => connection);
+        connection.connect('token');
+        await tester.pumpWidget(
+          const MaterialApp(home: Scaffold(body: TasksPage())),
+        );
+        await tester.pumpAndSettle();
+        final current = find.ancestor(
+          of: find.text('Current task'),
+          matching: find.byType(Card),
+        );
+        final other = find.ancestor(
+          of: find.text('Other task'),
+          matching: find.byType(Card),
+        );
+        expect(
+          find.descendant(
+            of: current,
+            matching: find.text('Resolving conflicts · running checks'),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: other,
+            matching: find.byIcon(Icons.play_circle_outline),
+          ),
+          findsNothing,
+        );
+        status = 'blocked';
+        connection.send(DashboardCommand('refresh'));
+        await tester.pumpAndSettle();
+        expect(
+          find.descendant(of: current, matching: find.text('Needs attention')),
+          findsOneWidget,
+        );
+        run = 'stale-run';
+        connection.send(DashboardCommand('refresh'));
+        await tester.pumpAndSettle();
+        expect(find.text('Needs attention'), findsNothing);
+        expect(find.byIcon(Icons.play_circle_outline), findsNothing);
+      });
+    },
+  );
+
   for (final state in ['queued', 'running']) {
     testWidgets('$state validation links to the builds page', (tester) async {
       tester.view.physicalSize = const Size(1280, 1400);

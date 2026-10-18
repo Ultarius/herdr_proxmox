@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'dart:js_interop';
 import 'package:jaspr/dom.dart' as dom;
 import 'package:web/web.dart' as web;
+import 'package:herdr_dashboard_state/task_execution.dart';
 import '../ui.dart';
 import '../navigation.dart' as navigation;
 import 'task_activity.dart'
@@ -65,12 +66,14 @@ class TaskWorkflow extends StatefulComponent {
     this.profiles = const [],
     this.groups = const [],
     this.activity,
+    this.taskExecutions = const {},
     this.executor = 'unavailable',
     this.loading = false,
     this.initialView = 'workflow',
     this.releases = const [],
     this.onReleaseAction,
     this.releaseBusy = false,
+    this.releaseFailure,
     this.onLoadReleaseHistory,
   });
   final List<Map<String, dynamic>> tasks;
@@ -79,12 +82,17 @@ class TaskWorkflow extends StatefulComponent {
   final List<Map<String, dynamic>> releases;
   final void Function(String, Map<String, dynamic>)? onReleaseAction;
   final bool releaseBusy;
+  final Map<String, String>? releaseFailure;
   final Future<Map<String, dynamic>> Function(String, String?, int?)?
   onLoadReleaseHistory;
 
   /// Live agent activity by profile id (working, idle, attention, offline),
-  /// from the dashboard snapshot. Null when the host has no live state.
+  /// This is the session signal, not task attribution. Only taskExecutions
+  /// can link work to a task. Null when the host has no live state.
   final Map<String, String>? activity;
+
+  /// Only gateway-verified live session bindings, keyed by task id.
+  final Map<String, Map<String, dynamic>> taskExecutions;
   final void Function(String) onOpenTask;
   final Component? listView;
   final String executor, initialView;
@@ -106,6 +114,7 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
   String releaseGroup = '';
   String? releaseReviewLimit;
   String? releasePullTitle, releasePullBody, releasePullSha;
+  Map<String, dynamic>? selectionPreview;
   String exclusionReason = '';
   String? historyRelease;
   List<Map<String, dynamic>> retainedRevisions = [];
@@ -308,6 +317,9 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
   String? _activity(String owner) => component.activity == null
       ? null
       : component.activity![owner] ?? 'offline';
+
+  TaskWork? _work(Map task) =>
+      taskWork(task, component.taskExecutions[_id(task)]);
 
   String _stateKey(Map task) => taskStateKey(task);
   String _stateLabel(String key) => taskStateLabel(key);

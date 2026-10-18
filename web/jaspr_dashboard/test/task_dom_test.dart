@@ -188,6 +188,177 @@ void main() {
       : {'workspaces': [], 'agents': []};
 
   test(
+    'live snapshot binding identifies the current task on the board and list',
+    () async {
+      var activeTask = 'task', activeRun = 'current-run';
+      final current = publishedTask()
+        ..['state'] = 'pr_open'
+        ..['title'] = 'Repair delivery contracts'
+        ..['profile_id'] = 'worker'
+        ..['run_id'] = 'current-run'
+        ..['assigned_agent'] = {'id': 'worker', 'name': 'Nora'}
+        ..['pr_repair'] = {'state': 'running', 'kind': 'validation_update'};
+      final other = <String, dynamic>{
+        ...current,
+        'id': 'other-task',
+        'title': 'Other task',
+        'run_id': 'previous-run',
+        'pr_repair': null,
+      };
+      await mount(const TasksPage(), (request) {
+        if (request.url.path.endsWith('/snapshot'))
+          return {
+            'workspaces': [],
+            'agents': [
+              {
+                'name': 'nora-session',
+                'profile_id': 'worker',
+                'agent_status': 'working',
+                'run_id': activeRun,
+                'task_id': activeTask,
+              },
+            ],
+          };
+        if (request.url.path.endsWith('/tasks'))
+          return {
+            'tasks': [other, current],
+            'github': {'configured': true},
+          };
+        return {'workspaces': [], 'agents': []};
+      });
+      expect(
+        elements(
+          '.task-wf-node[data-work=working]',
+        ).single.getAttribute('data-node'),
+        'task',
+      );
+      expect(
+        elements('.agent-chip[data-current-task=task]').single.textContent,
+        contains('Repair delivery contracts'),
+      );
+      // A run can switch tasks without changing its Working activity label.
+      activeTask = 'other-task';
+      activeRun = 'previous-run';
+      connection!.send(DashboardCommand('refresh'));
+      await settle();
+      expect(
+        elements(
+          '.task-wf-node[data-work=working]',
+        ).single.getAttribute('data-node'),
+        'other-task',
+      );
+      activeTask = 'task';
+      activeRun = 'current-run';
+      connection!.send(DashboardCommand('refresh'));
+      await settle();
+      elements(
+        '[role=tab]',
+      ).firstWhere((tab) => tab.textContent!.startsWith('List')).click();
+      await settle();
+      final rows = elements(
+        'tr',
+      ).where((row) => row.querySelector('h2') != null).toList();
+      final active = rows.singleWhere(
+        (row) => row.textContent!.contains('Repair delivery contracts'),
+      );
+      final inactive = rows.singleWhere(
+        (row) => row.textContent!.contains('Other task'),
+      );
+      expect(active.querySelector('[data-live=true]'), isNotNull);
+      expect(
+        active.textContent,
+        contains('Resolving conflicts · running checks'),
+      );
+      expect(inactive.querySelector('[data-live=true]'), isNull);
+    },
+  );
+
+  test(
+    'ambiguous live bindings never pick an arbitrary current task',
+    () async {
+      final current = publishedTask()
+        ..['profile_id'] = 'worker'
+        ..['run_id'] = 'current-run';
+      await mount(const TasksPage(), (request) {
+        if (request.url.path.endsWith('/snapshot'))
+          return {
+            'workspaces': [],
+            'agents': [
+              for (final run in ['current-run', 'unexpected-run'])
+                {
+                  'name': run,
+                  'profile_id': 'worker',
+                  'agent_status': 'working',
+                  'run_id': run,
+                  'task_id': 'task',
+                },
+            ],
+          };
+        return taskResponse(request, current);
+      });
+      expect(elements('.task-wf-node[data-work]'), isEmpty);
+      expect(elements('.agent-chip[data-current-task]'), isEmpty);
+    },
+  );
+
+  test(
+    'freeze failures stay visible inside release details and link changed members',
+    () async {
+      final taskRow = publishedTask()..['head_sha'] = 'a' * 40;
+      final member = <String, dynamic>{
+        'task_id': 'task',
+        'title': 'Task with new commit',
+        'candidate_sha': 'a' * 40,
+        'current_candidate_sha': 'a' * 40,
+        'candidate_changed': false,
+      };
+      final release = <String, dynamic>{
+        'id': 'release-one',
+        'version': 'alpha.15',
+        'repository': 'repo',
+        'state': 'collecting',
+        'edit_version': 1,
+        'members': [member],
+      };
+      await mount(const TasksPage(), (request) {
+        if (request.url.path.endsWith('/releases/freeze')) {
+          member['candidate_changed'] = true;
+          member['current_candidate_sha'] = 'b' * 40;
+          taskRow['head_sha'] = 'b' * 40;
+          throw Exception(
+            'Task with new commit: selected candidate changed. Review Selected changes.',
+          );
+        }
+        if (request.url.path.endsWith('/tasks'))
+          return {
+            'tasks': [taskRow],
+            'releases': [release],
+            'github': {},
+          };
+        return {'workspaces': [], 'agents': []};
+      });
+      elements('[data-node="release:release-one"]').single.click();
+      await settle();
+      await click('Freeze and integrate 1 tasks');
+      await settle();
+      final dialog = elements('dialog').single;
+      expect(
+        dialog.textContent,
+        contains(
+          'Last release action could not complete: Task with new commit',
+        ),
+      );
+      expect(dialog.textContent, contains('Selection needs review'));
+      expect(dialog.textContent, contains('Current candidate ${'b' * 40}'));
+      await click('Review change: Task with new commit');
+      expect(
+        web.document.activeElement?.getAttribute('data-release-member'),
+        'task',
+      );
+    },
+  );
+
+  test(
     'superseded inspection chat is visible in the activity subtitle',
     () async {
       final task = publishedTask()

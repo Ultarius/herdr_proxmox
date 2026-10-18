@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'discovery_panel.dart';
 import 'routes.dart';
 import 'task_activity.dart';
@@ -8,6 +9,7 @@ import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'clipboard_copy.dart';
 import 'request_id.dart';
+import 'package:herdr_dashboard_state/task_execution.dart';
 
 /// Task lifecycle labels. The gateway owns these states; an unknown value is
 /// shown verbatim rather than guessed.
@@ -141,6 +143,15 @@ class _TasksPageState extends State<TasksPage> {
   // Keep the exact request across lost responses. Changing the selection gets
   // a new identity; retrying the same action reconciles the durable request.
   final Map<String, String> requests = {};
+  String liveActivity = '';
+  Map<String, Map<String, dynamic>> get taskExecutions => taskExecutionBindings(
+    connection.state.agents,
+    available:
+        connection.state.connected &&
+        connection.state.error == null &&
+        connection.state.serverStatus != 'stopped',
+  );
+
   bool get admin => connection.operator.value['role'] == 'admin';
 
   @override
@@ -151,6 +162,8 @@ class _TasksPageState extends State<TasksPage> {
       if (!mounted) return;
       if (connection.state.connected != connected)
         setState(() => connected = connection.state.connected);
+      final live = jsonEncode(taskExecutions);
+      if (live != liveActivity) setState(() => liveActivity = live);
       if (generation != connection.generation) {
         generation = connection.generation;
         setState(() {
@@ -1029,6 +1042,7 @@ class _TasksPageState extends State<TasksPage> {
 
   @override
   Widget build(BuildContext context) {
+    final executions = taskExecutions;
     final drafts = tasks.where((t) => t['state'] == 'draft').toList();
     final started = tasks.where((t) => t['state'] != 'draft').toList();
     return selectedId == null
@@ -1101,7 +1115,7 @@ class _TasksPageState extends State<TasksPage> {
                         : 'No development tasks yet.',
                   ),
                 ),
-              for (final task in started) _summary(task),
+              for (final task in started) _summary(task, executions),
               // Drafts are proposals waiting on an operator, not work in flight.
               // Grouping them keeps the active list readable when a group has
               // proposed several follow-ups.
@@ -1130,12 +1144,12 @@ class _TasksPageState extends State<TasksPage> {
                     ],
                   ),
                 ),
-                for (final task in drafts) _summary(task),
+                for (final task in drafts) _summary(task, executions),
               ],
               DiscoveryPanel(coordinator: widget.coordinator),
             ],
           )
-        : _detail();
+        : _detail(executions);
   }
 
   Future<void> openTask(String id) async {
@@ -1166,7 +1180,10 @@ class _TasksPageState extends State<TasksPage> {
     }
   }
 
-  Widget _summary(Map<String, dynamic> task) => Card(
+  Widget _summary(
+    Map<String, dynamic> task,
+    Map<String, Map<String, dynamic>> executions,
+  ) => Card(
     child: Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
@@ -1178,6 +1195,7 @@ class _TasksPageState extends State<TasksPage> {
           ),
           Text('${taskState(task)} \u00b7 ${task['repository']}'),
           Text('${taskAgentName(task)}'),
+          _liveWork(task, executions),
           Text(taskNextStep(task, executor: executor)),
           if (task['updated_at'] != null)
             Text('Last activity ${task['updated_at']}'),
@@ -1190,6 +1208,23 @@ class _TasksPageState extends State<TasksPage> {
       ),
     ),
   );
+
+  Widget _liveWork(Map task, Map<String, Map<String, dynamic>> executions) {
+    final work = taskWork(task, executions[task['id']]);
+    if (work == null) return const SizedBox.shrink();
+    final working = work.activity == 'working';
+    return Row(
+      children: [
+        Icon(
+          working ? Icons.play_circle_outline : Icons.warning_amber_rounded,
+          color: working ? Colors.green : Theme.of(context).colorScheme.error,
+          semanticLabel: working ? 'Live task work' : 'Task needs attention',
+        ),
+        const SizedBox(width: 6),
+        Flexible(child: Text(work.label)),
+      ],
+    );
+  }
 
   Future<void> showCommit(Map<String, dynamic> task, String sha) async {
     final epoch = connection.generation;
@@ -2309,7 +2344,7 @@ class _TasksPageState extends State<TasksPage> {
     );
   }
 
-  Widget _detail() {
+  Widget _detail(Map<String, Map<String, dynamic>> executions) {
     final task = tasks.isEmpty ? null : tasks.first;
     return ListView(
       padding: const EdgeInsets.all(20),
@@ -2340,6 +2375,7 @@ class _TasksPageState extends State<TasksPage> {
             style: Theme.of(context).textTheme.headlineMedium,
           ),
           Text('${taskState(task)} \u00b7 ${task['repository']}'),
+          _liveWork(task, executions),
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 12),
             child: Text(
