@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:herdr_dashboard_state/task_validation.dart';
+
+export 'package:herdr_dashboard_state/task_validation.dart';
 
 /// JSON collections are dynamic: extension getters must not be dispatched on them.
 String taskAgentName(
@@ -138,11 +141,17 @@ String taskNextStep(Map task, {String executor = 'service'}) {
   if (task['state'] == 'merged')
     return 'Merged on GitHub. Updating the base and deployment are separate.';
   if (task['state'] == 'closed') return 'Task closed.';
-  final target = task['merge_sha'] ?? task['head_sha'];
+  final target = taskValidationTarget(task);
   final build = (task['builds'] as Map?)?[target];
   // The map is keyed by target, but a record can carry a different `target`
   // field. Without this check a stale build reports the current candidate as
   // validated.
+  if (taskValidationNeedsRecheck(task, target)) {
+    if (task['validation_policy']['target'] != target)
+      return 'The policy assessment is for another commit. Validate latest commit again.';
+    return task['validation_policy']['reason']?.toString() ??
+        'Validation must be repeated under the current approved policy.';
+  }
   if (build is Map && build['target'] == target) {
     if (build['state'] == 'complete')
       return build['required_checks_verified'] == true

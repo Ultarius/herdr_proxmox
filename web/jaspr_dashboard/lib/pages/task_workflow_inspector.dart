@@ -69,7 +69,7 @@ extension _Inspector on _TaskWorkflowState {
     final id = _id(task),
         execution = task['execution'] as Map?,
         assignment = task['assignment'] as Map?,
-        target = task['merge_sha'] ?? task['head_sha'],
+        target = taskValidationTarget(task),
         build = _evidence(task),
         pull = task['pull'];
     final reviewer = (task['acceptance'] as Map?)?['reviewer_profile_id'];

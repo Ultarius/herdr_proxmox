@@ -254,6 +254,95 @@ void main() {
   );
 
   test(
+    'an old-policy pass offers revalidation in the next step and checks view',
+    () async {
+      final task = publishedTask()
+        ..['state'] = 'pr_open'
+        ..['merge_sha'] = 'c' * 40
+        ..['builds'] = {
+          'b' * 40: {
+            'target': 'b' * 40,
+            'state': 'complete',
+            'required_checks_verified': true,
+          },
+        }
+        ..['validation_policy'] = {
+          'target': 'b' * 40,
+          'matches': false,
+          'state': 'stale',
+          'reason':
+              'Recorded checks used a different policy. Validate latest commit under the current approved policy.',
+        };
+      await mount(const TasksPage(taskId: 'task'), (request) {
+        if (request.url.path.endsWith('/tasks/build')) {
+          task['validation_policy'] = null;
+          task['builds'] = {
+            'b' * 40: {'target': 'b' * 40, 'state': 'queued'},
+          };
+          return task;
+        }
+        return taskResponse(request, task);
+      });
+      final next = elements('.task-detail__next').single;
+      expect(next.textContent, contains('different policy'));
+      expect(next.textContent, isNot(contains('ready for review')));
+      expect(
+        next.querySelector('button')?.textContent,
+        'Validate latest commit',
+      );
+      await click('Checks & builds');
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('recorded checks passed; revalidation required'),
+      );
+      await click('Validate latest commit');
+      final request = posts.singleWhere(
+        (post) => post['path'] == '/api/tasks/build',
+      );
+      expect(request['target'], 'b' * 40);
+      expect(request['update_branch'], true);
+      expect(
+        elements(
+          'button',
+        ).where((node) => node.textContent == 'Validate latest commit'),
+        isEmpty,
+      );
+      expect(button('Validation in progress · view build').disabled, false);
+    },
+  );
+
+  test(
+    'current-policy complete evidence does not offer redundant validation',
+    () async {
+      final task = publishedTask()
+        ..['state'] = 'pr_open'
+        ..['builds'] = {
+          'b' * 40: {
+            'target': 'b' * 40,
+            'state': 'complete',
+            'required_checks_verified': true,
+          },
+        }
+        ..['validation_policy'] = {
+          'target': 'b' * 40,
+          'matches': true,
+          'state': 'current',
+        };
+      await mount(
+        const TasksPage(taskId: 'task'),
+        (request) => taskResponse(request, task),
+      );
+      expect(
+        elements(
+          'button',
+        ).where((node) => node.textContent == 'Validate latest commit'),
+        isEmpty,
+      );
+      expect(posts, isEmpty);
+    },
+  );
+
+  test(
     'validate latest commit authorizes an update and shows saved progress',
     () async {
       final task = publishedTask()..['state'] = 'review_ready';

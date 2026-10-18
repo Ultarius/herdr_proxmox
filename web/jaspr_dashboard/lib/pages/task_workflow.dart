@@ -5,7 +5,8 @@ import 'package:jaspr/dom.dart' as dom;
 import 'package:web/web.dart' as web;
 import '../ui.dart';
 import '../navigation.dart' as navigation;
-import 'task_activity.dart' show taskAgentName, taskNextStep, shortSha;
+import 'task_activity.dart'
+    show taskAgentName, taskNextStep, shortSha, taskValidationTarget;
 import 'task_state.dart';
 
 part 'task_workflow_layout.dart';
@@ -312,7 +313,7 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
   String _stateLabel(String key) => taskStateLabel(key);
   String _state(Map task) => taskState(task);
   Map? _evidence(Map task) {
-    final target = task['merge_sha'] ?? task['head_sha'];
+    final target = taskValidationTarget(task);
     final record = (task['builds'] as Map?)?[target];
     return target != null && record is Map && record['target'] == target
         ? record

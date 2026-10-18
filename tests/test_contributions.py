@@ -1297,7 +1297,9 @@ class ContributionTests(unittest.TestCase):
         self.assertNotIn('completion_token', detail['sessions'][0])
         self.assertNotIn('secret', detail['sessions'][0]['history'][0])
         self.assertEqual(self.service.get(task['id']), before)
-        change = self.service.commit_detail(task['id'], task['head_sha'])
+        with patch.object(self.service, 'validation_policy') as assessment:
+            change = self.service.commit_detail(task['id'], task['head_sha'])
+            assessment.assert_not_called()
         self.assertIn('+implementation', change['diff'])
         self.assertEqual(change['comparison'], 'first parent')
         with self.assertRaisesRegex(ValueError, 'task history'):
@@ -2138,6 +2140,67 @@ class ContributionTests(unittest.TestCase):
         self.assertTrue(again['required_checks_verified'])
         self.assertEqual(again['exit_code'], 0)
         self.assertEqual(again['checks'], [dict(id='test', status='passed')])
+
+    def test_detail_distinguishes_historical_pass_from_current_validation_policy(self):
+        task = self.candidate()
+        head = task['head_sha']
+        policy = toolchain_policy.resolve_committed(self.repo)
+        task['builds'] = {head: dict(target=head, state='complete', required_checks_verified=True,
+                                    policy_digest='old-policy', checks=[])}
+        self.service.save(task, 'build_result', 'tests')
+        before = self.service.get(task['id'])
+        with patch('toolchain_policy.resolve_committed', return_value=policy) as resolve:
+            detail = self.service.detail(task['id'])
+            resolve.assert_called_once()
+        self.assertEqual(detail['validation_policy']['state'], 'stale')
+        self.assertFalse(detail['validation_policy']['matches'])
+        self.assertEqual(detail['validation_policy']['policy_digest'], toolchain_policy.digest(policy))
+        self.assertTrue(detail['builds'][head]['required_checks_verified'])
+        self.assertEqual(self.service.get(task['id']), before)
+
+    def test_validation_policy_requires_identity_even_without_toolchains_and_reports_unknowns(self):
+        policy = dict(toolchains=[], declarations={}, lockfiles={}, checks=[])
+        task = dict(self.task, head_sha=self.base, state='review_ready', builds={self.base: dict(
+            target=self.base, state='complete', required_checks_verified=True, policy_digest=toolchain_policy.digest(policy))})
+        with patch('toolchain_policy.resolve_committed', return_value=policy) as resolve:
+            self.assertTrue(self.service.validation_policy(task)['matches'])
+            resolve.assert_called_once()
+            task['builds'][self.base].pop('policy_digest')
+            self.assertEqual(self.service.validation_policy(task)['state'], 'stale')
+        with patch('toolchain_policy.resolve_committed', side_effect=ValueError('unreadable policy')):
+            self.assertEqual(self.service.validation_policy(task)['state'], 'unavailable')
+        task['builds'][self.base]['state'] = 'queued'
+        with patch('toolchain_policy.resolve_committed') as resolve:
+            self.assertIsNone(self.service.validation_policy(task))
+            resolve.assert_not_called()
+
+    def test_revalidation_of_completed_sha_queues_new_policy_without_reusing_old_pass(self):
+        from build_queue import BuildQueue
+        from validation import ValidationRuns
+        task = self.candidate()
+        head = task['head_sha']
+        queue = BuildQueue(self.root / 'build-queue')
+        self.service.validation = ValidationRuns(self.root, self.service.build_event,
+            root=self.root / 'validation', queue=queue)
+        first = self.service.action('build', dict(request_id='first-policy', task_id=task['id'], target=head), 'admin', 'admin')
+        run = queue.get(first['builds'][head]['run_id'])
+        run.update(state='complete', required_checks_verified=True, checks=[])
+        queue.finish(run)
+        self.service.record_build(run['event_id'], dict(run_id=run['id'], target=head, state='complete',
+            required_checks_verified=True, policy_digest=run['policy_digest'], checks=[]))
+        approved = dict(toolchain_policy.resolve_committed(self.repo), checks=['new-approved-check'])
+        with patch('toolchain_policy.resolve_committed', return_value=approved):
+            self.assertFalse(self.service.validation_policy(self.service.get(task['id']))['matches'])
+            second = self.service.action('build', dict(request_id='second-policy', task_id=task['id'],
+                target=head, update_branch=True), 'admin', 'admin')
+            fresh = queue.get(second['builds'][head]['run_id'])
+            self.assertNotEqual(fresh['id'], run['id'])
+            self.assertEqual(fresh['state'], 'queued')
+            self.assertEqual(fresh['policy_digest'], toolchain_policy.digest(approved))
+            replay = self.service.action('build', dict(request_id='second-policy-retry', task_id=task['id'],
+                target=head, update_branch=True), 'admin', 'admin')
+            self.assertEqual(replay['builds'][head]['run_id'], fresh['id'])
+        self.assertEqual(queue.get(run['id'])['state'], 'complete')
 
     def test_background_poll_survives_storage_faults_and_never_publishes(self):
         task = self.candidate()

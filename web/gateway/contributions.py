@@ -1047,17 +1047,18 @@ class Contributions:
         except (ValueError, OSError, sqlite3.Error):
             return False
 
-    def policy_matches(self, task, evidence):
+    def policy_matches(self, task, evidence, approved=None):
         """Whether a run's evidence was produced under the approved policy.
 
         A candidate that changed the declaration, the checks or a lockfile has
         not been verified against the rules that now apply, so its evidence
         cannot authorise publication.
         """
-        try:
-            approved = toolchain_policy.resolve_committed(self.path_for(task))
-        except (OSError, ValueError):
-            return False
+        if approved is None:
+            try:
+                approved = toolchain_policy.resolve_committed(self.path_for(task))
+            except (OSError, ValueError):
+                return False
         if approved.get('plan_digest') and task.get('run_id'):
             try:
                 frozen = pr_repairs.validation_binding(task) or self.frozen_environment(task)
@@ -1067,6 +1068,31 @@ class Contributions:
                     or frozen.get('digest') != evidence.get('policy_digest')):
                 return False
         return toolchain_policy.evidence_matches(approved, evidence)
+
+    def validation_policy(self, task):
+        """Live detail-only assessment; a historical pass is not current admission.
+
+        Avoid resolving every repository during task-list polls. Admission still
+        rechecks on mutation; this observation only makes the next action honest.
+        """
+        target = task.get('merge_sha') if task['state'] == 'merged' else task.get('head_sha')
+        evidence = task.get('builds', {}).get(target, {})
+        if (not target or evidence.get('target') != target or evidence.get('state') != 'complete'
+                or evidence.get('required_checks_verified') is not True):
+            return None
+        result = dict(target=target, matches=False, assessed_at=stamp(),
+                      recorded_policy_digest=evidence.get('policy_digest'))
+        try:
+            approved = toolchain_policy.resolve_committed(self.path_for(task))
+        except (ValueError, OSError):
+            return dict(result, state='unavailable', reason='The approved validation policy could not be assessed. Inspect project configuration and validate again.')
+        current = toolchain_policy.digest(approved)
+        result['policy_digest'] = current
+        if evidence.get('policy_digest') != current:
+            return dict(result, state='stale', reason='Recorded checks used a different or missing policy identity. Validate latest commit under the current approved policy.')
+        if not self.policy_matches(task, evidence, approved):
+            return dict(result, state='stale', reason='Recorded evidence does not satisfy the current approved policy. Validate latest commit again.')
+        return dict(result, state='current', matches=True, reason='Recorded checks satisfy the current approved policy.')
 
     def frozen_environment(self, task):
         if not task.get('run_id'):
@@ -1940,7 +1966,7 @@ class Contributions:
             # no candidate to report.
             return False
 
-    def detail(self, task_id):
+    def detail(self, task_id, *, include_validation_policy=True):
         if not isinstance(task_id, str) or not re.fullmatch(r'[a-f0-9]{32}', task_id):
             raise ValueError('Select a valid task.')
         task = self.get(task_id)
@@ -2038,6 +2064,12 @@ class Contributions:
             except (ValueError, OSError) as error:
                 task['history_error'] = str(error)[:500]
                 task['commit_graph'] = []
+        if include_validation_policy:
+            # Resolve once per task detail request: this is live readiness, not
+            # immutable commit data. Commit-only views do not need it.
+            # Discovery is revision-cached by the resolver; approval and prepared
+            # environment receipts can change without a repository HEAD change.
+            task['validation_policy'] = self.validation_policy(task)
         return task
 
     @staticmethod
@@ -2062,7 +2094,7 @@ class Contributions:
         return result
 
     def commit_detail(self, task_id, sha):
-        task = self.detail(task_id)
+        task = self.detail(task_id, include_validation_policy=False)
         if not SHA.fullmatch(str(sha)) or sha not in {n['sha'] for n in task.get('commit_graph', [])}:
             raise ValueError('Select a commit from this task history.')
         repository = self.path_for(task)

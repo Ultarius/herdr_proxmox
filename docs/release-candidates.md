@@ -30,6 +30,19 @@ distinguish them. Eligibility snapshots reuse loaded tasks and batch missing
 records on one connection. Notifications omit unchanged and audit-only saves,
 while retaining real incorporation progress.
 
+If freezing reports that recorded checks used a different policy, open that
+member's task. **Validate latest commit** appears in its top **Next step** area
+and in the bottom actions, even if a historical run passed. **Checks & builds**
+distinguishes that recorded pass from current-policy readiness. The detail page
+assesses the current approved policy without rewriting the historical evidence;
+an unavailable policy assessment does not count as a current pass.
+
+Validation may queue the existing branch-update process when upstream policy
+files moved. If that captures a new candidate SHA, remove and add the member
+again to review its new selection before freezing. The durable build queue
+already distinguishes policies for the same commit, so a new approved policy
+can create a fresh run without discarding the older result.
+
 ## Plans from group discussions
 
 Enable **Create release plans from group discussions automatically** in the

@@ -3,6 +3,29 @@ import 'package:juice/juice.dart';
 import 'package:herdr_dashboard/task_activity.dart';
 
 void main() {
+  test('validation uses the candidate until the task is merged', () {
+    final task = <String, dynamic>{
+      'state': 'pr_open',
+      'head_sha': 'candidate',
+      // An old or stray merge identity must not change the validation target.
+      'merge_sha': 'merge',
+      'validation_policy': {'target': 'candidate', 'matches': true},
+      'builds': {
+        'candidate': {
+          'target': 'candidate',
+          'state': 'complete',
+          'required_checks_verified': true,
+        },
+      },
+    };
+    expect(taskValidationTarget(task), 'candidate');
+    expect(taskNextStep(task), contains('ready for review'));
+    task['state'] = 'merged';
+    expect(taskValidationTarget(task), 'merge');
+    task.remove('merge_sha');
+    expect(taskValidationTarget(task), isNull);
+  });
+
   testWidgets(
     'superseded chat reference is visible without expanding raw audit',
     (tester) async {
@@ -183,4 +206,42 @@ void main() {
     };
     expect(taskNextStep(exact), contains('ready for review'));
   });
+  test(
+    'historical checks do not claim readiness under a changed or unknown policy',
+    () {
+      final head = 'a' * 40;
+      final task = <String, dynamic>{
+        'state': 'pr_open',
+        'head_sha': head,
+        'builds': {
+          head: {
+            'target': head,
+            'state': 'complete',
+            'required_checks_verified': true,
+          },
+        },
+        'validation_policy': {
+          'target': head,
+          'matches': false,
+          'state': 'stale',
+          'reason': 'Policy changed. Validate latest commit.',
+        },
+      };
+      expect(taskValidationNeedsRecheck(task, head), true);
+      expect(taskNextStep(task), 'Policy changed. Validate latest commit.');
+      task['validation_policy'] = {
+        'target': head,
+        'matches': false,
+        'state': 'unavailable',
+        'reason': 'Current policy could not be assessed.',
+      };
+      expect(taskNextStep(task), 'Current policy could not be assessed.');
+      task['validation_policy'] = {'target': 'b' * 40, 'matches': true};
+      expect(taskValidationNeedsRecheck(task, head), true);
+      expect(taskNextStep(task), contains('another commit'));
+      task['validation_policy'] = {'target': head, 'matches': true};
+      expect(taskValidationNeedsRecheck(task, head), false);
+      expect(taskNextStep(task), contains('ready for review'));
+    },
+  );
 }

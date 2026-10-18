@@ -2015,7 +2015,7 @@ class _TasksPageState extends State<TasksPage> {
         ),
       );
     }
-    final target = task['merge_sha'] ?? task['head_sha'];
+    final target = taskValidationTarget(task);
     final evidence = (task['builds'] as Map?)?[target] as Map?;
     if (task['launch_retryable'] == true) {
       return FilledButton.icon(
@@ -2237,6 +2237,7 @@ class _TasksPageState extends State<TasksPage> {
     }
     if (target == null || ['closed', 'completed'].contains(task['state']))
       return const SizedBox.shrink();
+    if (taskValidationNeedsRecheck(task, target)) return _validateAction(task);
     if (task['task_publication_allowed'] != false &&
         task['state'] == 'published' &&
         task['pull'] == null &&
@@ -2810,14 +2811,16 @@ class _TasksPageState extends State<TasksPage> {
           if (section == 'Checks & builds') ...[
             Builder(
               builder: (context) {
-                final target = task['merge_sha'] ?? task['head_sha'];
+                final target = taskValidationTarget(task);
                 final build = (task['builds'] as Map?)?[target];
                 final label = build is! Map
                     ? 'not run'
                     : build['state'] == 'complete'
                     ? (build['target'] == target &&
                               build['required_checks_verified'] == true
-                          ? 'verified'
+                          ? (taskValidationNeedsRecheck(task, target)
+                                ? 'recorded checks passed; revalidation required'
+                                : 'verified')
                           : 'finished without verified required checks')
                     : '${build['state']}';
                 return Text('Current candidate validation: $label');
@@ -2826,7 +2829,7 @@ class _TasksPageState extends State<TasksPage> {
             if (task['builds'] is Map)
               for (final entry in (task['builds'] as Map).entries)
                 if (entry.value is Map)
-                  if (entry.key == (task['merge_sha'] ?? task['head_sha']))
+                  if (entry.key == taskValidationTarget(task))
                     _buildEvidence('${entry.key}', entry.value)
                   else
                     ExpansionTile(
@@ -3131,23 +3134,25 @@ class _TasksPageState extends State<TasksPage> {
     ],
   );
 
-  /// Validation for the current target. Verified evidence hides the action
-  /// (the durable queue would not re-run it) and an in-flight build disables it.
+  /// A historical pass hides validation only while its approved policy matches.
+  /// The durable queue separates policy identities. Next step links to active builds.
   Widget _validateAction(Map<String, dynamic> task) {
-    final target = task['state'] == 'merged'
-        ? task['merge_sha']
-        : task['head_sha'];
+    final target = taskValidationTarget(task);
     if (target == null) return const SizedBox.shrink();
     final build = (task['builds'] as Map?)?[target];
     if (build is Map &&
         build['target'] == target &&
         build['state'] == 'complete' &&
-        build['required_checks_verified'] == true)
+        build['required_checks_verified'] == true &&
+        !taskValidationNeedsRecheck(task, target))
       return const SizedBox.shrink();
     final running =
-        build is Map && ['queued', 'running'].contains(build['state']);
+        build is Map &&
+        build['target'] == target &&
+        ['queued', 'running'].contains(build['state']);
+    if (running) return const SizedBox.shrink();
     return OutlinedButton(
-      onPressed: admin && !busy && !running
+      onPressed: admin && !busy
           ? () => act('build', {
               'task_id': task['id'],
               'target': target,
@@ -3157,7 +3162,7 @@ class _TasksPageState extends State<TasksPage> {
       child: Text(
         task['state'] == 'merged'
             ? 'Build merged result'
-            : 'Validate candidate',
+            : 'Validate latest commit',
       ),
     );
   }

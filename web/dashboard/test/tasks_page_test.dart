@@ -7,6 +7,36 @@ import 'package:herdr_dashboard/dashboard_bloc.dart';
 import 'package:herdr_dashboard/tasks_page.dart';
 import 'package:herdr_dashboard/routes.dart';
 
+Future<void> withDashboardConnection(
+  WidgetTester tester,
+  DashboardBloc connection,
+  Future<void> Function() body,
+) async {
+  var cleaned = false;
+  Future<void> cleanup() async {
+    if (cleaned) return;
+    cleaned = true;
+    try {
+      await tester.pumpWidget(const SizedBox.shrink());
+    } finally {
+      try {
+        await connection.disconnect();
+      } finally {
+        await BlocScope.reset();
+      }
+    }
+  }
+
+  addTearDown(cleanup);
+  try {
+    await body();
+  } finally {
+    // Flutter checks pending timers before addTearDown runs. Cancel polling
+    // here even when an assertion fails; teardown remains the safety net.
+    await cleanup();
+  }
+}
+
 void main() {
   testWidgets(
     'draft PR previews public text and sends only after confirmation',
@@ -53,46 +83,45 @@ void main() {
           );
         }),
       );
-      BlocScope.register<DashboardBloc>(() => connection);
-      connection.connect('token');
-      connection.operator.value = {'role': 'admin'};
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: Scaffold(body: TasksPage(taskId: 'task')),
-        ),
-      );
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Changes'));
-      await tester.pumpAndSettle();
-      await tester.ensureVisible(find.text('Open draft PR'));
-      await tester.tap(find.text('Open draft PR'));
-      await tester.pumpAndSettle();
-      expect(find.text('Preview draft pull request'), findsOneWidget);
-      expect(find.textContaining('Exact candidate: $head'), findsOneWidget);
-      expect(posts, isEmpty);
-      await tester.tap(find.text('Cancel'));
-      await tester.pumpAndSettle();
-      expect(posts, isEmpty);
-      await tester.tap(find.text('Open draft PR'));
-      await tester.pumpAndSettle();
-      await tester.enterText(
-        find.widgetWithText(TextFormField, 'PR title'),
-        'Edited PR title',
-      );
-      await tester.enterText(
-        find.widgetWithText(TextFormField, 'PR description (Markdown)'),
-        'Edited public description.',
-      );
-      await tester.tap(find.text('Create draft PR'));
-      await tester.pumpAndSettle();
-      expect(posts.single['title'], 'Edited PR title');
-      expect(posts.single['body'], 'Edited public description.');
-      expect(posts.single['head_sha'], head);
-      expect(posts.single['reviewed'], isTrue);
-      expect(tester.takeException(), isNull);
-      await tester.pumpWidget(const SizedBox.shrink());
-      await connection.disconnect();
-      await BlocScope.reset();
+      await withDashboardConnection(tester, connection, () async {
+        BlocScope.register<DashboardBloc>(() => connection);
+        connection.connect('token');
+        connection.operator.value = {'role': 'admin'};
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: TasksPage(taskId: 'task')),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Changes'));
+        await tester.pumpAndSettle();
+        await tester.ensureVisible(find.text('Open draft PR'));
+        await tester.tap(find.text('Open draft PR'));
+        await tester.pumpAndSettle();
+        expect(find.text('Preview draft pull request'), findsOneWidget);
+        expect(find.textContaining('Exact candidate: $head'), findsOneWidget);
+        expect(posts, isEmpty);
+        await tester.tap(find.text('Cancel'));
+        await tester.pumpAndSettle();
+        expect(posts, isEmpty);
+        await tester.tap(find.text('Open draft PR'));
+        await tester.pumpAndSettle();
+        await tester.enterText(
+          find.widgetWithText(TextFormField, 'PR title'),
+          'Edited PR title',
+        );
+        await tester.enterText(
+          find.widgetWithText(TextFormField, 'PR description (Markdown)'),
+          'Edited public description.',
+        );
+        await tester.tap(find.text('Create draft PR'));
+        await tester.pumpAndSettle();
+        expect(posts.single['title'], 'Edited PR title');
+        expect(posts.single['body'], 'Edited public description.');
+        expect(posts.single['head_sha'], head);
+        expect(posts.single['reviewed'], isTrue);
+        expect(tester.takeException(), isNull);
+      });
     },
   );
 
@@ -148,50 +177,51 @@ void main() {
           );
         }),
       );
-      BlocScope.register<DashboardBloc>(() => connection);
-      connection.connect('token');
-      connection.operator.value = {'name': 'admin', 'role': 'admin'};
-      await tester.pumpWidget(
-        const MaterialApp(home: Scaffold(body: TasksPage(taskId: 'task-1'))),
-      );
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Changes'));
-      await tester.pumpAndSettle();
-      await tester.scrollUntilVisible(
-        find.text('Open draft PR'),
-        200,
-        scrollable: find.byType(Scrollable).first,
-      );
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Open draft PR'));
-      await tester.pumpAndSettle();
-      expect(find.text('Preview draft pull request'), findsOneWidget);
-      final description = find.widgetWithText(
-        TextFormField,
-        'PR description (Markdown)',
-      );
-      // The excerpt publishes internal deliberation, so it stays out of the
-      // default body and is offered as an explicit choice.
-      expect(
-        tester.widget<TextFormField>(description).controller!.text,
-        isNot(contains('Group findings')),
-      );
-      final optIn = find.text('Include the finalized discussion excerpt');
-      await tester.ensureVisible(optIn);
-      await tester.pumpAndSettle();
-      await tester.tap(optIn);
-      await tester.pumpAndSettle();
-      expect(
-        tester.widget<TextFormField>(description).controller!.text,
-        contains('Group findings'),
-      );
-      await tester.tap(find.text('Create draft PR'));
-      await tester.pumpAndSettle();
-      expect(posts.single['body'], contains('Group findings'));
-      expect(tester.takeException(), isNull);
-      await tester.pumpWidget(const SizedBox.shrink());
-      await connection.disconnect();
-      await BlocScope.reset();
+      await withDashboardConnection(tester, connection, () async {
+        BlocScope.register<DashboardBloc>(() => connection);
+        connection.connect('token');
+        connection.operator.value = {'name': 'admin', 'role': 'admin'};
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: TasksPage(taskId: 'task-1')),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Changes'));
+        await tester.pumpAndSettle();
+        await tester.scrollUntilVisible(
+          find.text('Open draft PR'),
+          200,
+          scrollable: find.byType(Scrollable).first,
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Open draft PR'));
+        await tester.pumpAndSettle();
+        expect(find.text('Preview draft pull request'), findsOneWidget);
+        final description = find.widgetWithText(
+          TextFormField,
+          'PR description (Markdown)',
+        );
+        // The excerpt publishes internal deliberation, so it stays out of the
+        // default body and is offered as an explicit choice.
+        expect(
+          tester.widget<TextFormField>(description).controller!.text,
+          isNot(contains('Group findings')),
+        );
+        final optIn = find.text('Include the finalized discussion excerpt');
+        await tester.ensureVisible(optIn);
+        await tester.pumpAndSettle();
+        await tester.tap(optIn);
+        await tester.pumpAndSettle();
+        expect(
+          tester.widget<TextFormField>(description).controller!.text,
+          contains('Group findings'),
+        );
+        await tester.tap(find.text('Create draft PR'));
+        await tester.pumpAndSettle();
+        expect(posts.single['body'], contains('Group findings'));
+        expect(tester.takeException(), isNull);
+      });
     });
   }
 
@@ -263,74 +293,76 @@ void main() {
         );
       }),
     );
-    BlocScope.register<DashboardBloc>(() => connection);
-    connection.connect('token');
-    connection.operator.value = {'role': 'admin'};
-    await tester.pumpWidget(
-      const MaterialApp(home: Scaffold(body: TasksPage())),
-    );
-    await tester.pumpAndSettle();
-    // Setup reports capability, and never claims to have exercised a write.
-    expect(find.textContaining('Token write access has not been tested'), findsOneWidget);
-    expect(
-      find.textContaining('Different GitHub authentication is required'),
-      findsOneWidget,
-    );
-    await tester.tap(find.text('Open task'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Changes'));
-    await tester.pumpAndSettle();
-    await tester.scrollUntilVisible(
-      find.text('Configure authentication for upstream PR'),
-      200,
-      scrollable: find.byType(Scrollable).first,
-    );
-    await tester.pumpAndSettle();
-    expect(find.text('Open draft PR'), findsNothing);
-    await tester.tap(find.text('Configure authentication for upstream PR'));
-    await tester.pumpAndSettle();
-    expect(find.text('GitHub publishing'), findsOneWidget);
-    expect(posts, isEmpty);
-    await tester.tap(find.text('Cancel'));
-    await tester.pumpAndSettle();
-    // Once compatible authentication is configured, the existing PR preview
-    // still distinguishes the fork branch from the upstream target.
-    prCapability = 'supported';
-    await tester.pump(const Duration(seconds: 15));
-    await tester.pumpAndSettle();
-    await tester.scrollUntilVisible(
-      find.text('Open draft PR'),
-      200,
-      scrollable: find.byType(Scrollable).first,
-    );
-    await tester.pumpAndSettle();
-    // The branch destination and the pull request target are separate.
-    expect(
-      find.textContaining(
-        'Publish branch to: contributor/repo\nOpen draft PR into: owner/repo',
-      ),
-      findsOneWidget,
-    );
-    await tester.tap(find.text('Open draft PR'));
-    await tester.pumpAndSettle();
-    expect(
-      find.textContaining(
-        'Publish branch to: contributor/repo\n\nOpen draft PR into: owner/repo',
-      ),
-      findsOneWidget,
-    );
-    expect(
-      find.textContaining('Source branch: contributor:$branch'),
-      findsOneWidget,
-    );
-    await tester.tap(find.text('Create draft PR'));
-    await tester.pumpAndSettle();
-    expect(posts.single['head_sha'], head);
-    expect(posts.single['reviewed'], isTrue);
-    expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox.shrink());
-    await connection.disconnect();
-    await BlocScope.reset();
+    await withDashboardConnection(tester, connection, () async {
+      BlocScope.register<DashboardBloc>(() => connection);
+      connection.connect('token');
+      connection.operator.value = {'role': 'admin'};
+      await tester.pumpWidget(
+        const MaterialApp(home: Scaffold(body: TasksPage())),
+      );
+      await tester.pumpAndSettle();
+      // Setup reports capability, and never claims to have exercised a write.
+      expect(
+        find.textContaining('Token write access has not been tested'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('Different GitHub authentication is required'),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Open task'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Changes'));
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(
+        find.text('Configure authentication for upstream PR'),
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Open draft PR'), findsNothing);
+      await tester.tap(find.text('Configure authentication for upstream PR'));
+      await tester.pumpAndSettle();
+      expect(find.text('GitHub publishing'), findsOneWidget);
+      expect(posts, isEmpty);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      // Once compatible authentication is configured, the existing PR preview
+      // still distinguishes the fork branch from the upstream target.
+      prCapability = 'supported';
+      await tester.pump(const Duration(seconds: 15));
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(
+        find.text('Open draft PR'),
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.pumpAndSettle();
+      // The branch destination and the pull request target are separate.
+      expect(
+        find.textContaining(
+          'Publish branch to: contributor/repo\nOpen draft PR into: owner/repo',
+        ),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Open draft PR'));
+      await tester.pumpAndSettle();
+      expect(
+        find.textContaining(
+          'Publish branch to: contributor/repo\n\nOpen draft PR into: owner/repo',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('Source branch: contributor:$branch'),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Create draft PR'));
+      await tester.pumpAndSettle();
+      expect(posts.single['head_sha'], head);
+      expect(posts.single['reviewed'], isTrue);
+      expect(tester.takeException(), isNull);
+    });
   });
 
   test(
@@ -378,21 +410,21 @@ void main() {
           return http.Response('{"workspaces":[],"agents":[]}', 200);
         }),
       );
-      BlocScope.register<DashboardBloc>(() => connection);
-      await connection.restoreSession();
-      await tester.pumpAndSettle();
-      final generation = connection.generation;
-      await expectLater(
-        connection.request('tasks/refresh', {
-          'task_id': 'task',
-          'request_id': 'retry',
-        }),
-        throwsA(isA<Exception>()),
-      );
-      expect(connection.generation, generation);
-      expect(connection.state.connected, isTrue);
-      await connection.disconnect();
-      await BlocScope.reset();
+      await withDashboardConnection(tester, connection, () async {
+        BlocScope.register<DashboardBloc>(() => connection);
+        await connection.restoreSession();
+        await tester.pumpAndSettle();
+        final generation = connection.generation;
+        await expectLater(
+          connection.request('tasks/refresh', {
+            'task_id': 'task',
+            'request_id': 'retry',
+          }),
+          throwsA(isA<Exception>()),
+        );
+        expect(connection.generation, generation);
+        expect(connection.state.connected, isTrue);
+      });
     },
   );
   for (final brightness in Brightness.values) {
@@ -429,38 +461,37 @@ void main() {
             ),
           ),
         );
-        BlocScope.register<DashboardBloc>(() => connection);
-        connection.connect('token');
-        connection.operator.value = {'name': 'admin', 'role': 'admin'};
-        await tester.pumpWidget(
-          MaterialApp(
-            theme: ThemeData(brightness: brightness),
-            home: const Scaffold(body: TasksPage()),
-          ),
-        );
-        await tester.pumpAndSettle();
-        // Drafts are proposals awaiting an operator, so they sit under a header
-        // rather than mixed into work that is actually in flight.
-        expect(find.text('Drafts (1)'), findsOneWidget);
-        expect(
-          tester.getTopLeft(find.text('Proposed follow-up')).dy,
-          greaterThan(tester.getTopLeft(find.text('Implement feature')).dy),
-        );
-        final caption = find.text(
-          'Work that has not started. Open a task for its next step.',
-        );
-        final text = tester.widget<Text>(caption);
-        final theme = Theme.of(tester.element(caption));
-        final foreground = text.style!.color!.computeLuminance();
-        final background = theme.scaffoldBackgroundColor.computeLuminance();
-        final ratio = foreground > background
-            ? (foreground + 0.05) / (background + 0.05)
-            : (background + 0.05) / (foreground + 0.05);
-        expect(ratio, greaterThanOrEqualTo(4.5));
-        expect(tester.takeException(), isNull);
-        await tester.pumpWidget(const SizedBox());
-        await connection.disconnect();
-        await BlocScope.reset();
+        await withDashboardConnection(tester, connection, () async {
+          BlocScope.register<DashboardBloc>(() => connection);
+          connection.connect('token');
+          connection.operator.value = {'name': 'admin', 'role': 'admin'};
+          await tester.pumpWidget(
+            MaterialApp(
+              theme: ThemeData(brightness: brightness),
+              home: const Scaffold(body: TasksPage()),
+            ),
+          );
+          await tester.pumpAndSettle();
+          // Drafts are proposals awaiting an operator, so they sit under a header
+          // rather than mixed into work that is actually in flight.
+          expect(find.text('Drafts (1)'), findsOneWidget);
+          expect(
+            tester.getTopLeft(find.text('Proposed follow-up')).dy,
+            greaterThan(tester.getTopLeft(find.text('Implement feature')).dy),
+          );
+          final caption = find.text(
+            'Work that has not started. Open a task for its next step.',
+          );
+          final text = tester.widget<Text>(caption);
+          final theme = Theme.of(tester.element(caption));
+          final foreground = text.style!.color!.computeLuminance();
+          final background = theme.scaffoldBackgroundColor.computeLuminance();
+          final ratio = foreground > background
+              ? (foreground + 0.05) / (background + 0.05)
+              : (background + 0.05) / (foreground + 0.05);
+          expect(ratio, greaterThanOrEqualTo(4.5));
+          expect(tester.takeException(), isNull);
+        });
       });
     }
   }
@@ -523,33 +554,32 @@ void main() {
             return http.Response('{"workspaces":[],"agents":[]}', 200);
           }),
         );
-        BlocScope.register<DashboardBloc>(() => connection);
-        connection.connect('token');
-        connection.operator.value = {'name': 'admin', 'role': 'admin'};
-        await tester.pumpWidget(
-          MaterialApp(
-            theme: ThemeData(brightness: brightness),
-            home: const Scaffold(body: TasksPage(taskId: 'task-1')),
-          ),
-        );
-        await tester.pumpAndSettle();
-        expect(find.text('Implement feature'), findsOneWidget);
-        await tester.ensureVisible(find.text('Review and publish'));
-        await tester.pumpAndSettle();
-        await tester.tap(find.text('Review and publish'));
-        await tester.pumpAndSettle();
-        expect(find.text('Review and publish candidate'), findsOneWidget);
-        expect(published, isEmpty);
-        await tester.ensureVisible(find.text('Approve publication'));
-        await tester.pumpAndSettle();
-        await tester.tap(find.text('Approve publication'));
-        await tester.pumpAndSettle();
-        expect(published.single['head_sha'], ''.padLeft(40, 'b'));
-        expect(published.single['request_id'], isNotEmpty);
-        expect(tester.takeException(), isNull);
-        await tester.pumpWidget(const SizedBox.shrink());
-        await connection.disconnect();
-        await BlocScope.reset();
+        await withDashboardConnection(tester, connection, () async {
+          BlocScope.register<DashboardBloc>(() => connection);
+          connection.connect('token');
+          connection.operator.value = {'name': 'admin', 'role': 'admin'};
+          await tester.pumpWidget(
+            MaterialApp(
+              theme: ThemeData(brightness: brightness),
+              home: const Scaffold(body: TasksPage(taskId: 'task-1')),
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(find.text('Implement feature'), findsOneWidget);
+          await tester.ensureVisible(find.text('Review and publish'));
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('Review and publish'));
+          await tester.pumpAndSettle();
+          expect(find.text('Review and publish candidate'), findsOneWidget);
+          expect(published, isEmpty);
+          await tester.ensureVisible(find.text('Approve publication'));
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('Approve publication'));
+          await tester.pumpAndSettle();
+          expect(published.single['head_sha'], ''.padLeft(40, 'b'));
+          expect(published.single['request_id'], isNotEmpty);
+          expect(tester.takeException(), isNull);
+        });
       });
     }
   }
@@ -633,53 +663,57 @@ void main() {
         ),
       ),
     );
-    BlocScope.register<DashboardBloc>(() => connection);
-    connection.connect('token');
-    connection.operator.value = {'name': 'admin', 'role': 'admin'};
-    await tester.pumpWidget(
-      const MaterialApp(
-        home: Scaffold(body: TasksPage(taskId: 'task-1')),
-      ),
-    );
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Changes'));
-    await tester.pumpAndSettle();
-    // Conflicts are only reported for a pull request that can still merge.
-    expect(find.textContaining('PR #7 · Open for review'), findsOneWidget);
-    expect(find.text('GitHub reports merge conflicts.'), findsOneWidget);
-    expect(find.textContaining('PR has merge conflicts'), findsOneWidget);
-    await tester.pumpWidget(
-      const MaterialApp(
-        home: Scaffold(
-          body: TasksPage(key: ValueKey('merged'), taskId: 'task-2'),
+    await withDashboardConnection(tester, connection, () async {
+      BlocScope.register<DashboardBloc>(() => connection);
+      connection.connect('token');
+      connection.operator.value = {'name': 'admin', 'role': 'admin'};
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(body: TasksPage(taskId: 'task-1')),
         ),
-      ),
-    );
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Changes'));
-    await tester.pumpAndSettle();
-    // A merged pull request is never presented as awaiting review.
-    expect(find.textContaining('PR #8 · Merged'), findsOneWidget);
-    expect(find.text('Merged · repo'), findsOneWidget);
-    expect(find.textContaining('Merged result: $merge'), findsOneWidget);
-    expect(find.text('Build merged result'), findsOneWidget);
-    await tester.tap(find.text('Checks & builds'));
-    await tester.pumpAndSettle();
-    await tester.ensureVisible(find.textContaining('Previous candidate build'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.textContaining('Previous candidate build'));
-    await tester.pumpAndSettle();
-    expect(
-      find.text('Does not validate the current candidate.'),
-      findsOneWidget,
-    );
-    expect(find.textContaining('required checks not verified'), findsOneWidget);
-    expect(find.textContaining('not evidence of a pass'), findsOneWidget);
-    expect(find.text('unit: failed'), findsOneWidget);
-    expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox.shrink());
-    await connection.disconnect();
-    await BlocScope.reset();
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Changes'));
+      await tester.pumpAndSettle();
+      // Conflicts are only reported for a pull request that can still merge.
+      expect(find.textContaining('PR #7 · Open for review'), findsOneWidget);
+      expect(find.text('GitHub reports merge conflicts.'), findsOneWidget);
+      expect(find.textContaining('PR has merge conflicts'), findsOneWidget);
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: TasksPage(key: ValueKey('merged'), taskId: 'task-2'),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Changes'));
+      await tester.pumpAndSettle();
+      // A merged pull request is never presented as awaiting review.
+      expect(find.textContaining('PR #8 · Merged'), findsOneWidget);
+      expect(find.text('Merged · repo'), findsOneWidget);
+      expect(find.textContaining('Merged result: $merge'), findsOneWidget);
+      expect(find.text('Build merged result'), findsOneWidget);
+      await tester.tap(find.text('Checks & builds'));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(
+        find.textContaining('Previous candidate build'),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.textContaining('Previous candidate build'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Does not validate the current candidate.'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('required checks not verified'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('not evidence of a pass'), findsOneWidget);
+      expect(find.text('unit: failed'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    });
   });
 
   testWidgets(
@@ -718,36 +752,35 @@ void main() {
           ),
         ),
       );
-      BlocScope.register<DashboardBloc>(() => connection);
-      connection.connect('token');
-      connection.operator.value = {'name': 'admin', 'role': 'admin'};
-      await tester.pumpWidget(
-        const MaterialApp(home: Scaffold(body: TasksPage())),
-      );
-      await tester.pumpAndSettle();
-      expect(find.textContaining('mode 0600'), findsOneWidget);
-      await tester.tap(find.text('Open task'));
-      await tester.pumpAndSettle();
-      await tester.scrollUntilVisible(
-        find.text('Open draft PR'),
-        200,
-        scrollable: find.byType(Scrollable).first,
-      );
-      await tester.pumpAndSettle();
-      // Publishing actions stay disabled rather than failing after the click.
-      expect(
-        tester
-            .widget<FilledButton>(
-              find.widgetWithText(FilledButton, 'Open draft PR'),
-            )
-            .onPressed,
-        isNull,
-      );
-      // There is no pull request yet, so there is nothing to refresh.
-      expect(find.text('Refresh PR status'), findsNothing);
-      await tester.pumpWidget(const SizedBox.shrink());
-      await connection.disconnect();
-      await BlocScope.reset();
+      await withDashboardConnection(tester, connection, () async {
+        BlocScope.register<DashboardBloc>(() => connection);
+        connection.connect('token');
+        connection.operator.value = {'name': 'admin', 'role': 'admin'};
+        await tester.pumpWidget(
+          const MaterialApp(home: Scaffold(body: TasksPage())),
+        );
+        await tester.pumpAndSettle();
+        expect(find.textContaining('mode 0600'), findsOneWidget);
+        await tester.tap(find.text('Open task'));
+        await tester.pumpAndSettle();
+        await tester.scrollUntilVisible(
+          find.text('Open draft PR'),
+          200,
+          scrollable: find.byType(Scrollable).first,
+        );
+        await tester.pumpAndSettle();
+        // Publishing actions stay disabled rather than failing after the click.
+        expect(
+          tester
+              .widget<FilledButton>(
+                find.widgetWithText(FilledButton, 'Open draft PR'),
+              )
+              .onPressed,
+          isNull,
+        );
+        // There is no pull request yet, so there is nothing to refresh.
+        expect(find.text('Refresh PR status'), findsNothing);
+      });
     },
   );
 
@@ -764,96 +797,96 @@ void main() {
         ),
       ),
     );
-    BlocScope.register<DashboardBloc>(() => connection);
-    connection.connect('token');
-    connection.operator.value = {'name': 'viewer', 'role': 'operator'};
-    await tester.pumpWidget(
-      const MaterialApp(home: Scaffold(body: TasksPage())),
-    );
-    await tester.pumpAndSettle();
-    expect(
-      tester
-          .widget<FilledButton>(
-            find.widgetWithText(FilledButton, 'Create task'),
-          )
-          .onPressed,
-      isNull,
-    );
-    expect(
-      tester
-          .widget<OutlinedButton>(
-            find.widgetWithText(OutlinedButton, 'GitHub publishing'),
-          )
-          .onPressed,
-      isNull,
-    );
-    await tester.pumpWidget(const SizedBox.shrink());
-    await connection.disconnect();
-    await BlocScope.reset();
+    await withDashboardConnection(tester, connection, () async {
+      BlocScope.register<DashboardBloc>(() => connection);
+      connection.connect('token');
+      connection.operator.value = {'name': 'viewer', 'role': 'operator'};
+      await tester.pumpWidget(
+        const MaterialApp(home: Scaffold(body: TasksPage())),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<FilledButton>(
+              find.widgetWithText(FilledButton, 'Create task'),
+            )
+            .onPressed,
+        isNull,
+      );
+      expect(
+        tester
+            .widget<OutlinedButton>(
+              find.widgetWithText(OutlinedButton, 'GitHub publishing'),
+            )
+            .onPressed,
+        isNull,
+      );
+    });
   });
 
-  testWidgets('queued validation links to the builds page', (tester) async {
-    tester.view.physicalSize = const Size(1280, 1400);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
-    final head = ''.padLeft(40, 'b');
-    final task = {
-      'id': 'task-1',
-      'title': 'Implement feature',
-      'state': 'review_ready',
-      'repository': 'repo',
-      'github_repository': 'owner/repo',
-      'run_id': 'run',
-      'branch': 'herdr/task-abcdefabcdef',
-      'base_ref': 'refs/remotes/origin/main',
-      'base_sha': ''.padLeft(40, 'a'),
-      'head_sha': head,
-      'builds': {
-        head: {'run_id': 'run-1', 'state': 'queued', 'target': head},
-      },
-      'audit': [],
-    };
-    final connection = DashboardBloc(
-      client: MockClient(
-        (request) async => http.Response(
-          jsonEncode(
-            request.url.path.endsWith('/tasks/detail')
-                ? task
-                : {
-                    'tasks': [task],
-                    'github': {'configured': false},
-                    'executor': 'service',
-                  },
+  for (final state in ['queued', 'running']) {
+    testWidgets('$state validation links to the builds page', (tester) async {
+      tester.view.physicalSize = const Size(1280, 1400);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final head = ''.padLeft(40, 'b');
+      final task = {
+        'id': 'task-1',
+        'title': 'Implement feature',
+        'state': 'review_ready',
+        'repository': 'repo',
+        'github_repository': 'owner/repo',
+        'run_id': 'run',
+        'branch': 'herdr/task-abcdefabcdef',
+        'base_ref': 'refs/remotes/origin/main',
+        'base_sha': ''.padLeft(40, 'a'),
+        'head_sha': head,
+        'builds': {
+          head: {'run_id': 'run-1', 'state': state, 'target': head},
+        },
+        'audit': [],
+      };
+      final connection = DashboardBloc(
+        client: MockClient(
+          (request) async => http.Response(
+            jsonEncode(
+              request.url.path.endsWith('/tasks/detail')
+                  ? task
+                  : {
+                      'tasks': [task],
+                      'github': {'configured': false},
+                      'executor': 'service',
+                    },
+            ),
+            200,
           ),
-          200,
         ),
-      ),
-    );
-    BlocScope.register<DashboardBloc>(() => connection);
-    connection.connect('token');
-    connection.operator.value = {'name': 'admin', 'role': 'admin'};
-    await tester.pumpWidget(
-      MaterialApp(
-        home: Scaffold(
-          body: TasksPage(taskId: 'task-1', coordinator: AppCoordinator()),
-        ),
-      ),
-    );
-    await tester.pumpAndSettle();
-    final chip = find.widgetWithText(
-      OutlinedButton,
-      'Validation in progress \u00b7 view build',
-    );
-    expect(chip, findsOneWidget);
-    expect(find.text('Validate latest commit'), findsNothing);
-    // The link is usable rather than a disabled "in progress" button.
-    expect(tester.widget<OutlinedButton>(chip).onPressed, isNotNull);
-    expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox.shrink());
-    await connection.disconnect();
-    await BlocScope.reset();
-  });
+      );
+      await withDashboardConnection(tester, connection, () async {
+        BlocScope.register<DashboardBloc>(() => connection);
+        connection.connect('token');
+        connection.operator.value = {'name': 'admin', 'role': 'admin'};
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: TasksPage(taskId: 'task-1', coordinator: AppCoordinator()),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        final chip = find.widgetWithText(
+          OutlinedButton,
+          'Validation in progress \u00b7 view build',
+        );
+        expect(chip, findsOneWidget);
+        expect(find.text('Validate latest commit'), findsNothing);
+        // The link is usable rather than a disabled "in progress" button.
+        expect(tester.widget<OutlinedButton>(chip).onPressed, isNotNull);
+        expect(tester.takeException(), isNull);
+      });
+    });
+  }
 
   for (final exactTarget in [true, false]) {
     testWidgets('validate action respects exact target: $exactTarget', (
@@ -875,6 +908,7 @@ void main() {
         'base_ref': 'refs/remotes/origin/main',
         'base_sha': ''.padLeft(40, 'a'),
         'head_sha': head,
+        'merge_sha': 'c' * 40,
         'builds': {
           head: {
             'run_id': 'run-1',
@@ -905,34 +939,33 @@ void main() {
           ),
         ),
       );
-      BlocScope.register<DashboardBloc>(() => connection);
-      connection.connect('token');
-      connection.operator.value = {'name': 'admin', 'role': 'admin'};
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: Scaffold(body: TasksPage(taskId: 'task-1')),
-        ),
-      );
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Checks & builds'));
-      await tester.pumpAndSettle();
-      expect(
-        find.text(
-          exactTarget
-              ? 'Current candidate validation: verified'
-              : 'Current candidate validation: finished without verified required checks',
-        ),
-        findsOneWidget,
-      );
-      // Re-running the same identity is a no-op, so the action is hidden.
-      expect(
-        find.text('Validate candidate'),
-        exactTarget ? findsNothing : findsOneWidget,
-      );
-      expect(tester.takeException(), isNull);
-      await tester.pumpWidget(const SizedBox.shrink());
-      await connection.disconnect();
-      await BlocScope.reset();
+      await withDashboardConnection(tester, connection, () async {
+        BlocScope.register<DashboardBloc>(() => connection);
+        connection.connect('token');
+        connection.operator.value = {'name': 'admin', 'role': 'admin'};
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: TasksPage(taskId: 'task-1')),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Checks & builds'));
+        await tester.pumpAndSettle();
+        expect(
+          find.text(
+            exactTarget
+                ? 'Current candidate validation: verified'
+                : 'Current candidate validation: finished without verified required checks',
+          ),
+          findsOneWidget,
+        );
+        // Re-running the same identity is a no-op, so the action is hidden.
+        expect(
+          find.text('Validate latest commit'),
+          exactTarget ? findsNothing : findsOneWidget,
+        );
+        expect(tester.takeException(), isNull);
+      });
     });
   }
 
@@ -981,36 +1014,35 @@ void main() {
         ),
       ),
     );
-    BlocScope.register<DashboardBloc>(() => connection);
-    connection.connect('token');
-    connection.operator.value = {'name': 'admin', 'role': 'admin'};
-    await tester.pumpWidget(
-      const MaterialApp(
-        home: Scaffold(body: TasksPage(taskId: 'task-1')),
-      ),
-    );
-    await tester.pumpAndSettle();
-    expect(
-      find.textContaining(
-        'Outcome review scheduled for: Project Review \u00b7 outcome completed \u00b7 meeting meeting-9.',
-      ),
-      findsOneWidget,
-    );
-    expect(
-      find.textContaining(
-        'Acceptance: not satisfied by Iris. Missing boundary check.',
-      ),
-      findsOneWidget,
-    );
-    expect(
-      find.textContaining(
-        'Acceptance review needs attention: Missing boundary check.',
-      ),
-      findsOneWidget,
-    );
-    expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox.shrink());
-    await connection.disconnect();
-    await BlocScope.reset();
+    await withDashboardConnection(tester, connection, () async {
+      BlocScope.register<DashboardBloc>(() => connection);
+      connection.connect('token');
+      connection.operator.value = {'name': 'admin', 'role': 'admin'};
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(body: TasksPage(taskId: 'task-1')),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.textContaining(
+          'Outcome review scheduled for: Project Review \u00b7 outcome completed \u00b7 meeting meeting-9.',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining(
+          'Acceptance: not satisfied by Iris. Missing boundary check.',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining(
+          'Acceptance review needs attention: Missing boundary check.',
+        ),
+        findsOneWidget,
+      );
+      expect(tester.takeException(), isNull);
+    });
   });
 }
