@@ -81,6 +81,7 @@ AUTOMATION_DEFAULTS = dict(auto_queue_proposals=False, max_per_meeting=1, max_op
                            # manual, so capture, validation and publication were
                            # clicked through one task at a time.
                            auto_capture=False, auto_validate=False, auto_publish=False, auto_create_releases=False,
+                           publication_mode='release', publication_repositories={},
                            auto_prepare=False, auto_prepare_checks=False, auto_prepare_agent=False, auto_prepare_restore=False)
 AUTOMATION_LIMITS = (('max_per_meeting', 0, 10), ('max_open_per_agent', 0, 50),
                      ('max_follow_up_depth', 0, 10), ('daily_cap', 0, 100),
@@ -362,6 +363,9 @@ class Contributions:
             db.execute('CREATE TABLE IF NOT EXISTS audit (task_id TEXT NOT NULL, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS assignments (task_id TEXT PRIMARY KEY, position INTEGER NOT NULL, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS policies (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
+            import publication_routes
+            publication_routes.migrate(db)
+            publication_routes.receipts_schema(db)
         from notifications import Notifications
         if not isinstance(getattr(self.store, 'events', None), Notifications):
             self.store.events = Notifications()
@@ -984,7 +988,7 @@ class Contributions:
     @staticmethod
     def discussion_artifact(job):
         """Only a finalized artifact can propose tasks or a release plan."""
-        if not isinstance(job, dict) or job.get('state') != 'artifact_ready':
+        if not isinstance(job, dict) or job.get('state') != 'artifact_ready' or job.get('purpose') == 'release_review':
             return {}
         result = job.get('result')
         if not isinstance(result, str) or not result:
@@ -1305,6 +1309,21 @@ class Contributions:
             policy = self.policy(organization_id)
             was_enabled = policy['auto_queue_proposals']
             previous = dict(policy)
+            import publication_routes
+            if 'publication_mode' in body:
+                if body['publication_mode'] not in publication_routes.MODES:
+                    raise FieldValidationError('Choose release, both or task publication mode.', ['publication_mode'])
+                policy['publication_mode'] = body['publication_mode']
+            if 'publication_repositories' in body:
+                overrides = body['publication_repositories']
+                if (not isinstance(overrides, dict) or len(overrides) > 100 or
+                        any(not isinstance(k, str) or not k or v not in publication_routes.MODES for k, v in overrides.items())):
+                    raise FieldValidationError('Repository publication overrides must map repository paths to release, both or task.', ['publication_repositories'])
+                for repository in overrides:
+                    path = project_directory(self.projects, str(self.projects / repository))
+                    if path.relative_to(self.projects).as_posix() != repository:
+                        raise ValueError('Use a managed repository-relative path for publication overrides.')
+                policy['publication_repositories'] = dict(overrides)
             for key in ('auto_queue_proposals', 'paused', 'reap_finished_sessions', 'reap_orphaned_panes',
                         'auto_capture', 'auto_validate', 'auto_publish', 'auto_create_releases', 'auto_prepare', 'auto_prepare_checks', 'auto_prepare_agent', 'auto_prepare_restore'):
                 if key in body:
@@ -1848,6 +1867,8 @@ class Contributions:
     def snapshot(self, role='admin'):
         with closing(self.connect()) as db:
             tasks = [json.loads(row[0]) for row in db.execute('SELECT data FROM tasks ORDER BY rowid DESC LIMIT 100')]
+            import publication_routes
+            publication_routes.decorate(db, tasks)
         common_dirs = {}  # Request-scoped only: never reuse live readiness across polls.
         for task in tasks:
             task.pop('diff', None)  # Fetch the candidate only when reviewing it.
@@ -1925,6 +1946,9 @@ class Contributions:
         task = self.get(task_id)
         # The frozen dispatch payload is server-side retry state, not evidence.
         task['managed_revisions'] = self.commits.revisions(task_id, limit=10)
+        with closing(self.connect()) as db:
+            import publication_routes
+            publication_routes.decorate(db, [task])
         for revision in task['managed_revisions']['revisions']:
             revision['file_count'] = len(revision.pop('files', []))
         task.pop('outcome_request', None)
@@ -2319,6 +2343,8 @@ class Contributions:
     def task_instructions(self, task):
         """The standard task prompt; shared by first launches and handovers."""
         prompt = 'Task: ' + task['title'] + '\n' + task['description']
+        if getattr(self, 'releases', None) is not None:
+            prompt += self.releases.task_guidance(task)
         if task_delivery.enabled(task):
             prompt += ('\nYour completion receipt submits the commit for durable verification and optional automatic draft PR publication. '
                        'Remain in this task session after writing it; the dashboard will send delivery evidence for a final read-only inspection. '
@@ -2747,6 +2773,9 @@ class Contributions:
         """Prepare the same delivery contract for inherited and explicit policy."""
         if not isinstance(automatic, bool) or not isinstance(publish, bool):
             raise ValueError('Choose whether automatic validation and publication are enabled.')
+        if publish:
+            from publication_routes import require_task_publication
+            require_task_publication(task)
         capture = automatic if capture is None else capture
         if not isinstance(capture, bool):
             raise ValueError('Choose whether automatic candidate capture is enabled.')
@@ -2823,12 +2852,19 @@ class Contributions:
                 task['acceptance'] = dict(review, at=stamp())
             publish = (automatic and bool(delivery.get('auto_publish'))
                        and self.validation.snapshot().get('executor') == 'service')
+            from publication_routes import selected
+            task.update(publication_mode=selected(delivery, task['repository']), publication_mode_basis='organization_at_creation')
+            if task['publication_mode'] == 'release':
+                publish = False
             task.update(self.delivery_settings(task, automatic, publish,
                                                actor, organization_policy=delivery, capture=bool(delivery.get('auto_capture'))))
             project_git.configured_base(repository, base)
             return self.save(task, 'create', actor)
         task = self.get(task_id)
         had_error = task.pop('error', None) is not None
+        if action in ('publish', 'pull', 'publication'):
+            from publication_routes import require_task_publication
+            require_task_publication(task)
         # An unchanged background refresh must not rewrite the task or its audit.
         unchanged = self.comparable(task) if action == 'refresh' else None
         if task['state'] in ('merged', 'closed', 'completed') and action not in ('refresh', 'build', 'discuss', 'review_policy', 'proposal', 'complete', 'assignment', 'policy'):

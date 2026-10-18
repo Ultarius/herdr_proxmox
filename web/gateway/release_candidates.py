@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import sqlite3
 import threading
+import time
 import uuid
 
 import project_git
@@ -41,10 +42,13 @@ class ReleaseCandidates:
         self.root = service.projects.parent / 'herdr-releases'
         self.stopped, self.wake = threading.Event(), threading.Event()
         self.thread = None
+        self.assembly_checked = {}
         with closing(service.connect()) as db, db:
             db.execute('CREATE TABLE IF NOT EXISTS release_candidates (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS release_requests (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS release_revisions (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
+            from publication_routes import receipts_schema
+            receipts_schema(db)
 
     def start(self):
         self.thread = threading.Thread(target=self.poll, daemon=True, name='release-integration')
@@ -64,10 +68,22 @@ class ReleaseCandidates:
                 with closing(self.service.connect()) as db:
                     identifiers = [row[0] for row in db.execute(
                         "SELECT id FROM release_candidates WHERE json_extract(data, '$.state') IN (" +
-                        ','.join('?' for _ in ACTIVE) + ') ORDER BY rowid', ACTIVE)]
+                        ','.join('?' for _ in ACTIVE) + ") OR json_extract(data, '$.continuous.enabled')=1 "
+                        "OR json_extract(data, '$.review.state') IN ('queued','running') "
+                        "OR (json_extract(data, '$.review_policy.enabled')=1 AND json_extract(data, '$.state') IN ('collecting','assembled','ready')) "
+                        "OR json_extract(data, '$.pull_request.state')='queued' "
+                        "OR json_extract(data, '$.pull_refresh_requested')=1 "
+                        "OR (json_extract(data, '$.state')='published' AND json_extract(data, '$.pull_request.state')='complete' "
+                        "AND COALESCE(json_extract(data, '$.pull_request.remote_state'),'pr_open')='pr_open' "
+                        "AND COALESCE(json_extract(data, '$.pull_request.next_refresh_at'),0)<=?) ORDER BY rowid", (*ACTIVE, time.time()))]
             except (OSError, sqlite3.Error):
                 self.wake.wait(2)
                 continue
+            # Only this worker owns the idle cache. The record version below
+            # invalidates it on committed operator/callback changes without a
+            # concurrent pop racing this loop's timestamp update.
+            for identifier in self.assembly_checked.keys() - set(identifiers):
+                self.assembly_checked.pop(identifier, None)
             try:
                 self.capture_planned_candidates()
             except (ValueError, OSError, sqlite3.Error):
@@ -78,6 +94,15 @@ class ReleaseCandidates:
                 if self.stopped.is_set():
                     break
                 try:
+                    current = self.get(identifier)
+                    queued = ((current.get('review') or {}).get('state') == 'queued' or
+                              (current.get('pull_request') or {}).get('state') == 'queued' or current.get('pull_refresh_requested'))
+                    if current['state'] not in ACTIVE and not queued:
+                        now = time.monotonic()
+                        checked, version = self.assembly_checked.get(identifier, (-10, None))
+                        if version == current.get('record_version') and now - checked < 10:
+                            continue
+                        self.assembly_checked[identifier] = (now, current.get('record_version'))
                     self.advance(identifier)
                 except (ValueError, OSError, sqlite3.Error):
                     # A busy repository or storage outage is retried. Other
@@ -216,10 +241,28 @@ class ReleaseCandidates:
             releases = [json.loads(row[0]) for row in db.execute(
                 'SELECT data FROM release_candidates ORDER BY rowid DESC LIMIT 100')]
             tasks = dict(tasks or {})
-            identifiers = {member['task_id'] for release in releases if release['state'] == 'collecting'
+            identifiers = {member['task_id'] for release in releases
                            for member in release.get('members', [])} - tasks.keys()
             tasks.update(self.service.task_records(identifiers, db))
             return [self.present(release, tasks) for release in releases]
+
+    def task_guidance(self, task):
+        """Launch-time membership context; it grants no additional task effects."""
+        with closing(self.service.connect()) as db:
+            records = [json.loads(row[0]) for row in db.execute(
+                "SELECT data FROM release_candidates WHERE json_extract(data, '$.repository')=? "
+                "AND (json_extract(data, '$.state')='collecting' OR json_extract(data, '$.continuous.enabled')=1) "
+                "AND EXISTS (SELECT 1 FROM json_each(data, '$.members') "
+                "WHERE json_extract(value, '$.task_id')=?) ORDER BY rowid DESC LIMIT 10",
+                (task['repository'], task['id']))]
+        if not records:
+            return ''
+        return ('\nRelease membership recorded at task launch: ' + ', '.join(
+            r['version'] + ' (' + r['id'] + ')' for r in records) + '. '
+            'Continue only your assigned task. Herdr consumes captured, checked task commits into private release assemblies; '
+            'do not merge task branches into a release yourself. Report the managed commit SHA and real check results. '
+            'Membership is coordination context, not authorization to start other tasks, capture, publish, open PRs or deploy. '
+            'The gateway uses the existing task delivery permissions and independently validates the combined result.\n')
 
     def get(self, identifier, db=None):
         if not isinstance(identifier, str) or not re.fullmatch('[a-f0-9]{32}', identifier):
@@ -262,14 +305,39 @@ class ReleaseCandidates:
             if notify and hasattr(self.service, 'events'):
                 from notifications import record
                 record(db, 'release', release['id'])
+            from publication_routes import record_receipts
+            record_receipts(db, release)
 
-    def present(self, release, tasks=None, db=None):
+    def present(self, release, tasks=None, db=None, *, historical=False):
         revision = release.get('revision')
         revision = revision if isinstance(revision, dict) else {}
-        members = revision.get('members', release.get('members', []))
+        continuous = release.get('continuous') or {}
+        assembling = not historical and (continuous.get('enabled') is True or
+            (revision.get('purpose') == 'assembly' and release['state'] not in ('ready', 'published', 'publishing')))
+        members = release.get('members', []) if assembling else revision.get('members', release.get('members', []))
         results = release.get('results', {})
-        release['members'] = [dict(member, **results.get(member['task_id'], {})) for member in members]
-        if release['state'] == 'collecting':
+        pinned = {member['task_id']: member.get('candidate_sha') for member in revision.get('members', [])}
+        release['members'] = [dict(member, **(results.get(member['task_id'], {}) if not assembling or
+            pinned.get(member['task_id']) == member.get('candidate_sha') else {})) for member in members]
+        if not historical:
+            if tasks is None:
+                tasks = self.service.task_records([member['task_id'] for member in members], db)
+            for member in release['members']:
+                task = tasks.get(member['task_id']) or {}
+                member['work'] = {key: task.get(key) for key in ('profile_id', 'state', 'run_id', 'head_sha')}
+            from release_coordination import packet, pull_preview
+            review = release.get('review')
+            if review:
+                # Preserve the original packet; presentation never transfers an
+                # old group's advice onto a newer candidate or check receipt.
+                review['current'] = review['digest'] == digest(packet(self, release, tasks))
+                # Full packets/prompts are retained in the journal, not copied
+                # into every tasks poll. The digest identifies the review input.
+                review.pop('packet', None)
+                review.pop('prompt', None)
+            if release['state'] == 'published':
+                release['pull_preview'] = pull_preview(release)
+        if release['state'] == 'collecting' or assembling:
             if tasks is None:
                 tasks = self.service.task_records([member['task_id'] for member in members], db)
             for member in release['members']:
@@ -287,7 +355,8 @@ class ReleaseCandidates:
                 elif evidence.get('target') != sha or evidence.get('state') != 'complete' or evidence.get('required_checks_verified') is not True:
                     reason = 'Required checks have not passed for this selected commit.'
                 else:
-                    reason = 'Selected commit passed its checks; current policy and protected inputs are checked when freezing.'
+                    reason = ('Recorded checks passed for this SHA. Freeze still checks the current approved policy; '
+                              'open the task and validate again if that policy changed.')
                 member['eligibility_reason'] = reason
         counts = {state: 0 for state in ('pending', 'integrating', 'incorporated', 'blocked', 'excluded')}
         for member in release['members']:
@@ -302,7 +371,7 @@ class ReleaseCandidates:
             raise ValueError('Only an administrator can manage release candidates.')
         if not isinstance(body, dict) or not TASK_REQUEST.fullmatch(str(body.get('request_id', ''))):
             raise ValueError('A stable request ID is required.')
-        if action not in ('create', 'membership', 'freeze', 'revise', 'retry', 'resume', 'repair', 'exclude', 'publish'):
+        if action not in ('create', 'single', 'membership', 'freeze', 'revise', 'retry', 'resume', 'repair', 'exclude', 'publish', 'assembly', 'review', 'review_policy', 'pull', 'refresh'):
             raise ValueError('Unknown release action.')
         fingerprint = digest([action, body, actor])
         # Request replay and all manifest edits commit together. Network effects
@@ -322,7 +391,16 @@ class ReleaseCandidates:
                     inputs = self.service.task_records([m['task_id'] for m in prepared['members']], db)
                 # Git inspection and ref retention can be slow. Hold the
                 # repository claim, but never SQLite's global writer slot.
-                self.freeze(prepared, inputs)
+                if ((prepared.get('continuous') or {}).get('enabled') or
+                        (prepared.get('revision') or {}).get('purpose') == 'assembly'):
+                    if prepared['state'] == 'assembled' and (
+                            body.get('revision') != (prepared.get('revision') or {}).get('digest') or
+                            body.get('head_sha') != prepared.get('resulting_sha')):
+                        raise ValueError('Review the exact checked assembly manifest and combined SHA before freezing.')
+                    from release_assembly import freeze_assembled
+                    freeze_assembled(self, prepared, inputs)
+                else:
+                    self.freeze(prepared, inputs)
             return self._action(action, body, actor, fingerprint, prepared, inputs)
 
     def replay(self, db, identifier, fingerprint):
@@ -337,7 +415,7 @@ class ReleaseCandidates:
     def freeze_inputs(tasks):
         """Only admission facts: unrelated audit or worker updates cannot stale a freeze."""
         fields = ('target', 'state', 'required_checks_verified', 'policy_digest')
-        return {identifier: dict(repository=task['repository'], head_sha=task.get('head_sha'),
+        return {identifier: dict(repository=task['repository'], organization_id=task.get('organization_id'), head_sha=task.get('head_sha'),
             evidence={key: task.get('builds', {}).get(task.get('head_sha'), {}).get(key) for key in fields})
             for identifier, task in tasks.items()}
 
@@ -347,13 +425,25 @@ class ReleaseCandidates:
             replay = self.replay(db, body['request_id'], fingerprint)
             if replay is not None:
                 return replay
-            if action == 'create':
-                repository = body.get('repository')
+            if action in ('create', 'single'):
+                task = self.service.get(body.get('task_id')) if action == 'single' else None
+                if task is not None:
+                    from contributions import SHA
+                    if (not SHA.fullmatch(str(task.get('head_sha'))) or body.get('head_sha') != task['head_sha']
+                            or task.get('state') in ('merged', 'closed', 'completed')):
+                        raise ValueError('Review the current captured task candidate before creating its release.')
+                    identifier = uuid.uuid5(uuid.NAMESPACE_URL, 'herdr:single-release:' + task['id'] + ':' + task['head_sha']).hex
+                    old = db.execute('SELECT data FROM release_candidates WHERE id=?', (identifier,)).fetchone()
+                    if old:
+                        result = self.present(json.loads(old[0]), db=db)
+                        db.execute('INSERT INTO release_requests VALUES (?,?,?)', (body['request_id'], fingerprint, json.dumps(result)))
+                        return result
+                repository = task['repository'] if task is not None else body.get('repository')
                 if not isinstance(repository, str) or not repository:
                     raise ValueError('Select a project repository.')
                 path = project_directory(self.service.projects, self.service.projects / repository)
                 project_git.git(path, 'rev-parse', '--verify', 'HEAD^{commit}')
-                version = body.get('version')
+                version = 'task-' + task['id'][:12] + '-' + task['head_sha'][:12] if task is not None else body.get('version')
                 if not isinstance(version, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', version):
                     raise ValueError('Enter a release name of up to 64 letters, digits, dots or hyphens.')
                 cut = body.get('planned_cut_at') or None
@@ -364,9 +454,12 @@ class ReleaseCandidates:
                         datetime.fromisoformat(cut)
                     except ValueError:
                         raise ValueError('Enter a valid planned cut date.') from None
-                release = dict(id=uuid.uuid4().hex, repository=path.relative_to(self.service.projects).as_posix(),
+                release = dict(id=identifier if task is not None else uuid.uuid4().hex, repository=path.relative_to(self.service.projects).as_posix(),
                                version=version, planned_cut_at=cut, state='collecting', members=[],
                                generation=0, edit_version=0, created_at=stamp(), actor=actor, audit=[])
+                if task is not None:
+                    release.update(organization_id=task.get('organization_id'), source=dict(kind='single_task', task_id=task['id']),
+                        members=[dict(task_id=task['id'], title=task['title'], candidate_sha=task['head_sha'])])
                 if db.execute("SELECT 1 FROM release_candidates WHERE json_extract(data, '$.repository')=? "
                               "AND json_extract(data, '$.version')=? COLLATE NOCASE", (release['repository'], version)).fetchone():
                     raise ValueError('A release with this name already exists in this repository. Revise it or choose another name.')
@@ -375,7 +468,7 @@ class ReleaseCandidates:
                 if body.get('edit_version') != release['edit_version']:
                     raise ValueError('Release selection changed. Refresh and review it again.')
                 if action == 'membership':
-                    if release['state'] != 'collecting':
+                    if release['state'] != 'collecting' and not (release.get('continuous') or {}).get('enabled'):
                         raise ValueError('This manifest is frozen. Create another release candidate to change membership.')
                     task = self.service.get(body.get('task_id'))
                     if task['repository'] != release['repository']:
@@ -388,6 +481,17 @@ class ReleaseCandidates:
                         if len(members) >= 100:
                             raise ValueError('A release can select at most 100 tasks.')
                         members.append(dict(task_id=task['id'], title=task['title'], candidate_sha=task.get('head_sha')))
+                elif action == 'assembly':
+                    from release_assembly import configure
+                    configure(self, release, body)
+                elif action == 'review':
+                    from release_coordination import queue_review
+                    tasks = self.service.task_records([m['task_id'] for m in release['members']], db)
+                    queue_review(self, release, body, tasks)
+                elif action == 'review_policy':
+                    from release_coordination import configure_reviews
+                    tasks = self.service.task_records([m['task_id'] for m in release['members']], db)
+                    configure_reviews(self, release, body, tasks)
                 elif action == 'freeze':
                     if release['record_version'] != prepared['record_version']:
                         raise ReleaseChanged('Release changed during freeze; refresh before retrying.')
@@ -396,16 +500,18 @@ class ReleaseCandidates:
                         raise ReleaseChanged('Task candidates or validation changed during freeze; review them again.')
                     release = prepared
                 elif action == 'revise':
-                    if release['state'] not in ('blocked', 'validation_failed', 'ready', 'published'):
+                    if (release.get('pull_request') or {}).get('state') == 'queued':
+                        raise ValueError('Wait for the current release PR operation before revising its selection.')
+                    if release['state'] not in ('blocked', 'validation_failed', 'ready', 'published', 'assembled'):
                         raise ValueError('Wait for the current release operation to finish before revising.')
                     revision = release.get('revision')
                     if not isinstance(revision, dict) or not isinstance(revision.get('members'), list):
                         raise ValueError('The frozen manifest is unavailable. Inspect this record and create a new release candidate.')
-                    members = [dict(m) for m in revision['members']]
+                    members = [dict(m) for m in (release['members'] if revision.get('purpose') == 'assembly' else revision['members'])]
                     # Retain the entire previous run in release_revisions. A new
                     # revision never rewrites its evidence, branch or repair.
                     release = {k: release[k] for k in ('id', 'repository', 'version', 'planned_cut_at', 'record_version',
-                               'generation', 'edit_version', 'created_at', 'actor', 'audit', 'source', 'organization_id')
+                               'generation', 'edit_version', 'created_at', 'actor', 'audit', 'source', 'organization_id', 'review_policy')
                                if k in release}
                     release.update(state='collecting', members=members)
                 else:
@@ -421,7 +527,7 @@ class ReleaseCandidates:
                         if release['state'] != 'blocked' or not release.get('intent'):
                             raise ValueError('Select a release blocked on an integration conflict.')
                         release.update(state='repair_queued', repair_profile_id=body.get('profile_id'),
-                                       repair_attempt=release.get('repair_attempt', 0) + 1, error='')
+                                       repair_attempt=release.get('repair_attempt', 0) + 1, error='', auto_repair_queued=False)
                     elif action == 'exclude':
                         if release['state'] != 'blocked' or not release.get('intent') or body.get('task_id') != release['intent']['task_id']:
                             raise ValueError('Select the blocked member to exclude.')
@@ -433,6 +539,13 @@ class ReleaseCandidates:
                         if release['state'] != 'ready' or body.get('head_sha') != release.get('resulting_sha'):
                             raise ValueError('Review the verified combined commit before publishing.')
                         release.update(state='publishing', error='')
+                    elif action == 'pull':
+                        from release_coordination import queue_pull
+                        queue_pull(release, body)
+                    elif action == 'refresh':
+                        if release['state'] != 'published' or (release.get('pull_request') or {}).get('state') != 'complete':
+                            raise ValueError('Create a release PR before refreshing its status.')
+                        release['pull_refresh_requested'] = True
             release['edit_version'] += 1
             release['audit'] = [*release['audit'][-49:], dict(action=action, actor=actor, at=stamp())]
             self.save(release, db)
@@ -441,7 +554,7 @@ class ReleaseCandidates:
         self.wake.set()
         return result
 
-    def freeze(self, release, tasks=None):
+    def freeze(self, release, tasks=None, *, assembly=False):
         from contributions import task_base, SHA, remote_info
         if release['state'] != 'collecting':
             raise ValueError('This release manifest is already frozen.')
@@ -466,16 +579,29 @@ class ReleaseCandidates:
                 raise ValueError('A selected task candidate changed. Remove and add it again to review the new SHA.')
             evidence = task.get('builds', {}).get(sha, {})
             if (evidence.get('target') != sha or evidence.get('state') != 'complete'
-                    or evidence.get('required_checks_verified') is not True
-                    or evidence.get('policy_digest') != toolchain_policy.digest(policy)):
-                raise ValueError(task['title'] + ': required checks must pass for the selected SHA under the approved policy.')
+                    or evidence.get('required_checks_verified') is not True):
+                raise ValueError(task['title'] + ': required checks must pass for the selected SHA under the approved policy. '
+                                 'Open the task and choose Validate latest commit before freezing.')
+            if assembly and not evidence.get('policy_digest'):
+                raise ValueError(task['title'] + ': source validation must record its policy identity before assembly.')
+            if not assembly and evidence.get('policy_digest') != toolchain_policy.digest(policy):
+                policy_reason = ('Recorded checks used a different policy.' if evidence.get('policy_digest')
+                                 else 'Recorded checks have no policy identity.')
+                raise ValueError(task['title'] + ': required checks must pass for the selected SHA under the approved policy. '
+                                 + policy_reason + ' Open the task and choose Validate latest commit. '
+                                 'If its candidate changes, remove and add it to this release again.')
             project_git.git(repository, 'cat-file', '-e', sha + '^{commit}')
             # Compare protected inputs to the approved base, not the task's
             # historical base: upstream-only updates must not look authored.
             from pr_repairs import protected_changes
-            if protected_changes(repository, base, sha, policy):
+            boundary = project_git.git(repository, 'merge-base', base, sha).strip() if assembly else base
+            if protected_changes(repository, boundary, sha, policy):
                 raise ValueError(task['title'] + ': protected policy differs from the approved base; review and update the task.')
             frozen_member = dict(member)
+            if assembly:
+                frozen_member['source_boundary'] = boundary
+                frozen_member['source_validation'] = {key: evidence.get(key) for key in
+                    ('target', 'state', 'required_checks_verified', 'policy_digest')}
             if task.get('candidate_revision'):
                 frozen_member['task_revision_id'] = task['candidate_revision']
             else:
@@ -485,6 +611,8 @@ class ReleaseCandidates:
         revision = dict(release_id=release['id'], generation=generation, repository=release['repository'],
                         base_ref=base_ref, base_sha=base, policy_digest=toolchain_policy.digest(policy),
                         plan_digest=policy.get('plan_digest'), members=members)
+        if assembly:
+            revision['purpose'] = 'assembly'
         revision['digest'] = digest(revision)
         release.update(state='integrating', generation=generation, revision=revision, results={},
                        checkpoint=base, branch='herdr/release-' + release['id'] + '-r' + str(generation))
@@ -531,14 +659,14 @@ class ReleaseCandidates:
                 return True  # A late callback cannot reopen a terminal or revised run.
             if summary.get('target') != release.get('resulting_sha'):
                 release.update(state='validation_failed', error='Release validation evidence does not match the combined commit.')
-                self.save(release, db)
-                return True  # Consume foreign evidence; never retry it as a pass.
-            release['validation'] = summary
-            good = (summary.get('state') == 'complete' and summary.get('required_checks_verified') is True
-                    and summary.get('policy_digest') == release['revision']['policy_digest'])
-            release.update(state='ready' if good else 'validation_failed',
-                           error='' if good else str(summary.get('note') or 'Combined required checks did not pass.')[:2000])
+            else:
+                release['validation'] = summary
+                good = (summary.get('state') == 'complete' and summary.get('required_checks_verified') is True
+                        and summary.get('policy_digest') == release['revision']['policy_digest'])
+                release.update(state=('assembled' if release['revision'].get('purpose') == 'assembly' else 'ready') if good else 'validation_failed',
+                               error='' if good else str(summary.get('note') or 'Combined required checks did not pass.')[:2000])
             self.save(release, db)
+        self.wake.set()  # Commit precedes the wake; its new record version bypasses idle throttling.
         return True
 
     def worktree(self, release):
@@ -555,7 +683,7 @@ class ReleaseCandidates:
                                  (revision, identifier)).fetchone()
                 if not row:
                     raise ValueError('Retained revision not found for this release.')
-                return dict(release=self.present(json.loads(row[0])), read_only=True)
+                return dict(release=self.present(json.loads(row[0]), historical=True), read_only=True)
             if before is not None and (type(before) is not int or not 1 <= before <= 2**63 - 1):
                 raise ValueError('Select a positive revision history cursor.')
             rows = db.execute("SELECT data FROM release_revisions WHERE json_extract(data, '$.id')=? " +
@@ -575,6 +703,74 @@ class ReleaseCandidates:
         repository = self.service.path_for(release)
         with repository_lock(repository):
             release = self.get(identifier)  # The durable record after claiming.
+            pull = release.get('pull_request') or {}
+            if release['state'] == 'published' and pull.get('state') == 'complete' and (
+                    release.get('pull_refresh_requested') or (pull.get('remote_state', 'pr_open') == 'pr_open' and pull.get('next_refresh_at', 0) <= time.time())):
+                from release_coordination import refresh_pull
+                try:
+                    refresh_pull(self, release)
+                except ReleaseChanged:
+                    return
+                except (ValueError, OSError) as error:
+                    from discovery import redact
+                    release['pull_refresh_error'] = redact(error)[:1000]
+                    release['pull_refresh_requested'] = False
+                    release['pull_request']['next_refresh_at'] = time.time() + 60
+                    self.save(release)
+                return
+            from release_coordination import advance_review, advance_pull
+            review = release.get('review') or {}
+            if review.get('state') in ('queued', 'running'):
+                try:
+                    advance_review(self, release)
+                except ReleaseChanged:
+                    return
+                except OSError:
+                    pass  # Replay the same durable discussion request after an uncertain response.
+                except ValueError as error:
+                    from discovery import redact
+                    review.update(state='needs_attention', error=redact(error)[:1000])
+                    self.save(release)
+                release = self.get(identifier)
+            from release_coordination import automatic_review
+            try:
+                automatic_review(self, release, repository)
+            except ReleaseChanged:
+                return
+            except (ValueError, OSError) as error:
+                from discovery import redact
+                policy = release.get('review_policy') or {}
+                message = redact(error)[:1000]
+                if policy.get('notice') != message:
+                    policy['notice'] = message
+                    self.save(release)
+            release = self.get(identifier)
+            if (release.get('pull_request') or {}).get('state') == 'queued':
+                try:
+                    advance_pull(self, release, repository)
+                except ReleaseChanged:
+                    return
+                except (ValueError, OSError) as error:
+                    # An uncertain POST is reconciled by identity on explicit
+                    # retry. It cannot turn a published branch into a failed assembly.
+                    latest = self.get(identifier)
+                    if (latest.get('pull_request') or {}).get('state') == 'queued':
+                        from discovery import redact
+                        latest['pull_request'].update(state='needs_attention', error=redact(error)[:1000])
+                        self.save(latest)
+                return
+            if (release.get('continuous') or {}).get('enabled'):
+                from release_assembly import coordinate
+                try:
+                    if coordinate(self, release, repository):
+                        return
+                except ReleaseChanged:
+                    return
+                except (ValueError, OSError) as error:
+                    if release.get('assembly_notice') != str(error)[:1000]:
+                        release['assembly_notice'] = str(error)[:1000]
+                        self.save(release)
+                    return
             if release['state'] not in ACTIVE:
                 return
             try:
@@ -582,6 +778,19 @@ class ReleaseCandidates:
             except ReleaseChanged:
                 return
             except (ValueError, OSError) as error:
+                if isinstance(error, OSError) and release.get('auto_repair_queued'):
+                    # A dispatch or save can fail after the chat was accepted.
+                    # Keep its committed reservation and stable request ID; a
+                    # retry reconciles that effect without spending a new grant.
+                    latest = self.get(identifier)
+                    if latest['state'] == 'repairing':
+                        return  # The dispatch checkpoint committed despite the lost acknowledgement.
+                    if latest['state'] == 'repair_queued':
+                        message = 'Conflict dispatch uncertain; reconciling the same reserved request.'
+                        if latest.get('assembly_notice') != message:
+                            latest['assembly_notice'] = message
+                            self.save(latest)
+                        return
                 release['failure_phase'] = release['state']
                 release.update(state='blocked', error=str(error)[:2000])
                 intent = release.get('intent')
@@ -607,6 +816,14 @@ class ReleaseCandidates:
             self.publish(release, repository)
             return
         if release['state'] == 'repair_queued':
+            if release.get('auto_repair_queued') and not (
+                    (release.get('continuous') or {}).get('enabled') and
+                    (release.get('continuous') or {}).get('auto_repair') and
+                    (release.get('continuous') or {}).get('profile_id') == release.get('repair_profile_id') and
+                    (release.get('continuous') or {}).get('repairs_used', 0) <= (release.get('continuous') or {}).get('max_repairs', 0)):
+                release.update(state='blocked', error='Automatic conflict repair authorization changed before dispatch.')
+                self.save(release)
+                return
             self.repair(release, repository, tree)
             return
         if release['state'] == 'repairing':
@@ -749,14 +966,31 @@ class ReleaseCandidates:
         self.save(release)
 
     def repair(self, release, repository, tree):
+        profile, run = self.repair_agent(release, repository)
+        intent = release['intent']
+        if not project_git.merge_state(tree):
+            raise ValueError('No unfinished integration merge exists. Inspect the worktree and resume instead.')
+        from organizations import policy_guidance
+        prompt = (f"Resolve the release integration conflict ONLY in {tree}. Release {release['version']}, "
+                  f"manifest {release['revision']['digest']}. First parent must remain {intent['before']}; "
+                  f"incoming second parent must be {intent['candidate_sha']}. Finish this existing merge and commit it. "
+                  'Do not reset, rebase, install SDKs, change protected policy inputs, push, open PRs or modify task branches. '
+                  'Use the approved project environment. Report the full resulting SHA and checks. '
+                  'Herdr independently verifies the parents, clean tree, policy and combined required checks.')
+        prompt += policy_guidance(run.get('toolchain_policy') or {})
+        # A reserved attempt retains the same dispatch identity across uncertain
+        # responses and process death. OrganizationStore reconciles the chat.
+        job = self.service.store.action('chat', dict(request_id='release-repair-' + digest([release['revision']['digest'], intent, release['repair_attempt']]),
+            organization_id=profile['organization_id'], profile_id=profile['id'], expected_run_id=run['id'], prompt=prompt, wait_seconds=1800))
+        release.update(state='repairing', repair_chat_id=job['id'])
+        self.save(release)
+
+    def repair_agent(self, release, repository):
         profiles = self.service.store.snapshot(live_status=False)['profiles']
         profile = next((p for p in profiles if p['id'] == release.get('repair_profile_id')), None)
         if (not profile or profile.get('read_only') or profile.get('archived') or profile.get('group_id')
                 or Path(profile.get('project', '')).resolve() != repository.resolve()):
             raise ValueError('Choose a writable agent assigned to this repository.')
-        intent = release['intent']
-        if not project_git.merge_state(tree):
-            raise ValueError('No unfinished integration merge exists. Inspect the worktree and resume instead.')
         runs = self.service.store.job_records()
         run = next((j for j in reversed(runs) if j.get('kind') == 'launch' and j.get('profile_id') == profile['id']
                     and j.get('state') == 'persona_sent'), None)
@@ -766,20 +1000,7 @@ class ReleaseCandidates:
         frozen = run.get('toolchain_policy') or {}
         if frozen.get('digest') != release['revision']['policy_digest']:
             raise ValueError('The agent session uses a different environment. Relaunch it under the approved policy.')
-        from organizations import policy_guidance
-        prompt = (f"Resolve the release integration conflict ONLY in {tree}. Release {release['version']}, "
-                  f"manifest {release['revision']['digest']}. First parent must remain {intent['before']}; "
-                  f"incoming second parent must be {intent['candidate_sha']}. Finish this existing merge and commit it. "
-                  'Do not reset, rebase, install SDKs, change protected policy inputs, push, open PRs or modify task branches. '
-                  'Use the approved project environment. Report the full resulting SHA and checks. '
-                  'Herdr independently verifies the parents, clean tree, policy and combined required checks.')
-        prompt += policy_guidance(frozen)
-        # Stable identity survives a crash after dispatch but before saving the
-        # chat pointer. OrganizationStore owns idle/session admission.
-        job = self.service.store.action('chat', dict(request_id='release-repair-' + digest([release['revision']['digest'], intent, release['repair_attempt']]),
-            organization_id=profile['organization_id'], profile_id=profile['id'], expected_run_id=run['id'], prompt=prompt, wait_seconds=1800))
-        release.update(state='repairing', repair_chat_id=job['id'])
-        self.save(release)
+        return profile, run
 
     def publish(self, release, repository):
         from contributions import push

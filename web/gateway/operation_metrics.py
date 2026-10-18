@@ -15,8 +15,9 @@ import time
 
 NAMES = frozenset(('git.command', 'repository.lock_wait', 'repository.lock_hold',
                   'workspace.prepare', 'dependencies.restore', 'execution.prepare', 'execution.materialize',
-                  'validation.checks', 'repository.query', 'http.read'))
-COUNTERS = frozenset(('repository.cache_hit', 'repository.cache_miss'))
+                  'validation.checks', 'repository.query', 'http.read', 'task.submit', 'task.construct'))
+COUNTERS = frozenset(('repository.cache_hit', 'repository.cache_miss',
+                      'task.submit_accepted', 'task.submit_limited'))
 _request = ContextVar('repository_query_metrics', default=None)
 
 

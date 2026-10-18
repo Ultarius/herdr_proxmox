@@ -119,6 +119,9 @@ class _BuildsState extends OperationsState<BuildsPage> {
         paragraph(
           'Repository query cache: ${data['counters']?['repository.cache_hit'] ?? 0} hits · ${data['counters']?['repository.cache_miss'] ?? 0} misses.',
         ),
+        paragraph(
+          'Task submissions: ${data['counters']?['task.submit_accepted'] ?? 0} admitted · ${data['counters']?['task.submit_limited'] ?? 0} limited. Limits apply per gateway process; retry the same captured request after the reported delay.',
+        ),
       ],
     ], iconName: 'activity');
   }

@@ -546,6 +546,10 @@ class ContributionTests(unittest.TestCase):
         self.store.agent_locks = {}
         self.store.snapshot.return_value = dict(profiles=[self.profile], jobs=[])
         self.service = Contributions(self.root / 'tasks.sqlite3', self.root, self.store, self.api)
+        # This fixture exercises the retained per-task publication workflow.
+        with closing(self.service.connect()) as db, db:
+            db.execute('INSERT OR REPLACE INTO policies VALUES (?,?)',
+                       ('org', json.dumps(dict(publication_mode='task'))))
         self.body = dict(request_id='create-1', title='Fix task', description='Implement and test.',
                          repository='repo', base_ref='refs/remotes/origin/main', profile_id='worker')
         self.task = self.service.action('create', self.body, 'admin', 'admin')
@@ -1732,6 +1736,13 @@ class ContributionTests(unittest.TestCase):
         source = (root / 'web/gateway/organizations.py').read_text()
         cap = int(re.search(r"task_prompt', (\d+)", source).group(1))
         self.assertGreater(cap, 8000 + len(contributions.task_tool_guidance()) + 500)
+        # Release membership is bounded but adds launch context. A handover
+        # uses that same prompt and must have the same channel budget.
+        with patch.object(self.service.releases, 'task_guidance', return_value='r' * 1800):
+            prompt = self.service.task_instructions(dict(self.task, title='t' * 120, description='d' * 8000))
+        self.assertLessEqual(len(prompt), cap)
+        handover_cap = int(re.search(r'len\(task_prompt\) > (\d+)', source).group(1))
+        self.assertEqual(handover_cap, cap)
 
     def test_tool_policy_extraction_reports_an_inconsistent_installation(self):
         with patch.object(contributions.Path, 'is_file', return_value=False):

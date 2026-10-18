@@ -5,6 +5,7 @@ String releaseStateLabel(Object? state) => switch (state) {
   'integrating' => 'Integrating',
   'validating' => 'Validating combined result',
   'ready' => 'Ready for publication',
+  'assembled' => 'Assembly checked · awaiting freeze',
   'blocked' => 'Needs attention',
   'validation_failed' => 'Combined checks failed',
   'repair_queued' => 'Conflict agent queued',
@@ -21,6 +22,237 @@ List<Map<String, dynamic>> releaseMembers(Map release) => [
 ];
 
 extension _Releases on _TaskWorkflowState {
+  Component memberWork(Map member) {
+    final live = component.tasks
+        .where((t) => t['id'] == member['task_id'])
+        .firstOrNull;
+    final work = member['work'] as Map? ?? {};
+    final profileId = live?['profile_id'] ?? work['profile_id'];
+    final profile = component.profiles
+        .where((p) => p['id'] == profileId)
+        .firstOrNull;
+    final name =
+        profile?['name'] ??
+        (live == null ? 'Agent identity unavailable' : taskAgentName(live));
+    final state = live?['state'] ?? work['state'] ?? 'unavailable';
+    final activity = component.activity?[profileId];
+    return el(
+      'p',
+      [
+        text(
+          '$name · task $state${activity == null ? '' : ' · session $activity'}',
+        ),
+      ],
+      classes: 'wf-insp__muted',
+      attributes: {'data-release-work': '${member['task_id']}'},
+    );
+  }
+
+  Component releaseReview(Map release, bool canAct) {
+    final review = release['review'] as Map?;
+    final policy = release['review_policy'] as Map? ?? {};
+    final group = releaseGroup.isNotEmpty
+        ? releaseGroup
+        : '${policy['group_id'] ?? ''}';
+    final limit = releaseReviewLimit ?? '${policy['max_reviews'] ?? 3}';
+    final active = ['queued', 'running'].contains(review?['state']);
+    final beforePublication = ![
+      'publishing',
+      'published',
+    ].contains(release['state']);
+    return section('Group evidence review', [
+      notice(
+        'Groups assess missing capture, checks and integration risks. Their advice does not approve a release or authorize changes and publication.',
+      ),
+      if (review != null) ...[
+        term('Review group', review['group_name']),
+        term('Discussion state', review['state']),
+        if (review['current'] == false)
+          notice(
+            'Outdated review: task or release evidence changed. Request a fresh review before relying on this advice.',
+            error: true,
+          ),
+        term('Evidence packet', review['digest'], mono: true),
+        if (review['job_id'] != null) ...[
+          term('Discussion job', review['job_id'], mono: true),
+          button(
+            'Open group discussions',
+            () => navigation.navigate('/groups/${review['group_id']}'),
+            small: true,
+          ),
+        ],
+        if (review['error'] != null) notice(review['error'], error: true),
+        if (canAct && review['state'] == 'needs_attention')
+          button(
+            'Re-check interrupted group review',
+            () => releaseAction('review', release, {'retry': true}),
+            disabled: component.releaseBusy,
+          ),
+        if (review['report'] != null)
+          el('pre', [text(review['report'])], classes: 'wf-insp__muted'),
+      ],
+      term(
+        'Automatic review',
+        !beforePublication
+            ? 'Not scheduled after publication'
+            : policy['enabled'] == true
+            ? 'Enabled after the full selection passes combined checks'
+            : 'Disabled',
+      ),
+      term(
+        'Automatic reviews reserved',
+        '${policy['reviews_used'] ?? 0} / ${policy['max_reviews'] ?? 3}',
+      ),
+      if (policy['notice'] != null) notice(policy['notice']),
+      if (canAct) ...[
+        select('Release review group', group, {
+          '': 'Choose a repository group',
+          for (final group in component.groups.where(
+            (g) =>
+                g['archived'] != true &&
+                (release['organization_id'] == null ||
+                    g['organization_id'] == release['organization_id']),
+          ))
+            '${group['id']}': '${group['name']}',
+        }, (value) => update(() => releaseGroup = value)),
+        if (!active && review?['state'] != 'needs_attention')
+          button(
+            'Ask group to review release evidence',
+            () => releaseAction('review', release, {'group_id': group}),
+            disabled:
+                component.releaseBusy ||
+                group.isEmpty ||
+                releaseMembers(release).isEmpty,
+          ),
+        if (beforePublication)
+          field(
+            'Automatic review limit (1–20)',
+            limit,
+            (value) => update(() => releaseReviewLimit = value),
+          ),
+        if (beforePublication)
+          button(
+            policy['enabled'] == true
+                ? 'Update automatic review authorization'
+                : 'Enable automatic release review',
+            () => releaseAction('review_policy', release, {
+              'enabled': true,
+              'group_id': group,
+              'max_reviews': int.tryParse(limit),
+            }),
+            disabled:
+                component.releaseBusy ||
+                group.isEmpty ||
+                int.tryParse(limit) == null,
+          ),
+        if (policy['enabled'] == true)
+          button(
+            'Disable automatic release review',
+            () => releaseAction('review_policy', release, {'enabled': false}),
+            disabled: component.releaseBusy,
+          ),
+      ],
+    ]);
+  }
+
+  Component releasePull(Map release, bool canAct) {
+    final pull = release['pull_request'] as Map?;
+    final preview = release['pull_preview'] as Map? ?? {};
+    final stale =
+        releasePullSha != null && releasePullSha != release['resulting_sha'];
+    return section('Release pull request', [
+      if (pull != null) ...[
+        term('PR request', pull['state']),
+        if (pull['remote_state'] != null)
+          term('Observed GitHub status', pull['remote_state']),
+        if (pull['merge_sha'] != null)
+          term('Release merge commit', pull['merge_sha']),
+        if (pull['remote_state'] == 'merged')
+          notice(
+            'Delivered through a merged release. Individual task SHAs need not be ancestors after squash or rebase; deployment acceptance remains separate.',
+          ),
+        if (release['pull_refresh_error'] != null)
+          notice(release['pull_refresh_error'], error: true),
+        if (canAct &&
+            release['state'] == 'published' &&
+            pull['state'] == 'complete')
+          button(
+            'Refresh release PR status',
+            () => releaseAction('refresh', release),
+            disabled: component.releaseBusy,
+          ),
+        if (pull['reused'] == true)
+          notice(
+            'An existing PR was reconciled. Its title and description were preserved.',
+          ),
+        if (pull['error'] != null) notice(pull['error'], error: true),
+        if (pull['number'] != null)
+          el(
+            'a',
+            [text('Open release PR #${pull['number']}')],
+            attributes: {
+              'href': '${pull['url']}',
+              'target': '_blank',
+              'rel': 'noopener noreferrer',
+            },
+          ),
+      ],
+      if (canAct &&
+          release['state'] == 'published' &&
+          !['queued', 'complete'].contains(pull?['state'])) ...[
+        notice(
+          'Review the public title and description for this exact combined commit. This creates a draft PR; merging and deployment are separate.',
+        ),
+        field(
+          'Release PR title',
+          releasePullTitle ?? '${preview['title'] ?? ''}',
+          (value) => update(() {
+            releasePullTitle = value;
+            releasePullSha ??= '${release['resulting_sha']}';
+          }),
+        ),
+        textarea(
+          'Release PR description',
+          releasePullBody ?? '${preview['body'] ?? ''}',
+          (value) => update(() {
+            releasePullBody = value;
+            releasePullSha ??= '${release['resulting_sha']}';
+          }),
+        ),
+        if (stale) ...[
+          notice(
+            'The combined commit changed. Reset and review the current PR preview.',
+            error: true,
+          ),
+          button(
+            'Reset release PR preview',
+            () => update(
+              () => releasePullTitle = releasePullBody = releasePullSha = null,
+            ),
+          ),
+        ],
+        button(
+          pull?['state'] == 'needs_attention'
+              ? 'Reconcile or create draft release PR'
+              : 'Create reviewed draft release PR',
+          () => releaseAction('pull', release, {
+            'head_sha': release['resulting_sha'],
+            'reviewed': true,
+            'title': releasePullTitle ?? preview['title'],
+            'body': releasePullBody ?? preview['body'],
+          }),
+          disabled:
+              component.releaseBusy ||
+              stale ||
+              (releasePullTitle ?? '${preview['title'] ?? ''}')
+                  .trim()
+                  .isEmpty ||
+              (releasePullBody ?? '${preview['body'] ?? ''}').trim().isEmpty,
+        ),
+      ],
+    ]);
+  }
+
   List<String> get releaseRepositories => {
     for (final record in [...component.tasks, ...component.releases])
       if ('${record['repository'] ?? ''}'.isNotEmpty) '${record['repository']}',
@@ -147,6 +379,15 @@ extension _Releases on _TaskWorkflowState {
     final counts = release['counts'] as Map? ?? {};
     final total = counts['selected'] ?? releaseMembers(release).length;
     final incorporated = counts['incorporated'] ?? 0;
+    final tasksById = {for (final task in component.tasks) task['id']: task};
+    final implementing = releaseMembers(release)
+        .where(
+          (member) =>
+              (tasksById[member['task_id']]?['state'] ??
+                  member['work']?['state']) ==
+              'implementing',
+        )
+        .length;
     final state = releaseStateLabel(release['state']);
     return el(
       'button',
@@ -177,7 +418,9 @@ extension _Releases on _TaskWorkflowState {
           attributes: {'aria-hidden': 'true'},
         ),
         el('span', [
-          text('$incorporated of $total incorporated'),
+          text(
+            '$incorporated of $total incorporated${implementing == 0 ? '' : ' · $implementing implementing'}',
+          ),
         ], classes: 'wf-release__count'),
         if (release['planned_cut_at'] != null)
           el('span', [
@@ -254,6 +497,27 @@ extension _Releases on _TaskWorkflowState {
   Component releaseMembership(
     Map<String, dynamic> task,
   ) => section('Release membership', [
+    if (component.onReleaseAction != null &&
+        task['head_sha'] != null &&
+        !['merged', 'closed', 'completed'].contains(task['state']))
+      button(
+        'Release this task only',
+        () => component.onReleaseAction?.call('single', {
+          'task_id': task['id'],
+          'head_sha': task['head_sha'],
+        }),
+        disabled: component.releaseBusy,
+      ),
+    for (final receipt
+        in (task['release_deliveries'] as List? ?? []).whereType<Map>()) ...[
+      term('Release delivery', '${receipt['version']} · ${receipt['stage']}'),
+      term('Included candidate', receipt['candidate_sha']),
+      notice(
+        receipt['current_candidate_matches'] == true
+            ? 'Receipt covers the current candidate.'
+            : 'Receipt covers an earlier candidate; it does not deliver the current head.',
+      ),
+    ],
     for (final release in component.releases.where(
       (r) => r['repository'] == task['repository'],
     ))
@@ -274,7 +538,8 @@ extension _Releases on _TaskWorkflowState {
               '${member['state'] ?? 'Selected'} · ${shortSha('${member['candidate_sha'] ?? ''}')}',
             ),
           if (component.onReleaseAction != null &&
-              release['state'] == 'collecting')
+              (release['state'] == 'collecting' ||
+                  release['continuous']?['enabled'] == true))
             button(
               '${member == null ? 'Add to' : 'Remove from'} ${release['version']}',
               () => releaseAction('membership', release, {
@@ -291,6 +556,87 @@ extension _Releases on _TaskWorkflowState {
         text('No release candidate for this repository.'),
       ], classes: 'wf-insp__muted'),
   ]);
+
+  Component assemblyControls(Map release) {
+    final grant = release['continuous'] as Map? ?? {};
+    final mode =
+        assemblyMode ?? (grant['auto_repair'] == true ? 'agent' : 'stop');
+    final agent = assemblyAgent ?? '${grant['profile_id'] ?? ''}';
+    final runs = assemblyRuns ?? '${grant['max_runs'] ?? 20}';
+    final repairs = assemblyRepairs ?? '${grant['max_repairs'] ?? 2}';
+    return section('Continuous private assembly', [
+      notice(
+        'Selected task heads are assembled and checked automatically. A checked assembly still needs explicit freeze; publication and deployment remain separate.',
+      ),
+      term(
+        'Assembly runs used',
+        '${grant['runs_used'] ?? 0} / ${grant['max_runs'] ?? 20}',
+      ),
+      term(
+        'Automatic repairs used',
+        '${grant['repairs_used'] ?? 0} / ${grant['max_repairs'] ?? 2}',
+      ),
+      select(
+        'Assembly conflict handling',
+        mode,
+        const {
+          'stop': 'Stop for operator inspection',
+          'agent': 'Authorize bounded agent repair',
+        },
+        (value) => update(() => assemblyMode = value),
+      ),
+      if (mode == 'agent')
+        select(
+          'Assembly conflict agent',
+          agent,
+          {
+            '': 'Choose a launched repository agent',
+            for (final profile in component.profiles.where(
+              (p) =>
+                  p['read_only'] != true &&
+                  p['archived'] != true &&
+                  p['group_id'] == null,
+            ))
+              '${profile['id']}': '${profile['name']}',
+          },
+          (value) => update(() => assemblyAgent = value),
+        ),
+      field(
+        'Assembly run limit (1–100)',
+        runs,
+        (value) => update(() => assemblyRuns = value),
+      ),
+      if (mode == 'agent')
+        field(
+          'Automatic repair limit (1–10)',
+          repairs,
+          (value) => update(() => assemblyRepairs = value),
+        ),
+      button(
+        grant['enabled'] == true
+            ? 'Update assembly authorization'
+            : 'Enable continuous assembly',
+        () => releaseAction('assembly', release, {
+          'enabled': true,
+          'auto_repair': mode == 'agent',
+          'profile_id': agent,
+          'max_runs': int.tryParse(runs),
+          'max_repairs': int.tryParse(repairs),
+        }),
+        disabled:
+            component.releaseBusy ||
+            int.tryParse(runs) == null ||
+            int.tryParse(repairs) == null ||
+            (mode == 'agent' && agent.isEmpty),
+      ),
+      if (grant['enabled'] == true)
+        button(
+          'Stop assembly automation',
+          () => releaseAction('assembly', release, {'enabled': false}),
+          disabled: component.releaseBusy,
+        ),
+    ]);
+  }
 
   Component releaseInspector(
     Map<String, dynamic> release, {
@@ -328,42 +674,59 @@ extension _Releases on _TaskWorkflowState {
           ),
         if ('${release['error'] ?? ''}'.isNotEmpty)
           notice(release['error'], error: true),
+        if ('${release['assembly_notice'] ?? ''}'.isNotEmpty)
+          notice(release['assembly_notice']),
+        if (revision?['purpose'] == 'assembly')
+          notice(
+            'This is an immutable assembly snapshot. New task heads wait for another assembly; only an explicit freeze approves a checked checkpoint as a release candidate.',
+          ),
         if (release['source']?['kind'] == 'discussion')
           notice(
             'Planned from group discussion ${release['source']['job_id']}. While collecting, automatic members follow their latest captured candidate after required checks pass. Freeze pins the selection.',
           ),
-        section(revision == null ? 'Release plan' : 'Frozen selection', [
-          el('dl', [
-            term('Repository', release['repository']),
-            term('Selected', members.length),
-            term('Incorporated', counts['incorporated'] ?? 0),
-            term('Blocked', counts['blocked'] ?? 0),
-            term('Excluded with reason', counts['excluded'] ?? 0),
-            if (release['planned_cut_at'] != null)
-              term('Planned cut', release['planned_cut_at']),
-            if (revision != null) ...[
-              term('Manifest digest', revision['digest'], mono: true),
-              term('Base', revision['base_sha'], mono: true),
-              term('Policy digest', revision['policy_digest'], mono: true),
-            ],
-            if (release['resulting_sha'] != null)
-              term('Combined commit', release['resulting_sha'], mono: true),
-            if (release['branch'] != null)
-              term('Release branch', release['branch'], mono: true),
-            if (release['publication'] is Map)
-              term(
-                'Publication destination',
-                release['publication']['destination'],
+        if (canAct &&
+            !['ready', 'published', 'publishing'].contains(release['state']) &&
+            (revision == null || revision['purpose'] == 'assembly'))
+          assemblyControls(release),
+        section(
+          revision == null
+              ? 'Release plan'
+              : revision['purpose'] == 'assembly'
+              ? 'Assembly selection'
+              : 'Frozen selection',
+          [
+            el('dl', [
+              term('Repository', release['repository']),
+              term('Selected', members.length),
+              term('Incorporated', counts['incorporated'] ?? 0),
+              term('Blocked', counts['blocked'] ?? 0),
+              term('Excluded with reason', counts['excluded'] ?? 0),
+              if (release['planned_cut_at'] != null)
+                term('Planned cut', release['planned_cut_at']),
+              if (revision != null) ...[
+                term('Manifest digest', revision['digest'], mono: true),
+                term('Base', revision['base_sha'], mono: true),
+                term('Policy digest', revision['policy_digest'], mono: true),
+              ],
+              if (release['resulting_sha'] != null)
+                term('Combined commit', release['resulting_sha'], mono: true),
+              if (release['branch'] != null)
+                term('Release branch', release['branch'], mono: true),
+              if (release['publication'] is Map)
+                term(
+                  'Publication destination',
+                  release['publication']['destination'],
+                ),
+              if (historical && release['updated_at'] != null)
+                term('Recorded at', release['updated_at']),
+            ], classes: 'dl'),
+            el('p', [
+              text(
+                'Membership is separate from task dependencies. Incorporation does not mean merged into main. Hidden tasks remain in the selected count.',
               ),
-            if (historical && release['updated_at'] != null)
-              term('Recorded at', release['updated_at']),
-          ], classes: 'dl'),
-          el('p', [
-            text(
-              'Membership is separate from task dependencies. Incorporation does not mean merged into main. Hidden tasks remain in the selected count.',
-            ),
-          ], classes: 'wf-insp__muted'),
-        ]),
+            ], classes: 'wf-insp__muted'),
+          ],
+        ),
         section('Selected changes', [
           for (final member in members)
             el(
@@ -377,6 +740,7 @@ extension _Releases on _TaskWorkflowState {
                 badge(
                   '${member['state'] ?? (member['selection'] == 'automatic' && member['candidate_sha'] == null ? 'Planned · awaiting checks' : 'Selected')}',
                 ),
+                if (!historical) memberWork(member),
                 el('p', [
                   text(
                     'Candidate ${member['candidate_sha'] ?? 'not captured'}',
@@ -392,6 +756,14 @@ extension _Releases on _TaskWorkflowState {
                   el('p', [
                     text(member['eligibility_reason']),
                   ], classes: 'wf-insp__muted'),
+                if (!historical &&
+                    (release['state'] == 'collecting' ||
+                        release['continuous']?['enabled'] == true))
+                  button(
+                    'Open task and validation',
+                    () => component.onOpenTask('${member['task_id']}'),
+                    small: true,
+                  ),
               ],
               classes: 'wf-release__member',
               attributes: {'data-release-member': '${member['task_id']}'},
@@ -419,12 +791,30 @@ extension _Releases on _TaskWorkflowState {
               small: true,
             ),
         ]),
+        if (!historical) releaseReview(release, canAct),
+        if (!historical &&
+            (release['state'] == 'published' ||
+                release['pull_request'] != null))
+          releasePull(release, canAct),
         if (canAct)
           section('Actions', [
-            if (release['state'] == 'collecting')
+            if (release['state'] == 'collecting' &&
+                release['continuous']?['enabled'] != true)
               button(
                 'Freeze and integrate ${members.length} tasks',
                 () => releaseAction('freeze', release),
+                primary: true,
+                disabled:
+                    component.releaseBusy ||
+                    members.isEmpty ||
+                    members.any((member) => member['candidate_sha'] == null),
+              ),
+            if (release['state'] == 'assembled')
+              button(
+                'Freeze verified assembly as release candidate',
+                () => releaseAction('freeze', release, {
+                  'head_sha': release['resulting_sha'],
+                }),
                 primary: true,
                 disabled:
                     component.releaseBusy ||
@@ -500,6 +890,7 @@ extension _Releases on _TaskWorkflowState {
               'validation_failed',
               'ready',
               'published',
+              'assembled',
             ].contains(release['state']))
               button(
                 'Revise selection',

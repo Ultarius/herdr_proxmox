@@ -18,10 +18,11 @@ import tempfile
 
 import project_git
 from discovery import redact
-from operation_metrics import measured
+from operation_metrics import measured, query_measurement
 from repository_lock import repository_lock
+from task_submission_limits import SubmissionLimits
 
-from task_revision_contract import normalize, MAX_REQUEST
+from task_revision_contract import normalize, MAX_REQUEST, ID
 
 
 def command(path, *args, data=None, index=None, identity=None):
@@ -53,6 +54,65 @@ def index_digest(path):
     if path.is_symlink() or not path.is_file():
         raise ValueError('Task index is unavailable or unsafe.')
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def parent_entries(path, parent, files):
+    """Inspect prefix-free pathspecs at each depth, bounded for Windows argv.
+
+    Mixing an ancestor directory and its child in one ls-tree invocation expands
+    unrelated descendants. Breadth-first batches avoid that and stop at absent or
+    non-directory ancestors, preserving explicit replacement/deletion checks.
+    """
+    requested = {item['path'] for item in files}
+    pending = [name.split('/') for name in requested]
+    entries, depth = {}, 1
+    while pending:
+        selected = sorted({'/'.join(parts[:depth]) for parts in pending})
+        batches, batch, size = [], [], 0
+        for name in selected:
+            argument = ':(literal)' + name
+            cost = len(argument.encode('utf-8')) + 4
+            if batch and size + cost > 8000:
+                batches.append(batch)
+                batch, size = [], 0
+            batch.append(argument)
+            size += cost
+        if batch:
+            batches.append(batch)
+        observed = {}
+        for batch in batches:
+            listing = command(path, 'ls-tree', '-z', '--full-tree', parent, '--', *batch)
+            for entry in listing.split(b'\0'):
+                if entry:
+                    header, name = entry.split(b'\t', 1)
+                    observed[name.decode('utf-8')] = tuple(header.decode('ascii').split())
+        # Keep only target entries and non-directory ancestors for validation.
+        # Do not allocate every full prefix of every submitted path up front.
+        entries.update({name: entry for name, entry in observed.items()
+                        if name in requested or entry[0] != '040000'})
+        pending = [parts for parts in pending if len(parts) > depth and
+                   observed.get('/'.join(parts[:depth]), (None,))[0] == '040000']
+        depth += 1
+    return entries
+
+
+def write_blobs(path, files, directory, sha_length):
+    """Hash immutable captured bytes together, with filters explicitly disabled."""
+    additions = [item for item in files if item['mode'] != 'deleted']
+    if not additions:
+        return {}
+    names = []
+    for number, item in enumerate(additions):
+        blob_file = directory / ('blob-' + str(number))
+        blob_file.write_bytes(base64.b64decode(item['content']))
+        # Git accepts C-quoted --stdin-paths names, including spaces and UTF-8.
+        names.append(json.dumps(blob_file.as_posix(), ensure_ascii=False))
+    hashes = command(path, 'hash-object', '--no-filters', '-w', '--stdin-paths',
+                     data=('\n'.join(names) + '\n').encode()).decode('ascii').splitlines()
+    if len(hashes) != len(additions) or any(len(sha) != sha_length or
+            any(c not in '0123456789abcdef' for c in sha) for sha in hashes):
+        raise ValueError('Git returned invalid batch blob identities.')
+    return {item['path']: sha for item, sha in zip(additions, hashes)}
 
 
 def sync_directory(path):
@@ -109,6 +169,7 @@ def replace_index(index, content):
 class TaskCommits:
     def __init__(self, service):
         self.service = service
+        self.limits = SubmissionLimits.configured()
         with closing(service.connect()) as db, db:
             db.execute('CREATE TABLE IF NOT EXISTS task_revisions '
                        '(id TEXT PRIMARY KEY, task_id TEXT NOT NULL, fingerprint TEXT NOT NULL, data TEXT NOT NULL)')
@@ -145,7 +206,34 @@ class TaskCommits:
                              "AND json_extract(data,'$.state')='complete' ORDER BY rowid DESC LIMIT 1", (task_id, sha)).fetchone()
         return self.public(json.loads(row[0])) if row else None
 
+    def authorize(self, task, body):
+        jobs = self.service.store.snapshot(live_status=False)['jobs']
+        run = next((job for job in jobs if job['id'] == task.get('run_id')), None)
+        token = body.get('token')
+        if (not run or run.get('state') != 'persona_sent' or run.get('task_id') != task['id']
+                or run.get('profile_id') != task.get('profile_id') or body.get('run_id') != run['id']
+                or not isinstance(token, str) or not run.get('completion_token')
+                or not hmac.compare_digest(token.encode(), run['completion_token'].encode())):
+            raise ValueError('Task revision requires the current task session token.')
+        if run.get('alias'):
+            from collaboration import current_run
+            run = current_run(self.service.store, run, ready=False)
+            if not hmac.compare_digest(token.encode(), str(run.get('completion_token', '')).encode()):
+                raise ValueError('Task revision requires the current task session token.')
+        return run
+
     def submit(self, body):
+        # Authenticate before retaining a bucket; shed load before decoding up
+        # to 8 MiB or waiting on the task/repository locks. Recheck inside the
+        # task claim so reassignment or token rotation cannot race admission.
+        if not isinstance(body, dict) or not ID.fullmatch(str(body.get('task_id', ''))):
+            raise ValueError('Select a task and its current session token.')
+        run = self.authorize(self.service.get(body['task_id']), body)
+        with query_measurement('task.submit'):
+            with self.limits.claim(run['id'], body['token']):
+                return self._submit(body)
+
+    def _submit(self, body):
         payload = normalize(body)
         task_id = payload['task_id']
         fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -153,23 +241,11 @@ class TaskCommits:
         marker = ('Herdr task revision\n' + revision_id + '\n' + fingerprint + '\n').encode()
         with self.service.operation('task:' + task_id):
             task = self.service.get(task_id)
-            jobs = self.service.store.snapshot(live_status=False)['jobs']
-            run = next((job for job in jobs if job['id'] == task.get('run_id')), None)
-            token = body.get('token')
-            if (not run or run.get('state') != 'persona_sent' or run.get('task_id') != task_id
-                    or run.get('profile_id') != task.get('profile_id') or payload['run_id'] != run['id']
-                    or not isinstance(token, str) or not run.get('completion_token')
-                    or not hmac.compare_digest(token.encode(), run['completion_token'].encode())):
-                raise ValueError('Task revision requires the current task session token.')
+            run = self.authorize(task, body)
             if task['state'] in ('merged', 'closed', 'completed'):
                 raise ValueError('This task is terminal; create a new task for further changes.')
             if task.get('branch') != 'herdr/task-' + task_id[:12]:
                 raise ValueError('Task branch identity is invalid; inspect the task record.')
-            if run.get('alias'):
-                from collaboration import current_run
-                run = current_run(self.service.store, run, ready=False)
-                if not hmac.compare_digest(token.encode(), str(run.get('completion_token', '')).encode()):
-                    raise ValueError('Task revision requires the current task session token.')
             with closing(self.service.connect()) as db:
                 saved = db.execute('SELECT fingerprint,data FROM task_revisions WHERE id=?', (revision_id,)).fetchone()
             if saved and saved[0] != fingerprint:
@@ -228,7 +304,9 @@ class TaskCommits:
                             policy_digest=(run.get('toolchain_policy') or {}).get('digest'),
                             policy_review='Required checks and protected-input review remain separate.')
                         self.store(record, fingerprint)
-                    replace_index(index, self.advance(path, record, fingerprint, index))
+                    with measured('task.construct'):
+                        prepared_bytes = self.advance(path, record, fingerprint, index)
+                    replace_index(index, prepared_bytes)
                     record['state'] = 'complete'
                     record.pop('error', None)
                     self.store(record, fingerprint)
@@ -261,30 +339,34 @@ class TaskCommits:
             if record['state'] == 'intent':
                 payload = record['payload']
                 command(path, 'read-tree', record['parent'], index=prepared)
-                changes = []
+                entries = parent_entries(path, record['parent'], payload['files'])
                 for item in payload['files']:
                     name = item['path']
-                    existing = command(path, 'ls-tree', record['parent'], '--', ':(literal)' + name)
-                    if existing and not existing.startswith((b'100644 blob ', b'100755 blob ')):
+                    existing = entries.get(name)
+                    if existing and existing[:2] not in (('100644', 'blob'), ('100755', 'blob')):
                         raise ValueError('Submitted path replaces a non-regular entry; inspect it explicitly.')
                     # Refuse implicit removal of a parent file by a nested add.
                     for parent in PurePosixPath(name).parents:
                         if str(parent) != '.':
-                            ancestor = command(path, 'ls-tree', record['parent'], '--', ':(literal)' + str(parent))
-                            if ancestor and not ancestor.startswith(b'040000 tree '):
+                            ancestor = entries.get(str(parent))
+                            if ancestor and ancestor[:2] != ('040000', 'tree'):
                                 raise ValueError('Submitted path has a non-directory ancestor in its parent commit.')
+                    if item['mode'] == 'deleted' and not existing:
+                        raise ValueError('Submitted deletion is absent from the parent commit.')
+                blobs = write_blobs(path, payload['files'], Path(directory), len(record['parent']))
+                changes, index_entries = [], []
+                for item in payload['files']:
+                    name = item['path']
                     if item['mode'] == 'deleted':
-                        if not existing:
-                            raise ValueError('Submitted deletion is absent from the parent commit.')
                         blob = '0' * len(record['parent'])
                         mode = '0'
                     else:
-                        blob = command(path, 'hash-object', '-w', '--stdin',
-                                       data=base64.b64decode(item['content'])).decode().strip()
+                        blob = blobs[name]
                         mode = item['mode']
-                    command(path, 'update-index', '-z', '--index-info', index=prepared,
-                            data=(mode + ' ' + blob + '\t' + name + '\0').encode())
+                    index_entries.append(mode + ' ' + blob + '\t' + name + '\0')
                     changes.append({k: v for k, v in dict(item, blob=blob if mode != '0' else None).items() if k != 'content'})
+                command(path, 'update-index', '-z', '--index-info', index=prepared,
+                        data=''.join(index_entries).encode())
                 tree = command(path, 'write-tree', index=prepared).decode().strip()
                 if tree == command(path, 'rev-parse', record['parent'] + '^{tree}').decode().strip():
                     raise ValueError('Submitted revision has no changes; use a no-changes receipt when appropriate.')

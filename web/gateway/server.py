@@ -167,7 +167,7 @@ class BrowserSessions:
 
 
 class Handler(BaseHTTPRequestHandler):
-    def reply(self, status, data, cookie=None):
+    def reply(self, status, data, cookie=None, *, retry_after=None):
         payload = json.dumps(data).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
@@ -176,6 +176,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('X-Herdr-Git-Calls', str(self.read_metrics['git_calls']))
         if cookie is not None:
             self.send_header('Set-Cookie', cookie)
+        if retry_after is not None:
+            self.send_header('Retry-After', str(retry_after))
         self.send_header('Content-Length', str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -572,6 +574,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == '/api/tasks/submit':
+            from task_submission_limits import SubmissionBusy
             # A task-scoped session credential grants commit submission only.
             # It cannot call dashboard actions, publish or approve policy edits.
             if not self.same_origin():
@@ -583,6 +586,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('Invalid task revision request size.')
                 body = json.loads(self.rfile.read(size))
                 self.reply(200, self.server.contributions.commits.submit(body))
+            except SubmissionBusy as error:
+                self.reply(429, {'error': str(error), 'retryable': True, 'retry_after': error.retry_after},
+                           retry_after=error.retry_after)
             except (ValueError, OSError) as error:
                 self.reply(400, {'error': str(error)[:500]})
             except sqlite3.Error:
@@ -649,7 +655,7 @@ class Handler(BaseHTTPRequestHandler):
         actions['/api/organizations/templates/library'] = 'template_library'
         environment_actions = {f'/api/projects/environment/{name}': name for name in ('plan', 'select', 'prepare', 'cancel', 'authorize-restore')}
         actions.update(environment_actions)
-        release_actions = {f'/api/releases/{name}': name for name in ('create', 'membership', 'freeze', 'revise', 'retry', 'resume', 'repair', 'exclude', 'publish')}
+        release_actions = {f'/api/releases/{name}': name for name in ('create', 'single', 'membership', 'freeze', 'revise', 'retry', 'resume', 'repair', 'exclude', 'publish', 'assembly', 'review', 'review_policy', 'pull', 'refresh')}
         actions.update(release_actions)
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'resolve_delegation', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'retry_discussion', 'cancel_discussion', 'remove_agent', 'remove_group', 'session', 'realign_discussion_session')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close', 'verify', 'install_integration')}

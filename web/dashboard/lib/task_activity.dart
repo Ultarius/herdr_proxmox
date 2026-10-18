@@ -148,7 +148,9 @@ String taskNextStep(Map task, {String executor = 'service'}) {
       return build['required_checks_verified'] == true
           ? (task['state'] == 'published'
                 ? 'Branch published; open a draft pull request.'
-                : 'Current candidate validated; ready for review.')
+                : (task['task_publication_allowed'] == false
+                      ? 'Current candidate validated; ready for release collection.'
+                      : 'Current candidate validated; ready for review.'))
           : 'Validation finished without verified required checks; inspect the evidence.';
     if (['failed', 'error', 'interrupted'].contains(build['state']))
       return 'Current candidate validation needs attention.';

@@ -118,6 +118,59 @@ class ReleaseCandidateTests(unittest.TestCase):
                     self.releases.poll()
                 advance.assert_called_once_with(release['id'])
 
+    def poll_once(self, now=101):
+        self.releases.stopped.clear()
+        with patch('release_candidates.time.monotonic', return_value=now), \
+                patch.object(self.releases, 'capture_planned_candidates'), \
+                patch.object(self.releases, 'advance') as advance, \
+                patch.object(self.releases.wake, 'wait', side_effect=lambda _: self.releases.stopped.set()):
+            self.releases.poll()
+        return advance
+
+    def test_idle_poll_throttles_unchanged_records_and_prunes_inactive_cache_entries(self):
+        release = self.action('create', repository='repo', version='idle-throttle')
+        release = self.action('assembly', release, enabled=True)
+        self.releases.assembly_checked[release['id']] = (100, release['record_version'])
+        self.releases.assembly_checked['retired'] = (100, 1)
+        self.poll_once().assert_not_called()
+        self.assertNotIn('retired', self.releases.assembly_checked)
+        self.poll_once(now=110).assert_called_once_with(release['id'])
+
+    def test_queued_review_and_pr_bypass_a_fresh_idle_timestamp(self):
+        release = self.action('create', repository='repo', version='queued-effects')
+        for state, field in (('collecting', 'review'), ('published', 'pull_request')):
+            with self.subTest(field=field):
+                current = self.releases.get(release['id'])
+                current.pop('review', None)
+                current.pop('pull_request', None)
+                current.update(state=state, **{field: dict(state='queued')})
+                self.releases.save(current)
+                self.releases.assembly_checked[current['id']] = (100, current['record_version'])
+                self.poll_once().assert_called_once_with(current['id'])
+
+    def test_explicit_action_invalidates_fresh_idle_throttle_by_record_version(self):
+        release = self.action('create', repository='repo', version='changed-action')
+        release = self.action('assembly', release, enabled=True)
+        self.releases.assembly_checked[release['id']] = (100, release['record_version'])
+        self.releases.wake.clear()
+        self.action('assembly', release, enabled=True, max_runs=21)
+        self.assertTrue(self.releases.wake.is_set())
+        self.poll_once().assert_called_once_with(release['id'])
+
+    def test_validation_completion_wakes_worker_and_invalidates_idle_throttle(self):
+        release = self.action('create', repository='repo', version='validation-wake')
+        release.update(state='validating', continuous=dict(enabled=True), resulting_sha='a' * 40,
+            revision=dict(policy_digest='policy', purpose='assembly'),
+            validation_event=dict(id='event', release_id=release['id']))
+        self.releases.save(release)
+        self.releases.assembly_checked[release['id']] = (100, release['record_version'])
+        self.releases.wake.clear()
+        self.assertTrue(self.releases.record_validation('event', dict(target='a' * 40,
+            state='complete', required_checks_verified=True, policy_digest='policy')))
+        self.assertTrue(self.releases.wake.is_set())
+        self.assertEqual(self.releases.get(release['id'])['state'], 'assembled')
+        self.poll_once().assert_called_once_with(release['id'])
+
     def test_unchanged_planned_capture_never_claims_the_sqlite_writer(self):
         identifier = self.task()
         result = self.discussion_plan(identifier)
@@ -493,6 +546,24 @@ class ReleaseCandidateTests(unittest.TestCase):
         with patch('toolchain_policy.resolve_committed', return_value=dict(POLICY, changed=True)):
             self.releases.advance(release['id'])
         self.assertIn('policy changed', self.releases.get(release['id'])['error'])
+
+    def test_freeze_distinguishes_old_policy_from_recorded_check_success(self):
+        identifier = self.task()
+        release = self.action('create', repository='repo', version='old-check-policy')
+        release = self.action('membership', release, task_id=identifier, included=True)
+        evidence = self.tasks[identifier]['builds'][self.tasks[identifier]['head_sha']]
+        evidence['policy_digest'] = 'old-policy'
+        member = self.releases.present(release)['members'][0]
+        self.assertIn('Recorded checks passed', member['eligibility_reason'])
+        self.assertIn('policy changed', member['eligibility_reason'])
+        with self.assertRaisesRegex(ValueError, 'different policy.*Validate latest commit'):
+            self.action('freeze', release)
+        self.assertEqual(self.releases.get(release['id'])['state'], 'collecting')
+        evidence.pop('policy_digest')
+        with self.assertRaisesRegex(ValueError, 'no policy identity.*Validate latest commit'):
+            self.action('freeze', release)
+        evidence['policy_digest'] = toolchain_policy.digest(POLICY)
+        self.assertEqual(self.action('freeze', release)['state'], 'integrating')
 
     def test_no_second_submission_after_lost_validation_response(self):
         release = self.frozen(self.task())

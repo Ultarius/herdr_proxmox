@@ -84,6 +84,36 @@ class CollaborationTests(unittest.TestCase):
         self.drain()
         return group
 
+    def test_release_review_purpose_is_retained_and_rechecks_member_repositories(self):
+        group = self.group()
+        profile = next(p for p in self.store.snapshot()['profiles'] if p['id'] == self.max)
+        with self.assertRaisesRegex(ValueError, 'changed repository'):
+            self.action('discuss', organization_id=self.org, group_id=group, purpose='release_review',
+                        review_repository=str(Path(profile['project']).parent), prompt='Review exact release evidence')
+        identifier = self.action('discuss', organization_id=self.org, group_id=group, purpose='release_review',
+                                 review_repository=profile['project'], prompt='Review exact release evidence')
+        self.assertEqual(self.job(identifier)['purpose'], 'release_review')
+        self.drain()
+        self.assertEqual(self.job(identifier)['purpose'], 'release_review')
+
+    def test_release_review_waiting_preparation_refuses_a_reassigned_member(self):
+        group = self.group()
+        profile = next(p for p in self.store.snapshot()['profiles'] if p['id'] == self.max)
+        with patch.object(self.store, 'execute'):
+            identifier = self.action('discuss', organization_id=self.org, group_id=group, purpose='release_review',
+                                     review_repository=profile['project'], prompt='Review exact release evidence')
+            self.drain()
+        with self.store.lock, closing(self.store.connect()) as db, db:
+            current = self.store.get(db, 'profiles', self.max, self.org)
+            current['project'] = str(Path(profile['project']).parent)
+            self.store.put(db, 'profiles', current)
+        before = len(self.calls)
+        from discussion_scheduler import prepare_locked
+        self.assertFalse(prepare_locked(self.store, identifier))
+        self.assertEqual(self.job(identifier)['state'], 'needs_attention')
+        self.assertIn('changed repository', self.job(identifier)['error'])
+        self.assertFalse(any(args[:2] in (('agent', 'start'), ('agent', 'prompt')) for args, _ in self.calls[before:]))
+
     def test_history_lists_created_and_skipped_proposals_without_reprocessing(self):
         from contributions import Contributions
         group_id = self.group()

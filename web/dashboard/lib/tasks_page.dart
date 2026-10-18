@@ -265,6 +265,43 @@ class _TasksPageState extends State<TasksPage> {
     }
   }
 
+  Future<void> releaseAct(String action, Map<String, dynamic> body) async {
+    if (busy || !admin) return;
+    final epoch = connection.generation;
+    final selection = 'release:$action:$body';
+    final request = requests.putIfAbsent(
+      selection,
+      () => 'release-${newRequestId()}',
+    );
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      await connection.request('releases/$action', {
+        ...body,
+        'request_id': request,
+      });
+      if (!mounted || epoch != connection.generation) return;
+      requests.remove(selection);
+      await refresh();
+      if (mounted && epoch == connection.generation) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Release candidate created. Manage it in the workflow board.',
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted && epoch == connection.generation)
+        setState(() => error = '$e');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
   Future<void> act(String action, Map<String, dynamic> body) async {
     if (busy || !admin) return;
     final epoch = connection.generation;
@@ -2200,7 +2237,8 @@ class _TasksPageState extends State<TasksPage> {
     }
     if (target == null || ['closed', 'completed'].contains(task['state']))
       return const SizedBox.shrink();
-    if (task['state'] == 'published' &&
+    if (task['task_publication_allowed'] != false &&
+        task['state'] == 'published' &&
         task['pull'] == null &&
         (task['publish'] as Map?)?['head_sha'] == target) {
       return FilledButton.icon(
@@ -2219,6 +2257,17 @@ class _TasksPageState extends State<TasksPage> {
       final verified =
           evidence?['target'] == target &&
           evidence?['required_checks_verified'] == true;
+      if (verified && task['task_publication_allowed'] == false) {
+        return OutlinedButton(
+          onPressed: admin && !busy
+              ? () => releaseAct('single', {
+                  'task_id': task['id'],
+                  'head_sha': task['head_sha'],
+                })
+              : null,
+          child: const Text('Release this task only'),
+        );
+      }
       if (verified &&
           !['merged', 'published', 'pr_open'].contains(task['state'])) {
         return FilledButton.icon(
@@ -2507,6 +2556,7 @@ class _TasksPageState extends State<TasksPage> {
                       admin &&
                           !busy &&
                           executor == 'service' &&
+                          task['task_publication_allowed'] != false &&
                           (task['auto_publish'] == true ||
                               github['configured'] == true) &&
                           ![
@@ -2932,7 +2982,8 @@ class _TasksPageState extends State<TasksPage> {
                           : 'Inspect repair validation',
                     ),
                   ),
-                if (state == 'ready')
+                if (state == 'ready' &&
+                    task['task_publication_allowed'] != false)
                   FilledButton(
                     onPressed: admin && !busy ? () => review(task) : null,
                     child: Text(
@@ -2959,6 +3010,27 @@ class _TasksPageState extends State<TasksPage> {
     spacing: 8,
     runSpacing: 8,
     children: [
+      if (task['head_sha'] != null &&
+          !['merged', 'closed', 'completed'].contains(task['state']))
+        OutlinedButton(
+          onPressed: admin && !busy
+              ? () => releaseAct('single', {
+                  'task_id': task['id'],
+                  'head_sha': task['head_sha'],
+                })
+              : null,
+          child: const Text('Release this task only'),
+        ),
+      if (task['task_publication_allowed'] == false)
+        const Text(
+          'Delivery route: release PR. Capture and validation remain available.',
+        ),
+      for (final receipt
+          in (task['release_deliveries'] as List? ?? []).whereType<Map>())
+        Text(
+          'Release ${receipt['version']}: ${receipt['stage']} · candidate ${receipt['candidate_sha']} · ${receipt['current_candidate_matches'] == true ? 'current candidate' : 'earlier candidate'}${receipt['pull'] is Map ? ' · ${receipt['pull']['url']}' : ''}',
+        ),
+
       if (task['run_id'] != null &&
           !['merged', 'closed', 'completed'].contains(task['state']))
         OutlinedButton(
@@ -3000,7 +3072,8 @@ class _TasksPageState extends State<TasksPage> {
                 },
           child: const Text('Download candidate patch'),
         ),
-      if (task['head_sha'] != null &&
+      if (task['task_publication_allowed'] != false &&
+          task['head_sha'] != null &&
           !['merged', 'closed', 'completed'].contains(task['state']))
         OutlinedButton(
           onPressed: admin && !busy && github['configured'] == true
@@ -3008,7 +3081,8 @@ class _TasksPageState extends State<TasksPage> {
               : null,
           child: const Text('Review and publish'),
         ),
-      if (task['publish'] == null &&
+      if (task['task_publication_allowed'] != false &&
+          task['publish'] == null &&
           task['github_repository'] != null &&
           (github['publication']
                   as Map?)?[task['github_repository']]?['mode'] ==
@@ -3019,7 +3093,9 @@ class _TasksPageState extends State<TasksPage> {
               : null,
           child: const Text('Publication destination'),
         ),
-      if (task['publish'] != null && task['pull'] == null)
+      if (task['task_publication_allowed'] != false &&
+          task['publish'] != null &&
+          task['pull'] == null)
         FilledButton(
           onPressed: admin && !busy && github['configured'] == true
               ? () => previewPull(task)

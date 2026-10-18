@@ -627,7 +627,12 @@ void main() {
                 'max_ms': 10,
               },
             },
-            'counters': {'repository.cache_hit': 3, 'repository.cache_miss': 1},
+            'counters': {
+              'repository.cache_hit': 3,
+              'repository.cache_miss': 1,
+              'task.submit_accepted': 8,
+              'task.submit_limited': 2,
+            },
           };
         return buildResponse(r);
       });
@@ -638,6 +643,10 @@ void main() {
       await click('Refresh performance diagnostics');
       expect(web.document.body!.textContent, contains('Process 42'));
       expect(web.document.body!.textContent, contains('p95 8 ms'));
+      expect(
+        web.document.body!.textContent,
+        contains('8 admitted · 2 limited'),
+      );
       expect(
         web.document.body!.textContent,
         contains('not a fleet-wide total'),

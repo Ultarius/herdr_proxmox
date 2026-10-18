@@ -62,6 +62,7 @@ class TaskWorkflow extends StatefulComponent {
     required this.onOpenTask,
     this.listView,
     this.profiles = const [],
+    this.groups = const [],
     this.activity,
     this.executor = 'unavailable',
     this.loading = false,
@@ -73,6 +74,7 @@ class TaskWorkflow extends StatefulComponent {
   });
   final List<Map<String, dynamic>> tasks;
   final List<Map<String, dynamic>> profiles;
+  final List<Map<String, dynamic>> groups;
   final List<Map<String, dynamic>> releases;
   final void Function(String, Map<String, dynamic>)? onReleaseAction;
   final bool releaseBusy;
@@ -99,6 +101,10 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
   bool creatingRelease = false;
   String newReleaseName = '', newReleaseRepository = '', newReleaseCut = '';
   String repairProfile = '';
+  String? assemblyMode, assemblyAgent, assemblyRuns, assemblyRepairs;
+  String releaseGroup = '';
+  String? releaseReviewLimit;
+  String? releasePullTitle, releasePullBody, releasePullSha;
   String exclusionReason = '';
   String? historyRelease;
   List<Map<String, dynamic>> retainedRevisions = [];
@@ -260,6 +266,10 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
   void chooseTask(String? id, {bool reveal = false}) {
     setState(() {
       selected = id;
+      assemblyMode = assemblyAgent = assemblyRuns = assemblyRepairs = null;
+      releaseGroup = '';
+      releaseReviewLimit = null;
+      releasePullTitle = releasePullBody = releasePullSha = null;
       creatingRelease = false;
       historyRelease = null;
       retainedRelease = null;

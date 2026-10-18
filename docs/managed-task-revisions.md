@@ -91,8 +91,31 @@ tasks, old launches, replaced conversations and mismatched assignees are refused
 It grants no dashboard, publication or policy-review authority. Agents share a
 Unix account and can already access Git: this is managed orchestration and
 provenance, not exclusive filesystem enforcement. Verification remains required.
-Payload size limits are not a per-token rate limit: there is currently no separate
-submission quota. Repeated submissions can contend for the repository lock.
+
+Authenticated submissions have process-local backpressure before base64 decoding
+and before task/repository lock acquisition. Defaults allow a burst of 8 requests
+per task-session token, replenishing one request every 5 seconds, at most 2 active
+requests per session and 4 across the gateway. Invalid credentials allocate no
+bucket. At most 2048 session buckets are retained; only inactive, replenished
+buckets are evicted. Token digests stay in memory and never enter diagnostics.
+
+Limits are load shedding, not a durable quota or a cross-process semaphore. A
+restart replenishes the allowance; separate gateway processes have separate
+budgets. Existing cross-process repository claims still serialize Git mutations.
+JSON request reading/parsing and lightweight session authentication precede
+admission, so this is not an ingress bandwidth or HTTP-thread limit.
+
+HTTP `429` includes `Retry-After`, `retry_after` and `retryable: true`. No journal
+or Git mutation happens for a limited request. Retry the same captured request
+file after the delay, including after an uncertain completed submission: the
+usual idempotency contract still applies. Completed replays consume allowance
+too, since recovery/summary inspection can use Git. The helper reports the
+refusal; it never recaptures, changes the request ID or loops automatically.
+
+Operators may tune `HERDR_TASK_SUBMIT_BURST` (1–128),
+`HERDR_TASK_SUBMIT_REFILL_SECONDS` (1–3600), `HERDR_TASK_SUBMIT_MAX_ACTIVE` (1–32),
+and `HERDR_TASK_SUBMIT_PER_SESSION` (1–8) before starting the gateway. Invalid
+values fail startup rather than silently disabling limits.
 
 ## Construction and recovery
 
@@ -124,9 +147,14 @@ Construction is serialized per repository, including across gateway processes.
 Each journal checkpoint uses a short SQLite writer transaction; the SQLite writer
 is not held throughout Git construction or while agents and checks run. This
 Git-backed workflow is not a lock-free WAL or a replacement storage engine.
-Construction still issues Git subprocesses per changed file and ancestor; the
-file-count bound does not imply constant construction time. Batching those calls
-is a possible optimization without changing the journal or Git commit identity.
+Parent-entry inspection uses prefix-free batches at each path depth with bounded
+argument sizes. Absent ancestors stop further inspection; regular-file, symlink,
+directory-replacement and missing-deletion refusals remain in force. Captured
+blobs are written in one `hash-object --no-filters --stdin-paths` invocation and
+the private index is updated through one NUL-delimited `update-index --index-info`
+feed. Blob paths are private temporary files, not reopened workspace files.
+Deep existing trees and large argument sets still require multiple inspection
+batches; the file-count bound does not imply constant construction time.
 Committed Git objects/refs request fsync; private marker/index files are flushed.
 These mechanisms do not strengthen the storage device's own durability guarantees.
 
@@ -161,6 +189,24 @@ new resulting SHA requiring fresh checks. Release integration, combined validati
 and explicit publication retain their existing contracts.
 
 ## Verification
+
+Administrator performance diagnostics expose `task.submit` and `task.construct`
+timings, Git/lock measurements and the fixed `task.submit_accepted` /
+`task.submit_limited` counters. There are no per-token labels. Compare these under
+real gateway load before increasing admission limits or changing repository locks.
+`task.submit` starts after initial authentication and includes admitted work or a
+limiter refusal; `task.construct` includes construction/recovery under the lock.
+
+For repeatable submission-only measurements on a disposable repository:
+
+```sh
+python3 scripts/benchmark-task-commits.py --files 64 --runs 3
+python3 scripts/benchmark-task-commits.py --files 512 --runs 3
+```
+
+Use the gateway's interpreter, Git and temporary filesystem. Output includes each
+sample's Git-call count and elapsed time; it excludes HTTP transfer and contention.
+Local measurements are not evidence of production throughput or Linux capture.
 
 `python3 -m unittest discover -s tests -p test_task_commits.py` exercises real Git,
 binary/deletion/mode handling, candidate association, idempotency, concurrent

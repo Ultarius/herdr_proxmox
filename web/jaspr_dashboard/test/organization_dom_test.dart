@@ -365,6 +365,51 @@ void main() {
   );
 
   test(
+    'publication routes validate repository overrides and preserve separate grants',
+    () async {
+      var policy = <String, dynamic>{};
+      await mount(
+        const OrganizationAutomation(organizationId: 'org'),
+        response: (request) {
+          if (request.url.path.endsWith('/organizations/automation'))
+            return {'policy': policy};
+          if (request.url.path.endsWith('/tasks/automation')) {
+            policy = Map<String, dynamic>.from(jsonDecode(request.body));
+            return {'policy': policy};
+          }
+          return null;
+        },
+      );
+      await click('Edit policy');
+      final mode =
+          nodes('.dialog-layer [data-field="publication_mode"] select').single
+              as web.HTMLSelectElement;
+      expect(mode.value, 'release');
+      mode.value = 'both';
+      mode.dispatchEvent(web.Event('change', web.EventInit(bubbles: true)));
+      await settle();
+      var overrides = policyInput('publication_repositories');
+      overrides.value = '{bad';
+      overrides.dispatchEvent(web.Event('input', web.EventInit(bubbles: true)));
+      await click('Save');
+      expect(policy, isEmpty);
+      overrides = policyInput('publication_repositories');
+      expect(
+        nodes(
+          '.dialog-layer [data-field="publication_repositories"]',
+        ).single.getAttribute('aria-invalid'),
+        'true',
+      );
+      overrides.value = '{"repo":"task"}';
+      overrides.dispatchEvent(web.Event('input', web.EventInit(bubbles: true)));
+      await click('Save');
+      expect(policy['publication_mode'], 'both');
+      expect(policy['publication_repositories'], {'repo': 'task'});
+      expect(policy['auto_publish'], isFalse);
+    },
+  );
+
+  test(
     'discussion artifacts explain release creation and point to the board',
     () async {
       await mount(

@@ -113,6 +113,8 @@ Instrumented operations include:
 - execution-environment preparation and provider materialization (dependency
   restoration is measured separately from recipes that require no restore);
 - validation check execution;
+- managed task submission and construction/recovery, with fixed admitted/limited
+  counters for process-local session backpressure (no token identities);
 - repository queries and HTTP GET handling, including long polls/static reads.
 
 Timings overlap and must not be added together as independent costs.

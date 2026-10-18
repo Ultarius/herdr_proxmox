@@ -65,16 +65,87 @@ publication receive no permission from the discussion plan.
 
 ## Freeze and integrate
 
+The default manual mode below is unchanged. Continuous private assembly is a
+separate per-release authorization; discussion-created plans do not enable it.
+
 Read-only repository questions and retained validation phase timings are
 documented in [Repository questions and operation measurements](repository-queries.md).
 
 **Freeze and integrate** pins the configured base commit, each selected candidate
 SHA in selection order, approved environment policy and manifest digest. The
-approved project checkout must match the configured base. Every selected commit
+inspector's recorded check success is historical: freeze also requires that
+evidence to carry the current approved policy digest. A published task or open
+PR alone is not release admission. If freeze refuses an old-policy result, use
+**Open task and validation**, choose **Validate latest commit**, and return after
+its required checks pass. If that changes the candidate SHA, remove and add the
+task to select the new SHA; no old result is transferred to it.
+
+The approved project checkout must match the configured base. Every selected commit
 must have passed required checks under that policy; changed candidates and
 protected policy differences are refused. No implicit fetch or policy waiver is
 performed. Local candidate commits are supported; prior publication is not
 required.
+
+## Continuous private assembly
+
+In a collecting release's inspector, enable **Continuous private assembly**.
+This authorizes the gateway to follow the latest checked heads of the selected
+tasks and build private assembly revisions. It grants no publication, deployment,
+task launch or policy approval. Membership may be edited while assembly runs;
+the in-flight manifest stays immutable and new inputs wait for the next revision.
+
+Each snapshot pins its base, selected eligible SHAs, approved policy, source
+validation identities and publication destination. Source checks must pass for
+their exact SHA and record a policy identity, but that source policy may be older
+than the current one. Authored protected-input changes still stop assembly:
+source comparison uses the merge base with the approved base so upstream-only
+drift is not mistaken for an authored policy edit. The final combined commit is
+checked against the approved base and validated under its current policy.
+
+The existing journal, retained refs, detached worktree, parent verification and
+exact-commit executor perform integration. Passing combined checks produces
+**Assembly checked · awaiting freeze**, not a publishable release. Partial scopes
+may assemble while other selected tasks await checks; freeze requires a current,
+checked checkpoint covering the complete selected scope. Explicit exclusions
+remain recorded with their reasons and original denominator.
+
+**Freeze verified assembly as release candidate** rechecks the selected task
+heads/evidence, base, policy, combined receipt, protected inputs and branch SHA.
+It admits that exact immutable checkpoint and stops automatic tracking.
+The freeze request names both the reviewed manifest digest and combined SHA.
+Historical task checks alone cannot grant release readiness. Publication remains explicit.
+An already-frozen release cannot silently change into continuous mode; revise its
+selection first. The manual freeze path still requires per-task current-policy
+checks before integration.
+
+Completed or blocked snapshots roll to a new generation when eligible task SHAs,
+membership, base or policy change. Old worktrees, conflicts, refs and receipts
+remain inspectable through retained revisions. Active integration, validation and
+agent work finish their current snapshot first. Identical failed inputs are not
+retried automatically; use **Re-run combined checks** or inspect and resume.
+Idle continuous releases are assessed on a 10-second safety cadence. Freeze
+always performs fresh admission checks rather than trusting that cached view.
+
+The default grant permits 20 assembly generations (maximum 100). Used counts
+survive restarts and stop/re-enable; changing the limit is an explicit admin
+action. Exhaustion is visible and never starts an unbounded rebuild loop.
+
+Automatic conflict repair is a separate option within the grant. Select an
+already-launched writable repository agent and a repair budget (default 2,
+maximum 10). Its session must match the assembly's frozen policy. Only the
+recorded unfinished merge with its exact parents can be dispatched; policy,
+unexpected-worktree and verification failures do not authorize arbitrary repair.
+The attempt reservation is committed before dispatch. Uncertain dispatch/save
+results reconcile the same request identity without consuming another attempt.
+An agent reply never substitutes for independent merge/result verification or
+combined validation. Budget exhaustion stops for operator inspection.
+
+**Stop assembly automation** prevents new generations and new automatic repair
+dispatches, including a reserved repair not yet sent. Work already dispatched
+may finish and be verified, but cannot publish. A stopped checked checkpoint
+still needs an explicit freeze. The API authorization is admin-only through
+`POST /api/releases/assembly`, with `enabled`, `auto_repair`, `profile_id`,
+`max_runs`, `max_repairs`, and the usual request/edit-version identity.
 
 Freeze performs Git inspection and member-ref retention outside the SQLite write
 transaction, under the repository lock. Before committing the manifest it
@@ -152,8 +223,8 @@ deployments need an explicit provider contract. Publication, deployment and
 acceptance remain separate facts; the node should display deployed, accepted or
 rejected only after their corresponding receipts exist.
 
-Administrator mutations use `/api/releases/{create,membership,freeze,revise,
-resume,retry,repair,exclude,publish}` with stable request IDs. Manifest edits
+Administrator mutations use `/api/releases/{create,membership,assembly,freeze,revise,
+resume,retry,repair,exclude,publish,review,review_policy,pull}` with stable request IDs. Manifest edits
 require the observed `edit_version`; frozen-run actions additionally require the
 manifest digest, and publication requires the reviewed `head_sha`. SQLite record
 versions prevent a worker from overwriting newer callbacks or operator actions.
@@ -162,11 +233,204 @@ Authenticated operators can read `/api/releases/revisions?id=<release-id>`;
 reads one release-scoped snapshot. A missing or incomplete active manifest is a
 visible blocker, rather than an exception that terminates the release worker.
 
+## Agents and group evidence review
+
+The release is a coordination point for selected tasks. Each member shows its
+assigned agent, recorded task state and (when available) live session activity.
+The canvas node also counts implementing tasks. These facts are separate from
+incorporation: an agent working on a task does not mean its code has entered the
+release. New task launches include their current collecting/assembly membership
+in the task instructions. This is a launch-time snapshot, not a new permission.
+
+The working sequence is:
+
+1. Assign tasks to the release and enable continuous private assembly. Agents
+   continue working in their own task branches and submit managed commits.
+2. Existing task capture/validation permissions govern delivery. Enabling
+   assembly does not start draft tasks, grant candidate capture, or install tools.
+   The release inspector's task links lead to the existing capture/validation
+   actions when that evidence is missing. With task delivery automation already
+   authorized, passing commits are consumed without another membership edit.
+3. The gateway assembles checked commits, shows pending members and integration
+   progress, and runs the combined required checks. A separately authorized,
+   bounded conflict agent can resolve an unfinished merge. Herdr verifies it.
+4. **Ask group to review release evidence** queues a discussion for a group whose
+   members share the tasks' organization and configured repository. The store
+   rechecks member repositories when accepting the discussion, so a roster edit
+   between selection and dispatch cannot redirect a release review.
+
+The retained review packet records full task IDs, selected and current SHAs,
+their check facts, the manifest/policy digests and combined validation facts.
+The prompt carries every selected SHA, a compact task prefix and an explicit
+missing/changed-evidence indicator. Oversized discussion inputs are refused
+before dispatch. A digest identifies the full packet; prompts and packets stay
+in the journal instead of being copied into every tasks poll.
+
+The group discusses missing capture/check evidence, risks and PR readiness. Its
+bounded, redacted report, discussion job link and packet digest appear in the
+release inspector. Changes to membership, task SHAs, check facts, manifest or
+combined result mark the advice outdated; ordinary task activity does not.
+Group output supplies neither a check receipt nor authorization. Release-review
+artifacts are excluded from automatic task proposals and release planning, even
+if the organization has separately granted those features.
+
+Discussion intent and the exact prompt are journaled before dispatch. A stable
+organization request identity reconciles an uncertain response across restart.
+An interrupted review can be rechecked against that same job/request after
+inspection; it does not silently start another group conversation. Existing
+discussion scheduling waits for busy members rather than interrupting task work.
+This is an instruction and orchestration boundary, not OS isolation from agents
+that share the gateway's Unix identity.
+
+### Automatic review after collection
+
+Select a repository group, set **Automatic review limit (1–20)**, then enable
+**Automatic release review**. This release-scoped authorization is independent
+of continuous assembly, task capture/validation and publication. It can be
+enabled while collecting; the worker waits for a checked full selection.
+
+The trigger requires every selected member to be incorporated or explicitly
+excluded, a combined receipt for the exact SHA under the frozen policy, and an
+unchanged approved base/policy. Included task candidates must still match their
+recorded SHAs, be past implementation, and have no pending required delivery
+inspection. A partial assembly cannot trigger the broad review. Exclusion
+states and reasons enter the review evidence; excluded code is not claimed as
+incorporated.
+
+The worker durably reserves one review per evidence snapshot and spends its
+review budget before discussion dispatch. A current manually requested review
+already covers that snapshot. Restarts, repeated polling, disabling/re-enabling,
+and revising the release do not reset the counter or replay a reserved snapshot.
+New checked assemblies can trigger another review within the remaining limit.
+Failures and uncertain discussions require inspection, rather than an automatic
+retry loop. The inspector displays the waiting reason, reserved count, report
+and recommended follow-up actions.
+
+The idle safety cadence does not delay queued discussion/PR effects. Committed
+operator edits and validation callbacks invalidate the idle throttle by record
+version; validation completion and automatic review reservation wake the worker
+after saving their durable state. Inactive throttle entries are pruned.
+
+Disabling the grant, or changing its group, cancels an automatic reservation
+that has not started dispatch. Once dispatch may have happened, the same request
+is reconciled instead of pretending the discussion was unsent. Group advice
+still cannot certify checks, create/launch follow-up tasks, freeze, publish, or
+open a PR. Follow-up recommendations remain visible for a separate authorized
+action through the existing task, conflict-repair and release controls.
+
+### Task completion and freeing agents
+
+Task lifecycle state, execution completion and release incorporation are
+different facts. Captured implementation normally becomes `review_ready`.
+Incorporating it into a release does not set `completed` or `merged`. Automatic
+`completed` applies to a verified no-changes result or a checked candidate whose
+file tree matches the fetched configured base. An operator can also record an
+inspected completion/supersession; a confirmed GitHub merge is recorded as
+`merged`.
+
+The assignment scheduler can reuse an agent before that task becomes terminal.
+It verifies the task's completion receipt, exact branch/HEAD, clean checkout,
+idle original session, and absence of other session owners. If durable task
+delivery is enabled, passing verification and the agent's delivery inspection
+must finish first (including task PR delivery if task auto-publication was
+separately enabled). It then archives/closes the original execution and starts
+the next queued assignment in order. A merely idle agent is insufficient.
+Release incorporation, freeze and publication are not prerequisites for handoff.
+A running group discussion does reserve its own participants through the normal
+session scheduler; a member cannot review and implement the next task at once.
+An independent reviewer group avoids competing for implementation agents.
+Without queued work, the session may remain retained for inspection; optional
+reaping policies govern cleanup. No-changes completion explicitly finishes its
+session, and terminal template instances have their own verified cleanup path.
+
+## Draft release pull requests
+
+After explicit freeze and successful branch publication, the inspector offers a
+title and description for **Create reviewed draft release PR**. This is another
+administrator action, bound to the manifest digest and exact combined SHA. It
+does not push again, merge, or deploy. The group may recommend this action; it
+cannot invoke it through its report.
+
+Before a GitHub write, the worker checks manifest integrity, the current approved
+policy, the exact combined required-check receipt, the local release branch and
+the published remote SHA. The upstream, publishing repository, branch and base
+come from the frozen revision. The request uses the configured PR credential
+and always creates a draft. Returned or existing PRs must match both repository
+identities, both branches and the exact head SHA. Links use a constructed GitHub
+URL rather than trusting a returned URL.
+
+The approved text is journaled before the network operation. Lost responses and
+duplicate-PR responses are reconciled by that exact identity before another POST.
+An uncertain result leaves branch publication intact and exposes an explicit
+retry action. Reusing an existing PR preserves its public title/description and
+is labeled as reuse. A worker cannot overwrite a newer operator update or
+callback with a stale save. Revised release generations do not inherit a PR
+approval or a group's current-evidence claim.
+
 ## Verification
 
-Run `python3 -m unittest tests.test_release_candidates` for real-Git recovery,
+Run `python3 -m unittest tests.test_release_candidates tests.test_release_assembly
+tests.test_release_coordination` for real-Git recovery,
 conflict, evidence and concurrency boundaries. Run the Jaspr
 `test/workflow_dom_test.dart` browser suite for release nodes, membership,
 keyboard navigation, filtering and revision-bound actions. The existing
 contribution suite exercises compatibility with task build routing. No live
-publication or deployment is needed to run these tests.
+publication or deployment is needed to run these tests. Publication-route,
+migration and exact-candidate receipt regressions are in
+`python3 -m unittest tests.test_publication_routes`.
+
+## Release-first delivery
+
+New organization configurations default to `publication_mode: release`. The
+organization automation dialog in both dashboards selects `release`, `both`, or
+`task`; repository overrides map managed repository-relative paths to a mode.
+The route is copied onto each task at creation. Changing policy affects future
+tasks, rather than silently redirecting work that is already running.
+
+Upgrade migration preserves existing task records and existing organization
+policies with the `task` route. Organizations represented by existing tasks also
+retain that route. An organization without a stored policy or any existing tasks
+uses the new default. Operators can opt into release-first delivery for future
+work in the automation dialog.
+
+* `release`: individual task push, publication-destination changes, draft PR
+  creation and automatic task publication are refused by the gateway. Capture,
+  validation and the existing agent verification/handoff barrier still run.
+* `both`: either delivery path is available. It does not automatically publish
+  both a task PR and a release PR.
+* `task`: retains individual task PR delivery, including existing automation.
+
+The automatic task-publication setting remains specific to the task/both routes;
+it never grants automatic release publication. Group review, private assembly,
+freeze, branch publication and release PR creation retain their separate grants
+and explicit approvals. Agents can take their next assignment after the existing
+implementation and delivery-inspection checks; they do not wait for the release
+to be published or merged.
+
+**Release this task only** is available on a captured task and in its workflow
+inspector. It creates a one-member **collecting** release pinned to the reviewed
+current SHA. It does not freeze, integrate, push, or create a PR. Repeating the
+shortcut for the same task/SHA returns the same release, including after restart;
+a changed head requires a new reviewed request. Normal admission, combined
+checks and release publication rules apply. Existing batch memberships remain
+explicit and are not silently removed.
+
+Release branch publication writes receipts for incorporated members in the same
+database transaction as the release state. Each receipt identifies the task's
+exact source candidate, immutable manifest, policy digest and combined commit.
+Branch publication, an open release PR, a closed PR and a verified GitHub merge
+are separate stages. Task snapshots and details expose up to ten receipts per
+task, labelled as covering either its current or an earlier candidate.
+
+Open release PRs are refreshed by the worker once per minute; administrators can
+also select **Refresh release PR status**. The observer checks the PR number,
+source and target repositories, branch, base and exact reviewed head before
+accepting merge evidence. Failed or contradictory refreshes preserve the prior
+receipt and report an error. A recorded merge cannot be downgraded by a stale
+observation. Network reads do not happen during ordinary task snapshot requests.
+
+The release remains `published`, with its PR observation stored separately.
+“Delivered through a merged release” does not set a member task to `merged` or
+assert that its source SHA is an ancestor of main: GitHub squash/rebase merges
+need not preserve that ancestry. A newer task candidate is never marked delivered
+by an older receipt. Deployment, acceptance and rollback remain separate work.

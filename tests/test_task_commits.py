@@ -21,6 +21,7 @@ import task_commits
 import task_commit_client
 import project_access
 import server
+from task_submission_limits import SubmissionLimits, SubmissionBusy
 
 
 def file_change(name='file', data=b'implementation\n', mode='100644'):
@@ -41,6 +42,8 @@ class ManagedCommitTests(unittest.TestCase):
         self.store.snapshot.return_value['jobs'] = [self.run]
         self.body = dict(task_id=self.task['id'], run_id='run', token='session-token', request_id='revision-1',
                          parent=self.base, message='Implement task', files=[file_change()])
+        # Payload/refusal tests deliberately issue bursts unrelated to rate policy.
+        self.service.commits.limits = SubmissionLimits(burst=1000)
 
     def submit(self, **changes):
         return self.service.commits.submit(dict(self.body, **changes))
@@ -145,6 +148,82 @@ class ManagedCommitTests(unittest.TestCase):
             event = json.loads(db.execute('SELECT data FROM build_events').fetchone()[0])
         self.assertEqual(event['task_revision_id'], result['id'])
         self.assertEqual(event['target'], result['sha'])
+
+    def test_batch_construction_preserves_literal_paths_raw_bytes_and_bounds_git_calls(self):
+        files = [file_change('batch/file-' + str(number), b'\x00\xff\r\n') for number in range(64)]
+        files += [file_change('batch/[literal] name.txt', b'utf-8 path'), file_change('batch/caf\u00e9.txt')]
+        original, calls = task_commits.command, []
+        def counted(path, *args, **kwargs):
+            calls.append(args)
+            return original(path, *args, **kwargs)
+        with patch('task_commits.command', side_effect=counted):
+            result = self.submit(files=files)
+        self.assertEqual(sum(args[0] == 'hash-object' for args in calls), 1)
+        self.assertEqual(sum(args[0] == 'update-index' for args in calls), 1)
+        self.assertLess(len(calls), 25)
+        self.assertEqual(task_commits.command(self.tree, 'show', result['sha'] + ':batch/file-63'), b'\x00\xff\r\n')
+        self.assertEqual(task_commits.command(self.tree, 'show', result['sha'] + ':batch/[literal] name.txt'), b'utf-8 path')
+        self.assertIn(':(literal)batch', next(args for args in calls if args[0] == 'ls-tree'))
+
+    def test_batched_parent_checks_reject_directory_replacement_and_file_ancestors(self):
+        first = self.submit(files=[file_change('nested/kept.txt'), file_change('file[1]')])
+        for name in ('nested', 'nested/kept.txt/child', 'file[1]/child'):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'non-regular|non-directory'):
+                self.submit(parent=first['sha'], request_id='bad-' + str(len(name)), files=[file_change(name)])
+        self.assertEqual(self.head(), first['sha'])
+
+    def test_batch_raw_blobs_ignore_worktree_filters_and_deletion_only_needs_no_hash(self):
+        (self.tree / '.gitattributes').write_text('*.dat filter=reject text eol=lf\n')
+        self.git('config', 'filter.reject.clean', 'exit 1')
+        self.git('config', 'filter.reject.required', 'true')
+        raw = b'\x00\xff\r\n'
+        first = self.submit(files=[file_change('binary.dat', raw)])
+        self.assertEqual(task_commits.command(self.tree, 'show', first['sha'] + ':binary.dat'), raw)
+        original = task_commits.command
+        with patch('task_commits.command', wraps=original) as calls:
+            second = self.submit(request_id='delete-only', parent=first['sha'],
+                                 files=[dict(path='binary.dat', mode='deleted')])
+        self.assertFalse(any(call.args[1] == 'hash-object' for call in calls.call_args_list))
+        self.assertEqual(self.git('ls-tree', second['sha'], 'binary.dat'), '')
+
+    def test_parent_batches_bound_arguments_for_many_long_paths(self):
+        files = [file_change(str(number) + '-' + 'x' * 400) for number in range(100)]
+        with patch('task_commits.command', return_value=b'') as calls:
+            self.assertEqual(task_commits.parent_entries(self.tree, self.base, files), {})
+        self.assertGreater(len(calls.call_args_list), 1)
+        for call in calls.call_args_list:
+            self.assertLessEqual(sum(len(arg.encode()) + 4 for arg in call.args[6:]), 8000)
+
+    def test_batch_inspection_refuses_committed_symlinks_and_gitlinks_without_following_them(self):
+        # Git objects exercise committed entry modes even on hosts where native
+        # symlink creation is unavailable. This does not emulate Linux capture.
+        link_blob = task_commits.command(self.tree, 'hash-object', '-w', '--stdin', data=b'file').decode().strip()
+        self.git('update-index', '--add', '--cacheinfo', '120000,' + link_blob + ',link', path=self.tree)
+        self.git('update-index', '--add', '--cacheinfo', '160000,' + self.base + ',submodule', path=self.tree)
+        tree = self.git('write-tree', path=self.tree).strip()
+        parent = self.git('commit-tree', tree, '-p', self.base, '-m', 'nonregular entries').strip()
+        self.git('update-ref', 'refs/heads/' + self.task['branch'], parent, self.base)
+        for number, name in enumerate(('link', 'link/child', 'submodule', 'submodule/child')):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'non-regular|non-directory'):
+                self.submit(parent=parent, request_id='nonregular-' + str(number), files=[file_change(name)])
+        self.assertEqual(self.head(), parent)
+
+    def test_limited_replay_never_recaptures_or_moves_head_and_can_retry_later(self):
+        clock = [100.0]
+        self.service.commits.limits = SubmissionLimits(burst=1, refill_seconds=10, clock=lambda: clock[0])
+        first = self.submit()
+        with patch('task_commits.normalize', side_effect=AssertionError('decoded limited payload')):
+            with self.assertRaises(SubmissionBusy) as caught:
+                self.submit()
+        self.assertEqual(caught.exception.retry_after, 10)
+        self.assertEqual(self.head(), first['sha'])
+        clock[0] += 10
+        self.assertEqual(self.submit(), first)
+
+    def test_invalid_credentials_never_allocate_admission_buckets(self):
+        with self.assertRaisesRegex(ValueError, 'current task session'):
+            self.submit(token='not-authorized')
+        self.assertEqual(self.service.commits.limits.sessions, {})
 
     def test_only_submitted_bytes_are_committed_and_live_edits_are_preserved(self):
         (self.tree / 'file').write_bytes(b'newer concurrent edit\n')
@@ -413,6 +492,17 @@ commits.submit(spec['body'])
         denied.exception.close()
         with urlopen(post(self.body), timeout=5) as response:
             result = json.load(response)
+        clock = [100.0]
+        self.service.commits.limits = SubmissionLimits(burst=1, refill_seconds=10, clock=lambda: clock[0])
+        with urlopen(post(self.body), timeout=5) as response:
+            self.assertEqual(json.load(response)['sha'], result['sha'])
+        with self.assertRaises(HTTPError) as limited:
+            urlopen(post(self.body), timeout=5)
+        self.assertEqual(limited.exception.code, 429)
+        self.assertEqual(limited.exception.headers['Retry-After'], '10')
+        self.assertTrue(json.load(limited.exception)['retryable'])
+        limited.exception.close()
+        clock[0] += 10
         history = url + '/api/tasks/revisions?id=' + self.task['id']
         with self.assertRaises(HTTPError) as denied:
             urlopen(history, timeout=5)

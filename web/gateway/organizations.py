@@ -1035,7 +1035,7 @@ class OrganizationStore:
                     if not isinstance(context_value, str) or not context_value.strip() or len(context_value) > 20000:
                         raise ValueError('The handover needs bounded context for the next agent.')
                     task_prompt = body.get('task_prompt', '')
-                    if not isinstance(task_prompt, str) or len(task_prompt) > 12000:
+                    if not isinstance(task_prompt, str) or len(task_prompt) > 16000:
                         raise ValueError('Invalid handover task prompt.')
                 elif any(j['kind'] == 'launch' and j['id'] != run['id'] and j.get('profile_id') == run['profile_id'] and j['state'] not in ('released', 'finished') for j in self.job_records()):
                     raise ValueError('Release the current agent binding before continuing an archived session.')

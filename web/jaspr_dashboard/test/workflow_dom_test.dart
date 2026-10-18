@@ -42,6 +42,9 @@ class _HostState extends State<_Host> {
       {'id': 'worker', 'name': 'Actual worker'},
       {'id': 'reviewer', 'name': 'Independent reviewer'},
     ],
+    groups: const [
+      {'id': 'release-group', 'name': 'Release evidence team'},
+    ],
     onOpenTask: opened.add,
     executor: 'service',
     listView: el('div', [
@@ -163,6 +166,272 @@ void main() {
       },
     ],
   };
+
+  test(
+    'release inspector shows task owners and explicitly requests group advice',
+    () async {
+      state.replace([row('origin', state: 'implementing'), row('follow')]);
+      state.replaceReleases([release()]);
+      await settle();
+      expect(
+        task('release:release-one').textContent,
+        contains('1 implementing'),
+      );
+      task('release:release-one').click();
+      await settle();
+      expect(
+        nodes('[data-release-work="origin"]').single.textContent,
+        contains('Actual worker · task implementing'),
+      );
+      await choose('Release review group', 'release-group');
+      await click('Ask group to review release evidence');
+      expect(state.releaseActions.single, containsPair('action', 'review'));
+      expect(
+        state.releaseActions.single,
+        containsPair('group_id', 'release-group'),
+      );
+      expect(state.releaseActions.single, containsPair('edit_version', 4));
+      expect(state.opened, isEmpty);
+      state.replaceReleases([
+        release()
+          ..['review'] = {
+            'state': 'complete',
+            'current': false,
+            'group_id': 'release-group',
+            'group_name': 'Release evidence team',
+            'digest': 'packet-digest',
+            'job_id': 'discussion',
+            'report': 'Capture and validate missing evidence.',
+          },
+      ]);
+      await settle();
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('Outdated review'),
+      );
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('Capture and validate'),
+      );
+      expect(state.releaseActions.length, 1);
+    },
+  );
+
+  test(
+    'automatic group review has a separate explicit grant and persistent budget',
+    () async {
+      state.replaceReleases([release()]);
+      await settle();
+      task('release:release-one').click();
+      await settle();
+      await choose('Release review group', 'release-group');
+      await click('Enable automatic release review');
+      expect(
+        state.releaseActions.single,
+        containsPair('action', 'review_policy'),
+      );
+      expect(state.releaseActions.single, containsPair('enabled', true));
+      expect(
+        state.releaseActions.single,
+        containsPair('group_id', 'release-group'),
+      );
+      expect(state.releaseActions.single, containsPair('max_reviews', 3));
+      state.replaceReleases([
+        release()
+          ..['review_policy'] = {
+            'enabled': true,
+            'group_id': 'release-group',
+            'max_reviews': 3,
+            'reviews_used': 1,
+            'notice': 'Waiting for required delivery inspections.',
+          },
+      ]);
+      await settle();
+      expect(nodes('.task-wf-inspector').single.textContent, contains('1 / 3'));
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('delivery inspections'),
+      );
+      await click('Disable automatic release review');
+      expect(
+        state.releaseActions.last,
+        containsPair('action', 'review_policy'),
+      );
+      expect(state.releaseActions.last, containsPair('enabled', false));
+      expect(state.releaseActions.length, 2);
+    },
+  );
+
+  test(
+    'draft release PR action reviews exact head and never repeats publication',
+    () async {
+      final published = release(state: 'published')
+        ..['resulting_sha'] = 'c' * 40
+        ..['revision'] = {'digest': 'manifest-digest'}
+        ..['pull_preview'] = {
+          'title': 'Release alpha.15',
+          'body': 'Verified combined evidence.',
+        };
+      state.replaceReleases([published]);
+      await settle();
+      task('release:release-one').click();
+      await settle();
+      await click('Create reviewed draft release PR');
+      expect(state.releaseActions.single, containsPair('action', 'pull'));
+      expect(state.releaseActions.single, containsPair('head_sha', 'c' * 40));
+      expect(
+        state.releaseActions.single,
+        containsPair('revision', 'manifest-digest'),
+      );
+      expect(state.releaseActions.single, containsPair('reviewed', true));
+      expect(
+        state.releaseActions.single,
+        containsPair('body', 'Verified combined evidence.'),
+      );
+      expect(
+        nodes(
+          'button',
+        ).any((b) => b.textContent == 'Publish verified release branch'),
+        false,
+      );
+      state.replaceReleases([
+        Map<String, dynamic>.from(published)
+          ..['pull_request'] = {
+            'state': 'complete',
+            'number': 15,
+            'url': 'https://github.com/example/repo/pull/15',
+            'reused': true,
+          },
+      ]);
+      await settle();
+      expect(
+        nodes('a')
+            .where((a) => a.textContent == 'Open release PR #15')
+            .single
+            .getAttribute('href'),
+        'https://github.com/example/repo/pull/15',
+      );
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('existing PR was reconciled'),
+      );
+      expect(
+        nodes(
+          'button',
+        ).any((b) => b.textContent == 'Create reviewed draft release PR'),
+        false,
+      );
+    },
+  );
+
+  test(
+    'edited release PR preview requires review again when the combined SHA changes',
+    () async {
+      final published = release(state: 'published')
+        ..['resulting_sha'] = 'c' * 40
+        ..['pull_preview'] = {
+          'title': 'Release alpha.15',
+          'body': 'Verified combined evidence.',
+        };
+      state.replaceReleases([published]);
+      await settle();
+      task('release:release-one').click();
+      await settle();
+      final input =
+          nodes('label')
+                  .firstWhere(
+                    (n) =>
+                        n.querySelector('span')?.textContent ==
+                        'Release PR title',
+                  )
+                  .querySelector('input')
+              as web.HTMLInputElement;
+      input.value = 'Reviewed title';
+      input.dispatchEvent(web.Event('input', web.EventInit(bubbles: true)));
+      await settle();
+      final body =
+          nodes('label')
+                  .firstWhere(
+                    (n) =>
+                        n.querySelector('span')?.textContent ==
+                        'Release PR description',
+                  )
+                  .querySelector('textarea')
+              as web.HTMLTextAreaElement;
+      body.value = 'Description reviewed for the original commit.';
+      body.dispatchEvent(web.Event('input', web.EventInit(bubbles: true)));
+      await settle();
+      state.replaceReleases([
+        Map<String, dynamic>.from(published)..['resulting_sha'] = 'd' * 40,
+      ]);
+      await settle();
+      final create =
+          nodes('button').firstWhere(
+                (b) => b.textContent == 'Create reviewed draft release PR',
+              )
+              as web.HTMLButtonElement;
+      expect(create.disabled, true);
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('combined commit changed'),
+      );
+      // Editing either old field must not implicitly approve the untouched
+      // counterpart for the new commit. Only the explicit reset rebinds it.
+      final staleTitle =
+          nodes('label')
+                  .firstWhere(
+                    (n) =>
+                        n.querySelector('span')?.textContent ==
+                        'Release PR title',
+                  )
+                  .querySelector('input')
+              as web.HTMLInputElement;
+      staleTitle.value = 'Reviewed title!';
+      staleTitle.dispatchEvent(
+        web.Event('input', web.EventInit(bubbles: true)),
+      );
+      await settle();
+      expect(
+        (nodes('button').firstWhere(
+                  (b) => b.textContent == 'Create reviewed draft release PR',
+                )
+                as web.HTMLButtonElement)
+            .disabled,
+        true,
+      );
+      final staleBody =
+          nodes('label')
+                  .firstWhere(
+                    (n) =>
+                        n.querySelector('span')?.textContent ==
+                        'Release PR description',
+                  )
+                  .querySelector('textarea')
+              as web.HTMLTextAreaElement;
+      expect(staleBody.value, 'Description reviewed for the original commit.');
+      staleBody.value += '!';
+      staleBody.dispatchEvent(web.Event('input', web.EventInit(bubbles: true)));
+      await settle();
+      expect(
+        (nodes('button').firstWhere(
+                  (b) => b.textContent == 'Create reviewed draft release PR',
+                )
+                as web.HTMLButtonElement)
+            .disabled,
+        true,
+      );
+      await click('Reset release PR preview');
+      expect(
+        (nodes('button').firstWhere(
+                  (b) => b.textContent == 'Create reviewed draft release PR',
+                )
+                as web.HTMLButtonElement)
+            .disabled,
+        false,
+      );
+      expect(state.releaseActions, isEmpty);
+    },
+  );
 
   test(
     'release membership includes every member and preserves provenance semantics',
@@ -364,6 +633,93 @@ void main() {
       isEmpty,
     );
   });
+
+  test(
+    'continuous assembly authorization is separate from freeze and publication',
+    () async {
+      final planned = release(state: 'collecting');
+      state.replace([row('origin'), row('follow')]);
+      state.replaceReleases([planned]);
+      await settle();
+      nodes('[data-release="release-one"]').single.click();
+      await settle();
+      await click('Enable continuous assembly');
+      expect(state.releaseActions.last, containsPair('action', 'assembly'));
+      expect(state.releaseActions.last, containsPair('enabled', true));
+      expect(state.releaseActions.last, containsPair('auto_repair', false));
+      expect(state.releaseActions.last, containsPair('max_runs', 20));
+      expect(
+        state.releaseActions.any(
+          (a) => a['action'] == 'freeze' || a['action'] == 'publish',
+        ),
+        isFalse,
+      );
+      state.replaceReleases([
+        {
+          ...planned,
+          'state': 'integrating',
+          'continuous': {
+            'enabled': true,
+            'auto_repair': false,
+            'max_runs': 20,
+            'max_repairs': 2,
+            'runs_used': 1,
+          },
+          'revision': {'purpose': 'assembly', 'digest': 'assembly-snapshot'},
+        },
+      ]);
+      await settle();
+      await click('Stop assembly automation');
+      expect(state.releaseActions.last, containsPair('enabled', false));
+    },
+  );
+
+  test(
+    'checked assembly requires explicit freeze before publication appears',
+    () async {
+      final checked = release(state: 'assembled')
+        ..['continuous'] = {'enabled': true, 'max_runs': 20, 'max_repairs': 2}
+        ..['resulting_sha'] = 'e' * 40
+        ..['revision'] = {'purpose': 'assembly', 'digest': 'checked-snapshot'};
+      state.replaceReleases([checked]);
+      await settle();
+      nodes('[data-release="release-one"]').single.click();
+      await settle();
+      expect(
+        nodes(
+          'button',
+        ).where((b) => b.textContent == 'Publish verified release branch'),
+        isEmpty,
+      );
+      await click('Freeze verified assembly as release candidate');
+      expect(state.releaseActions.last, containsPair('action', 'freeze'));
+      expect(
+        state.releaseActions.last,
+        containsPair('revision', 'checked-snapshot'),
+      );
+      expect(state.releaseActions.last, containsPair('head_sha', 'e' * 40));
+    },
+  );
+
+  test(
+    'collecting release members link to task validation without freezing',
+    () async {
+      state.replace([row('origin'), row('follow')]);
+      state.replaceReleases([release(state: 'collecting')]);
+      await settle();
+      nodes('[data-release="release-one"]').single.click();
+      await settle();
+      final member = nodes('[data-release-member="origin"]').single;
+      final buttons = member.querySelectorAll('button');
+      for (var index = 0; index < buttons.length; index++) {
+        final button = buttons.item(index) as web.HTMLButtonElement;
+        if (button.textContent == 'Open task and validation') button.click();
+      }
+      await settle();
+      expect(state.opened, ['origin']);
+      expect(state.releaseActions, isEmpty);
+    },
+  );
 
   test('release-only repositories are selectable during creation', () async {
     state.replace([]);
@@ -816,6 +1172,43 @@ void main() {
         contains('No development tasks yet.'),
       );
       expect(nodes('.task-wf-edge'), isEmpty);
+    },
+  );
+  test(
+    'single-task release uses exact candidate and keeps prior receipts distinct',
+    () async {
+      state.replace([
+        {
+          ...row('one', state: 'review_ready'),
+          'head_sha': 'a' * 40,
+          'task_publication_allowed': false,
+          'release_deliveries': [
+            {
+              'version': 'alpha.15',
+              'stage': 'merged',
+              'candidate_sha': 'b' * 40,
+              'current_candidate_matches': false,
+            },
+          ],
+        },
+      ]);
+      await settle();
+      task('one').click();
+      await settle();
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('Receipt covers an earlier candidate'),
+      );
+      await click('Release this task only');
+      expect(state.releaseActions.single, {
+        'action': 'single',
+        'task_id': 'one',
+        'head_sha': 'a' * 40,
+      });
+      expect(
+        nodes('.task-wf-node').single.textContent,
+        isNot(contains('Merged')),
+      );
     },
   );
 }

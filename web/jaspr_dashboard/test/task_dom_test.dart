@@ -460,6 +460,35 @@ void main() {
     },
   );
 
+  test(
+    'release delivery hides task publication and creates a collecting single-task release',
+    () async {
+      final task = publishedTask()
+        ..['state'] = 'review_ready'
+        ..['publication_mode'] = 'release'
+        ..['task_publication_allowed'] = false
+        ..remove('publish');
+      await mount(const TasksPage(taskId: 'task'), (r) {
+        if (r.url.path == '/api/releases/single')
+          return {
+            'id': 'release-one',
+            'version': 'urgent-task',
+            'state': 'collecting',
+          };
+        return taskResponse(r, task);
+      });
+      final names = elements('button').map((e) => e.textContent).join(' ');
+      expect(names, isNot(contains('Review and publish')));
+      expect(names, isNot(contains('Open draft PR')));
+      await click('Release this task only');
+      final request = posts.single;
+      expect(request['path'], '/api/releases/single');
+      expect(request['task_id'], 'task');
+      expect(request['head_sha'], 'b' * 40);
+      expect(request['request_id'], isNotEmpty);
+    },
+  );
+
   test('publishing credentials remain restricted to administrators', () async {
     await mount(const TasksPage(), publishingResponse, role: 'operator');
     expect(button('GitHub publishing').disabled, true);
