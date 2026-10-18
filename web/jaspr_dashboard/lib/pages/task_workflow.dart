@@ -114,6 +114,9 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
   bool historyLoading = false;
   String? historyError;
   bool hideMerged = false, lanes = true, panel = false, compact = false;
+  bool expanded = false, detailsMounted = false, presentationScheduled = false;
+  bool composing = false;
+  web.HTMLElement? expansionFocus, detailsFocus;
   double zoom = 1;
   ({double x, double y, double left, double top, int id})? drag;
   List<_Box> boxes = [];
@@ -131,6 +134,101 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
   void update(void Function() change) => setState(change);
   web.HTMLElement? get viewport =>
       web.document.getElementById('$instance-viewport') as web.HTMLElement?;
+  bool get releaseDetails =>
+      view == 'workflow' &&
+      panel &&
+      (creatingRelease ||
+          component.releases.any((r) => 'release:${r['id']}' == selected));
+
+  void toggleExpanded() {
+    if (!expanded)
+      expansionFocus =
+          web.document.getElementById('$instance-expand') as web.HTMLElement?;
+    setState(() => expanded = !expanded);
+    if (!expanded)
+      Timer.run(() {
+        if (mounted && (expansionFocus?.isConnected ?? false))
+          expansionFocus?.focus();
+      });
+  }
+
+  void closeReleaseDetails() {
+    setState(() {
+      panel = false;
+      creatingRelease = false;
+    });
+  }
+
+  void restoreDetailsFocus() {
+    final origin = detailsFocus;
+    detailsFocus = null;
+    final node =
+        web.document.getElementById('$instance-node-$selected')
+            as web.HTMLElement?;
+    final fallback =
+        web.document.getElementById('$instance-expand') ??
+        web.document.getElementById('$instance-tab-$view');
+    (node ??
+            (origin?.isConnected == true && origin != web.document.body
+                ? origin
+                : fallback as web.HTMLElement?))
+        ?.focus();
+  }
+
+  /// Only synchronize modal transitions, after Jaspr has committed the DOM.
+  /// Native modality covers the whole page and escapes ancestor stacking contexts.
+  void schedulePresentation() {
+    if (presentationScheduled || detailsMounted == releaseDetails) return;
+    presentationScheduled = true;
+    Timer.run(syncPresentation);
+  }
+
+  void syncPresentation() {
+    presentationScheduled = false;
+    if (!mounted) return;
+    final dialog =
+        web.document.getElementById('$instance-release-dialog')
+            as web.HTMLDialogElement?;
+    if (releaseDetails) {
+      if (dialog == null) return;
+      if (!dialog.open) {
+        detailsFocus = web.document.activeElement as web.HTMLElement?;
+        dialog.showModal();
+        dialog.focus();
+      }
+      detailsMounted = true;
+    } else if (detailsMounted) {
+      // This also covers a selected release disappearing in a fresh snapshot.
+      if (dialog?.open == true) dialog!.close();
+      detailsMounted = false;
+      composing = false;
+      restoreDetailsFocus();
+    }
+  }
+
+  void containFocus(web.KeyboardEvent event, web.HTMLElement root) {
+    if (event.key != 'Tab') return;
+    final nodes = root.querySelectorAll(
+      'button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),a[href],[tabindex="0"]',
+    );
+    final controls = <web.HTMLElement>[];
+    for (var i = 0; i < nodes.length; i++) {
+      final node = nodes.item(i) as web.HTMLElement;
+      if (node.getClientRects().length > 0) controls.add(node);
+    }
+    if (controls.isEmpty) {
+      event.preventDefault();
+      root.focus();
+      return;
+    }
+    final active = web.document.activeElement;
+    if (active == root ||
+        !root.contains(active) ||
+        (event.shiftKey ? active == controls.first : active == controls.last)) {
+      event.preventDefault();
+      (event.shiftKey ? controls.last : controls.first).focus();
+    }
+  }
 
   @override
   void initState() {
@@ -144,6 +242,11 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
   @override
   void dispose() {
     phone?.removeEventListener('change', phoneChanged);
+    final dialog =
+        web.document.getElementById('$instance-release-dialog')
+            as web.HTMLDialogElement?;
+    if (dialog?.open == true) dialog!.close();
+    detailsFocus = null;
     super.dispose();
   }
 
@@ -170,8 +273,10 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
     if (!component.tasks.any((task) => _id(task) == selected) &&
         !component.releases.any(
           (release) => 'release:${release['id']}' == selected,
-        ))
+        )) {
+      if (detailsMounted) panel = false;
       selected = null;
+    }
     if (!component.tasks.any(
           (task) => '${task['repository'] ?? ''}' == repository,
         ) &&
@@ -264,6 +369,11 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
   }
 
   void chooseTask(String? id, {bool reveal = false}) {
+    if (id != null && id == selected) {
+      setState(() => panel = true);
+      if (reveal) scheduleMicrotask(() => _reveal(id));
+      return;
+    }
     setState(() {
       selected = id;
       assemblyMode = assemblyAgent = assemblyRuns = assemblyRepairs = null;
@@ -327,10 +437,15 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
   }
 
   void keyFor(String id, web.KeyboardEvent event) {
+    if (event.isComposing || composing) return;
     String? next;
     if (event.key == 'Escape') {
       event.preventDefault();
-      chooseTask(null);
+      if (expanded) {
+        toggleExpanded();
+      } else {
+        chooseTask(null);
+      }
       return;
     }
     if (event.key == 'ArrowRight')
@@ -366,160 +481,279 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
     layoutGraph(tasks);
     final highlighted = emphasis;
     final repositories = releaseRepositories;
-    return el('section', [
-      el('div', [
-        el(
-          'div',
-          [
-            for (final value in ['workflow', 'list'])
+    schedulePresentation();
+    return el(
+      'section',
+      [
+        el('div', [
+          el(
+            'div',
+            [
+              for (final value in ['workflow', 'list'])
+                el(
+                  'button',
+                  [
+                    icon(value == 'workflow' ? 'workflow' : 'list'),
+                    text(value == 'workflow' ? 'Workflow' : 'List'),
+                    if (value == 'list')
+                      el('span', [
+                        text(component.tasks.length),
+                      ], classes: 'count'),
+                  ],
+                  classes: 'tabs__tab task-wf-tab',
+                  attributes: {
+                    'type': 'button',
+                    'role': 'tab',
+                    'id': '$instance-tab-$value',
+                    'aria-selected': '${view == value}',
+                    'aria-controls': '$instance-panel-$value',
+                  },
+                  events: {
+                    'click': (_) => setState(() {
+                      view = value;
+                      if (view == 'list') expanded = false;
+                    }),
+                  },
+                ),
+            ],
+            classes: 'tabs task-wf-tabs',
+            attributes: {'role': 'tablist', 'aria-label': 'Task view'},
+          ),
+          if (view == 'workflow')
+            el('div', [
+              if (component.onReleaseAction != null)
+                button(
+                  'New release candidate',
+                  () => setState(() {
+                    creatingRelease = true;
+                    selected = null;
+                    panel = true;
+                    newReleaseRepository = repository.isNotEmpty
+                        ? repository
+                        : (repositories.firstOrNull ?? '');
+                  }),
+                  small: true,
+                  iconName: 'rocket',
+                  disabled: component.releaseBusy,
+                ),
+              switchControl(
+                'Lanes by agent',
+                lanes,
+                (value) => setState(() => lanes = value),
+              ),
+              el(
+                'span',
+                [],
+                classes: 'toolbar__divider',
+                attributes: {'aria-hidden': 'true'},
+              ),
+              zoomGroup(),
               el(
                 'button',
                 [
-                  icon(value == 'workflow' ? 'workflow' : 'list'),
-                  text(value == 'workflow' ? 'Workflow' : 'List'),
-                  if (value == 'list')
-                    el('span', [
-                      text(component.tasks.length),
-                    ], classes: 'count'),
+                  icon(expanded ? 'x' : 'scan'),
+                  text(expanded ? 'Exit full screen' : 'Full screen'),
                 ],
-                classes: 'tabs__tab task-wf-tab',
+                classes: 'btn btn--secondary btn--sm',
                 attributes: {
                   'type': 'button',
-                  'role': 'tab',
-                  'id': '$instance-tab-$value',
-                  'aria-selected': '${view == value}',
-                  'aria-controls': '$instance-panel-$value',
+                  'id': '$instance-expand',
+                  'aria-pressed': '$expanded',
+                  'aria-controls': '$instance-panel-workflow',
                 },
-                events: {'click': (_) => setState(() => view = value)},
+                events: {'click': (_) => toggleExpanded()},
               ),
-          ],
-          classes: 'tabs task-wf-tabs',
-          attributes: {'role': 'tablist', 'aria-label': 'Task view'},
-        ),
+            ], classes: 'toolbar wf-view'),
+        ], classes: 'wf-tabsrow'),
         if (view == 'workflow')
           el('div', [
-            if (component.onReleaseAction != null)
-              button(
-                'New release candidate',
-                () => setState(() {
-                  creatingRelease = true;
-                  selected = null;
-                  panel = true;
-                  newReleaseRepository = repository.isNotEmpty
-                      ? repository
-                      : (repositories.firstOrNull ?? '');
-                }),
-                small: true,
-                iconName: 'rocket',
-                disabled: component.releaseBusy,
-              ),
+            select('Repository', repository, {
+              '': 'All repositories',
+              for (final name in repositories) name: name,
+            }, (value) => setState(() => repository = value)),
+            select('Task state', status, {
+              '': 'All states',
+              for (final state in component.tasks.map(_stateKey).toSet())
+                state: taskStateLabel(state),
+            }, (value) => setState(() => status = value)),
+            select('Validation', validation, {
+              '': 'All evidence',
+              'verified': 'Exact commit verified',
+              'running': 'Queued or running',
+              'unverified': 'Not verified',
+            }, (value) => setState(() => validation = value)),
             switchControl(
-              'Lanes by agent',
-              lanes,
-              (value) => setState(() => lanes = value),
+              'Hide merged',
+              hideMerged,
+              (value) => setState(() => hideMerged = value),
             ),
             el(
               'span',
-              [],
-              classes: 'toolbar__divider',
-              attributes: {'aria-hidden': 'true'},
+              [
+                text(
+                  'Showing ${tasks.length} of ${component.tasks.length} tasks',
+                ),
+              ],
+              classes: 'task-wf-result',
+              attributes: {'aria-live': 'polite'},
             ),
-            zoomGroup(),
-          ], classes: 'toolbar wf-view'),
-      ], classes: 'wf-tabsrow'),
-      if (view == 'workflow')
-        el('div', [
-          select('Repository', repository, {
-            '': 'All repositories',
-            for (final name in repositories) name: name,
-          }, (value) => setState(() => repository = value)),
-          select('Task state', status, {
-            '': 'All states',
-            for (final state in component.tasks.map(_stateKey).toSet())
-              state: taskStateLabel(state),
-          }, (value) => setState(() => status = value)),
-          select('Validation', validation, {
-            '': 'All evidence',
-            'verified': 'Exact commit verified',
-            'running': 'Queued or running',
-            'unverified': 'Not verified',
-          }, (value) => setState(() => validation = value)),
-          switchControl(
-            'Hide merged',
-            hideMerged,
-            (value) => setState(() => hideMerged = value),
-          ),
+          ], classes: 'toolbar task-wf-toolbar'),
+        if (view == 'workflow')
           el(
-            'span',
+            'div',
             [
-              text(
-                'Showing ${tasks.length} of ${component.tasks.length} tasks',
+              summary(),
+              agentBar(tasks),
+              el(
+                'div',
+                [
+                  el('div', [
+                    canvas(tasks, highlighted),
+                    legend(tasks),
+                  ], classes: 'task-wf-main'),
+                  if (panel && !releaseDetails)
+                    el(
+                      'div',
+                      [inspector()],
+                      classes: 'task-wf-panel',
+                      attributes: {'id': '$instance-inspector'},
+                    ),
+                ],
+                classes: 'task-wf-layout',
+                attributes: {
+                  'data-panel': '${panel && !releaseDetails}',
+                  'data-view': view,
+                },
               ),
             ],
-            classes: 'task-wf-result',
-            attributes: {'aria-live': 'polite'},
-          ),
-        ], classes: 'toolbar task-wf-toolbar'),
-      if (view == 'workflow')
-        el(
-          'div',
-          [
-            summary(),
-            agentBar(tasks),
-            el(
-              'div',
-              [
-                el('div', [
-                  canvas(tasks, highlighted),
-                  legend(tasks),
-                ], classes: 'task-wf-main'),
-                if (panel)
-                  el(
-                    'div',
-                    [inspector()],
-                    classes: 'task-wf-panel',
-                    attributes: {'id': '$instance-inspector'},
+            classes: 'task-wf-board',
+            attributes: {
+              'role': 'tabpanel',
+              'id': '$instance-panel-workflow',
+              'aria-labelledby': '$instance-tab-workflow',
+            },
+          )
+        else
+          el(
+            'div',
+            [
+              component.listView ??
+                  table(
+                    ['Task', 'Agent', 'State', 'Repository'],
+                    [
+                      for (final task in component.tasks)
+                        [
+                          button(
+                            '${task['title']}',
+                            () => component.onOpenTask(_id(task)),
+                          ),
+                          text(_name(task)),
+                          badge(_state(task), tone: _tone(task)),
+                          text(task['repository']),
+                        ],
+                    ],
                   ),
-              ],
-              classes: 'task-wf-layout',
-              attributes: {'data-panel': '$panel', 'data-view': view},
-            ),
-          ],
-          classes: 'task-wf-board',
-          attributes: {
-            'role': 'tabpanel',
-            'id': '$instance-panel-workflow',
-            'aria-labelledby': '$instance-tab-workflow',
-          },
-        )
-      else
+            ],
+            classes: 'task-wf-list-panel',
+            attributes: {
+              'role': 'tabpanel',
+              'id': '$instance-panel-list',
+              'aria-labelledby': '$instance-tab-list',
+            },
+          ),
         el(
-          'div',
+          'dialog',
           [
-            component.listView ??
-                table(
-                  ['Task', 'Agent', 'State', 'Repository'],
-                  [
-                    for (final task in component.tasks)
-                      [
-                        button(
-                          '${task['title']}',
-                          () => component.onOpenTask(_id(task)),
-                        ),
-                        text(_name(task)),
-                        badge(_state(task), tone: _tone(task)),
-                        text(task['repository']),
-                      ],
-                  ],
-                ),
+            el('header', [
+              el(
+                'h2',
+                [
+                  text(
+                    creatingRelease
+                        ? 'New release candidate'
+                        : 'Release details',
+                  ),
+                ],
+                attributes: {'id': '$instance-release-title'},
+              ),
+              button(
+                'Back to workflow',
+                closeReleaseDetails,
+                iconName: 'x',
+                small: true,
+              ),
+            ], classes: 'wf-release-dialog__header'),
+            if (releaseDetails) inspector(),
           ],
-          classes: 'task-wf-list-panel',
+          classes: 'wf-release-dialog',
           attributes: {
-            'role': 'tabpanel',
-            'id': '$instance-panel-list',
-            'aria-labelledby': '$instance-tab-list',
+            'id': '$instance-release-dialog',
+            // Preserve showModal's attribute on ordinary renders. Keep it until
+            // close() runs: removing it directly can strand a top-layer modal.
+            if (detailsMounted) 'open': '',
+            'role': 'dialog',
+            if (releaseDetails) 'aria-modal': 'true',
+            'aria-labelledby': '$instance-release-title',
+            'tabindex': '-1',
+          },
+          events: {
+            'cancel': (event) {
+              event.preventDefault();
+              if (!composing) closeReleaseDetails();
+            },
+            'click': (event) {
+              // Backdrop clicks target the dialog itself. Keep keyboard dismissal
+              // available even if a browser moves focus away from its content.
+              final dialog =
+                  web.document.getElementById('$instance-release-dialog')
+                      as web.HTMLDialogElement?;
+              if (event.target == dialog) dialog?.focus();
+            },
+            'keydown': (event) {
+              final key = event as web.KeyboardEvent;
+              key.stopPropagation();
+              if (key.isComposing || composing) {
+                if (key.key == 'Escape') key.preventDefault();
+                return;
+              }
+              if (key.key == 'Escape') {
+                key.preventDefault();
+                closeReleaseDetails();
+              }
+              final dialog =
+                  web.document.getElementById('$instance-release-dialog')
+                      as web.HTMLElement?;
+              if (dialog != null) containFocus(key, dialog);
+            },
           },
         ),
-    ], classes: 'task-workflow');
+      ],
+      classes: 'task-workflow',
+      attributes: {
+        'id': instance,
+        'data-expanded': '$expanded',
+        'aria-label': 'Task workflow',
+      },
+      events: {
+        'compositionstart': (_) => composing = true,
+        'compositionend': (_) => composing = false,
+        'keydown': (event) {
+          final key = event as web.KeyboardEvent;
+          if (!expanded ||
+              releaseDetails ||
+              key.defaultPrevented ||
+              key.isComposing ||
+              composing)
+            return;
+          if (key.key == 'Escape') {
+            key.preventDefault();
+            toggleExpanded();
+          }
+          final root =
+              web.document.getElementById(instance) as web.HTMLElement?;
+          if (root != null) containFocus(key, root);
+        },
+      },
+    );
   }
 }

@@ -333,7 +333,12 @@ extension _Canvas on _TaskWorkflowState {
           viewport?.removeAttribute('data-panning');
         },
         'keydown': (event) {
-          if ((event as web.KeyboardEvent).key == 'Escape') {
+          if (event.defaultPrevented ||
+              (event as web.KeyboardEvent).isComposing ||
+              composing)
+            return;
+          if (event.key == 'Escape') {
+            if (expanded) return; // The workflow root owns full-screen Escape.
             update(() {
               selected = null;
               agent = '';

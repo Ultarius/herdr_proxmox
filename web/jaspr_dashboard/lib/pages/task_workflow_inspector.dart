@@ -10,10 +10,15 @@ extension _Inspector on _TaskWorkflowState {
         ]),
       ]);
 
-  Component section(String title, List<Component> children) => el('section', [
-    el('h3', [text(title)], classes: 'overline inspector__section-title'),
-    ...children,
-  ], classes: 'inspector__section');
+  Component section(String title, List<Component> children) => el(
+    'section',
+    [
+      el('h3', [text(title)], classes: 'overline inspector__section-title'),
+      ...children,
+    ],
+    classes: 'inspector__section',
+    attributes: {'data-section': title},
+  );
 
   /// Template inspector: the workflow overview, or one task's recorded facts.
   Component inspector() {

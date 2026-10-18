@@ -22,6 +22,8 @@ class _HostState extends State<_Host> {
   final releaseActions = <Map<String, dynamic>>[];
   Future<Map<String, dynamic>> Function(String, String?, int?)? historyLoader;
   final opened = <String>[];
+  bool visible = true;
+  void hideWorkflow() => setState(() => visible = false);
   void replace(List<Map<String, dynamic>> rows) => setState(() => tasks = rows);
   void replaceReleases(List<Map<String, dynamic>> rows) =>
       setState(() => releases = rows);
@@ -32,26 +34,28 @@ class _HostState extends State<_Host> {
   }
 
   @override
-  Component build(BuildContext context) => TaskWorkflow(
-    tasks: tasks,
-    releases: releases,
-    onLoadReleaseHistory: historyLoader,
-    onReleaseAction: (action, body) =>
-        releaseActions.add({'action': action, ...body}),
-    profiles: const [
-      {'id': 'worker', 'name': 'Actual worker'},
-      {'id': 'reviewer', 'name': 'Independent reviewer'},
-    ],
-    groups: const [
-      {'id': 'release-group', 'name': 'Release evidence team'},
-    ],
-    onOpenTask: opened.add,
-    executor: 'service',
-    listView: el('div', [
-      text('Original task actions preserved'),
-      button('Open original task', () => opened.add('original-list')),
-    ]),
-  );
+  Component build(BuildContext context) => !visible
+      ? const Component.empty()
+      : TaskWorkflow(
+          tasks: tasks,
+          releases: releases,
+          onLoadReleaseHistory: historyLoader,
+          onReleaseAction: (action, body) =>
+              releaseActions.add({'action': action, ...body}),
+          profiles: const [
+            {'id': 'worker', 'name': 'Actual worker'},
+            {'id': 'reviewer', 'name': 'Independent reviewer'},
+          ],
+          groups: const [
+            {'id': 'release-group', 'name': 'Release evidence team'},
+          ],
+          onOpenTask: opened.add,
+          executor: 'service',
+          listView: el('div', [
+            text('Original task actions preserved'),
+            button('Open original task', () => opened.add('original-list')),
+          ]),
+        );
 }
 
 Future<void> settle() => Future<void>.delayed(const Duration(milliseconds: 25));
@@ -112,6 +116,9 @@ void main() {
     );
     for (final path in [
       '../web/css/tokens.css',
+      '../web/styles.css',
+      '../web/css/components.css',
+      '../web/css/composites.css',
       '../web/css/task-workflow.css',
     ]) {
       final loaded = Completer<void>();
@@ -599,7 +606,7 @@ void main() {
       expect(state.releaseActions.last, containsPair('included', false));
       await click('New release candidate');
       expect(
-        nodes('.task-wf-inspector').single.textContent,
+        nodes('.wf-release-dialog[open]').single.textContent,
         contains('New release candidate'),
       );
       expect(
@@ -1209,6 +1216,437 @@ void main() {
         nodes('.task-wf-node').single.textContent,
         isNot(contains('Merged')),
       );
+    },
+  );
+  test(
+    'full screen fills the viewport and preserves the same canvas, zoom and selection',
+    () async {
+      final oldOverflow = web.document.body!.style.overflow;
+      state.replace([
+        row('one'),
+        row('two', source: {'task_id': 'one'}),
+        row('three', source: {'task_id': 'two'}),
+        row('four', source: {'task_id': 'three'}),
+      ]);
+      await settle();
+      task('two').click();
+      await settle();
+      await click('Zoom in');
+      final zoom = nodes('.btn-group__readout').single.textContent;
+      final area = nodes('.task-wf-viewport').single;
+      area.scrollLeft = 100;
+      area.dispatchEvent(web.Event('scroll'));
+      await settle();
+      final left = area.scrollLeft;
+      await click('Full screen');
+      final root = nodes('.task-workflow').single;
+      expect(root.getAttribute('data-expanded'), 'true');
+      final bounds = root.getBoundingClientRect();
+      expect(bounds.left, closeTo(0, 1));
+      expect(bounds.top, closeTo(0, 1));
+      expect(bounds.width, closeTo(web.window.innerWidth.toDouble(), 1));
+      expect(bounds.height, closeTo(web.window.innerHeight.toDouble(), 1));
+      expect(nodes('.task-wf-viewport').single, same(area));
+      expect(area.clientHeight, greaterThan(100));
+      expect(area.scrollLeft, closeTo(left, 1));
+      expect(nodes('.btn-group__readout').single.textContent, zoom);
+      expect(task('two').getAttribute('aria-pressed'), 'true');
+      expect(
+        web.window.getComputedStyle(web.document.body!).overflow,
+        'hidden',
+      );
+      key(task('two'), 'Escape');
+      await settle();
+      expect(root.getAttribute('data-expanded'), 'false');
+      expect(web.document.body!.style.overflow, oldOverflow);
+      expect(task('two').getAttribute('aria-pressed'), 'true');
+      expect(
+        web.document.activeElement,
+        nodes('button').firstWhere((node) => node.textContent == 'Full screen'),
+      );
+      await click('Full screen');
+      nodes('[role=tab]')
+          .firstWhere((node) => node.textContent?.startsWith('List') ?? false)
+          .click();
+      await settle();
+      expect(root.getAttribute('data-expanded'), 'false');
+      expect(web.document.body!.style.overflow, oldOverflow);
+    },
+  );
+
+  test(
+    'release details use a wide dialog, wrap long content, and adapt to a narrow workspace',
+    () async {
+      state.replace([row('origin'), row('follow')]);
+      final current = release()
+        ..['members'] = [
+          {
+            'task_id': 'origin',
+            'title': 'A very long release member title ' * 8,
+            'candidate_sha': 'a' * 64,
+            'eligibility_reason': 'Evidence ' * 50,
+          },
+        ];
+      state.replaceReleases([current]);
+      await settle();
+      nodes('[data-release="release-one"]').single.click();
+      await settle();
+      final dialog = nodes('.wf-release-dialog').single;
+      final content = nodes('.wf-release-dialog .inspector__body').single;
+      expect(dialog.getAttribute('role'), 'dialog');
+      expect(dialog.getAttribute('aria-modal'), 'true');
+      expect(
+        dialog.getBoundingClientRect().width,
+        greaterThan(web.window.innerWidth * .8),
+      );
+      expect(
+        dialog.getBoundingClientRect().height,
+        greaterThan(web.window.innerHeight * .8),
+      );
+      expect(content.scrollWidth, lessThanOrEqualTo(content.clientWidth + 1));
+      expect(nodes('.task-wf-panel'), isEmpty);
+      expect(dialog.matches(':modal'), true);
+      task('origin').focus();
+      expect(dialog.contains(web.document.activeElement), true);
+      dialog.style.width = '320px';
+      await settle();
+      expect(dialog.getBoundingClientRect().width, lessThanOrEqualTo(360));
+      expect(content.scrollWidth, lessThanOrEqualTo(content.clientWidth + 1));
+      expect(
+        web.window
+            .getComputedStyle(content)
+            .gridTemplateColumns
+            .trim()
+            .split(' '),
+        hasLength(1),
+      );
+      await click('Back to workflow');
+      expect(nodes('.wf-release-dialog[open]'), isEmpty);
+      expect(nodes('.task-wf-board').single.hasAttribute('inert'), false);
+      expect(
+        web.document.activeElement,
+        nodes('[data-release="release-one"]').single,
+      );
+    },
+  );
+
+  test(
+    'release dialog traps focus and Escape returns to expanded workflow without losing a draft',
+    () async {
+      final published = release(state: 'published')
+        ..['resulting_sha'] = 'c' * 40
+        ..['pull_preview'] = {
+          'title': 'Suggested title',
+          'body': 'Suggested body',
+        };
+      state.replaceReleases([published]);
+      await settle();
+      await click('Full screen');
+      nodes('[data-release="release-one"]').single.click();
+      await settle();
+      final dialog = nodes('.wf-release-dialog').single;
+      expect(web.document.activeElement, dialog);
+      key(dialog, 'Tab');
+      expect(
+        web.document.activeElement?.textContent,
+        contains('Back to workflow'),
+      );
+      final input =
+          nodes('.wf-release-dialog input').first as web.HTMLInputElement;
+      input.value = 'Keep my reviewed title';
+      input.dispatchEvent(web.Event('input', web.EventInit(bubbles: true)));
+      await settle();
+      input.focus();
+      state.replaceReleases([
+        {...published, 'edit_version': 5},
+      ]);
+      await settle();
+      expect(web.document.activeElement, input);
+      expect(input.value, 'Keep my reviewed title');
+      key(input, 'Escape');
+      await settle();
+      expect(nodes('.wf-release-dialog[open]'), isEmpty);
+      expect(
+        nodes('.task-workflow').single.getAttribute('data-expanded'),
+        'true',
+      );
+      expect(
+        web.window.getComputedStyle(web.document.body!).overflow,
+        'hidden',
+      );
+      await click('Show details');
+      expect(
+        (nodes('.wf-release-dialog input').first as web.HTMLInputElement).value,
+        'Keep my reviewed title',
+      );
+      await click('Back to workflow');
+      nodes('[data-release="release-one"]').single.click();
+      await settle();
+      expect(
+        (nodes('.wf-release-dialog input').first as web.HTMLInputElement).value,
+        'Keep my reviewed title',
+      );
+      await click('Back to workflow');
+      await click('Exit full screen');
+    },
+  );
+
+  test(
+    'unmount restores document scrolling while expanded release details are open',
+    () async {
+      final oldOverflow = web.document.body!.style.overflow;
+      state.replaceReleases([release()]);
+      await settle();
+      await click('Full screen');
+      nodes('[data-release="release-one"]').single.click();
+      await settle();
+      expect(
+        web.window.getComputedStyle(web.document.body!).overflow,
+        'hidden',
+      );
+      state.hideWorkflow();
+      await settle();
+      expect(web.document.body!.style.overflow, oldOverflow);
+      expect(nodes('.wf-release-dialog[open]'), isEmpty);
+    },
+  );
+  test(
+    'native release modal covers the whole page and Escape works after a backdrop click',
+    () async {
+      final outside = web.HTMLButtonElement()
+        ..textContent = 'Outside navigation';
+      final overlay = web.HTMLDivElement()
+        ..style.position = 'fixed'
+        ..style.inset = '0'
+        ..style.zIndex = '999999';
+      overlay.appendChild(outside);
+      web.document.body!.appendChild(overlay);
+      addTearDown(() => overlay.remove());
+      state.replace([row('origin')]);
+      state.replaceReleases([release()]);
+      await settle();
+      await click('Full screen');
+      final releaseNode = nodes('[data-release="release-one"]').single;
+      releaseNode.focus();
+      releaseNode.click();
+      await settle();
+      final dialog =
+          nodes('.wf-release-dialog').single as web.HTMLDialogElement;
+      expect(dialog.open, true);
+      expect(dialog.matches(':modal'), true);
+      outside.focus();
+      expect(dialog.contains(web.document.activeElement), true);
+      final bounds = dialog.getBoundingClientRect();
+      expect(
+        dialog.contains(
+          web.document.elementFromPoint(bounds.left + 10, bounds.top + 10),
+        ),
+        true,
+      );
+      // Native backdrop clicks are retargeted to the dialog element.
+      dialog.click();
+      await settle();
+      expect(web.document.activeElement, dialog);
+      key(web.document.activeElement! as web.HTMLElement, 'Escape');
+      await settle();
+      expect(dialog.open, false);
+      expect(dialog.matches(':modal'), false);
+      expect(releaseNode.getAttribute('aria-pressed'), 'true');
+      expect(web.document.activeElement, releaseNode);
+      expect(
+        nodes('.task-workflow').single.getAttribute('data-expanded'),
+        'true',
+      );
+      await click('Show details');
+      dialog.dispatchEvent(
+        web.Event('cancel', web.EventInit(cancelable: true)),
+      );
+      await settle();
+      expect(dialog.open, false);
+      await click('Exit full screen');
+      outside.focus();
+      expect(web.document.activeElement, outside);
+    },
+  );
+
+  test(
+    'details controls resolve to mounted elements and creation has one heading',
+    () async {
+      web.HTMLElement toggle() =>
+          nodes('.wf-summary__actions button[aria-expanded]').single;
+      void validTarget() {
+        final target = toggle().getAttribute('aria-controls');
+        if (target != null)
+          expect(web.document.getElementById(target), isNotNull);
+      }
+
+      state.replace([row('origin')]);
+      state.replaceReleases([release()]);
+      await settle();
+      expect(toggle().getAttribute('aria-controls'), isNull);
+      await click('Show details');
+      validTarget();
+      await click('Hide details');
+      expect(toggle().getAttribute('aria-controls'), isNull);
+      nodes('[data-release="release-one"]').single.click();
+      await settle();
+      validTarget();
+      await click('Back to workflow');
+      validTarget();
+      expect(toggle().getAttribute('aria-expanded'), 'false');
+      await click('New release candidate');
+      validTarget();
+      final dialog = nodes('.wf-release-dialog[open]').single;
+      final heading = web.document.getElementById(
+        dialog.getAttribute('aria-labelledby')!,
+      );
+      expect(heading?.textContent, 'New release candidate');
+      expect(
+        nodes(
+          '.wf-release-dialog h2',
+        ).where((node) => node.textContent == 'New release candidate'),
+        hasLength(1),
+      );
+      await click('Back to workflow');
+    },
+  );
+
+  test(
+    'IME Escape cannot dismiss release details or exit the expanded workflow',
+    () async {
+      state.replace([row('origin')]);
+      state.replaceReleases([release()]);
+      await settle();
+      await click('Full screen');
+      nodes('[data-release="release-one"]').single.click();
+      await settle();
+      final dialog =
+          nodes('.wf-release-dialog').single as web.HTMLDialogElement;
+      dialog.dispatchEvent(
+        web.CompositionEvent(
+          'compositionstart',
+          web.CompositionEventInit(bubbles: true),
+        ),
+      );
+      dialog.dispatchEvent(
+        web.KeyboardEvent(
+          'keydown',
+          web.KeyboardEventInit(
+            key: 'Escape',
+            isComposing: true,
+            bubbles: true,
+            cancelable: true,
+          ),
+        ),
+      );
+      dialog.dispatchEvent(
+        web.Event('cancel', web.EventInit(cancelable: true)),
+      );
+      await settle();
+      expect(dialog.open, true);
+      dialog.dispatchEvent(
+        web.CompositionEvent(
+          'compositionend',
+          web.CompositionEventInit(bubbles: true),
+        ),
+      );
+      key(dialog, 'Escape');
+      await settle();
+      expect(dialog.open, false);
+      final root = nodes('.task-workflow').single;
+      task('origin').click();
+      await settle();
+      task('origin').dispatchEvent(
+        web.KeyboardEvent(
+          'keydown',
+          web.KeyboardEventInit(
+            key: 'Escape',
+            isComposing: true,
+            bubbles: true,
+            cancelable: true,
+          ),
+        ),
+      );
+      await settle();
+      expect(root.getAttribute('data-expanded'), 'true');
+      expect(task('origin').getAttribute('aria-pressed'), 'true');
+      root.dispatchEvent(
+        web.CompositionEvent(
+          'compositionstart',
+          web.CompositionEventInit(bubbles: true),
+        ),
+      );
+      key(root, 'Escape');
+      await settle();
+      expect(root.getAttribute('data-expanded'), 'true');
+      root.dispatchEvent(
+        web.CompositionEvent(
+          'compositionend',
+          web.CompositionEventInit(bubbles: true),
+        ),
+      );
+      key(root, 'Escape');
+      await settle();
+      expect(root.getAttribute('data-expanded'), 'false');
+    },
+  );
+
+  test(
+    'a disappearing release closes the modal and restores a connected focus target',
+    () async {
+      state.replace([row('origin')]);
+      state.replaceReleases([release()]);
+      await settle();
+      final releaseNode = nodes('[data-release="release-one"]').single;
+      releaseNode.focus();
+      releaseNode.click();
+      await settle();
+      final dialog =
+          nodes('.wf-release-dialog').single as web.HTMLDialogElement;
+      expect(dialog.open, true);
+      state.replaceReleases([]);
+      await settle();
+      expect(dialog.open, false);
+      expect(dialog.matches(':modal'), false);
+      expect(web.document.activeElement?.isConnected, true);
+      expect(web.document.activeElement?.textContent, 'Full screen');
+      expect(nodes('.task-wf-panel'), isEmpty);
+      final create = nodes(
+        'button',
+      ).firstWhere((node) => node.textContent == 'New release candidate');
+      create.focus();
+      create.click();
+      await settle();
+      await click('Back to workflow');
+      expect(web.document.activeElement, create);
+    },
+  );
+
+  test(
+    'CSS scroll locks preserve another overlay owner and never write inline overflow',
+    () async {
+      final body = web.document.body!;
+      final original = body.style.overflow;
+      addTearDown(() => body.style.overflow = original);
+      body.style.overflow = 'auto';
+      state.replaceReleases([release()]);
+      await settle();
+      await click('Full screen');
+      expect(body.style.overflow, 'auto');
+      expect(web.window.getComputedStyle(body).overflow, 'hidden');
+      // Another component takes its own lock while this workspace is expanded.
+      body.style.overflow = 'hidden';
+      await click('Exit full screen');
+      expect(body.style.overflow, 'hidden');
+      body.style.overflow = 'auto';
+      expect(web.window.getComputedStyle(body).overflow, 'auto');
+      nodes('[data-release="release-one"]').single.click();
+      await settle();
+      expect(body.style.overflow, 'auto');
+      expect(web.window.getComputedStyle(body).overflow, 'hidden');
+      await click('Back to workflow');
+      expect(body.style.overflow, 'auto');
+      expect(web.window.getComputedStyle(body).overflow, 'auto');
     },
   );
 }

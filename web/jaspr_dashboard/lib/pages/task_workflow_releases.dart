@@ -444,7 +444,7 @@ extension _Releases on _TaskWorkflowState {
         'style': 'left:${box.x}px;top:${box.y}px;height:${boxHeight(box)}px;',
       },
       events: {
-        'click': (_) => chooseTask(selected == id ? null : id),
+        'click': (_) => chooseTask(selected == id && panel ? null : id),
         'keydown': (event) => keyFor(id, event as web.KeyboardEvent),
         'pointerenter': (_) => update(() => hovered = id),
         'pointerleave': (_) => update(() => hovered = null),
@@ -453,9 +453,6 @@ extension _Releases on _TaskWorkflowState {
   }
 
   Component releaseCreateInspector() => el('aside', [
-    el('header', [
-      el('h2', [text('New release candidate')], classes: 'inspector__title'),
-    ], classes: 'inspector__header'),
     el('div', [
       select(
         'Repository',
@@ -684,10 +681,6 @@ extension _Releases on _TaskWorkflowState {
           notice(
             'Planned from group discussion ${release['source']['job_id']}. While collecting, automatic members follow their latest captured candidate after required checks pass. Freeze pins the selection.',
           ),
-        if (canAct &&
-            !['ready', 'published', 'publishing'].contains(release['state']) &&
-            (revision == null || revision['purpose'] == 'assembly'))
-          assemblyControls(release),
         section(
           revision == null
               ? 'Release plan'
@@ -791,6 +784,10 @@ extension _Releases on _TaskWorkflowState {
               small: true,
             ),
         ]),
+        if (canAct &&
+            !['ready', 'published', 'publishing'].contains(release['state']) &&
+            (revision == null || revision['purpose'] == 'assembly'))
+          assemblyControls(release),
         if (!historical) releaseReview(release, canAct),
         if (!historical &&
             (release['state'] == 'published' ||

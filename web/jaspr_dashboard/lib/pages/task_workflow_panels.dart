@@ -126,7 +126,10 @@ extension _Panels on _TaskWorkflowState {
           attributes: {
             'type': 'button',
             'aria-expanded': '$panel',
-            'aria-controls': '$instance-inspector',
+            if (creatingRelease || selected?.startsWith('release:') == true)
+              'aria-controls': '$instance-release-dialog'
+            else if (panel)
+              'aria-controls': '$instance-inspector',
           },
           events: {'click': (_) => update(() => panel = !panel)},
         ),

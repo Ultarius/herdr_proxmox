@@ -12,6 +12,81 @@
 .task-workflow { display: flex; flex-direction: column; min-width: 0; }
 .task-workflow :where(p, h2, h3) { margin: 0; }
 
+/* Expanded application workspace, below the shared confirmation dialogs.
+   Keep the same canvas DOM so pan, selection and unsent drafts survive. */
+.task-workflow[data-expanded="true"] {
+  position: fixed; inset: 0; z-index: var(--z-drawer); box-sizing: border-box;
+  height: 100dvh; padding: var(--space-4); background: var(--color-canvas);
+  overflow: hidden; overscroll-behavior: contain; gap: 0;
+}
+.task-workflow[data-expanded="true"] > :is(.wf-tabsrow, .task-wf-toolbar) { flex-shrink: 0; }
+.task-workflow[data-expanded="true"] .task-wf-board { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.task-workflow[data-expanded="true"] .task-wf-layout { flex: 1; min-height: 0; }
+.task-workflow[data-expanded="true"] .task-wf-main { min-height: 0; display: flex; flex-direction: column; }
+.task-workflow[data-expanded="true"] .task-wf-viewport { flex: 1; height: auto; min-height: 0; max-height: none; }
+.task-workflow[data-expanded="true"] :is(.wf-summary, .wf-agents, .task-wf-legend) { flex-shrink: 0; }
+.task-workflow[data-expanded="true"] .task-wf-list-panel { overflow: auto; min-height: 0; }
+@media (min-width: 768px) {
+  .task-workflow[data-expanded="true"] .task-wf-layout > .task-wf-panel {
+    position: absolute; z-index: 3; inset: var(--space-2) var(--space-2) var(--space-2) auto;
+    width: min(var(--inspector-width), 45%); display: flex;
+  }
+  .task-workflow[data-expanded="true"] .task-wf-panel .task-wf-inspector {
+    flex: 1; min-height: 0; height: auto; border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg); overflow: hidden;
+  }
+}
+
+/* Native modal: whole-page inertness and the browser top layer are independent
+   of the expanded workflow's stacking context. CSS locks compose with other
+   overlays without a leaf component overwriting body.style.overflow. */
+body:has(.task-workflow[data-expanded="true"]),
+body:has(dialog.wf-release-dialog[open]),
+.main-content:has(.task-workflow[data-expanded="true"]),
+.main-content:has(dialog.wf-release-dialog[open]) { overflow: hidden !important; }
+.wf-release-dialog:not([open]) { display: none; }
+.wf-release-dialog::backdrop { background: var(--color-scrim); }
+.wf-release-dialog {
+  container-type: inline-size; position: fixed; inset: 0; margin: auto; padding: 0;
+  display: flex; flex-direction: column; min-width: 0; width: min(80rem, calc(100vw - var(--space-12)));
+  height: min(92dvh, 72rem); max-width: calc(100vw - var(--space-4)); max-height: calc(100dvh - var(--space-4));
+  box-sizing: border-box; overflow: hidden; color: var(--color-text); background: var(--color-surface);
+  border: 1px solid var(--color-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg);
+}
+.wf-release-dialog__header {
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+  gap: var(--space-3); padding: var(--space-3) var(--space-5); border-bottom: 1px solid var(--color-border);
+}
+.wf-release-dialog__header > h2 { font-size: var(--text-md-size); }
+.wf-release-dialog > .task-wf-inspector {
+  display: flex; flex-direction: column; flex: 1; min-height: 0; height: auto;
+  border: 0; border-radius: 0; overflow: hidden;
+}
+.wf-release-dialog .inspector__header { flex-shrink: 0; flex-wrap: wrap; }
+.wf-release-dialog > .task-wf-inspector .inspector__body {
+  flex: 1; min-height: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start; gap: var(--space-4); padding: var(--space-5); overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
+}
+.wf-release-dialog > .task-wf-inspector .inspector__body > :not(.inspector__section) { grid-column: 1 / -1; }
+.wf-release-dialog .task-wf-inspector .inspector__section {
+  min-width: 0; border: 1px solid var(--color-border); border-radius: var(--radius-md);
+  padding: var(--space-4); display: flex; flex-direction: column; gap: var(--space-3);
+}
+.wf-release-dialog [data-section="Selected changes"] { grid-column: 1 / -1; }
+.wf-release-dialog :is(p, dd, dt, .mono, .notice) { min-width: 0; overflow-wrap: anywhere; }
+.wf-release-dialog :is(.field, select, input, textarea) { min-width: 0; max-width: 100%; box-sizing: border-box; }
+.wf-release-dialog .btn { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+@container (max-width: 42rem) {
+  .wf-release-dialog > .task-wf-inspector .inspector__body { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 767.98px) {
+  .wf-release-dialog { width: calc(100vw - var(--space-4)); height: calc(100dvh - var(--space-4)); }
+  .wf-release-dialog > .task-wf-inspector .inspector__body { grid-template-columns: minmax(0, 1fr); padding: var(--space-3); }
+  .wf-release-dialog__header { padding-inline: var(--space-3); }
+  .task-workflow[data-expanded="true"] { padding: var(--space-2); overflow-y: auto; }
+  .task-workflow[data-expanded="true"] .task-wf-board { flex: 1 0 70dvh; }
+}
+
 /* ---- Tabs row (+ lanes switch and zoom) and the filter toolbar ------------ */
 .wf-tabsrow { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: var(--space-2) var(--space-4); box-shadow: inset 0 -1px 0 var(--color-border); }
 .wf-tabsrow > .tabs { min-width: 0; box-shadow: none; }

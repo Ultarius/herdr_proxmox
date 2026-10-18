@@ -6,6 +6,24 @@ select tasks and use **Add to …** in their inspectors. A task may belong to mo
 than one release. Follow-up provenance and execution-wait links are not code
 dependencies and never determine which tasks are selected.
 
+Release nodes open a wide **Release details** dialog with space for member
+evidence, combined checks, automation and review controls. The layout switches
+to one column on narrow screens, and long names and commit hashes wrap.
+**Back to workflow** or Escape closes the dialog and returns focus to its node;
+the board remains mounted with its zoom, filters, selection and pan position.
+Reopening the same release preserves unfinished form edits.
+
+The workflow toolbar's **Full screen** control expands the board to the browser
+viewport. **Exit full screen** or Escape restores the embedded board without
+resetting its view. When release details are open, Escape closes those first.
+Switching to List also leaves full-screen mode.
+
+Release details use a native modal dialog: the rest of the page is unavailable
+until it closes, including navigation outside the workflow. Clicking its backdrop
+keeps Escape available. Escape during IME composition does not dismiss details
+or leave full screen. Closing details keeps the node selected; if a refresh removes
+that release, the dialog closes and focus returns to an available workflow control.
+
 New release names are unique within a repository, ignoring ASCII case. Existing
 duplicate labels remain readable during upgrades; use each record's ID to
 distinguish them. Eligibility snapshots reuse loaded tasks and batch missing
