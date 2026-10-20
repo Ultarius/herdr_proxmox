@@ -31,7 +31,9 @@ class _SshAccessCardState extends State<SshAccessCard> {
         setState(() => count = data['key_count'] as int?);
       }
     } catch (error) {
-      if (mounted)
+      if (mounted &&
+          connection.state.connected &&
+          epoch == connection.generation)
         setState(
           () => message = error.toString().replaceFirst('Exception: ', ''),
         );
@@ -60,7 +62,9 @@ class _SshAccessCardState extends State<SshAccessCard> {
         });
       }
     } catch (error) {
-      if (mounted)
+      if (mounted &&
+          connection.state.connected &&
+          epoch == connection.generation)
         setState(
           () => message = error.toString().replaceFirst('Exception: ', ''),
         );

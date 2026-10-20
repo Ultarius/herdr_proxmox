@@ -49,7 +49,8 @@ class _LogsPageState extends State<LogsPage> {
         });
       }
     } catch (e) {
-      if (mounted) setState(() => error = '$e');
+      if (mounted && epoch == connection.generation)
+        setState(() => error = '$e');
     }
   }
 
@@ -72,7 +73,8 @@ class _LogsPageState extends State<LogsPage> {
         await refresh();
       }
     } catch (e) {
-      if (mounted) setState(() => error = '$e');
+      if (mounted && epoch == connection.generation)
+        setState(() => error = '$e');
     } finally {
       if (mounted) setState(() => busy = false);
     }
