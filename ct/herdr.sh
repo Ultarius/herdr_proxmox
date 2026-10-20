@@ -143,6 +143,13 @@ agent_installer="$(dirname -- "$installer")/agents-install.sh"
 [[ -f $agent_installer ]] || die 'Missing install/agents-install.sh; use a complete checkout.'
 if ((web)); then
   [[ -f $repo/web/public/index.html && -f $repo/web/public/main.dart.js && -f $repo/web/public/dashboard/index.html ]] || die 'Build web assets first using scripts/build-web.sh.'
+  web_install_files=(.fvmrc install/toolchains.json install/python-tools.json
+    install/web-install.sh install/dashboard-update.py install/sdk-install.py
+    install/operator-admin.py install/dev-tools-install.sh install/flutter-release.py
+    install/build-install.sh install/build-service-setup.sh install/build-service-install.py)
+  for file in "${web_install_files[@]}"; do
+    [[ -f $repo/$file ]] || die "Missing $file; use a complete dashboard release or checkout."
+  done
 fi
 if [[ -z $template ]]; then
   command -v pveam >/dev/null || die 'Missing Proxmox command: pveam'
@@ -186,7 +193,7 @@ else
 fi
 if ((web)); then
   archive=$(mktemp)
-  tar -C "$repo" -czf "$archive" web/public web/gateway .fvmrc install/toolchains.json install/web-install.sh install/dashboard-update.py install/sdk-install.py install/operator-admin.py install/dev-tools-install.sh install/flutter-release.py install/build-install.sh
+  tar -C "$repo" -czf "$archive" web/public web/gateway "${web_install_files[@]}"
   pct push "$ctid" "$archive" /root/herdr-web.tar.gz --perms 0600
   pct exec "$ctid" -- mkdir -p /opt/herdr-web
   pct exec "$ctid" -- tar -xzf /root/herdr-web.tar.gz -C /opt/herdr-web

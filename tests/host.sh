@@ -119,6 +119,9 @@ cp "$repo/install/operator-admin.py" "$tmp/install/"
 cp "$repo/install/dev-tools-install.sh" "$tmp/install/"
 cp "$repo/install/flutter-release.py" "$tmp/install/"
 cp "$repo/install/build-install.sh" "$tmp/install/"
+cp "$repo/install/build-service-setup.sh" "$tmp/install/"
+cp "$repo/install/build-service-install.py" "$tmp/install/"
+cp "$repo/install/python-tools.json" "$tmp/install/"
 # The release archive ships the catalog too: the root SDK worker reads it, and
 # the gateway resolves the declared version through it.
 cp "$repo/install/toolchains.json" "$tmp/install/"
@@ -134,6 +137,16 @@ for file in cli_setup.py pty_exec.py run_logs.py log_view.html skills/herdr-work
 grep -q 'install/sdk-install.py' "$HERDR_TEST_WEB_CONTENTS"
 grep -q 'install/operator-admin.py' "$HERDR_TEST_WEB_CONTENTS"
 grep -q 'install/build-install.sh' "$HERDR_TEST_WEB_CONTENTS"
+for file in build-service-setup.sh build-service-install.py python-tools.json; do
+  grep -qx "install/$file" "$HERDR_TEST_WEB_CONTENTS"
+  # An incomplete dashboard must be rejected before creating a container.
+  mv "$tmp/install/$file" "$tmp/$file"
+  before=$(wc -l <"$HERDR_TEST_LOG")
+  if bash "$tmp/ct/herdr.sh" --web --template local:vztmpl/debian-13-standard_test_amd64.tar.zst >"$tmp/output" 2>&1; then exit 1; fi
+  grep -q "Missing install/$file" "$tmp/output"
+  [[ $(wc -l <"$HERDR_TEST_LOG") == "$before" ]]
+  mv "$tmp/$file" "$tmp/install/$file"
+done
 # The archive carries the project's own version declaration, which is the only
 # place the required SDK version is stated.
 grep -q '^\.fvmrc$' "$HERDR_TEST_WEB_CONTENTS"
