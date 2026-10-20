@@ -12,6 +12,81 @@
 .task-workflow { display: flex; flex-direction: column; min-width: 0; }
 .task-workflow :where(p, h2, h3) { margin: 0; }
 
+/* Expanded application workspace, below the shared confirmation dialogs.
+   Keep the same canvas DOM so pan, selection and unsent drafts survive. */
+.task-workflow[data-expanded="true"] {
+  position: fixed; inset: 0; z-index: var(--z-drawer); box-sizing: border-box;
+  height: 100dvh; padding: var(--space-4); background: var(--color-canvas);
+  overflow: hidden; overscroll-behavior: contain; gap: 0;
+}
+.task-workflow[data-expanded="true"] > :is(.wf-tabsrow, .task-wf-toolbar) { flex-shrink: 0; }
+.task-workflow[data-expanded="true"] .task-wf-board { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.task-workflow[data-expanded="true"] .task-wf-layout { flex: 1; min-height: 0; }
+.task-workflow[data-expanded="true"] .task-wf-main { min-height: 0; display: flex; flex-direction: column; }
+.task-workflow[data-expanded="true"] .task-wf-viewport { flex: 1; height: auto; min-height: 0; max-height: none; }
+.task-workflow[data-expanded="true"] :is(.wf-summary, .wf-agents, .task-wf-legend) { flex-shrink: 0; }
+.task-workflow[data-expanded="true"] .task-wf-list-panel { overflow: auto; min-height: 0; }
+@media (min-width: 768px) {
+  .task-workflow[data-expanded="true"] .task-wf-layout > .task-wf-panel {
+    position: absolute; z-index: 3; inset: var(--space-2) var(--space-2) var(--space-2) auto;
+    width: min(var(--inspector-width), 45%); display: flex;
+  }
+  .task-workflow[data-expanded="true"] .task-wf-panel .task-wf-inspector {
+    flex: 1; min-height: 0; height: auto; border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg); overflow: hidden;
+  }
+}
+
+/* Native modal: whole-page inertness and the browser top layer are independent
+   of the expanded workflow's stacking context. CSS locks compose with other
+   overlays without a leaf component overwriting body.style.overflow. */
+body:has(.task-workflow[data-expanded="true"]),
+body:has(dialog.wf-release-dialog[open]),
+.main-content:has(.task-workflow[data-expanded="true"]),
+.main-content:has(dialog.wf-release-dialog[open]) { overflow: hidden !important; }
+.wf-release-dialog:not([open]) { display: none; }
+.wf-release-dialog::backdrop { background: var(--color-scrim); }
+.wf-release-dialog {
+  container-type: inline-size; position: fixed; inset: 0; margin: auto; padding: 0;
+  display: flex; flex-direction: column; min-width: 0; width: min(80rem, calc(100vw - var(--space-12)));
+  height: min(92dvh, 72rem); max-width: calc(100vw - var(--space-4)); max-height: calc(100dvh - var(--space-4));
+  box-sizing: border-box; overflow: hidden; color: var(--color-text); background: var(--color-surface);
+  border: 1px solid var(--color-border); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg);
+}
+.wf-release-dialog__header {
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+  gap: var(--space-3); padding: var(--space-3) var(--space-5); border-bottom: 1px solid var(--color-border);
+}
+.wf-release-dialog__header > h2 { font-size: var(--text-md-size); }
+.wf-release-dialog > .task-wf-inspector {
+  display: flex; flex-direction: column; flex: 1; min-height: 0; height: auto;
+  border: 0; border-radius: 0; overflow: hidden;
+}
+.wf-release-dialog .inspector__header { flex-shrink: 0; flex-wrap: wrap; }
+.wf-release-dialog > .task-wf-inspector .inspector__body {
+  flex: 1; min-height: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start; gap: var(--space-4); padding: var(--space-5); overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
+}
+.wf-release-dialog > .task-wf-inspector .inspector__body > :not(.inspector__section) { grid-column: 1 / -1; }
+.wf-release-dialog .task-wf-inspector .inspector__section {
+  min-width: 0; border: 1px solid var(--color-border); border-radius: var(--radius-md);
+  padding: var(--space-4); display: flex; flex-direction: column; gap: var(--space-3);
+}
+.wf-release-dialog :is([data-section="Selected changes"], [data-section="Selection needs review"]) { grid-column: 1 / -1; }
+.wf-release-dialog :is(p, dd, dt, .mono, .notice) { min-width: 0; overflow-wrap: anywhere; }
+.wf-release-dialog :is(.field, select, input, textarea) { min-width: 0; max-width: 100%; box-sizing: border-box; }
+.wf-release-dialog .btn { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+@container (max-width: 42rem) {
+  .wf-release-dialog > .task-wf-inspector .inspector__body { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 767.98px) {
+  .wf-release-dialog { width: calc(100vw - var(--space-4)); height: calc(100dvh - var(--space-4)); }
+  .wf-release-dialog > .task-wf-inspector .inspector__body { grid-template-columns: minmax(0, 1fr); padding: var(--space-3); }
+  .wf-release-dialog__header { padding-inline: var(--space-3); }
+  .task-workflow[data-expanded="true"] { padding: var(--space-2); overflow-y: auto; }
+  .task-workflow[data-expanded="true"] .task-wf-board { flex: 1 0 70dvh; }
+}
+
 /* ---- Tabs row (+ lanes switch and zoom) and the filter toolbar ------------ */
 .wf-tabsrow { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: var(--space-2) var(--space-4); box-shadow: inset 0 -1px 0 var(--color-border); }
 .wf-tabsrow > .tabs { min-width: 0; box-shadow: none; }
@@ -66,6 +141,7 @@
 .wf-agents .agent-chip > .icon-tile--sm { width: 24px; height: 24px; margin: var(--space-0-5); border-radius: var(--radius-sm); }
 .wf-agents .agent-chip__meta { gap: var(--space-1); }
 .wf-agents .agent-chip__task { font-family: var(--font-sans); color: var(--color-text-secondary); }
+.wf-agents .agent-chip__current { display: block; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-xs-size); color: var(--color-text-secondary); }
 @media (min-width: 768px) { .wf-agents .agent-bar { flex-wrap: wrap; overflow-x: visible; } }
 
 /* ---- Layout: canvas + inspector (overlay from xl, docked below it) --------- */
@@ -115,13 +191,13 @@
 /* ---- Task card: mono id + PR / title / pill + flag ----------------------------- */
 .task-wf-node {
   position: absolute; z-index: 1; display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 0;
-  width: 184px; height: 96px; min-height: 0; padding: var(--space-2) var(--space-2-5);
+  width: 184px; height: 128px; min-height: 0; padding: var(--space-2) var(--space-2-5);
   border: 1px solid var(--color-border-strong); border-radius: var(--radius-md);
   background: var(--color-surface); color: var(--color-text); text-align: left; box-shadow: var(--shadow-sm);
   font-weight: var(--weight-regular); line-height: var(--text-sm-leading); cursor: pointer;
   transition: background-color var(--duration-base) var(--ease-standard), box-shadow var(--duration-fast) var(--ease-standard), border-color var(--duration-fast) var(--ease-standard);
 }
-.task-wf-stage:not([data-lanes]) .task-wf-node { height: 104px; }
+.task-wf-stage:not([data-lanes]) .task-wf-node { height: 136px; }
 .task-wf-node:hover:not(:disabled) { background: var(--color-surface); border-color: var(--color-text-tertiary); box-shadow: var(--shadow-md); z-index: 2; }
 .task-wf-node:focus-visible { outline-width: calc(var(--space-0-5) / var(--wf-zoom, 1)); outline-offset: calc(var(--space-1) / var(--wf-zoom, 1)); z-index: 2; }
 .task-wf-node[data-in]::before, .task-wf-node[data-out]::after {
@@ -148,6 +224,12 @@
 .wf-node__flag > .icon { width: var(--icon-sm); height: var(--icon-sm); }
 .wf-node__flag[data-flag="attention"] { color: var(--color-danger-fg); }
 .wf-node__flag:is([data-flag="queued"], [data-flag="waiting"]) { color: var(--color-warning-fg); }
+.wf-node__activity { display: flex; align-items: center; gap: var(--space-1); margin-top: var(--space-1); font-size: var(--text-xs-size); line-height: var(--text-xs-leading); color: var(--color-success-fg); }
+.wf-node__activity > .dot { flex: none; }
+.task-wf-node[data-work="attention"] { border-color: var(--color-warning-fg); }
+.task-wf-node[data-work="attention"] .wf-node__activity { color: var(--color-warning-fg); }
+.wf-list__activity { display: block; color: var(--color-success-fg); font-size: var(--text-xs-size); }
+.wf-list__activity[data-work="attention"] { color: var(--color-warning-fg); }
 /* States: finished = calm; attention = dashed danger */
 .task-wf-node:is([data-state="merged"], [data-state="completed"], [data-state="closed"]) { background: var(--color-surface-raised); border-color: var(--color-border); box-shadow: var(--shadow-xs); }
 .task-wf-node:is([data-state="merged"], [data-state="completed"], [data-state="closed"]) .wf-node__title { color: var(--color-text-secondary); font-weight: var(--weight-medium); }
@@ -160,11 +242,33 @@
 .task-wf-node[data-dim] { background: var(--color-surface-sunken); border-color: var(--color-border); box-shadow: none; }
 .task-wf-node[data-dim] :is(.wf-node__title, .wf-node__id, .wf-node__pr, .wf-node__type) { color: var(--color-text-tertiary); }
 .task-wf-node[data-dim] :is(.status, .role-tile, .wf-node__flag) { filter: grayscale(1); }
+/* Live work remains identifiable while another task or dependency chain is selected. */
+.task-wf-node[data-work="working"]:not([aria-pressed="true"]) { border-color: var(--color-success-fg); box-shadow: inset 3px 0 0 var(--color-success-fg), var(--shadow-sm); }
+.task-wf-node[data-work="working"][aria-pressed="true"] { box-shadow: inset 3px 0 0 var(--color-success-fg), 0 0 0 1px var(--color-accent), var(--shadow-md); }
 
 /* ---- Edges: follow-up (edge tone; success from done/merged work) and
    execution waits (warning, dashed). Dimmed lines drop opacity (no text). */
 .task-wf-edges { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
 .task-wf-edge { --task-edge: var(--color-edge); transition: opacity var(--duration-base) var(--ease-standard); }
+.task-wf-edge[data-kind="release-membership"] { --task-edge: var(--color-accent); }
+.task-wf-edge[data-kind="release-membership"] .task-wf-edge-line { stroke-dasharray: 5 4; }
+.task-wf-edge[data-edge="incorporated"] { --task-edge: var(--color-success); }
+.task-wf-edge[data-edge="incorporated"] .task-wf-edge-line { stroke-dasharray: none; }
+.task-wf-edge[data-edge="blocked"] { --task-edge: var(--color-danger); }
+.task-wf-edge[data-edge="excluded"] { opacity: .45; }
+.wf-release { border-style: dashed; gap: 5px; }
+.wf-release > .status { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-release__progress { display: flex; gap: 2px; width: 100%; height: 6px; }
+.wf-release__progress > span { flex: 1; background: var(--color-accent); border-radius: 2px; }
+.wf-release__progress > [data-member-state="incorporated"] { background: var(--color-success); }
+.wf-release__progress > [data-member-state="blocked"] { background: var(--color-danger); }
+.wf-release__progress > [data-member-state="excluded"] { background: var(--color-text-tertiary); }
+.wf-edge[data-sample="release-pending"] { --sample: var(--color-accent); }
+.wf-edge[data-sample="release-pending"] .wf-edge__line { stroke-dasharray: 4 3; }
+.wf-edge[data-sample="release-incorporated"] { --sample: var(--color-success); }
+.wf-release__count, .wf-release__cut { font-size: 11px; display: flex; align-items: center; gap: 4px; }
+.wf-release__member { padding-block: var(--space-2); border-bottom: 1px solid var(--color-border); overflow-wrap: anywhere; }
+.wf-release__member .mono { font-size: var(--text-xs-size); }
 .task-wf-edge-line { fill: none; stroke: var(--task-edge); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .task-wf-edge-head { fill: var(--task-edge); }
 .task-wf-edge[data-edge="finished"] { --task-edge: var(--color-success); }
@@ -405,3 +509,8 @@ button.task-timeline__subject:hover:not(:disabled) { background: transparent; co
   .wf-blocking { border-color: CanvasText; }
   .task-timeline__edge, .task-timeline__dot { stroke: CanvasText; }
 }
+
+/* Changed selections keep their saved commit visible until explicitly reviewed. */
+.wf-release__member[data-candidate-changed] { border-inline-start: 3px solid var(--color-warning-fg); padding: var(--space-3); border-radius: var(--radius-md); }
+.wf-release__member[data-candidate-changed]:focus { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.wf-release__selection-review { margin-top: var(--space-3); padding: var(--space-3); border: 1px solid var(--color-border-strong); border-radius: var(--radius-md); }

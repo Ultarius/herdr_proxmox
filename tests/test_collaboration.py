@@ -84,6 +84,36 @@ class CollaborationTests(unittest.TestCase):
         self.drain()
         return group
 
+    def test_release_review_purpose_is_retained_and_rechecks_member_repositories(self):
+        group = self.group()
+        profile = next(p for p in self.store.snapshot()['profiles'] if p['id'] == self.max)
+        with self.assertRaisesRegex(ValueError, 'changed repository'):
+            self.action('discuss', organization_id=self.org, group_id=group, purpose='release_review',
+                        review_repository=str(Path(profile['project']).parent), prompt='Review exact release evidence')
+        identifier = self.action('discuss', organization_id=self.org, group_id=group, purpose='release_review',
+                                 review_repository=profile['project'], prompt='Review exact release evidence')
+        self.assertEqual(self.job(identifier)['purpose'], 'release_review')
+        self.drain()
+        self.assertEqual(self.job(identifier)['purpose'], 'release_review')
+
+    def test_release_review_waiting_preparation_refuses_a_reassigned_member(self):
+        group = self.group()
+        profile = next(p for p in self.store.snapshot()['profiles'] if p['id'] == self.max)
+        with patch.object(self.store, 'execute'):
+            identifier = self.action('discuss', organization_id=self.org, group_id=group, purpose='release_review',
+                                     review_repository=profile['project'], prompt='Review exact release evidence')
+            self.drain()
+        with self.store.lock, closing(self.store.connect()) as db, db:
+            current = self.store.get(db, 'profiles', self.max, self.org)
+            current['project'] = str(Path(profile['project']).parent)
+            self.store.put(db, 'profiles', current)
+        before = len(self.calls)
+        from discussion_scheduler import prepare_locked
+        self.assertFalse(prepare_locked(self.store, identifier))
+        self.assertEqual(self.job(identifier)['state'], 'needs_attention')
+        self.assertIn('changed repository', self.job(identifier)['error'])
+        self.assertFalse(any(args[:2] in (('agent', 'start'), ('agent', 'prompt')) for args, _ in self.calls[before:]))
+
     def test_history_lists_created_and_skipped_proposals_without_reprocessing(self):
         from contributions import Contributions
         group_id = self.group()
@@ -95,7 +125,8 @@ class CollaborationTests(unittest.TestCase):
         parsed = Contributions.discussion_proposals(job)
         job['proposals'] = dict(drafts=[parsed[0]['key']], queued=[],
             created={parsed[0]['key']: 'created-task'}, skipped={parsed[1]['key']: 'meeting limit reached'},
-            deferred={parsed[0]['key']: 'daily automation limit reached'})
+            deferred={parsed[0]['key']: 'daily automation limit reached'},
+            release=dict(state='created', id='release-id', version='alpha.15'))
         with closing(self.store.connect()) as db, db:
             self.store.put(db, 'jobs', job)
         history = self.store.history(dict(group_id=group_id))
@@ -104,6 +135,8 @@ class CollaborationTests(unittest.TestCase):
         self.assertEqual(details[0]['task_id'], 'created-task')
         self.assertEqual(details[0]['reason'], 'daily automation limit reached')
         self.assertEqual(details[1]['reason'], 'meeting limit reached')
+        self.assertEqual(next(j for j in history['jobs'] if j['id'] == job['id'])['release_plan_outcome'],
+                         job['proposals']['release'])
         self.assertNotIn('proposal_details', self.job(job['id']))
 
     def test_history_resolves_task_linked_proposal_outcomes_from_parent_task(self):
@@ -720,6 +753,9 @@ class CollaborationTests(unittest.TestCase):
         self.assertIn('task_proposals', prompt)
         self.assertIn('needs_review', prompt)
         self.assertIn('empty array', prompt)
+        self.assertIn('release_plan', prompt)
+        self.assertIn('task_refs', prompt)
+        self.assertIn('does not authorize', prompt)
         assignable = json.loads(prompt.split('Assignable repository agents (use these exact ids as profile_id; attending agents are marked true and need not attend this discussion to be assigned): ')[1].split('. ')[0])
         self.assertEqual({entry['id'] for entry in assignable}, {self.max, self.iris})
         self.assertTrue(all(entry['name'] for entry in assignable))
@@ -1531,6 +1567,46 @@ class CollaborationTests(unittest.TestCase):
         self.assertNotIn('display_name', self.store.label_agents([agent])[0])
         self.store.update_job(run['id'], state='released', agent_session=run['agent_session'])
         self.assertNotIn('display_name', self.store.label_agents([agent])[0])
+
+    def test_live_task_binding_requires_the_verified_launch_conversation(self):
+        self.group()
+        run = next(j for j in self.store.job_records()
+                   if j['kind'] == 'launch' and j.get('profile_id') == self.max)
+        self.store.update_job(run['id'], task_id='current-task')
+        agent = dict(self.agents[run['alias']], agent_status='working')
+        labeled = self.store.label_agents([agent])[0]
+        self.assertEqual(labeled['task_id'], 'current-task')
+        self.assertEqual(labeled['run_id'], run['id'])
+        self.assertEqual(labeled['profile_id'], self.max)
+        self.assertNotIn('completion_token', labeled)
+        for changed in (dict(agent, pane_id='other:p1'),
+                        dict(agent, agent_session={'value': 'replacement'})):
+            # Even raw agent metadata cannot assert the gateway's task binding.
+            changed.update(task_id='current-task', run_id=run['id'], profile_id=self.iris,
+                group_id='forged-group', display_name='Forged name', entity_type='group')
+            refused = self.store.label_agents([changed])[0]
+            for field in ('task_id', 'run_id', 'profile_id', 'group_id', 'display_name', 'entity_type'):
+                self.assertNotIn(field, refused)
+        unknown = dict(name='unverified', pane_id='unknown:p1', profile_id=self.max,
+            group_id='forged-group', display_name='Max', entity_type='agent')
+        self.assertEqual(self.store.label_agents([unknown])[0], dict(name='unverified', pane_id='unknown:p1'))
+        self.store.update_job(run['id'], state='released')
+        self.assertNotIn('task_id', self.store.label_agents([agent])[0])
+
+    def test_duplicate_live_task_claims_are_suppressed_until_a_later_snapshot(self):
+        self.group()
+        runs = [j for j in self.store.job_records() if j['kind'] == 'launch'
+                and j.get('profile_id') in (self.max, self.iris)]
+        for run in runs:
+            self.store.update_job(run['id'], task_id='same-task')
+        agents = [self.agents[run['alias']] for run in runs]
+        labeled = self.store.label_agents(agents)
+        self.assertEqual({item['profile_id'] for item in labeled}, {self.max, self.iris})
+        self.assertTrue(all('task_id' not in item and 'run_id' not in item for item in labeled))
+        self.store.update_job(runs[0]['id'], state='released')
+        remaining = next(item for item in self.store.label_agents(agents) if item.get('task_id'))
+        self.assertEqual(remaining['task_id'], 'same-task')
+        self.assertEqual(remaining['run_id'], runs[1]['id'])
 
     def test_group_creation_and_messages_reuse_real_agent_binding(self):
         group_id = self.group()

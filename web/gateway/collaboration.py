@@ -222,6 +222,13 @@ def action(store, db, name, body, org):
             raise ValueError('Original task conversation changed; no inspection prompt was sent.')
     else:
         group = store.get(db, 'groups', text(body, 'group_id', 40), org_id)
+        if body.get('purpose') == 'release_review':
+            repository = Path(text(body, 'review_repository', 2000)).resolve()
+            for identifier in group['members']:
+                member = store.get(db, 'profiles', identifier, org_id)
+                if (member.get('archived') or not member.get('project') or
+                        Path(member['project']).resolve() != repository):
+                    raise ValueError('Release review participants changed repository; inspect the group.')
         # Preparation happens outside this transaction, under participant locks.
         # The roster is frozen on the discussion; no member must be turned on manually.
         runs = []
@@ -292,6 +299,11 @@ def action(store, db, name, body, org):
                     prompt=text(body, 'prompt', 8000, optional=True) or group['description'],
                     discussion_scope=group.get('review_scope', 'topic') if not body.get('prompt') else 'topic',
                     contributions=[], progress='Preparing discussion sessions', preparation={}, preparation_version=1)
+        if body.get('purpose') == 'release_review':
+            # Release advice is never a proposal source, including when the
+            # organization separately authorizes automatic task/release plans.
+            item['purpose'] = 'release_review'
+            item['review_repository'] = str(repository)
     store.put(db, 'jobs', item)
     return item
 
@@ -913,6 +925,10 @@ def execute(store, job):
                 'herdr_reported_cwd': live.get('cwd') if isinstance(live.get('cwd'), str) else None}
 
     contexts = [workspace_context(group_run), *(workspace_context(r) for r in job['runs'])]
+    if job.get('purpose') == 'release_review':
+        repository = Path(job['review_repository']).resolve()
+        if any(Path(context['configured_project']).resolve() != repository for context in contexts):
+            raise ValueError('Release review session repository changed; no discussion prompt was sent.')
     review_context = repository_review_context(store, job)
     roster = '\n'.join(f"{r['profile']['name']} ({r['profile']['role']}): {r['alias']}" for r in job['runs'])
     # A proposal may name any eligible repository worker, not only an attendee:
@@ -1002,6 +1018,12 @@ def execute(store, job):
         "Each description must include acceptance criteria and required checks. Use only the listed profile IDs. "
         "Set needs_review=true for anything that changes scope, adds dependencies or touches sensitive areas; those "
         "stay drafts for an operator. An empty array is a valid and common outcome. "
+        "Only when the discussion explicitly calls for a named release, optionally include release_plan in that SAME json object: "
+        '{"name":"alpha.15","task_refs":["api","tests"]}. Give each referenced task_proposal a unique '
+        '"ref" (1–40 letters, digits, underscores or hyphens). Select 1–10 proposals from this discussion, '
+        "all assigned to the same repository. Do not invent a release name, add unrelated existing tasks, or infer dependencies from membership. "
+        "Herdr creates this collecting plan only if the organization enables automatic release planning; it does not authorize "
+        "starting draft tasks, freezing, integrating or publishing. Omit release_plan when no release was requested. "
         f"Also write {transcript} as JSON with a contributions array. Each entry must have "
         f"profile_id (from the roster below), name, round (integer 1 to {MAX_ROUNDS}), and content (Markdown). "
         f"Budget at most {transcript_contribution_budget(len(job['runs']))} UTF-8 bytes per contribution, "

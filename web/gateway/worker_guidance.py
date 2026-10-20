@@ -28,6 +28,14 @@ def _local_bundle(checkout, recover):
         if len(data) > 100000:
             raise ValueError('Worker skill resource exceeds its size limit.')
         files[name] = data
+    # Ship the small submission client inside the existing checkout grant.
+    # Its shared wire contract and anchored reader need no gateway/database
+    # modules, dashboard credentials or external-directory permission.
+    for name in ('task_commit_client.py', 'task_revision_contract.py', 'project_access.py', 'request_identity.py'):
+        path = Path(__file__).parent / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 100000:
+            raise ValueError('Task submission helper is missing or unsafe: ' + name)
+        files[name] = path.read_bytes()
     digest = hashlib.sha256(b''.join(name.encode() + b'\0' + data for name, data in files.items())).hexdigest()
     relative = '.ci-cache/herdr-guidance/' + digest
     # Local metadata keeps arbitrary repositories clean without changing tracked rules.

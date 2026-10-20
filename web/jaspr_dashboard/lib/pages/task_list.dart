@@ -1,4 +1,5 @@
 import '../ui.dart';
+import 'package:herdr_dashboard_state/task_execution.dart';
 import 'task_activity.dart' show taskAgentName, taskNextStep, shortSha;
 import 'task_workflow.dart' show taskTone, taskStateTone, taskNeedsAttention;
 
@@ -33,7 +34,7 @@ Component taskList({
   required String Function(Map<String, dynamic>) stateLabel,
   required void Function(String) onOpen,
   String executor = 'service',
-  Map<String, String>? activity,
+  Map<String, Map<String, dynamic>> taskExecutions = const {},
 }) {
   final groups = <String, List<Map<String, dynamic>>>{};
   for (final task in tasks) {
@@ -55,13 +56,21 @@ Component taskList({
     final note = taskNextStep(task, executor: executor);
     final assigned = task['assigned_agent'] as Map?;
     final name = taskAgentName(task, fallback: 'Identity unavailable');
-    final owner = '${task['profile_id'] ?? assigned?['id'] ?? ''}';
+    final execution = taskExecutions[id];
+    final work = taskWork(task, execution);
     return el(
       'tr',
       [
         el(
           'td',
           [
+            if (work != null)
+              el(
+                'span',
+                [text(work.label)],
+                classes: 'wf-list__activity',
+                attributes: {'data-work': work.activity},
+              ),
             el('div', [
               el(
                 'span',
@@ -90,7 +99,7 @@ Component taskList({
                 name,
                 role: assigned?['role'] ?? name,
                 size: 'xs',
-                live: activity?[owner] == 'working',
+                live: work?.activity == 'working',
               ),
               el('span', [text(name)], classes: 'agent-label__name'),
             ], classes: 'agent-label'),

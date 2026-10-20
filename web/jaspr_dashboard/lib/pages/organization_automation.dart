@@ -263,13 +263,17 @@ class _OrganizationAutomationState extends State<OrganizationAutomation> {
 /// Display labels for the stored policy keys (shared with the edit form).
 const automationLabels = <String, String>{
   'auto_queue_proposals': 'Automatically queue qualifying follow-ups',
+  'auto_create_releases':
+      'Create release plans from group discussions automatically',
   'paused': 'Pause automatic follow-up',
   'reap_finished_sessions':
       'Archive and close finished idle sessions automatically',
   'reap_orphaned_panes': 'Reclaim proven empty orphaned panes',
   'auto_capture': 'Capture completed candidates automatically',
   'auto_validate': 'Validate captured candidates automatically',
-  'auto_publish': 'Publish validated tasks automatically',
+  'auto_publish': 'Publish validated task PRs automatically (task/both routes)',
+  'publication_mode': 'Delivery route for new tasks',
+  'publication_repositories': 'Repository route overrides (JSON object)',
   'auto_prepare': 'Prepare supported project SDKs before agent launch',
   'auto_prepare_restore': 'Restore project dependencies before launch',
   'auto_prepare_checks':
@@ -291,10 +295,12 @@ Future<Json?> editOrganizationAutomation(
 }) async {
   final defaults = <String, dynamic>{
     'auto_queue_proposals': false,
+    'auto_create_releases': false,
     'paused': false,
     'auto_validate': false,
     'auto_capture': policy['auto_capture'] ?? policy['auto_validate'] ?? false,
     'auto_publish': false,
+    'publication_mode': 'release',
     'auto_prepare': false,
     'auto_prepare_restore': false,
     'auto_prepare_checks': false,
@@ -309,6 +315,9 @@ Future<Json?> editOrganizationAutomation(
     'max_active_meetings': 0,
     'daily_session_cap': 0,
     ...policy,
+    'publication_repositories': jsonEncode(
+      policy['publication_repositories'] ?? {},
+    ),
   };
 
   final maxima = {
@@ -324,16 +333,28 @@ Future<Json?> editOrganizationAutomation(
   const labels = automationLabels;
   Json normalized(Json values) => {
     for (final key in labels.keys)
-      key: maxima.containsKey(key) ? int.parse('${values[key]}') : values[key],
+      key: key == 'publication_repositories'
+          ? jsonDecode('${values[key]}')
+          : maxima.containsKey(key)
+          ? int.parse('${values[key]}')
+          : values[key],
   };
 
   final result = await editRecord(
     'Organization automation & limits',
     defaults,
     labels,
+    choices: const {
+      'publication_mode': {
+        'release': 'Release PRs',
+        'both': 'Release or task PRs',
+        'task': 'Task PRs',
+      },
+    },
     submit: save == null ? null : (values) => save(normalized(values)),
     flags: {
       'auto_queue_proposals',
+      'auto_create_releases',
       'paused',
       'reap_finished_sessions',
       'reap_orphaned_panes',
@@ -346,6 +367,12 @@ Future<Json?> editOrganizationAutomation(
       'auto_prepare_agent',
     },
     extra: (v) => [
+      note(
+        'Delivery routes are recorded when tasks are created. Existing tasks keep their route. Both allows either path; it does not publish twice. Release freezing and publication remain explicit. Overrides map repository paths to release, both or task.',
+      ),
+      note(
+        'Release planning applies to new discussions with an explicit named plan. Planned tasks join the board before completion; their candidate follows the latest captured commit only after required checks pass. Task queueing, capture and validation use their own settings. Freezing, integration and publication remain explicit actions.',
+      ),
       note(
         'Managed SDK preparation uses trusted providers. Agent-assisted preparation is a separate opt-in for Node.js: a dedicated session can download and run installers in its allocation, and its provenance remains an unverified claim. This shares the service account and is not a sandbox. Locked Dependency restoration requires its own permission and can execute project build code. Native check approval is separate: build and test commands can restore dependencies and execute project code. Unsupported requirements stop the launch; disabling preparation does not silently resume a waiting launch.',
       ),
@@ -360,6 +387,19 @@ Future<Json?> editOrganizationAutomation(
         if (n == null || n < 0 || n > entry.value)
           errors[entry.key] =
               '${labels[entry.key]} must be a whole number from 0 to ${entry.value}.';
+      }
+      try {
+        final overrides = jsonDecode('${v['publication_repositories']}');
+        if (overrides is! Map ||
+            overrides.values.any(
+              (mode) => !['release', 'both', 'task'].contains(mode),
+            )) {
+          errors['publication_repositories'] =
+              'Enter an object mapping repository paths to release, both or task.';
+        }
+      } catch (_) {
+        errors['publication_repositories'] =
+            'Enter a valid JSON object, such as {}.';
       }
       return errors;
     },

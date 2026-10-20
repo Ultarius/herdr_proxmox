@@ -1,12 +1,15 @@
+import 'dart:convert';
 import 'discovery_panel.dart';
 import 'routes.dart';
 import 'task_activity.dart';
 import 'task_timeline.dart';
+import 'task_revisions.dart';
 import 'artifact_download.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'clipboard_copy.dart';
 import 'request_id.dart';
+import 'package:herdr_dashboard_state/task_execution.dart';
 
 /// Task lifecycle labels. The gateway owns these states; an unknown value is
 /// shown verbatim rather than guessed.
@@ -140,6 +143,15 @@ class _TasksPageState extends State<TasksPage> {
   // Keep the exact request across lost responses. Changing the selection gets
   // a new identity; retrying the same action reconciles the durable request.
   final Map<String, String> requests = {};
+  String liveActivity = '';
+  Map<String, Map<String, dynamic>> get taskExecutions => taskExecutionBindings(
+    connection.state.agents,
+    available:
+        connection.state.connected &&
+        connection.state.error == null &&
+        connection.state.serverStatus != 'stopped',
+  );
+
   bool get admin => connection.operator.value['role'] == 'admin';
 
   @override
@@ -150,6 +162,8 @@ class _TasksPageState extends State<TasksPage> {
       if (!mounted) return;
       if (connection.state.connected != connected)
         setState(() => connected = connection.state.connected);
+      final live = jsonEncode(taskExecutions);
+      if (live != liveActivity) setState(() => liveActivity = live);
       if (generation != connection.generation) {
         generation = connection.generation;
         setState(() {
@@ -261,6 +275,43 @@ class _TasksPageState extends State<TasksPage> {
     } catch (e) {
       if (mounted && epoch == connection.generation)
         setState(() => readError = '$e');
+    }
+  }
+
+  Future<void> releaseAct(String action, Map<String, dynamic> body) async {
+    if (busy || !admin) return;
+    final epoch = connection.generation;
+    final selection = 'release:$action:$body';
+    final request = requests.putIfAbsent(
+      selection,
+      () => 'release-${newRequestId()}',
+    );
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      await connection.request('releases/$action', {
+        ...body,
+        'request_id': request,
+      });
+      if (!mounted || epoch != connection.generation) return;
+      requests.remove(selection);
+      await refresh();
+      if (mounted && epoch == connection.generation) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Release candidate created. Manage it in the workflow board.',
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted && epoch == connection.generation)
+        setState(() => error = '$e');
+    } finally {
+      if (mounted) setState(() => busy = false);
     }
   }
 
@@ -991,6 +1042,7 @@ class _TasksPageState extends State<TasksPage> {
 
   @override
   Widget build(BuildContext context) {
+    final executions = taskExecutions;
     final drafts = tasks.where((t) => t['state'] == 'draft').toList();
     final started = tasks.where((t) => t['state'] != 'draft').toList();
     return selectedId == null
@@ -1063,7 +1115,7 @@ class _TasksPageState extends State<TasksPage> {
                         : 'No development tasks yet.',
                   ),
                 ),
-              for (final task in started) _summary(task),
+              for (final task in started) _summary(task, executions),
               // Drafts are proposals waiting on an operator, not work in flight.
               // Grouping them keeps the active list readable when a group has
               // proposed several follow-ups.
@@ -1092,12 +1144,12 @@ class _TasksPageState extends State<TasksPage> {
                     ],
                   ),
                 ),
-                for (final task in drafts) _summary(task),
+                for (final task in drafts) _summary(task, executions),
               ],
               DiscoveryPanel(coordinator: widget.coordinator),
             ],
           )
-        : _detail();
+        : _detail(executions);
   }
 
   Future<void> openTask(String id) async {
@@ -1128,7 +1180,10 @@ class _TasksPageState extends State<TasksPage> {
     }
   }
 
-  Widget _summary(Map<String, dynamic> task) => Card(
+  Widget _summary(
+    Map<String, dynamic> task,
+    Map<String, Map<String, dynamic>> executions,
+  ) => Card(
     child: Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
@@ -1140,6 +1195,7 @@ class _TasksPageState extends State<TasksPage> {
           ),
           Text('${taskState(task)} \u00b7 ${task['repository']}'),
           Text('${taskAgentName(task)}'),
+          _liveWork(task, executions),
           Text(taskNextStep(task, executor: executor)),
           if (task['updated_at'] != null)
             Text('Last activity ${task['updated_at']}'),
@@ -1152,6 +1208,23 @@ class _TasksPageState extends State<TasksPage> {
       ),
     ),
   );
+
+  Widget _liveWork(Map task, Map<String, Map<String, dynamic>> executions) {
+    final work = taskWork(task, executions[task['id']]);
+    if (work == null) return const SizedBox.shrink();
+    final working = work.activity == 'working';
+    return Row(
+      children: [
+        Icon(
+          working ? Icons.play_circle_outline : Icons.warning_amber_rounded,
+          color: working ? Colors.green : Theme.of(context).colorScheme.error,
+          semanticLabel: working ? 'Live task work' : 'Task needs attention',
+        ),
+        const SizedBox(width: 6),
+        Flexible(child: Text(work.label)),
+      ],
+    );
+  }
 
   Future<void> showCommit(Map<String, dynamic> task, String sha) async {
     final epoch = connection.generation;
@@ -1970,10 +2043,14 @@ class _TasksPageState extends State<TasksPage> {
       return OutlinedButton.icon(
         onPressed: () => setState(() => section = 'Activity & agents'),
         icon: const Icon(Icons.build_outlined),
-        label: const Text('View conflict repair'),
+        label: Text(
+          repair?['kind'] == 'validation_update'
+              ? 'View branch update'
+              : 'View conflict repair',
+        ),
       );
     }
-    final target = task['merge_sha'] ?? task['head_sha'];
+    final target = taskValidationTarget(task);
     final evidence = (task['builds'] as Map?)?[target] as Map?;
     if (task['launch_retryable'] == true) {
       return FilledButton.icon(
@@ -2195,10 +2272,38 @@ class _TasksPageState extends State<TasksPage> {
     }
     if (target == null || ['closed', 'completed'].contains(task['state']))
       return const SizedBox.shrink();
+    if (taskValidationNeedsRecheck(task, target)) return _validateAction(task);
+    if (task['task_publication_allowed'] != false &&
+        task['state'] == 'published' &&
+        task['pull'] == null &&
+        (task['publish'] as Map?)?['head_sha'] == target) {
+      return FilledButton.icon(
+        onPressed: admin && !busy && github['configured'] == true
+            ? () => previewPull(task)
+            : null,
+        icon: const Icon(Icons.rate_review),
+        label: Text(
+          needsPrAuthentication(github, task['github_repository'] as String?)
+              ? 'Configure PR authentication'
+              : 'Review draft PR',
+        ),
+      );
+    }
     if (evidence?['state'] == 'complete') {
       final verified =
           evidence?['target'] == target &&
           evidence?['required_checks_verified'] == true;
+      if (verified && task['task_publication_allowed'] == false) {
+        return OutlinedButton(
+          onPressed: admin && !busy
+              ? () => releaseAct('single', {
+                  'task_id': task['id'],
+                  'head_sha': task['head_sha'],
+                })
+              : null,
+          child: const Text('Release this task only'),
+        );
+      }
       if (verified &&
           !['merged', 'published', 'pr_open'].contains(task['state'])) {
         return FilledButton.icon(
@@ -2228,14 +2333,18 @@ class _TasksPageState extends State<TasksPage> {
       );
     return FilledButton.icon(
       onPressed: admin && !busy
-          ? () => act('build', {'task_id': task['id'], 'target': target})
+          ? () => act('build', {
+              'task_id': task['id'],
+              'target': target,
+              'update_branch': true,
+            })
           : null,
       icon: const Icon(Icons.fact_check),
       label: const Text('Validate latest commit'),
     );
   }
 
-  Widget _detail() {
+  Widget _detail(Map<String, Map<String, dynamic>> executions) {
     final task = tasks.isEmpty ? null : tasks.first;
     return ListView(
       padding: const EdgeInsets.all(20),
@@ -2266,6 +2375,7 @@ class _TasksPageState extends State<TasksPage> {
             style: Theme.of(context).textTheme.headlineMedium,
           ),
           Text('${taskState(task)} \u00b7 ${task['repository']}'),
+          _liveWork(task, executions),
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 12),
             child: Text(
@@ -2483,6 +2593,7 @@ class _TasksPageState extends State<TasksPage> {
                       admin &&
                           !busy &&
                           executor == 'service' &&
+                          task['task_publication_allowed'] != false &&
                           (task['auto_publish'] == true ||
                               github['configured'] == true) &&
                           ![
@@ -2713,6 +2824,7 @@ class _TasksPageState extends State<TasksPage> {
             if (task['merge_sha'] != null)
               SelectableText('Merged result: ${task['merge_sha']}'),
             const SizedBox(height: 12),
+            TaskRevisions(task: task),
             TaskTimeline(
               task: task,
               onSelect: (sha) => showCommit(task, sha),
@@ -2735,14 +2847,16 @@ class _TasksPageState extends State<TasksPage> {
           if (section == 'Checks & builds') ...[
             Builder(
               builder: (context) {
-                final target = task['merge_sha'] ?? task['head_sha'];
+                final target = taskValidationTarget(task);
                 final build = (task['builds'] as Map?)?[target];
                 final label = build is! Map
                     ? 'not run'
                     : build['state'] == 'complete'
                     ? (build['target'] == target &&
                               build['required_checks_verified'] == true
-                          ? 'verified'
+                          ? (taskValidationNeedsRecheck(task, target)
+                                ? 'recorded checks passed; revalidation required'
+                                : 'verified')
                           : 'finished without verified required checks')
                     : '${build['state']}';
                 return Text('Current candidate validation: $label');
@@ -2751,7 +2865,7 @@ class _TasksPageState extends State<TasksPage> {
             if (task['builds'] is Map)
               for (final entry in (task['builds'] as Map).entries)
                 if (entry.value is Map)
-                  if (entry.key == (task['merge_sha'] ?? task['head_sha']))
+                  if (entry.key == taskValidationTarget(task))
                     _buildEvidence('${entry.key}', entry.value)
                   else
                     ExpansionTile(
@@ -2785,10 +2899,12 @@ class _TasksPageState extends State<TasksPage> {
     if (!taskHasPrConflicts(task) && repair == null)
       return const SizedBox.shrink();
     final state = '${repair?['state'] ?? ''}';
+    final updating = repair?['kind'] == 'validation_update';
     final agent = taskAgentName(task, fallback: 'the assigned agent');
     final terminal = ['merged', 'closed', 'completed'].contains(task['state']);
     final canStart =
         !terminal &&
+        !updating &&
         taskHasPrConflicts(task) &&
         (repair == null ||
             [
@@ -2812,7 +2928,7 @@ class _TasksPageState extends State<TasksPage> {
                       (repair == null ||
                           ['cancelled', 'obsolete'].contains(state))
                   ? 'PR #${task['pull']?['number']} has merge conflicts'
-                  : 'Conflict repair · ${state.replaceAll('_', ' ')}',
+                  : '${updating ? 'Branch update' : 'Conflict repair'} · ${state.replaceAll('_', ' ')}',
               style: Theme.of(context).textTheme.titleMedium,
             ),
             const SizedBox(height: 8),
@@ -2821,16 +2937,22 @@ class _TasksPageState extends State<TasksPage> {
             ),
             Text('Assigned agent: $agent'),
             SelectableText(
-              'PR branch: ${task['branch']}\nPublish to: ${task['publishing_repository'] ?? task['github_repository']}\nPR target: ${task['github_repository']}',
+              'Task branch: ${task['branch']}\nPublish to: ${task['publishing_repository'] ?? task['github_repository']}\nPR target: ${task['github_repository']}',
             ),
             const Text(
-              'Repair keeps the existing PR branch. The agent commits locally; publication and merging remain separate actions.',
+              'The agent updates the existing task branch and commits locally. Publication and merging remain separate actions.',
             ),
             if (repair?['candidate'] != null)
-              SelectableText('Repaired candidate: ${repair?['candidate']}'),
+              SelectableText(
+                '${updating ? 'Updated candidate' : 'Repaired candidate'}: ${repair?['candidate']}',
+              ),
+            if ((repair?['policy_files'] as List? ?? []).isNotEmpty)
+              SelectableText(
+                'Upstream validation files: ${(repair?['policy_files'] as List).join(', ')}',
+              ),
             if (repair?['upstream_sha'] != null)
               SelectableText(
-                'Upstream commit for this repair: ${repair?['upstream_sha']}',
+                '${updating ? 'Upstream commit for this update' : 'Upstream commit for this repair'}: ${repair?['upstream_sha']}',
               ),
             const SizedBox(height: 12),
             Wrap(
@@ -2856,7 +2978,11 @@ class _TasksPageState extends State<TasksPage> {
                             'mode': 'cancel',
                           })
                         : null,
-                    child: const Text('Cancel queued repair'),
+                    child: Text(
+                      updating
+                          ? 'Cancel queued update'
+                          : 'Cancel queued repair',
+                    ),
                   ),
                 if (state == 'queued' ||
                     state == 'monitoring_unavailable' ||
@@ -2879,24 +3005,37 @@ class _TasksPageState extends State<TasksPage> {
                             'inspected': true,
                           })
                         : null,
-                    child: const Text('Recheck inspected repair'),
+                    child: Text(
+                      updating
+                          ? 'Recheck inspected update'
+                          : 'Recheck inspected repair',
+                    ),
                   ),
                 if (state == 'validating' || state == 'validation_failed')
                   OutlinedButton(
                     onPressed: () =>
                         setState(() => section = 'Checks & builds'),
-                    child: const Text('Inspect repair validation'),
+                    child: Text(
+                      updating
+                          ? 'Inspect update validation'
+                          : 'Inspect repair validation',
+                    ),
                   ),
-                if (state == 'ready')
+                if (state == 'ready' &&
+                    task['task_publication_allowed'] != false)
                   FilledButton(
                     onPressed: admin && !busy ? () => review(task) : null,
-                    child: const Text('Review and publish repaired candidate'),
+                    child: Text(
+                      updating
+                          ? 'Review and publish updated candidate'
+                          : 'Review and publish repaired candidate',
+                    ),
                   ),
                 OutlinedButton(
                   onPressed: admin && !busy
                       ? () => act('refresh', {'task_id': task['id']})
                       : null,
-                  child: const Text('Refresh PR status'),
+                  child: Text(updating ? 'Refresh task' : 'Refresh PR status'),
                 ),
               ],
             ),
@@ -2910,6 +3049,27 @@ class _TasksPageState extends State<TasksPage> {
     spacing: 8,
     runSpacing: 8,
     children: [
+      if (task['head_sha'] != null &&
+          !['merged', 'closed', 'completed'].contains(task['state']))
+        OutlinedButton(
+          onPressed: admin && !busy
+              ? () => releaseAct('single', {
+                  'task_id': task['id'],
+                  'head_sha': task['head_sha'],
+                })
+              : null,
+          child: const Text('Release this task only'),
+        ),
+      if (task['task_publication_allowed'] == false)
+        const Text(
+          'Delivery route: release PR. Capture and validation remain available.',
+        ),
+      for (final receipt
+          in (task['release_deliveries'] as List? ?? []).whereType<Map>())
+        Text(
+          'Release ${receipt['version']}: ${receipt['stage']} · candidate ${receipt['candidate_sha']} · ${receipt['current_candidate_matches'] == true ? 'current candidate' : 'earlier candidate'}${receipt['pull'] is Map ? ' · ${receipt['pull']['url']}' : ''}',
+        ),
+
       if (task['run_id'] != null &&
           !['merged', 'closed', 'completed'].contains(task['state']))
         OutlinedButton(
@@ -2951,7 +3111,8 @@ class _TasksPageState extends State<TasksPage> {
                 },
           child: const Text('Download candidate patch'),
         ),
-      if (task['head_sha'] != null &&
+      if (task['task_publication_allowed'] != false &&
+          task['head_sha'] != null &&
           !['merged', 'closed', 'completed'].contains(task['state']))
         OutlinedButton(
           onPressed: admin && !busy && github['configured'] == true
@@ -2959,7 +3120,8 @@ class _TasksPageState extends State<TasksPage> {
               : null,
           child: const Text('Review and publish'),
         ),
-      if (task['publish'] == null &&
+      if (task['task_publication_allowed'] != false &&
+          task['publish'] == null &&
           task['github_repository'] != null &&
           (github['publication']
                   as Map?)?[task['github_repository']]?['mode'] ==
@@ -2970,7 +3132,9 @@ class _TasksPageState extends State<TasksPage> {
               : null,
           child: const Text('Publication destination'),
         ),
-      if (task['publish'] != null && task['pull'] == null)
+      if (task['task_publication_allowed'] != false &&
+          task['publish'] != null &&
+          task['pull'] == null)
         FilledButton(
           onPressed: admin && !busy && github['configured'] == true
               ? () => previewPull(task)
@@ -3006,29 +3170,35 @@ class _TasksPageState extends State<TasksPage> {
     ],
   );
 
-  /// Validation for the current target. Verified evidence hides the action
-  /// (the durable queue would not re-run it) and an in-flight build disables it.
+  /// A historical pass hides validation only while its approved policy matches.
+  /// The durable queue separates policy identities. Next step links to active builds.
   Widget _validateAction(Map<String, dynamic> task) {
-    final target = task['state'] == 'merged'
-        ? task['merge_sha']
-        : task['head_sha'];
+    final target = taskValidationTarget(task);
     if (target == null) return const SizedBox.shrink();
     final build = (task['builds'] as Map?)?[target];
     if (build is Map &&
         build['target'] == target &&
         build['state'] == 'complete' &&
-        build['required_checks_verified'] == true)
+        build['required_checks_verified'] == true &&
+        !taskValidationNeedsRecheck(task, target))
       return const SizedBox.shrink();
     final running =
-        build is Map && ['queued', 'running'].contains(build['state']);
+        build is Map &&
+        build['target'] == target &&
+        ['queued', 'running'].contains(build['state']);
+    if (running) return const SizedBox.shrink();
     return OutlinedButton(
-      onPressed: admin && !busy && !running
-          ? () => act('build', {'task_id': task['id'], 'target': target})
+      onPressed: admin && !busy
+          ? () => act('build', {
+              'task_id': task['id'],
+              'target': target,
+              'update_branch': true,
+            })
           : null,
       child: Text(
         task['state'] == 'merged'
             ? 'Build merged result'
-            : 'Validate candidate',
+            : 'Validate latest commit',
       ),
     );
   }

@@ -3,12 +3,13 @@
 This does not lock out external Git clients. Callers still recheck state and
 respect Git's native locks. Never acquire this while waiting for an agent reply.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from pathlib import Path
 import os
 import subprocess
 import threading
 import time
+from operation_metrics import measured
 
 _guard = threading.Lock()
 _locks = {}
@@ -17,16 +18,36 @@ _local = threading.local()
 
 def common_directory(path):
     environment = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
-    result = subprocess.run(['git', '-C', str(path), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
-                            capture_output=True, timeout=15, env=environment)
-    if result.returncode:
-        raise ValueError('Cannot resolve repository metadata for locking.')
+    with measured('git.command'):
+        result = subprocess.run(['git', '-C', str(path), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                                capture_output=True, timeout=15, env=environment)
+        if result.returncode:
+            raise ValueError('Cannot resolve repository metadata for locking.')
     return Path(os.fsdecode(result.stdout).strip()).resolve()
 
 
 @contextmanager
 def repository_lock(path, timeout=15):
+    # Only the outer claim is timed: reentrant helpers are not additional waits.
+    # Identity resolution has its own git.command sample; lock_wait below is
+    # acquisition/contended waiting, not end-to-end repository claim latency.
     common = common_directory(path)
+    key = os.path.normcase(str(common))
+    nested = getattr(_local, 'depths', {}).get(key, 0)
+    if nested:
+        with _repository_lock(path, timeout, common):
+            yield common
+        return
+    with ExitStack() as stack:
+        with measured('repository.lock_wait'):
+            stack.enter_context(_repository_lock(path, timeout, common))
+        with measured('repository.lock_hold'):
+            yield common
+
+
+@contextmanager
+def _repository_lock(path, timeout=15, common=None):
+    common = common if common is not None else common_directory(path)
     key = os.path.normcase(str(common))
     with _guard:
         lock = _locks.setdefault(key, threading.RLock())

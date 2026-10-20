@@ -430,6 +430,95 @@ class GitHubTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which('git'), 'Git required')
 class ContributionTests(unittest.TestCase):
+    def test_release_notifications_skip_noop_and_audit_only_saves_but_keep_progress(self):
+        releases = self.service.releases
+        created = releases.action('create', dict(request_id='notify-release', repository='repo', version='alpha.15'), 'admin', 'admin')
+        def count():
+            with closing(self.service.connect()) as db:
+                return db.execute("SELECT COUNT(*) FROM notification_outbox WHERE topic='release'").fetchone()[0]
+        before = count()
+        release = releases.get(created['id'])
+        releases.save(release)
+        release['audit'].append(dict(action='inspection', actor='admin'))
+        releases.save(release)
+        self.assertEqual(count(), before)
+        releases.action('membership', dict(request_id='notify-membership', id=release['id'], edit_version=release['edit_version'],
+            task_id=self.task['id'], included=True), 'admin', 'admin')
+        self.assertEqual(count(), before + 1)
+
+    def test_release_http_routes_enforce_admin_and_replay_requests(self):
+        gateway = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        gateway.token = 'a' * 48
+        gateway.contributions = self.service
+        gateway.operators = SimpleNamespace(identify=lambda token: dict(name='viewer', role='operator') if token == 'viewer' else None)
+        thread = threading.Thread(target=gateway.serve_forever, daemon=True)
+        thread.start()
+        endpoint = 'http://127.0.0.1:' + str(gateway.server_port)
+        payload = json.dumps(dict(request_id='http-release-create', repository='repo', version='alpha.15')).encode()
+        try:
+            with self.assertRaises(HTTPError) as denied:
+                urlopen(Request(endpoint + '/api/releases/create', data=payload))
+            self.assertEqual(denied.exception.code, 401)
+            with self.assertRaises(HTTPError) as denied:
+                urlopen(Request(endpoint + '/api/releases/create', data=payload, headers={'Authorization': 'Bearer viewer'}))
+            self.assertEqual(denied.exception.code, 400)
+            headers = {'Authorization': 'Bearer ' + gateway.token}
+            first = json.load(urlopen(Request(endpoint + '/api/releases/create', data=payload, headers=headers)))
+            replay = json.load(urlopen(Request(endpoint + '/api/releases/create', data=payload, headers=headers)))
+            self.assertEqual(first, replay)
+            snapshot = json.load(urlopen(Request(endpoint + '/api/tasks', headers=headers)))
+            self.assertEqual(snapshot['releases'][0]['id'], first['id'])
+            self.assertEqual(snapshot['releases'][0]['state'], 'collecting')
+            history_path = '/api/releases/revisions?id=' + first['id']
+            with self.assertRaises(HTTPError) as denied:
+                urlopen(endpoint + history_path)
+            self.assertEqual(denied.exception.code, 401)
+            history = json.load(urlopen(Request(endpoint + history_path, headers={'Authorization': 'Bearer viewer'})))
+            self.assertEqual(history['revisions'], [])
+            retained = self.service.releases.get(first['id'])
+            retained.update(state='blocked', revision=dict(digest='d' * 64, generation=1, release_id=first['id'],
+                members=[], base_sha=self.base, policy_digest='e' * 64))
+            self.service.releases.save(retained)
+            detail = json.load(urlopen(Request(endpoint + history_path + '&revision=' + 'd' * 64,
+                headers={'Authorization': 'Bearer viewer'})))
+            self.assertTrue(detail['read_only'])
+            self.assertEqual(detail['release']['revision']['digest'], 'd' * 64)
+            with self.assertRaises(HTTPError) as invalid:
+                urlopen(Request(endpoint + history_path + '&before=invalid', headers=headers))
+            self.assertEqual(invalid.exception.code, 400)
+        finally:
+            gateway.shutdown()
+            gateway.server_close()
+            thread.join(timeout=2)
+
+    def test_release_results_route_without_becoming_task_builds_and_emit_notifications(self):
+        task = self.candidate()
+        policy = dict(toolchains=[], declarations={}, lockfiles={}, checks=[])
+        task['builds'] = {task['head_sha']: dict(target=task['head_sha'], state='complete',
+            required_checks_verified=True, policy_digest=toolchain_policy.digest(policy))}
+        self.service.save(task, 'verified', 'admin')
+        releases = self.service.releases
+        created = releases.action('create', dict(request_id='release-create', repository='repo', version='alpha.15'), 'admin', 'admin')
+        selected = releases.action('membership', dict(request_id='release-member', id=created['id'], edit_version=created['edit_version'],
+            task_id=task['id'], included=True), 'admin', 'admin')
+        with patch('toolchain_policy.resolve_committed', return_value=policy):
+            frozen = releases.action('freeze', dict(request_id='release-freeze', id=selected['id'],
+                edit_version=selected['edit_version']), 'admin', 'admin')
+            self.service.validation = MagicMock()
+            self.service.validation.snapshot.return_value = dict(runs=[])
+            releases.advance(frozen['id'])
+            releases.advance(frozen['id'])
+        waiting = releases.get(frozen['id'])
+        event = waiting['validation_event']
+        self.assertEqual(self.service.build_event(event['id']), event)
+        self.assertTrue(self.service.record_build(event['id'], dict(target=waiting['resulting_sha'], state='complete',
+            required_checks_verified=True, policy_digest=toolchain_policy.digest(policy))))
+        self.assertEqual(releases.get(frozen['id'])['state'], 'ready')
+        self.assertNotIn(waiting['resulting_sha'], self.service.get(task['id'])['builds'])
+        self.assertEqual(self.service.snapshot()['releases'][0]['counts']['incorporated'], 1)
+        with closing(self.service.connect()) as db:
+            self.assertGreater(db.execute("SELECT COUNT(*) FROM notification_outbox WHERE topic='release'").fetchone()[0], 0)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -457,6 +546,10 @@ class ContributionTests(unittest.TestCase):
         self.store.agent_locks = {}
         self.store.snapshot.return_value = dict(profiles=[self.profile], jobs=[])
         self.service = Contributions(self.root / 'tasks.sqlite3', self.root, self.store, self.api)
+        # This fixture exercises the retained per-task publication workflow.
+        with closing(self.service.connect()) as db, db:
+            db.execute('INSERT OR REPLACE INTO policies VALUES (?,?)',
+                       ('org', json.dumps(dict(publication_mode='task'))))
         self.body = dict(request_id='create-1', title='Fix task', description='Implement and test.',
                          repository='repo', base_ref='refs/remotes/origin/main', profile_id='worker')
         self.task = self.service.action('create', self.body, 'admin', 'admin')
@@ -522,6 +615,119 @@ class ContributionTests(unittest.TestCase):
         result.update(changes)
         self.store.snapshot.return_value['jobs'].append(dict(id='feedback', kind='chat', state='answered',
             profile_id='worker', runs=[run], result=json.dumps(result), delivery=dict(stage='reply_verified')))
+
+    def test_delivery_attention_for_previous_candidate_is_preserved_and_superseded(self):
+        import task_delivery
+        task, _, _ = self._delivery_task(publish=False)
+        previous = dict(sha=self.base, state='attention', error='Previous candidate failed validation',
+            agent_report=dict(summary='Previous candidate inspection'), feedback_prompt='old frozen prompt',
+            notification_pending=True, notification_retry_after=0, remote_check_after=10**12)
+        task['delivery_workflow'] = previous
+        task['delivery_repair_count'] = 2
+        self.service.save(task, 'old-delivery', 'test')
+        with patch('collaboration.current_run'), patch('contributions.push') as push:
+            task_delivery.advance(self.service)
+        current = self.service.get(task['id'])
+        self.assertEqual(current['delivery_history'][0]['agent_report'], previous['agent_report'])
+        self.assertEqual(current['delivery_history'][0]['superseded_by'], task['head_sha'])
+        self.assertEqual(current['delivery_workflow']['sha'], task['head_sha'])
+        self.assertEqual(current['delivery_workflow']['state'], 'waiting_agent')
+        self.assertNotIn('old frozen prompt', self.store.action.call_args.args[1]['prompt'])
+        self.assertEqual(current['delivery_repair_count'], 2)
+        self.assertTrue(task_delivery.pending(current))
+        push.assert_not_called()
+
+    def test_current_candidate_attention_still_requires_inspection(self):
+        import task_delivery
+        task, _, _ = self._delivery_task(publish=False)
+        task['delivery_workflow'] = dict(sha=task['head_sha'], state='attention', error='Current failure')
+        self.service.save(task, 'current-attention', 'test')
+        task_delivery.advance(self.service)
+        current = self.service.get(task['id'])
+        self.assertEqual(current['delivery_workflow']['error'], 'Current failure')
+        self.assertNotIn('delivery_history', current)
+        self.store.action.assert_not_called()
+
+    def test_superseded_delivery_history_excludes_replay_payloads_and_tracks_late_chat(self):
+        import task_delivery
+        task, run, _ = self._delivery_task(publish=False)
+        previous = dict(sha=self.base, state='waiting_agent', chat_id='old-inspection', error='e' * 40000,
+            feedback_prompt='x' * 40000, packet={'payload': 'y' * 40000}, notification_pending=True,
+            agent_report=dict(sha=self.base, summary='Old inspection', extra='z' * 40000))
+        task['delivery_history'] = [dict(previous) for _ in range(5)]
+        task['delivery_workflow'] = previous
+        self.service.save(task, 'previous-inspection', 'test')
+        old_chat = dict(id='old-inspection', state='queued', kind='chat', runs=[run])
+        self.store.snapshot.return_value['jobs'].append(old_chat)
+        self.store.action.return_value = dict(id='new-inspection')
+        with patch('collaboration.current_run'):
+            task_delivery.advance(self.service)
+            current = self.service.get(task['id'])
+            self.assertEqual(len(current['delivery_history']), 5)
+            for entry in current['delivery_history']:
+                self.assertNotIn('feedback_prompt', entry)
+                self.assertNotIn('packet', entry)
+                self.assertNotIn('notification_pending', entry)
+                self.assertNotIn('extra', entry['agent_report'])
+                self.assertEqual(entry['error'], 'e' * 2000)
+            self.assertEqual(current['delivery_history'][-1]['chat_id'], 'old-inspection')
+            activity = next(entry for entry in current['audit'] if entry['action'] == 'delivery_superseded')
+            self.assertEqual(activity['delivery_chat_id'], 'old-inspection')
+            self.assertIn('old-inspection', activity['detail'])
+            self.assertEqual(current['delivery_workflow']['chat_id'], 'new-inspection')
+            old_chat.update(state='answered', result=json.dumps(dict(sha=self.base, outcome='reviewed', summary='Late old reply')),
+                            delivery=dict(stage='reply_verified'))
+            self.store.snapshot.return_value['jobs'].append(dict(id='new-inspection', state='queued', kind='chat', runs=[run]))
+            task_delivery.advance(self.service)
+        current = self.service.get(task['id'])
+        self.assertEqual(current['delivery_workflow']['state'], 'waiting_agent')
+        self.assertEqual(current['delivery_workflow']['sha'], task['head_sha'])
+        self.assertNotIn('agent_report', current['delivery_workflow'])
+        self.assertTrue(task_delivery.pending(current))
+
+    def test_task_capture_cannot_enter_during_delivery_publication(self):
+        import task_delivery
+        task, _, _ = self._delivery_task()
+        entered, release = threading.Event(), threading.Event()
+        remote, errors = [None], []
+
+        def blocked_push(*args):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError('Publication was not released by the test.')
+            remote[0] = task['head_sha']
+
+        def deliver():
+            try:
+                task_delivery.advance(self.service)
+            except BaseException as error:
+                errors.append(error)
+
+        operation = self.service.operation
+
+        @contextmanager
+        def nonblocking(key, **kwargs):
+            with operation(key, timeout=0):
+                yield
+
+        with patch('collaboration.current_run'), patch.object(self.service, 'remote_head', side_effect=lambda _: remote[0]), \
+                patch('contributions.push', side_effect=blocked_push):
+            worker = threading.Thread(target=deliver, daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(timeout=5))
+                with patch.object(self.service, 'operation', side_effect=nonblocking):
+                    with self.assertRaises(contributions.Busy):
+                        self.service.action('candidate', dict(request_id='capture-while-publishing',
+                            task_id=task['id']), 'admin', 'admin')
+            finally:
+                release.set()
+                worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        saved = self.service.get(task['id'])
+        self.assertEqual(saved['head_sha'], task['head_sha'])
+        self.assertEqual(saved['delivery_workflow']['state'], 'waiting_agent')
 
     def assert_inherited_publication(self, fork=False):
         import task_delivery
@@ -876,6 +1082,44 @@ class ContributionTests(unittest.TestCase):
             self.assertEqual(persisted['delivery_repair_count'], 1)
             self.assertEqual(persisted['builds'][candidate]['state'], 'queued')
 
+    def test_delivery_repair_recovers_after_candidate_capture_without_superseding_its_flow(self):
+        import task_delivery
+        task, run, _ = self._delivery_task(publish=False, build_state='failed', verified=False)
+        with patch('collaboration.current_run'):
+            task_delivery.advance(self.service)
+            tree = Path(task['worktree'])
+            (tree / 'file').write_text('fixed implementation\n')
+            self.git('add', 'file', path=tree)
+            self.git('commit', '-m', 'fix checks', path=tree)
+            candidate = self.git('rev-parse', 'HEAD', path=tree).strip()
+            self._receipt(task, commit=candidate)
+            self._delivery_reply(task, run, outcome='repaired', candidate=candidate)
+            original = self.service.perform
+
+            def captured_then_interrupted(action, *args, **kwargs):
+                result = original(action, *args, **kwargs)
+                if action == 'candidate':
+                    raise RuntimeError('restart after capture')
+                return result
+
+            with patch.object(self.service, 'perform', side_effect=captured_then_interrupted):
+                with self.assertRaisesRegex(RuntimeError, 'restart after capture'):
+                    task_delivery.advance(self.service)
+            saved = self.service.get(task['id'])
+            self.assertEqual(saved['head_sha'], candidate)
+            self.assertEqual(saved['delivery_workflow']['sha'], task['head_sha'])
+            self.assertNotEqual(saved['head_sha'], saved['delivery_workflow']['sha'])
+            self.assertEqual(saved['delivery_workflow']['state'], 'accepting_repair')
+            self.service.validation.submit.return_value = dict(id='new-build', state='queued')
+            task_delivery.advance(self.service)
+        saved = self.service.get(task['id'])
+        self.assertEqual(saved['delivery_workflow']['state'], 'waiting_verification')
+        self.assertEqual(saved['delivery_workflow']['sha'], candidate)
+        self.assertEqual(saved['delivery_repair_count'], 1)
+        self.assertEqual(saved['builds'][candidate]['state'], 'queued')
+        self.assertNotIn('delivery_history', saved)
+        self.assertFalse(any(entry['action'] == 'delivery_superseded' for entry in saved['audit']))
+
     def test_delivery_enable_rejects_invalid_live_publication_preflight_without_saving_policy(self):
         task, _, _ = self._delivery_task(publish=False)
         self.api.publication_preflight.side_effect = ValueError('Upstream authentication is incompatible')
@@ -1053,7 +1297,9 @@ class ContributionTests(unittest.TestCase):
         self.assertNotIn('completion_token', detail['sessions'][0])
         self.assertNotIn('secret', detail['sessions'][0]['history'][0])
         self.assertEqual(self.service.get(task['id']), before)
-        change = self.service.commit_detail(task['id'], task['head_sha'])
+        with patch.object(self.service, 'validation_policy') as assessment:
+            change = self.service.commit_detail(task['id'], task['head_sha'])
+            assessment.assert_not_called()
         self.assertIn('+implementation', change['diff'])
         self.assertEqual(change['comparison'], 'first parent')
         with self.assertRaisesRegex(ValueError, 'task history'):
@@ -1472,7 +1718,13 @@ class ContributionTests(unittest.TestCase):
         self.assertNotIn(resource.read_text(encoding='utf-8').strip(), prompt)
         self.assertNotIn('## Merge procedure', prompt)
         self.assertIn('Never push', arguments['task_prompt'])
-        self.assertIn('user.name=Herdr-Agent', prompt)
+        self.assertIn('{{HERDR_TASK_COMMIT_HELPER}}', prompt)
+        self.assertIn(contributions.shlex.quote(sys.executable), prompt)
+        self.assertNotIn('`python3 ', prompt)
+        self.assertIn('--context {{HERDR_TASK_CONTEXT}}', prompt)
+        self.assertIn('--parent FULL_EXPECTED_HEAD_SHA', prompt)
+        self.assertIn('assigned checkout root; file paths are repository-relative', prompt)
+        self.assertNotIn('user.name=Herdr-Agent', prompt)
         self.assertIn('Never infer the operator identity', prompt)
         self.assertEqual(project_git.configured_base(self.repo), self.task['base_ref'])
         self.assertEqual(launched['state'], 'implementing')
@@ -1486,6 +1738,13 @@ class ContributionTests(unittest.TestCase):
         source = (root / 'web/gateway/organizations.py').read_text()
         cap = int(re.search(r"task_prompt', (\d+)", source).group(1))
         self.assertGreater(cap, 8000 + len(contributions.task_tool_guidance()) + 500)
+        # Release membership is bounded but adds launch context. A handover
+        # uses that same prompt and must have the same channel budget.
+        with patch.object(self.service.releases, 'task_guidance', return_value='r' * 1800):
+            prompt = self.service.task_instructions(dict(self.task, title='t' * 120, description='d' * 8000))
+        self.assertLessEqual(len(prompt), cap)
+        handover_cap = int(re.search(r'len\(task_prompt\) > (\d+)', source).group(1))
+        self.assertEqual(handover_cap, cap)
 
     def test_tool_policy_extraction_reports_an_inconsistent_installation(self):
         with patch.object(contributions.Path, 'is_file', return_value=False):
@@ -1881,6 +2140,67 @@ class ContributionTests(unittest.TestCase):
         self.assertTrue(again['required_checks_verified'])
         self.assertEqual(again['exit_code'], 0)
         self.assertEqual(again['checks'], [dict(id='test', status='passed')])
+
+    def test_detail_distinguishes_historical_pass_from_current_validation_policy(self):
+        task = self.candidate()
+        head = task['head_sha']
+        policy = toolchain_policy.resolve_committed(self.repo)
+        task['builds'] = {head: dict(target=head, state='complete', required_checks_verified=True,
+                                    policy_digest='old-policy', checks=[])}
+        self.service.save(task, 'build_result', 'tests')
+        before = self.service.get(task['id'])
+        with patch('toolchain_policy.resolve_committed', return_value=policy) as resolve:
+            detail = self.service.detail(task['id'])
+            resolve.assert_called_once()
+        self.assertEqual(detail['validation_policy']['state'], 'stale')
+        self.assertFalse(detail['validation_policy']['matches'])
+        self.assertEqual(detail['validation_policy']['policy_digest'], toolchain_policy.digest(policy))
+        self.assertTrue(detail['builds'][head]['required_checks_verified'])
+        self.assertEqual(self.service.get(task['id']), before)
+
+    def test_validation_policy_requires_identity_even_without_toolchains_and_reports_unknowns(self):
+        policy = dict(toolchains=[], declarations={}, lockfiles={}, checks=[])
+        task = dict(self.task, head_sha=self.base, state='review_ready', builds={self.base: dict(
+            target=self.base, state='complete', required_checks_verified=True, policy_digest=toolchain_policy.digest(policy))})
+        with patch('toolchain_policy.resolve_committed', return_value=policy) as resolve:
+            self.assertTrue(self.service.validation_policy(task)['matches'])
+            resolve.assert_called_once()
+            task['builds'][self.base].pop('policy_digest')
+            self.assertEqual(self.service.validation_policy(task)['state'], 'stale')
+        with patch('toolchain_policy.resolve_committed', side_effect=ValueError('unreadable policy')):
+            self.assertEqual(self.service.validation_policy(task)['state'], 'unavailable')
+        task['builds'][self.base]['state'] = 'queued'
+        with patch('toolchain_policy.resolve_committed') as resolve:
+            self.assertIsNone(self.service.validation_policy(task))
+            resolve.assert_not_called()
+
+    def test_revalidation_of_completed_sha_queues_new_policy_without_reusing_old_pass(self):
+        from build_queue import BuildQueue
+        from validation import ValidationRuns
+        task = self.candidate()
+        head = task['head_sha']
+        queue = BuildQueue(self.root / 'build-queue')
+        self.service.validation = ValidationRuns(self.root, self.service.build_event,
+            root=self.root / 'validation', queue=queue)
+        first = self.service.action('build', dict(request_id='first-policy', task_id=task['id'], target=head), 'admin', 'admin')
+        run = queue.get(first['builds'][head]['run_id'])
+        run.update(state='complete', required_checks_verified=True, checks=[])
+        queue.finish(run)
+        self.service.record_build(run['event_id'], dict(run_id=run['id'], target=head, state='complete',
+            required_checks_verified=True, policy_digest=run['policy_digest'], checks=[]))
+        approved = dict(toolchain_policy.resolve_committed(self.repo), checks=['new-approved-check'])
+        with patch('toolchain_policy.resolve_committed', return_value=approved):
+            self.assertFalse(self.service.validation_policy(self.service.get(task['id']))['matches'])
+            second = self.service.action('build', dict(request_id='second-policy', task_id=task['id'],
+                target=head, update_branch=True), 'admin', 'admin')
+            fresh = queue.get(second['builds'][head]['run_id'])
+            self.assertNotEqual(fresh['id'], run['id'])
+            self.assertEqual(fresh['state'], 'queued')
+            self.assertEqual(fresh['policy_digest'], toolchain_policy.digest(approved))
+            replay = self.service.action('build', dict(request_id='second-policy-retry', task_id=task['id'],
+                target=head, update_branch=True), 'admin', 'admin')
+            self.assertEqual(replay['builds'][head]['run_id'], fresh['id'])
+        self.assertEqual(queue.get(run['id'])['state'], 'complete')
 
     def test_background_poll_survives_storage_faults_and_never_publishes(self):
         task = self.candidate()
@@ -2837,6 +3157,82 @@ class ContributionTests(unittest.TestCase):
                     result='```json\n' + json.dumps({'task_proposals': [
                         dict(title='Follow up ' + str(i), description='Acceptance criteria and required checks.',
                              profile_id='worker', needs_review=False) for i in range(count)]}) + '\n```')
+
+    def release_proposal_job(self, job_id='release-discussion'):
+        job = self.taskless_proposal_job(job_id, count=2)
+        artifact = self.service.discussion_artifact(job)
+        for index, proposal in enumerate(artifact['task_proposals']):
+            proposal['ref'] = 'work-' + str(index)
+        artifact['release_plan'] = dict(name='alpha.16', task_refs=['work-1', 'work-0'])
+        job['result'] = '```json\n' + json.dumps(artifact) + '\n```'
+        return job
+
+    def test_discussion_release_plans_attach_drafts_in_explicit_order_without_starting_them(self):
+        job = self.release_proposal_job()
+        self.service.materialize_discussion(job, dict(contributions.AUTOMATION_DEFAULTS, auto_create_releases=True),
+                                            'group_auto_queue', queue_allowed=False)
+        marker = self.store.update_job.call_args.kwargs['proposals']
+        release = self.service.releases.get(marker['release']['id'])
+        self.assertEqual([member['proposal_ref'] for member in release['members']], ['work-1', 'work-0'])
+        self.assertEqual(release['state'], 'collecting')
+        self.assertEqual(release['source']['job_id'], job['id'])
+        self.assertEqual(len(self.service.releases.snapshot()), 1)
+        for member in release['members']:
+            self.assertIsNone(member['candidate_sha'])
+            self.assertEqual(member['selection'], 'automatic')
+            task = self.service.get(member['task_id'])
+            self.assertEqual(task['state'], 'draft')
+            self.assertNotIn('assignment', task)
+        self.assertNotIn(self.task['id'], [member['task_id'] for member in release['members']])
+
+    def test_discussion_release_policy_is_separate_from_task_queueing_and_has_a_freshness_window(self):
+        self.store.snapshot.return_value['organizations'] = [dict(id='org')]
+        self.assertFalse(self.service.policy('org')['auto_create_releases'])
+        with self.assertRaisesRegex(ValueError, 'administrator'):
+            self.service.action('automation', dict(request_id='release-policy-denied', organization_id='org',
+                auto_create_releases=True), 'reader', 'operator')
+        with self.assertRaisesRegex(ValueError, 'policy value'):
+            self.service.set_automation_policy(dict(organization_id='org', auto_create_releases='true'), 'admin')
+        job = self.release_proposal_job()
+        job['created_at'] = '2000-01-01T00:00:00+00:00'
+        policy = self.service.set_automation_policy(dict(organization_id='org', auto_create_releases=True), 'admin')['policy']
+        self.assertIn('auto_create_releases_since', policy)
+        self.service.materialize_discussion(job, policy, 'group_auto_queue', queue_allowed=False)
+        self.assertEqual(self.service.releases.snapshot(), [])
+        self.assertIn('predates', self.store.update_job.call_args.kwargs['proposals']['release']['reason'])
+        # Unrelated policy edits do not move the release-planning window.
+        updated = self.service.set_automation_policy(dict(organization_id='org', daily_cap=6), 'admin')['policy']
+        self.assertEqual(updated['auto_create_releases_since'], policy['auto_create_releases_since'])
+
+    def test_discussion_release_recovers_after_release_commit_before_job_marker(self):
+        job = self.release_proposal_job()
+        policy = dict(contributions.AUTOMATION_DEFAULTS, auto_create_releases=True)
+        self.store.update_job.side_effect = RuntimeError('crash before marker')
+        with self.assertRaisesRegex(RuntimeError, 'crash before marker'):
+            self.service.materialize_discussion(job, policy, 'group_auto_queue', queue_allowed=False)
+        first = self.service.releases.get(self.service.releases.snapshot()[0]['id'])
+        self.store.update_job.side_effect = None
+        self.service.materialize_discussion(job, policy, 'group_auto_queue', queue_allowed=False)
+        marker = self.store.update_job.call_args.kwargs['proposals']
+        self.assertEqual(marker['release']['id'], first['id'])
+        self.assertEqual(len(self.service.releases.snapshot()), 1)
+        self.assertEqual(len(self.service.snapshot()['tasks']), 3)
+        self.assertEqual(self.service.releases.get(first['id'])['members'], first['members'])
+
+    def test_task_linked_discussion_creates_only_its_explicit_release_members(self):
+        job = self.release_proposal_job()
+        job['task_id'] = self.task['id']
+        self.store.snapshot.return_value['jobs'] = [job]
+        host = self.service.get(self.task['id'])
+        host['meetings'] = [dict(job_id=job['id'], group_id=job['group_id'])]
+        self.service.save(host, 'discussion', 'admin')
+        self.service.materialize_meeting(self.task['id'], job['id'],
+            dict(contributions.AUTOMATION_DEFAULTS, auto_create_releases=True), 'group_auto_queue', queue_allowed=False)
+        host = self.service.get(self.task['id'])
+        release = self.service.releases.get(host['auto_queue'][job['id']]['release']['id'])
+        self.assertEqual(release['source']['task_id'], self.task['id'])
+        self.assertEqual({member['task_id'] for member in release['members']}, set(host['follow_up_tasks'].values()))
+        self.assertNotIn(self.task['id'], [member['task_id'] for member in release['members']])
 
     def manual_proposal_job(self, **changes):
         job = self.taskless_proposal_job('a' * 32, count=2)

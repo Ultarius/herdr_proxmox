@@ -41,6 +41,37 @@ BASH = usable_bash()
 
 
 class ValidationRunTests(unittest.TestCase):
+    def test_full_service_queue_is_a_typed_capacity_wait(self):
+        from unittest.mock import Mock
+        from build_queue import BuildQueueBusy
+        self.runs.queue = Mock()
+        self.runs.queue.enqueue.side_effect = BuildQueueBusy('Build queue is full.')
+        with patch('toolchain_policy.resolve_committed', return_value=dict(toolchains=[])), \
+                patch('validation.threading.Thread') as thread:
+            with self.assertRaises(validation.ValidationBusy):
+                self.runs.submit({'id': 'a' * 64})
+        thread.assert_not_called()
+        self.assertEqual(self.runs._history(), [])
+
+    def test_frozen_policy_without_plan_cannot_drift_before_execution(self):
+        policy = dict(toolchains=[], declarations={}, lockfiles={}, checks=[])
+        self.runs.lookup = lambda identifier: dict(id=identifier, repository='source', path='source',
+            target=self.target, frozen_policy_digest='previous-policy', frozen_plan_digest=None)
+        with patch('toolchain_policy.resolve_committed', return_value=policy), \
+                patch('check_runner.run_scripts') as scripts:
+            run = self.submit_and_wait()
+        self.assertEqual(run['state'], 'error')
+        self.assertEqual(run['blocker'], 'policy_changed')
+        scripts.assert_not_called()
+
+    def test_busy_gateway_refuses_before_starting_a_run(self):
+        with patch.object(self.runs, 'running', return_value=[{'state': 'running'}]), \
+                patch('validation.threading.Thread') as thread:
+            with self.assertRaises(validation.ValidationBusy):
+                self.runs.submit({'id': 'a' * 64})
+        thread.assert_not_called()
+        self.assertEqual(self.records, [])
+
     def test_candidate_cannot_replace_the_approved_validation_script(self):
         original = self.target
         (self.repository / 'scripts/build-web.sh').write_text('#!/bin/sh\necho checks-disabled\n')
@@ -106,6 +137,9 @@ class ValidationRunTests(unittest.TestCase):
         self.assertFalse((self.runs.root / run['id'] / 'tree').exists())
         event_id, summary = self.records[0]
         self.assertEqual((event_id, summary['run_id'], summary['state']), ('a' * 64, run['id'], 'complete'))
+        self.assertEqual(set(run['timings']), {'workspace', 'environment', 'checks'})
+        self.assertTrue(all(item['status'] == 'complete' and item['duration_ms'] >= 0 for item in run['timings'].values()))
+        self.assertEqual(summary['timings'], run['timings'])
         self.assertEqual(self.runs.snapshot()['running'], 0)
 
     @unittest.skipUnless(BASH, 'a POSIX bash is unavailable')
@@ -115,6 +149,7 @@ class ValidationRunTests(unittest.TestCase):
         with patch.object(validation, 'BASH', BASH):
             run = self.submit_and_wait()
         self.assertEqual((run['state'], run['exit_code']), ('failed', 3))
+        self.assertEqual(run['timings']['checks']['status'], 'failed')
         _, content = self.runs.log(run['id'])
         self.assertIn('broken', content)
         self.assertIn('status 3', content)

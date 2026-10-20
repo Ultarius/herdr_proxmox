@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:herdr_dashboard_state/task_validation.dart';
+
+export 'package:herdr_dashboard_state/task_validation.dart';
 
 /// JSON collections are dynamic: extension getters must not be dispatched on them.
 String taskAgentName(
@@ -74,6 +77,8 @@ String taskNextStep(Map task, {String executor = 'service'}) {
   final delivery = task['delivery_workflow'] as Map?;
   if ((task['await_verification'] == true || task['auto_publish'] == true) &&
       delivery != null &&
+      task['head_sha'] != null &&
+      delivery['sha'] == task['head_sha'] &&
       !['merged', 'closed', 'completed'].contains(task['state'])) {
     switch (delivery['state']) {
       case 'attention':
@@ -136,15 +141,25 @@ String taskNextStep(Map task, {String executor = 'service'}) {
   if (task['state'] == 'merged')
     return 'Merged on GitHub. Updating the base and deployment are separate.';
   if (task['state'] == 'closed') return 'Task closed.';
-  final target = task['merge_sha'] ?? task['head_sha'];
+  final target = taskValidationTarget(task);
   final build = (task['builds'] as Map?)?[target];
   // The map is keyed by target, but a record can carry a different `target`
   // field. Without this check a stale build reports the current candidate as
   // validated.
+  if (taskValidationNeedsRecheck(task, target)) {
+    if (task['validation_policy']['target'] != target)
+      return 'The policy assessment is for another commit. Validate latest commit again.';
+    return task['validation_policy']['reason']?.toString() ??
+        'Validation must be repeated under the current approved policy.';
+  }
   if (build is Map && build['target'] == target) {
     if (build['state'] == 'complete')
       return build['required_checks_verified'] == true
-          ? 'Current candidate validated; ready for review.'
+          ? (task['state'] == 'published'
+                ? 'Branch published; open a draft pull request.'
+                : (task['task_publication_allowed'] == false
+                      ? 'Current candidate validated; ready for release collection.'
+                      : 'Current candidate validated; ready for review.'))
           : 'Validation finished without verified required checks; inspect the evidence.';
     if (['failed', 'error', 'interrupted'].contains(build['state']))
       return 'Current candidate validation needs attention.';
@@ -180,6 +195,9 @@ const activityLabels = {
   'publication': 'Publication destination recorded',
   'complete': 'Task marked done',
   'discuss': 'Group review requested',
+  'validation_update_queued': 'Task branch update queued before validation',
+  'delivery_superseded':
+      'Previous candidate delivery report retained as history',
   'review_policy': 'Automatic group review policy changed',
   'proposal': 'Follow-up draft created',
   'proposal_accepted': 'Discussion proposal accepted',
@@ -225,6 +243,17 @@ const activityLabels = {
 String activityLabel(Object? action) {
   final value = '${action ?? ''}';
   return activityLabels[value] ?? value.replaceAll('_', ' ');
+}
+
+/// Candidate/chat references belong in the visible list as well as raw audit.
+String activitySubtitle(Map entry) {
+  final metadata =
+      '${entry['actor'] == 'automatic_task_policy' ? 'Task automation' : entry['actor']} · ${entry['at']}'
+      '${shortSha(entry['head_sha']).isEmpty ? (entry['state'] == null ? '' : ' · ${entry['state']}') : ' · ${shortSha(entry['head_sha'])}'}';
+  if (entry['action'] != 'delivery_superseded') return metadata;
+  final previous = shortSha(entry['previous_sha']);
+  final chat = '${entry['delivery_chat_id'] ?? ''}';
+  return '$metadata\nSuperseded ${previous.isEmpty ? 'candidate' : previous}${chat.isEmpty ? '' : ' · chat $chat'}';
 }
 
 /// Which section holds an entry's evidence. The activity list is the index.
@@ -373,10 +402,7 @@ class TaskActivity extends StatelessWidget {
             title: Text(
               '${activityLabel(entry['action'])}${entry['count'] > 1 ? ' (${entry['count']} records)' : ''}',
             ),
-            subtitle: Text(
-              '${entry['actor'] == 'automatic_task_policy' ? 'Task automation' : entry['actor']} \u00b7 ${entry['at']}'
-              '${shortSha(entry['head_sha']).isEmpty ? (entry['state'] == null ? '' : ' \u00b7 ${entry['state']}') : ' \u00b7 ${shortSha(entry['head_sha'])}'}',
-            ),
+            subtitle: Text(activitySubtitle(entry)),
           ),
         ExpansionTile(
           title: const Text('Retained audit records (up to 500)'),

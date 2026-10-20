@@ -1,9 +1,10 @@
-"""Explicit, durable conflict repairs on an existing task and PR branch."""
+"""Explicit, durable branch updates and conflict repairs on existing tasks."""
 from pathlib import Path
 import hashlib
 import uuid
 
 import project_git
+import toolchain_policy
 from herdr_errors import HerdrError
 from repository_lock import repository_lock
 from session_ownership import reserves
@@ -40,6 +41,109 @@ def refresh_pull(service, task):
     return pull
 
 
+def validation_update(task):
+    return (task.get('pr_repair') or {}).get('kind') == 'validation_update'
+
+
+def protected_changes(repository, before, after, policy):
+    """Compare committed files, including new manifests absent from the policy.
+
+    A difference against today's checkout alone cannot attribute an edit to an
+    agent. The task's pinned base is the provenance boundary for that decision.
+    """
+    import project_inventory
+    protected = set(policy.get('declarations', {})) | set(policy.get('lockfiles', {}))
+    protected.update(toolchain_policy.DECLARATIONS)
+    protected.update(toolchain_policy.LOCKFILES)
+    names = project_git.git(repository, 'diff', '--name-only', '--no-renames', '-z', before, after, '--').split('\0')
+    return sorted(name for name in names if name and
+                  (name in protected or project_inventory.is_manifest(Path(name).name)))
+
+
+def queue_validation_update(service, task, actor):
+    """One explicit validation click may authorize one durable branch update.
+
+    No policy waiver: only upstream-owned drift is eligible. Subsequent build
+    submissions from this scheduler cannot recursively authorize another repair.
+    A click that cannot queue one answers with `action_message` instead of a
+    silent fall-through whenever the operator has something to act on.
+    """
+    from contributions import SHA, stamp
+    if (validation_update(task) and task['pr_repair'].get('state') == 'validation_failed'
+            and task['pr_repair'].get('candidate') == task.get('head_sha')):
+        return None  # Explicitly retry checks, never launch another agent turn.
+    if active(task):
+        return dict(task, action_message='A branch repair is already in progress. No second execution was started.')
+    if task['state'] not in ('review_ready', 'published', 'pr_open'):
+        return None
+    repository = service.path_for(task)
+    candidate, base = task.get('head_sha'), task.get('base_sha')
+    if not SHA.fullmatch(str(candidate)) or not SHA.fullmatch(str(base)):
+        return None
+    upstream = project_git.git(repository, 'rev-parse', '--verify', task['base_ref'] + '^{commit}').strip()
+    if upstream == base:
+        return None  # The fetched base holds nothing the task does not already have.
+    try:
+        project_git.git(repository, 'merge-base', '--is-ancestor', upstream, candidate)
+        return None  # The candidate already contains the fetched base.
+    except ValueError:
+        pass
+    for descendant in (candidate, upstream):
+        project_git.git(repository, 'merge-base', '--is-ancestor', base, descendant)
+    policy = toolchain_policy.resolve_committed(repository)
+    drift = protected_changes(repository, candidate, upstream, policy)
+    if not drift:
+        return None  # Upstream-owned protected files did not move; the build proceeds unchanged.
+    authored = protected_changes(repository, base, candidate, policy)
+    if authored:
+        raise ValueError('The task changed protected policy files; explicit review is required: ' + ', '.join(authored))
+    approved = project_git.git(repository, 'rev-parse', '--verify', 'HEAD^{commit}').strip()
+    # A mismatch may mean lag, divergence or an unrelated checkout branch;
+    # inequality alone cannot establish that the approved checkout is behind.
+    if upstream != approved:
+        return dict(task, action_message='The approved checkout does not match the fetched task base branch '
+            + task['base_ref'] + '. Review and update the project checkout, then click Validate latest commit again.')
+    previous = task.get('pr_repair') or {}
+    if (previous.get('kind') == 'validation_update' and previous.get('head_sha') == candidate
+            and previous.get('upstream_sha') == upstream and previous.get('state') != 'cancelled'):
+        raise ValueError('This branch update was already attempted. Inspect the saved repair before retrying.')
+    profile = next((p for p in service.store.snapshot(live_status=False)['profiles']
+                    if p['id'] == task['profile_id'] and not p.get('archived')), None)
+    if not profile or profile.get('ephemeral') or profile.get('group_id') or not profile.get('use_worktree', True):
+        raise ValueError('Updating this task requires an assigned persistent worktree agent.')
+    history = list(task.get('pr_repair_history') or [])
+    if previous:
+        history.append(previous)
+    task['pr_repair_history'] = history[-20:]
+    task['pr_repair'] = dict(id=uuid.uuid4().hex, kind='validation_update', state='queued',
+        head_sha=candidate, upstream_sha=upstream, previous_base=base, previous_state=task['state'],
+        actor=actor, requested_at=stamp(), policy_digest=toolchain_policy.digest(policy),
+        policy_files=drift, message='Updating task branch before validation; queued for the assigned agent.')
+    saved = service.save(task, 'validation_update_queued', actor)
+    return dict(saved, action_message='Task branch update queued for the assigned agent; publication remains separate.')
+
+
+def check_validation_update(service, task):
+    """Recheck the pinned target and approval before dispatch and acceptance."""
+    repository, repair = service.path_for(task), task['pr_repair']
+    upstream = project_git.git(repository, 'rev-parse', '--verify', task['base_ref'] + '^{commit}').strip()
+    if (upstream != repair['upstream_sha'] or
+            project_git.git(repository, 'rev-parse', '--verify', 'HEAD^{commit}').strip() != upstream or
+            toolchain_policy.digest(toolchain_policy.resolve_committed(repository)) != repair['policy_digest']):
+        raise ValueError('The approved upstream changed during the branch update. Inspect before retrying.')
+
+
+def validation_binding(task):
+    """An exact, receipt-backed transition, never a rewrite of session policy."""
+    repair = task.get('pr_repair') or {}
+    binding = repair.get('validation_policy')
+    if (validation_update(task) and isinstance(binding, dict) and
+            repair.get('candidate') == task.get('head_sha') == binding.get('candidate') and
+            (task.get('completion_receipt') or {}).get('commit') == binding.get('candidate')):
+        return binding
+    return None
+
+
 def request(service, task, body, actor):
     from contributions import SHA, stamp
     if body.get('mode') not in (None, 'cancel', 'retry'):
@@ -51,6 +155,10 @@ def request(service, task, body, actor):
         run = next((j for j in service.store.snapshot(live_status=False)['jobs'] if j['id'] == task.get('run_id')), {})
         if previous.get('started_at') or run.get('session_request_id') == 'pr-repair-' + previous['id']:
             previous.update(state='queued', message='Rechecking the inspected repair; existing delivery will be adopted.')
+            return service.save(task, 'pr_repair_recheck', actor)
+        if validation_update(task):
+            check_validation_update(service, task)
+            previous.update(state='queued', message='Rechecking the inspected branch update against its pinned commits.')
             return service.save(task, 'pr_repair_recheck', actor)
         previous['state'] = 'obsolete'
         body = dict(body, head_sha=task.get('head_sha'))
@@ -93,8 +201,11 @@ def request(service, task, body, actor):
 def instructions(task):
     repair = task['pr_repair']
     procedure = (Path(__file__).parent / 'skills/herdr-worktree-integration/references/merge.md').resolve().as_posix()
-    return (f"Resolve merge conflicts in existing PR #{task['pull']['number']} for {task['github_repository']}. "
-            f"Work only on assigned branch {task['branch']} in this checkout. Starting published commit: {repair['head_sha']}. "
+    assignment = (f"Update this task branch to the approved upstream before validation for {task['github_repository']}. "
+                  if validation_update(task) else
+                  f"Resolve merge conflicts in existing PR #{task['pull']['number']} for {task['github_repository']}. ")
+    return (assignment +
+            f"Work only on assigned branch {task['branch']} in this checkout. Starting candidate commit: {repair['head_sha']}. "
             f"Merge EXACT upstream commit {repair['upstream_sha']} using git -c user.name=Herdr-Agent "
             '-c user.email=agent@herdr.local merge --no-edit. '
             f"Pinned recovery: {repair['recovery']['ref']}. Read and follow {procedure} before mutation. "
@@ -107,6 +218,9 @@ def instructions(task):
             'Write the completion receipt LAST to {{HERDR_TASK_RECEIPT}} with outcome=complete, commit=full HEAD SHA, '
             'run_id={{HERDR_TASK_RUN}}, token={{HERDR_TASK_TOKEN}}, and tests as an array of actual check results. '
             'Missing or failed checks must be reported honestly. Publication requires dashboard approval.\n\n'
+            + ('Protected validation files must match the supplied upstream commit exactly. Do not weaken or '
+               'rewrite validation rules. If preserving task behavior requires a policy change, stop and report it.\n\n'
+               if validation_update(task) else '')
             + task['title'] + '\nOriginal task and acceptance criteria:\n' + task['description'])
 
 
@@ -121,7 +235,7 @@ def dispatch(service, task):
     # A restart or lost response after session submission adopts that execution;
     # it must never send the same repair as another turn.
     if run.get('session_request_id') == request_id:
-        repair.update(state='running', message='Agent is resolving conflicts in the existing PR branch.')
+        repair.update(state='running', message='Agent is updating the task branch and resolving conflicts.')
         return save(service, task, 'pr_repair_started')
     if any(reserves(j, task['profile_id']) for j in jobs):
         repair['message'] = 'Queued: another job still owns this agent session.'
@@ -151,15 +265,18 @@ def dispatch(service, task):
                 policy['daily_session_cap'] and budget['started'] >= policy['daily_session_cap']):
             repair['message'] = 'Queued: waiting for the organization session budget.'
             return save(service, task, 'pr_repair_waiting')
-        pull = refresh_pull(service, task)
-        if pull['head']['sha'] != repair['head_sha'] or pull['base'].get('sha') != repair['upstream_sha']:
-            raise ValueError('The PR head or upstream base changed while queued. Inspect and request a fresh repair.')
-        if pull.get('mergeable') is not False:
-            if pull.get('mergeable') is None:
-                repair['message'] = 'Queued: GitHub is calculating mergeability.'
-                return save(service, task, 'pr_repair_waiting')
-            repair.update(state='obsolete', message='GitHub no longer reports conflicts; no agent prompt was sent.')
-            return service.save(task, 'pr_repair_obsolete', 'pr_repair_scheduler')
+        if validation_update(task):
+            check_validation_update(service, task)
+        else:
+            pull = refresh_pull(service, task)
+            if pull['head']['sha'] != repair['head_sha'] or pull['base'].get('sha') != repair['upstream_sha']:
+                raise ValueError('The PR head or upstream base changed while queued. Inspect and request a fresh repair.')
+            if pull.get('mergeable') is not False:
+                if pull.get('mergeable') is None:
+                    repair['message'] = 'Queued: GitHub is calculating mergeability.'
+                    return save(service, task, 'pr_repair_waiting')
+                repair.update(state='obsolete', message='GitHub no longer reports conflicts; no agent prompt was sent.')
+                return service.save(task, 'pr_repair_obsolete', 'pr_repair_scheduler')
         if run.get('state') == 'persona_sent':
             agent = service.store.identity(run, ready=False)
             if agent.get('agent_status', agent.get('state')) not in ('idle', 'done'):
@@ -175,8 +292,10 @@ def dispatch(service, task):
         with repository_lock(repository):
             if (project_git.git(path, 'rev-parse', 'HEAD').strip() != repair['head_sha'] or
                     project_git.merge_state(path) or project_git.git(path, 'status', '--porcelain=v1', '--untracked-files=all').strip()):
-                raise ValueError('Original PR checkout is changed or has unfinished work; inspect it before repair.')
+                raise ValueError('Original task checkout is changed or has unfinished work; inspect it before repair.')
             project_git.fetch(repository)
+            if validation_update(task):
+                check_validation_update(service, task)
             project_git.git(path, 'cat-file', '-e', repair['upstream_sha'] + '^{commit}')
             if not repair.get('recovery'):
                 repair['recovery'] = project_git.recovery_snapshot(service.projects,
@@ -194,21 +313,24 @@ def dispatch(service, task):
         if run.get('state') not in ('finished', 'released') or not run.get('session_archive_id'):
             raise ValueError('The original session must have a verified archive before restarting its checkout.')
         with repository_lock(repository):
+            if validation_update(task):
+                check_validation_update(service, task)
             if (project_git.git(path, 'rev-parse', 'HEAD').strip() != repair['head_sha'] or
                     project_git.merge_state(path) or project_git.git(path, 'status', '--porcelain=v1', '--untracked-files=all').strip()):
                 raise ValueError('The original checkout changed during archival; inspect it before repair.')
         service.store.manage_session(dict(mode='handover', job_id=run['id'], organization_id=task['organization_id'],
             target_profile_id=task['profile_id'], archive_id=run['session_archive_id'], inspected=True,
-            continuation_context='Continue the same task and PR in its preserved checkout. The explicit conflict-repair '
+            continuation_context='Continue the same task in its preserved checkout. The explicit branch-repair '
                                  'assignment replaces the old implementation prompt.', task_prompt=instructions(task),
             request_id=request_id), 'pr_repair_scheduler')
-        repair.update(state='running', started_at=stamp(), message='Agent is resolving conflicts in the existing PR branch.')
+        repair.update(state='running', started_at=stamp(), message='Agent is updating the task branch and resolving conflicts.')
         return service.save(task, 'pr_repair_started', 'pr_repair_scheduler')
 
 
 def reconcile(service, task):
     from collaboration import current_run
     from contributions import stamp
+    from validation import ValidationBusy
     repair = task['pr_repair']
     if task['state'] in ('merged', 'closed', 'completed'):
         repair.update(state='obsolete' if repair['state'] == 'queued' else 'needs_attention',
@@ -227,15 +349,27 @@ def reconcile(service, task):
     if repair['state'] == 'validating':
         build = (task.get('builds') or {}).get(repair['candidate'], {})
         if build.get('target') != repair['candidate']:
-            if not service.validation or service.validation.snapshot().get('executor') != 'service':
+            if not service.validation:
+                repair['message'] = 'Waiting for validation to be available.'
+                return save(service, task, 'pr_repair_waiting')
+            if not validation_update(task) and service.validation.snapshot().get('executor') != 'service':
                 repair['message'] = 'Waiting for the durable build service. Install it under Builds & deployments.'
                 return save(service, task, 'pr_repair_waiting')
-            return service.perform('build', {'target': repair['candidate']}, task['id'], 'pr_repair_scheduler')
+            try:
+                return service.perform('build', {'target': repair['candidate']}, task['id'], 'pr_repair_scheduler')
+            except ValidationBusy:
+                # The gateway has one build slot. A busy slot is a transient
+                # admission refusal, not an uncertain build or an agent error.
+                repair['message'] = 'Waiting for the current validation to finish; submission will retry automatically.'
+                return save(service, task, 'pr_repair_waiting')
         if build.get('state') == 'complete' and build.get('required_checks_verified') is True:
-            repair.update(state='ready', message='Repaired candidate passed required checks. Review and publish to update the existing PR.')
+            repair.update(state='ready', message=('Updated candidate passed required checks; ready for review.'
+                if validation_update(task) else 'Repaired candidate passed required checks. Review and publish to update the existing PR.'))
             return service.save(task, 'pr_repair_validated', 'pr_repair_scheduler')
-        if build.get('state') in ('failed', 'error', 'interrupted', 'complete'):
-            repair.update(state='validation_failed', message='Repaired candidate validation needs attention. Inspect Checks & builds.')
+        if build.get('state') in ('failed', 'error', 'interrupted', 'cancelled', 'complete'):
+            repair.update(state='validation_failed', message=(
+                'Updated candidate validation needs attention. Inspect Checks & builds.' if validation_update(task)
+                else 'Repaired candidate validation needs attention. Inspect Checks & builds.'))
             return service.save(task, 'pr_repair_validation_failed', 'pr_repair_scheduler')
         return
     run = next((j for j in service.store.snapshot(live_status=False)['jobs'] if j['id'] == task.get('run_id')), None)
@@ -297,13 +431,30 @@ def reconcile(service, task):
             raise ValueError('The repaired candidate must preserve the published commit and incorporate the pinned upstream commit.') from None
         if project_git.merge_state(path) or project_git.git(path, 'status', '--porcelain=v1', '--untracked-files=all').strip():
             raise ValueError('Repair checkout is dirty or has unresolved Git operations.')
+        if validation_update(task):
+            check_validation_update(service, task)
+            policy = toolchain_policy.resolve_committed(service.path_for(task))
+            changed = protected_changes(path, repair['upstream_sha'], head, policy)
+            if changed:
+                raise ValueError('Updated candidate changes protected policy files; explicit review is required: ' + ', '.join(changed))
         task['base_sha'] = repair['upstream_sha']
         task['completion_receipt'] = dict(commit=head, tests=receipt['tests'], verified_at=stamp())
         service.save(task, 'pr_repair_receipt', 'pr_repair_scheduler')
         task = service.perform('candidate', {}, task['id'], 'pr_repair_scheduler')
     repair = task['pr_repair']
-    repair.update(state='validating', candidate=head, message='Conflict resolution committed; validating the new candidate.')
-    task['state'] = 'pr_open'
+    if validation_update(task):
+        # The operator authorized this pinned upstream update, and the receipt
+        # and protected-file comparison above establish the resulting candidate.
+        # Independent validation adopts that policy without claiming the agent
+        # originally executed under it.
+        # Use the policy already checked while accepting the merge result.
+        # A later checkout move must fail validation, never rewrite this grant.
+        repair['validation_policy'] = dict(candidate=head, digest=repair['policy_digest'],
+            plan_digest=policy.get('plan_digest'), approved_sha=repair['upstream_sha'],
+            repair_id=repair['id'], actor=repair['actor'], authorized_at=repair['requested_at'])
+    repair.update(state='validating', candidate=head, message=('Task branch updated; validating the new candidate.'
+        if validation_update(task) else 'Conflict resolution committed; validating the new candidate.'))
+    task['state'] = ('pr_open' if task.get('pull') else 'review_ready') if validation_update(task) else 'pr_open'
     return service.save(task, 'pr_repair_candidate', 'pr_repair_scheduler')
 
 

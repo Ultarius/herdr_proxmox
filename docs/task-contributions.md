@@ -33,7 +33,7 @@ merges a pull request or deploys a build. For a step-by-step first run, see
 4. The agent implements, tests and commits locally. Inspect its conversation via
    Organization/agent activity. Capture candidate requires a clean task checkout,
    the expected branch and an actual commit descended from the recorded base.
-5. Review its diff and exact SHA. Validate candidate uses the existing exact-commit
+5. Review its diff and exact SHA. Validate latest commit uses the existing exact-commit
    build runner and attaches independent check evidence to that SHA. Missing checks
    are not passes. Retained artifacts/logs remain on Builds & deployments.
 6. Configure GitHub publishing, then Review and publish. This is explicit upload

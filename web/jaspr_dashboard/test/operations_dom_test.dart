@@ -609,8 +609,63 @@ void main() {
       );
     },
   );
+  test(
+    'performance diagnostics are on demand and show their process scope',
+    () async {
+      await mount(const BuildsPage(), (r) {
+        if (r.url.path == '/api/diagnostics/performance')
+          return {
+            'pid': 42,
+            'started_at': '2026-10-18T10:00:00Z',
+            'sample_window': 256,
+            'operations': {
+              'git.command': {
+                'count': 10,
+                'failed': 1,
+                'p50_ms': 2,
+                'p95_ms': 8,
+                'max_ms': 10,
+              },
+            },
+            'counters': {
+              'repository.cache_hit': 3,
+              'repository.cache_miss': 1,
+              'task.submit_accepted': 8,
+              'task.submit_limited': 2,
+            },
+          };
+        return buildResponse(r);
+      });
+      expect(
+        requests.where((r) => r['path'] == '/api/diagnostics/performance'),
+        isEmpty,
+      );
+      await click('Refresh performance diagnostics');
+      expect(web.document.body!.textContent, contains('Process 42'));
+      expect(web.document.body!.textContent, contains('p95 8 ms'));
+      expect(
+        web.document.body!.textContent,
+        contains('8 admitted · 2 limited'),
+      );
+      expect(
+        web.document.body!.textContent,
+        contains('not a fleet-wide total'),
+      );
+      expect(
+        requests.where((r) => r['path'] == '/api/diagnostics/performance'),
+        hasLength(1),
+      );
+    },
+  );
+
   test('viewer cannot deploy, rollback or resolve source identity', () async {
     await mount(const BuildsPage(), buildResponse, role: 'viewer');
+    expect(
+      elements(
+        'button',
+      ).where((e) => e.textContent == 'Refresh performance diagnostics'),
+      isEmpty,
+    );
     expect(
       elements('button').where(
         (e) => [

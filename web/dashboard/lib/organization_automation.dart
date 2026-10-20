@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'request_id.dart';
@@ -137,6 +138,9 @@ class _OrganizationAutomationState extends State<OrganizationAutomation> {
         if (error != null) SelectableText(error!),
         if (p != null) ...[
           Text(
+            'Delivery route for new tasks: ${p['publication_mode'] ?? 'release'}. Existing task routes are retained.',
+          ),
+          Text(
             'Max per meeting: ${p['max_per_meeting'] ?? 1} (automatically queued tasks). Max automatic follow-up depth: ${p['max_follow_up_depth'] ?? 1}.',
           ),
           Text(
@@ -185,7 +189,12 @@ Future<Map<String, dynamic>?> editOrganizationAutomation(
   Map<String, dynamic> policy,
 ) async {
   var enabled = policy['auto_queue_proposals'] == true;
+  var autoCreateReleases = policy['auto_create_releases'] == true;
   var paused = policy['paused'] == true;
+  var publicationMode = '${policy['publication_mode'] ?? 'release'}';
+  final publicationRepositories = TextEditingController(
+    text: jsonEncode(policy['publication_repositories'] ?? {}),
+  );
   var reap = policy['reap_finished_sessions'] == true;
   var reapOrphaned = policy['reap_orphaned_panes'] == true;
   var autoPrepare = policy['auto_prepare'] == true;
@@ -232,6 +241,50 @@ Future<Map<String, dynamic>?> editOrganizationAutomation(
                     const Text(
                       'Applies to all groups in this organization, including standalone discussions. Valid proposals are kept as drafts when queueing is disabled or a queue limit is reached; publishing, merging and deployment remain manual.',
                     ),
+                    DropdownButtonFormField<String>(
+                      initialValue: publicationMode,
+                      decoration: const InputDecoration(
+                        labelText: 'Delivery route for new tasks',
+                      ),
+                      items: const [
+                        DropdownMenuItem(
+                          value: 'release',
+                          child: Text('Release PRs'),
+                        ),
+                        DropdownMenuItem(
+                          value: 'both',
+                          child: Text('Release or task PRs'),
+                        ),
+                        DropdownMenuItem(
+                          value: 'task',
+                          child: Text('Task PRs'),
+                        ),
+                      ],
+                      onChanged: (value) => update(
+                        () => publicationMode = value ?? publicationMode,
+                      ),
+                    ),
+                    const Text(
+                      'Existing tasks retain their route. Both allows either path; it does not publish twice. Release freezing and publication remain explicit.',
+                    ),
+                    TextFormField(
+                      controller: publicationRepositories,
+                      decoration: const InputDecoration(
+                        labelText: 'Repository route overrides (JSON object)',
+                      ),
+                      validator: (value) {
+                        try {
+                          final overrides = jsonDecode(value ?? '');
+                          if (overrides is Map &&
+                              overrides.values.every(
+                                (mode) =>
+                                    ['release', 'both', 'task'].contains(mode),
+                              ))
+                            return null;
+                        } catch (_) {}
+                        return 'Map repository paths to release, both or task, or enter {}.';
+                      },
+                    ),
                     SwitchListTile(
                       value: enabled,
                       onChanged: (value) =>
@@ -247,6 +300,17 @@ Future<Map<String, dynamic>?> editOrganizationAutomation(
                       title: const Text('Pause automatic follow-up'),
                       subtitle: const Text(
                         'Queued work stays queued; nothing new starts automatically.',
+                      ),
+                    ),
+                    SwitchListTile(
+                      value: autoCreateReleases,
+                      onChanged: (value) =>
+                          update(() => autoCreateReleases = value == true),
+                      title: const Text(
+                        'Create release plans from group discussions automatically',
+                      ),
+                      subtitle: const Text(
+                        'New discussions may create named plans with unfinished tasks. Task execution uses its own settings; freezing, integration and publication remain explicit.',
                       ),
                     ),
                     _limitField(perMeeting, 'Max per meeting', 10),
@@ -352,7 +416,12 @@ Future<Map<String, dynamic>?> editOrganizationAutomation(
               onPressed: () {
                 if (form.currentState?.validate() != true) return;
                 Navigator.pop(context, {
+                  'publication_mode': publicationMode,
+                  'publication_repositories': jsonDecode(
+                    publicationRepositories.text,
+                  ),
                   'auto_queue_proposals': enabled,
+                  'auto_create_releases': autoCreateReleases,
                   'paused': paused,
                   'reap_finished_sessions': reap,
                   'reap_orphaned_panes': reapOrphaned,
@@ -377,6 +446,7 @@ Future<Map<String, dynamic>?> editOrganizationAutomation(
     },
   );
   await dialogClosed;
+  publicationRepositories.dispose();
   perMeeting.dispose();
   perAgent.dispose();
   depth.dispose();

@@ -1,11 +1,13 @@
 part of 'task_workflow.dart';
 
-// Graph sizes (Phase 2 workflow viewer): compact 184 × 96 cards (104 with
-// lanes off, when the foot also holds the assignee tile), 32px column gaps,
+// Graph sizes: 184 × 128 cards (136 with lanes off, when the foot also holds
+// the assignee tile), including space for live work phases, 32px column gaps,
 // a 120px lane header column (48px on phones) and 12px stage padding.
 const _nodeW = 184.0;
-const _nodeH = 96.0;
-const _nodeHTile = 104.0;
+const _nodeH = 128.0;
+const _nodeHTile = 136.0;
+const _releaseH = 136.0;
+const _releaseGap = 16.0;
 const _colGap = 32.0;
 const _rowGap = 8.0;
 const _lanePad = 8.0;
@@ -19,13 +21,28 @@ const _stagger = 4.0; // bends that share a gap spread by up to this much
 const _radius = 5.0;
 
 class _Link {
-  const _Link(this.from, this.to, this.kind);
+  const _Link(
+    this.from,
+    this.to,
+    this.kind, {
+    this.state = '',
+    this.reason = '',
+  });
   final String from, to, kind;
+  final String state, reason;
 }
 
 class _Box {
-  const _Box(this.id, this.agent, this.column, this.x, this.y);
+  const _Box(
+    this.id,
+    this.agent,
+    this.column,
+    this.x,
+    this.y, {
+    this.kind = 'task',
+  });
   final String id, agent;
+  final String kind;
   final int column;
   final double x, y;
 }
@@ -44,6 +61,7 @@ class _Route {
 
 extension _Layout on _TaskWorkflowState {
   double get nodeH => lanes ? _nodeH : _nodeHTile;
+  double boxHeight(_Box box) => box.kind == 'release' ? _releaseH : nodeH;
 
   /// Recorded links only (follow-up provenance and execution waits), depth
   /// columns, then lanes (one band per agent) or compact layering.
@@ -151,10 +169,47 @@ extension _Layout on _TaskWorkflowState {
         }
       }
     }
+    // Membership is not a dependency: release nodes never enter depth recursion.
+    final releases = visibleReleases.toList()
+      ..sort((a, b) => '${a['id']}'.compareTo('${b['id']}'));
+    final taskY = {for (final box in next) box.id: box.y};
+    var releaseFloor = _pad;
+    for (final release in releases) {
+      final id = 'release:${release['id']}';
+      final members = releaseMembers(release);
+      final ys = [
+        for (final member in members)
+          if (taskY.containsKey(member['task_id'])) taskY[member['task_id']]!,
+      ];
+      final desired = ys.isEmpty
+          ? _pad
+          : ys.reduce((a, b) => a + b) / ys.length;
+      final y = math.max(releaseFloor, desired);
+      next.add(
+        _Box(id, '', maximum + 1, colX(maximum + 1), y, kind: 'release'),
+      );
+      releaseFloor = y + _releaseH + _releaseGap;
+      bottom = math.max(bottom, releaseFloor);
+      for (final member in members) {
+        if (ids.contains(member['task_id'])) {
+          links.add(
+            _Link(
+              '${member['task_id']}',
+              id,
+              'release-membership',
+              state: '${member['state'] ?? 'pending'}',
+              reason: '${member['reason'] ?? ''}',
+            ),
+          );
+        }
+      }
+    }
     boxes = next;
     bands = nextBands;
-    graphWidth = tasks.isEmpty ? 0 : colX(maximum) + _nodeW + _pad;
-    graphHeight = tasks.isEmpty ? 0 : bottom;
+    graphWidth = next.isEmpty
+        ? 0
+        : colX(maximum + (releases.isEmpty ? 0 : 1)) + _nodeW + _pad;
+    graphHeight = next.isEmpty ? 0 : bottom;
   }
 
   /// Orthogonal connectors with rounded bends. Bends turn inside column gaps;
@@ -180,8 +235,8 @@ extension _Layout on _TaskWorkflowState {
     final routes = <_Link, _Route>{};
     for (final link in links) {
       final from = at[link.from]!, to = at[link.to]!;
-      final sx = from.x + _nodeW + _handle, sy = from.y + h / 2;
-      final tip = to.x - _handle, ty = to.y + h / 2;
+      final sx = from.x + _nodeW + _handle, sy = from.y + boxHeight(from) / 2;
+      final tip = to.x - _handle, ty = to.y + boxHeight(to) / 2;
       final end = tip - _arrow + 1;
       final first =
           from.x +

@@ -17,6 +17,10 @@ class _BuildsState extends OperationsState<BuildsPage> {
   String executor = 'gateway';
   int queued = 0;
   bool refreshing = false;
+  Map<String, dynamic>? performance;
+  int performanceEpoch = -1;
+  bool loadingPerformance = false;
+  String? performanceError;
   String? downloading;
   Timer? timer;
   @override
@@ -66,6 +70,62 @@ class _BuildsState extends OperationsState<BuildsPage> {
   }
 
   bool get deploying => ['queued', 'running'].contains(deployment?['state']);
+
+  Future<void> loadPerformance() async {
+    if (!admin || loadingPerformance || !connection.state.connected) return;
+    final epoch = connection.generation;
+    setState(() {
+      loadingPerformance = true;
+      performanceError = null;
+    });
+    try {
+      final result = await connection.request('diagnostics/performance');
+      if (valid(epoch))
+        setState(() {
+          performance = Map<String, dynamic>.from(result);
+          performanceEpoch = epoch;
+        });
+    } catch (e) {
+      if (valid(epoch)) setState(() => performanceError = '$e');
+    } finally {
+      if (mounted) setState(() => loadingPerformance = false);
+    }
+  }
+
+  Component performanceCard() {
+    final data = performanceEpoch == connection.generation ? performance : null;
+    final operations = data?['operations'] as Map? ?? {};
+    return card('Performance diagnostics', [
+      paragraph(
+        'Measured gateway process activity since restart. Timings overlap and must not be summed. Worker phase timings are retained on individual builds; this is not a fleet-wide total.',
+      ),
+      button(
+        'Refresh performance diagnostics',
+        loadPerformance,
+        disabled: loadingPerformance,
+      ),
+      if (performanceError != null)
+        el('p', [text(performanceError)], classes: 'error'),
+      if (data != null) ...[
+        paragraph(
+          'Process ${data['pid']} · since ${data['started_at']} · percentiles use the latest ${data['sample_window']} samples per operation.',
+        ),
+        if (operations.isEmpty)
+          paragraph('No instrumented operations recorded yet.'),
+        for (final entry in operations.entries)
+          paragraph(
+            '${entry.key}: ${entry.value['count']} calls, ${entry.value['failed']} failed · p50 ${entry.value['p50_ms']} ms · p95 ${entry.value['p95_ms']} ms · max ${entry.value['max_ms']} ms',
+          ),
+        paragraph(
+          'Repository query cache: ${data['counters']?['repository.cache_hit'] ?? 0} hits · ${data['counters']?['repository.cache_miss'] ?? 0} misses.',
+        ),
+        paragraph(
+          'Task submissions: ${data['counters']?['task.submit_accepted'] ?? 0} admitted · ${data['counters']?['task.submit_limited'] ?? 0} limited. Limits apply per gateway process; retry the same captured request after the reported delay.',
+        ),
+      ],
+    ], iconName: 'activity');
+  }
+
   bool get installingBuildService =>
       ['queued', 'running'].contains(buildService?['state']);
 
@@ -436,6 +496,13 @@ class _BuildsState extends OperationsState<BuildsPage> {
           ]),
         if (checks.isNotEmpty)
           checkSteps(checks, open: newest || failed.isNotEmpty),
+        if (run['timings'] is Map)
+          disclosure('Recorded phase timings', [
+            for (final entry in (run['timings'] as Map).entries)
+              paragraph(
+                '${entry.key}: ${entry.value['duration_ms']} ms · ${entry.value['status']}',
+              ),
+          ]),
         _downloads(run),
       ],
       classes: 'build-card',
@@ -549,6 +616,7 @@ class _BuildsState extends OperationsState<BuildsPage> {
     if (identity != null) _runningCard(),
     ?cadenceStrip(runs, DateTime.now()),
     _history(),
+    if (admin) performanceCard(),
     const UpdateCard(),
   ], classes: 'stack builds-page');
 }

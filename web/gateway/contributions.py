@@ -80,7 +80,8 @@ AUTOMATION_DEFAULTS = dict(auto_queue_proposals=False, max_per_meeting=1, max_op
                            # including every proposal-created one — started
                            # manual, so capture, validation and publication were
                            # clicked through one task at a time.
-                           auto_capture=False, auto_validate=False, auto_publish=False,
+                           auto_capture=False, auto_validate=False, auto_publish=False, auto_create_releases=False,
+                           publication_mode='release', publication_repositories={},
                            auto_prepare=False, auto_prepare_checks=False, auto_prepare_agent=False, auto_prepare_restore=False)
 AUTOMATION_LIMITS = (('max_per_meeting', 0, 10), ('max_open_per_agent', 0, 50),
                      ('max_follow_up_depth', 0, 10), ('daily_cap', 0, 100),
@@ -150,9 +151,21 @@ def fork_publication(task):
     return publishing_repository(task).lower() != task['github_repository'].lower()
 
 
-def push(repository, branch, sha, github, publishing):
-    if not BRANCH.fullmatch(branch) or not SHA.fullmatch(sha):
-        raise ValueError('Only a task branch and full reviewed commit may be published.')
+def push(repository, branch, sha, github, publishing, *, release_lookup=None):
+    if not isinstance(branch, str) or not isinstance(sha, str) or not SHA.fullmatch(sha):
+        raise ValueError('Only a task branch and full reviewed commit, or a recorded release run, may be published.')
+    if not BRANCH.fullmatch(branch):
+        release_branch = re.fullmatch(r'herdr/release-([a-f0-9]{32})-r([1-9][0-9]*)', branch)
+        if not release_branch:
+            raise ValueError('Only a task branch and full reviewed commit, or a recorded release run, may be published.')
+        if release_lookup is None:
+            raise ValueError('Release publication requires a recorded release run.')
+        run = release_lookup(release_branch[1])
+        if (run.get('id') != release_branch[1] or run.get('state') != 'publishing'
+                or run.get('branch') != branch or run.get('resulting_sha') != sha
+                or (run.get('publication') or {}).get('destination') != publishing
+                or (run.get('revision') or {}).get('generation') != int(release_branch[2])):
+            raise ValueError('Publication does not match the recorded release run and reviewed commit.')
     if not isinstance(publishing, str) or not REPOSITORY.fullmatch(publishing):
         raise ValueError('Invalid publishing repository.')
     if sys.platform == 'win32':
@@ -350,6 +363,9 @@ class Contributions:
             db.execute('CREATE TABLE IF NOT EXISTS audit (task_id TEXT NOT NULL, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS assignments (task_id TEXT PRIMARY KEY, position INTEGER NOT NULL, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS policies (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
+            import publication_routes
+            publication_routes.migrate(db)
+            publication_routes.receipts_schema(db)
         from notifications import Notifications
         if not isinstance(getattr(self.store, 'events', None), Notifications):
             self.store.events = Notifications()
@@ -362,6 +378,10 @@ class Contributions:
         self.knowledge.sync_jobs()
         from discovery import Discovery
         self.discovery = Discovery(self)
+        from release_candidates import ReleaseCandidates
+        self.releases = ReleaseCandidates(self)
+        from task_commits import TaskCommits
+        self.commits = TaskCommits(self)
 
     def connect(self):
         from notifications import Connection
@@ -394,10 +414,12 @@ class Contributions:
 
 
     def start(self):
+        self.releases.start()
         self.thread = threading.Thread(target=self.poll, daemon=True, name='contribution-status')
         self.thread.start()
 
     def close(self):
+        self.releases.close()
         self.stopped.set()
         self.mailbox.set()  # Wake this consumer without clearing another's signal.
         if self.thread:
@@ -964,6 +986,21 @@ class Contributions:
                     continue
 
     @staticmethod
+    def discussion_artifact(job):
+        """Only a finalized artifact can propose tasks or a release plan."""
+        if not isinstance(job, dict) or job.get('state') != 'artifact_ready' or job.get('purpose') == 'release_review':
+            return {}
+        result = job.get('result')
+        if not isinstance(result, str) or not result:
+            return {}
+        match = re.search(r'```json\s*(.*?)\s*```', result, re.DOTALL)
+        try:
+            data = json.loads(match[1] if match else result)
+        except (ValueError, TypeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
     def discussion_proposals(job):
         """Read proposals from a finalized discussion artifact.
 
@@ -972,16 +1009,7 @@ class Contributions:
         reads: the dashboard resolves assignee names for display, and the
         materializer validates eligibility against profiles it already holds.
         """
-        if not isinstance(job, dict) or job.get('state') != 'artifact_ready':
-            return []
-        result = job.get('result')
-        if not isinstance(result, str) or not result:
-            return []
-        match = re.search(r'```json\s*(.*?)\s*```', result, re.DOTALL)
-        try:
-            data = json.loads(match[1] if match else result)
-        except (ValueError, TypeError):
-            return []
+        data = Contributions.discussion_artifact(job)
         proposals = data.get('task_proposals', []) if isinstance(data, dict) else []
         if not isinstance(proposals, list):
             return []
@@ -1019,26 +1047,52 @@ class Contributions:
         except (ValueError, OSError, sqlite3.Error):
             return False
 
-    def policy_matches(self, task, evidence):
+    def policy_matches(self, task, evidence, approved=None):
         """Whether a run's evidence was produced under the approved policy.
 
         A candidate that changed the declaration, the checks or a lockfile has
         not been verified against the rules that now apply, so its evidence
         cannot authorise publication.
         """
-        try:
-            approved = toolchain_policy.resolve_committed(self.path_for(task))
-        except (OSError, ValueError):
-            return False
+        if approved is None:
+            try:
+                approved = toolchain_policy.resolve_committed(self.path_for(task))
+            except (OSError, ValueError):
+                return False
         if approved.get('plan_digest') and task.get('run_id'):
             try:
-                frozen = self.frozen_environment(task)
+                frozen = pr_repairs.validation_binding(task) or self.frozen_environment(task)
             except (OSError, ValueError, sqlite3.Error):
                 return False
             if (not frozen or frozen.get('plan_digest') != evidence.get('plan_digest')
                     or frozen.get('digest') != evidence.get('policy_digest')):
                 return False
         return toolchain_policy.evidence_matches(approved, evidence)
+
+    def validation_policy(self, task):
+        """Live detail-only assessment; a historical pass is not current admission.
+
+        Avoid resolving every repository during task-list polls. Admission still
+        rechecks on mutation; this observation only makes the next action honest.
+        """
+        target = task.get('merge_sha') if task['state'] == 'merged' else task.get('head_sha')
+        evidence = task.get('builds', {}).get(target, {})
+        if (not target or evidence.get('target') != target or evidence.get('state') != 'complete'
+                or evidence.get('required_checks_verified') is not True):
+            return None
+        result = dict(target=target, matches=False, assessed_at=stamp(),
+                      recorded_policy_digest=evidence.get('policy_digest'))
+        try:
+            approved = toolchain_policy.resolve_committed(self.path_for(task))
+        except (ValueError, OSError):
+            return dict(result, state='unavailable', reason='The approved validation policy could not be assessed. Inspect project configuration and validate again.')
+        current = toolchain_policy.digest(approved)
+        result['policy_digest'] = current
+        if evidence.get('policy_digest') != current:
+            return dict(result, state='stale', reason='Recorded checks used a different or missing policy identity. Validate latest commit under the current approved policy.')
+        if not self.policy_matches(task, evidence, approved):
+            return dict(result, state='stale', reason='Recorded evidence does not satisfy the current approved policy. Validate latest commit again.')
+        return dict(result, state='current', matches=True, reason='Recorded checks satisfy the current approved policy.')
 
     def frozen_environment(self, task):
         if not task.get('run_id'):
@@ -1281,8 +1335,23 @@ class Contributions:
             policy = self.policy(organization_id)
             was_enabled = policy['auto_queue_proposals']
             previous = dict(policy)
+            import publication_routes
+            if 'publication_mode' in body:
+                if body['publication_mode'] not in publication_routes.MODES:
+                    raise FieldValidationError('Choose release, both or task publication mode.', ['publication_mode'])
+                policy['publication_mode'] = body['publication_mode']
+            if 'publication_repositories' in body:
+                overrides = body['publication_repositories']
+                if (not isinstance(overrides, dict) or len(overrides) > 100 or
+                        any(not isinstance(k, str) or not k or v not in publication_routes.MODES for k, v in overrides.items())):
+                    raise FieldValidationError('Repository publication overrides must map repository paths to release, both or task.', ['publication_repositories'])
+                for repository in overrides:
+                    path = project_directory(self.projects, str(self.projects / repository))
+                    if path.relative_to(self.projects).as_posix() != repository:
+                        raise ValueError('Use a managed repository-relative path for publication overrides.')
+                policy['publication_repositories'] = dict(overrides)
             for key in ('auto_queue_proposals', 'paused', 'reap_finished_sessions', 'reap_orphaned_panes',
-                        'auto_capture', 'auto_validate', 'auto_publish', 'auto_prepare', 'auto_prepare_checks', 'auto_prepare_agent', 'auto_prepare_restore'):
+                        'auto_capture', 'auto_validate', 'auto_publish', 'auto_create_releases', 'auto_prepare', 'auto_prepare_checks', 'auto_prepare_agent', 'auto_prepare_restore'):
                 if key in body:
                     if not isinstance(body[key], bool):
                         raise FieldValidationError('Invalid automation policy value.', [key])
@@ -1316,6 +1385,8 @@ class Contributions:
                 # Enabling starts a fresh window: discussions created earlier are
                 # never queued retroactively.
                 policy['auto_queue_since'] = stamp()
+            if policy['auto_create_releases'] and not previous['auto_create_releases']:
+                policy['auto_create_releases_since'] = stamp()
             policy.update(updated_at=stamp(), updated_by=actor)
             with closing(self.connect()) as db, db:
                 db.execute('INSERT OR REPLACE INTO policies VALUES (?,?)', (organization_id, json.dumps(policy)))
@@ -1595,8 +1666,10 @@ class Contributions:
             else:
                 drafts.append(proposal['key'])
             created[proposal['key']] = made['id']
+        release = self.releases.from_discussion(job, self.discussion_artifact(job), proposals, created, policy, actor)
         self.store.update_job(job_id, proposals=dict(
             at=stamp(), queued=queued, drafts=drafts, skipped=skipped, created=created, deferred=deferred,
+            release=release,
             policy={k: policy[k] for k in AUTOMATION_DEFAULTS}))
 
     def materialize_meeting(self, task_id, job_id, policy, actor, queue_allowed=True):
@@ -1672,8 +1745,11 @@ class Contributions:
                     deferred[proposal['key']] = queue_reason
                 (queued if wants_queue else drafts).append(proposal['key'])
         task = self.get(task_id)
+        created = {proposal['key']: task.get('follow_up_tasks', {}).get(proposal['key']) for proposal in proposals}
+        release = self.releases.from_discussion(job, self.discussion_artifact(job), proposals, created, policy, actor)
         task.setdefault('auto_queue', {})[job_id] = dict(
             at=stamp(), queued=queued, drafts=drafts, skipped=skipped, deferred=deferred,
+            release=release,
             policy={k: policy[k] for k in AUTOMATION_DEFAULTS})
         self.save(task, 'auto_queue_checked', actor)
 
@@ -1684,12 +1760,27 @@ class Contributions:
             raise ValueError('Task not found.')
         return json.loads(row[0])
 
+    def task_records(self, identifiers, db=None):
+        """Read selected tasks in bounded batches on a single connection."""
+        if db is None:
+            with closing(self.connect()) as connection:
+                return self.task_records(identifiers, connection)
+        identifiers = list(set(identifiers))
+        tasks = {}
+        for start in range(0, len(identifiers), 500):
+            batch = identifiers[start:start + 500]
+            rows = db.execute('SELECT id,data FROM tasks WHERE id IN (' + ','.join('?' for _ in batch) + ')', batch)
+            tasks.update((identifier, json.loads(data)) for identifier, data in rows)
+        return tasks
+
     def build_event(self, event_id):
         with closing(self.connect()) as db:
             row = db.execute('SELECT data FROM build_events WHERE id=?', (event_id,)).fetchone()
-        return json.loads(row[0]) if row else None
+        return json.loads(row[0]) if row else self.releases.event(event_id)
 
     def record_build(self, event_id, summary):
+        if self.releases.record_validation(event_id, summary):
+            return True
         event = self.build_event(event_id)
         if not event:
             return False
@@ -1715,7 +1806,12 @@ class Contributions:
         task['updated_at'] = stamp()
         entry = dict(action=action, actor=actor, at=task['updated_at'],
                      state=task['state'], head_sha=task.get('head_sha'))
-        if action.startswith('pr_repair_') and task.get('pr_repair'):
+        if action == 'delivery_superseded' and task.get('delivery_history'):
+            previous = task['delivery_history'][-1]
+            entry.update(previous_sha=previous.get('sha'), delivery_chat_id=previous.get('chat_id'),
+                detail='Previous delivery report superseded for ' + str(previous.get('sha')) +
+                       ('. Inspection chat retained for audit: ' + str(previous['chat_id']) if previous.get('chat_id') else ''))
+        if (action.startswith('pr_repair_') or action.startswith('validation_update_')) and task.get('pr_repair'):
             repair = task['pr_repair']
             entry.update(repair_id=repair['id'], repair_state=repair['state'],
                          detail=str(repair.get('message') or '')[:2000],
@@ -1797,6 +1893,8 @@ class Contributions:
     def snapshot(self, role='admin'):
         with closing(self.connect()) as db:
             tasks = [json.loads(row[0]) for row in db.execute('SELECT data FROM tasks ORDER BY rowid DESC LIMIT 100')]
+            import publication_routes
+            publication_routes.decorate(db, tasks)
         common_dirs = {}  # Request-scoped only: never reuse live readiness across polls.
         for task in tasks:
             task.pop('diff', None)  # Fetch the candidate only when reviewing it.
@@ -1829,7 +1927,8 @@ class Contributions:
         if role != 'admin':
             automation = {organization: {k: v for k, v in policy.items() if k in AUTOMATION_DEFAULTS}
                           for organization, policy in automation.items()}
-        return dict(tasks=tasks, github=github, executor=executor, automation=automation)
+        return dict(tasks=tasks, releases=self.releases.snapshot({task['id']: task for task in tasks}),
+                    github=github, executor=executor, automation=automation)
 
     def awaiting_candidate(self, task, common_dirs=None):
         """Whether an agent has committed and only the capture step remains.
@@ -1867,11 +1966,17 @@ class Contributions:
             # no candidate to report.
             return False
 
-    def detail(self, task_id):
+    def detail(self, task_id, *, include_validation_policy=True):
         if not isinstance(task_id, str) or not re.fullmatch(r'[a-f0-9]{32}', task_id):
             raise ValueError('Select a valid task.')
         task = self.get(task_id)
         # The frozen dispatch payload is server-side retry state, not evidence.
+        task['managed_revisions'] = self.commits.revisions(task_id, limit=10)
+        with closing(self.connect()) as db:
+            import publication_routes
+            publication_routes.decorate(db, [task])
+        for revision in task['managed_revisions']['revisions']:
+            revision['file_count'] = len(revision.pop('files', []))
         task.pop('outcome_request', None)
         if task.get('acceptance'):
             task['acceptance'] = {k: v for k, v in task['acceptance'].items() if k != 'request'}
@@ -1959,6 +2064,12 @@ class Contributions:
             except (ValueError, OSError) as error:
                 task['history_error'] = str(error)[:500]
                 task['commit_graph'] = []
+        if include_validation_policy:
+            # Resolve once per task detail request: this is live readiness, not
+            # immutable commit data. Commit-only views do not need it.
+            # Discovery is revision-cached by the resolver; approval and prepared
+            # environment receipts can change without a repository HEAD change.
+            task['validation_policy'] = self.validation_policy(task)
         return task
 
     @staticmethod
@@ -1983,7 +2094,7 @@ class Contributions:
         return result
 
     def commit_detail(self, task_id, sha):
-        task = self.detail(task_id)
+        task = self.detail(task_id, include_validation_policy=False)
         if not SHA.fullmatch(str(sha)) or sha not in {n['sha'] for n in task.get('commit_graph', [])}:
             raise ValueError('Select a commit from this task history.')
         repository = self.path_for(task)
@@ -2264,6 +2375,8 @@ class Contributions:
     def task_instructions(self, task):
         """The standard task prompt; shared by first launches and handovers."""
         prompt = 'Task: ' + task['title'] + '\n' + task['description']
+        if getattr(self, 'releases', None) is not None:
+            prompt += self.releases.task_guidance(task)
         if task_delivery.enabled(task):
             prompt += ('\nYour completion receipt submits the commit for durable verification and optional automatic draft PR publication. '
                        'Remain in this task session after writing it; the dashboard will send delivery evidence for a final read-only inspection. '
@@ -2277,9 +2390,23 @@ class Contributions:
                 prompt = ('Follow-up of task ' + origin['id'] + ': ' + origin['title'] +
                           '\nRecorded completion: ' + str(origin.get('completion', {}).get('reason', 'unavailable'))[:500] +
                           '\n\n' + prompt)
+        query_command = ' '.join(shlex.quote(str(value)) for value in (
+            sys.executable, Path(__file__).parent / 'repository_queries.py', '--projects', self.projects,
+            '--repository', task['repository'], '--tasks-db', self.path, '--task-id', task['id'], '--kind', 'status'))
         return (prompt +
-                '\nWork only in your assigned task branch. Implement, run required checks, and commit your changes. '
-                'Commit using git -c user.name=Herdr-Agent -c user.email=agent@herdr.local commit. Never infer the operator identity or change global Git config. '
+                '\nFor recorded task state or required-check evidence, use the bounded read-only query helper: `' + query_command +
+                '`. Replace status with evidence for recorded checks; diff/history/ancestry require full commit SHAs via --revision, and diff/ancestry also require --base. '
+                'This uses existing filesystem access and no dashboard credentials. If unavailable, report the exact failure; do not widen access or search for credentials. '
+                'Recorded evidence is not fresh approval to publish.\n' +
+                '\nWork only in your assigned task branch. Implement and run required checks. Submit explicit changed files through Herdr managed commits: '
+                '`' + shlex.quote(sys.executable) + ' {{HERDR_TASK_COMMIT_HELPER}}' +
+                ' --context {{HERDR_TASK_CONTEXT}} --request-file {{HERDR_TASK_REVISION_REQUEST}} --parent FULL_EXPECTED_HEAD_SHA --message "Describe the change" --file path/to/file` '
+                '(repeat --file for every changed or deleted file). Use this provided ignored request path. '
+                'Run the helper from the assigned checkout root; file paths are repository-relative. '
+                'The request file captures immutable bytes; retry the same file after an uncertain response. Change its filename for a new revision. '
+                'Do not stage or run git commit yourself, change global Git config, or fall back to direct commits if submission fails. '
+                'Never infer the operator identity; Herdr supplies author and committer metadata. '
+                'Herdr preserves working files; inspect remaining edits and use the returned full SHA in the completion receipt. '
                 'Never push, open a pull request, update the shared checkout or deploy. '
                 'Before implementing, verify whether the requested behavior and its checks already exist at the recorded base; if the task is already satisfied, prove it with the checks and use the no_changes receipt instead of manufacturing a commit. '
                 'When complete, write JSON to {{HERDR_TASK_RECEIPT}} with outcome=complete, commit=the full HEAD SHA, run_id={{HERDR_TASK_RUN}}, token={{HERDR_TASK_TOKEN}}, and tests as an array of actual check results. Write it last after committing. '
@@ -2678,6 +2805,9 @@ class Contributions:
         """Prepare the same delivery contract for inherited and explicit policy."""
         if not isinstance(automatic, bool) or not isinstance(publish, bool):
             raise ValueError('Choose whether automatic validation and publication are enabled.')
+        if publish:
+            from publication_routes import require_task_publication
+            require_task_publication(task)
         capture = automatic if capture is None else capture
         if not isinstance(capture, bool):
             raise ValueError('Choose whether automatic candidate capture is enabled.')
@@ -2754,12 +2884,19 @@ class Contributions:
                 task['acceptance'] = dict(review, at=stamp())
             publish = (automatic and bool(delivery.get('auto_publish'))
                        and self.validation.snapshot().get('executor') == 'service')
+            from publication_routes import selected
+            task.update(publication_mode=selected(delivery, task['repository']), publication_mode_basis='organization_at_creation')
+            if task['publication_mode'] == 'release':
+                publish = False
             task.update(self.delivery_settings(task, automatic, publish,
                                                actor, organization_policy=delivery, capture=bool(delivery.get('auto_capture'))))
             project_git.configured_base(repository, base)
             return self.save(task, 'create', actor)
         task = self.get(task_id)
         had_error = task.pop('error', None) is not None
+        if action in ('publish', 'pull', 'publication'):
+            from publication_routes import require_task_publication
+            require_task_publication(task)
         # An unchanged background refresh must not rewrite the task or its audit.
         unchanged = self.comparable(task) if action == 'refresh' else None
         if task['state'] in ('merged', 'closed', 'completed') and action not in ('refresh', 'build', 'discuss', 'review_policy', 'proposal', 'complete', 'assignment', 'policy'):
@@ -3058,6 +3195,8 @@ class Contributions:
                 task.update(head_sha=head, diff=diff[:65536], diff_truncated=len(diff) > 65536,
                             diff_stat=project_git.git(path, 'diff', '--stat', task['base_sha'], head, '--')[:12000],
                             state='review_ready', candidate_changed=bool(task.get('pull') and task['pull']['head_sha'] != head))
+                revision = self.commits.for_commit(task['id'], head)
+                task['candidate_revision'] = revision['id'] if revision else None
         elif action == 'publication':
             if task.get('auto_publish'):
                 raise ValueError('Disable automatic publication before changing its destination.')
@@ -3119,8 +3258,14 @@ class Contributions:
             # A task that already has a pull request stays in its pull state.
             task['state'] = 'pr_open' if task.get('pull') else 'published'
             if (task.get('pr_repair') or {}).get('candidate') == head:
-                task['pr_repair'].update(state='published', message='Repaired candidate published to the existing PR branch; refresh GitHub conflict status.')
-                task['pull'].update(mergeable=None, mergeable_state='unknown')
+                # Validation updates also run before the first PR exists. The
+                # branch push is complete in that case; PR creation is the next
+                # action, not a prerequisite for recording publication.
+                task['pr_repair'].update(state='published', message=(
+                    'Repaired candidate published to the existing PR branch; refresh GitHub conflict status.'
+                    if task.get('pull') else 'Updated candidate branch published; review and open its draft PR.'))
+                if task.get('pull'):
+                    task['pull'].update(mergeable=None, mergeable_state='unknown')
         elif action == 'pull':
             published = task.get('publish', {}).get('head_sha')
             # Two related guards that must not be merged. This one defaults a
@@ -3205,17 +3350,28 @@ class Contributions:
                 raise ValueError('Capture a candidate or refresh a merged PR before building.')
             if body.get('target') != target:
                 raise ValueError('Build selection changed; review the exact resulting commit.')
+            if body.get('update_branch') is True and actor != 'pr_repair_scheduler' and task['state'] != 'merged':
+                update = pr_repairs.queue_validation_update(self, task, actor)
+                if update is not None:
+                    return update
             if (task.get('pr_repair') or {}).get('candidate') == target and task['pr_repair'].get('state') == 'validation_failed':
-                task['pr_repair'].update(state='validating', message='Retrying validation of the repaired candidate.')
+                task['pr_repair'].update(state='validating', message=(
+                    'Retrying validation of the updated branch.' if pr_repairs.validation_update(task)
+                    else 'Retrying validation of the repaired candidate.'))
             try:
                 project_git.git(repository, 'cat-file', '-e', target + '^{commit}')
             except ValueError:
                 raise ValueError('Fetch this repository in Project explorer before building the merged result.') from None
             event_id = hashlib.sha256(('task:' + task['id'] + ':' + target).encode()).hexdigest()
             event = dict(id=event_id, task_id=task['id'], repository=task['repository'], path=task['repository'], target=target)
+            if target == task.get('head_sha') and task.get('candidate_revision'):
+                event['task_revision_id'] = task['candidate_revision']
             approved = toolchain_policy.resolve_committed(repository)
             if approved.get('plan_digest') and task.get('run_id'):
-                frozen = self.frozen_environment(task) or {}
+                transition = pr_repairs.validation_binding(task)
+                frozen = transition or self.frozen_environment(task) or {}
+                if transition:
+                    event['policy_transition'] = dict(transition)
                 event.update(frozen_plan_digest=frozen.get('plan_digest') or 'unavailable',
                              frozen_policy_digest=frozen.get('digest') or 'unavailable')
                 event_id = hashlib.sha256((event_id + ':' + task['run_id'] + ':' + event['frozen_plan_digest']).encode()).hexdigest()

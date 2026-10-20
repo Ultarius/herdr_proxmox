@@ -1,7 +1,96 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:juice/juice.dart';
 import 'package:herdr_dashboard/task_activity.dart';
 
 void main() {
+  test('validation uses the candidate until the task is merged', () {
+    final task = <String, dynamic>{
+      'state': 'pr_open',
+      'head_sha': 'candidate',
+      // An old or stray merge identity must not change the validation target.
+      'merge_sha': 'merge',
+      'validation_policy': {'target': 'candidate', 'matches': true},
+      'builds': {
+        'candidate': {
+          'target': 'candidate',
+          'state': 'complete',
+          'required_checks_verified': true,
+        },
+      },
+    };
+    expect(taskValidationTarget(task), 'candidate');
+    expect(taskNextStep(task), contains('ready for review'));
+    task['state'] = 'merged';
+    expect(taskValidationTarget(task), 'merge');
+    task.remove('merge_sha');
+    expect(taskValidationTarget(task), isNull);
+  });
+
+  testWidgets(
+    'superseded chat reference is visible without expanding raw audit',
+    (tester) async {
+      final entry = {
+        'action': 'delivery_superseded',
+        'actor': 'gateway',
+        'at': 'now',
+        'head_sha': 'b' * 40,
+        'previous_sha': 'a' * 40,
+        'delivery_chat_id': 'inspection-old',
+      };
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SingleChildScrollView(
+              child: TaskActivity(
+                task: {
+                  'audit': [entry],
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(
+        find.textContaining('Superseded aaaaaaaa · chat inspection-old'),
+        findsOneWidget,
+      );
+      expect(find.text('$entry'), findsNothing);
+    },
+  );
+
+  test(
+    'a previous candidate delivery error does not replace current publication',
+    () {
+      final task = {
+        'state': 'published',
+        'head_sha': 'current',
+        'await_verification': true,
+        'publish': {'head_sha': 'current'},
+        'builds': {
+          'current': {
+            'state': 'complete',
+            'target': 'current',
+            'required_checks_verified': true,
+          },
+        },
+        'delivery_workflow': {
+          'sha': 'previous',
+          'state': 'attention',
+          'error': 'Old failure',
+        },
+      };
+      expect(
+        taskNextStep(task),
+        'Branch published; open a draft pull request.',
+      );
+      (task['delivery_workflow'] as Map)['sha'] = 'current';
+      expect(
+        taskNextStep(task),
+        contains('Delivery needs attention: Old failure'),
+      );
+    },
+  );
+
   test(
     'delivery states retain the agent and do not claim review readiness',
     () {
@@ -117,4 +206,42 @@ void main() {
     };
     expect(taskNextStep(exact), contains('ready for review'));
   });
+  test(
+    'historical checks do not claim readiness under a changed or unknown policy',
+    () {
+      final head = 'a' * 40;
+      final task = <String, dynamic>{
+        'state': 'pr_open',
+        'head_sha': head,
+        'builds': {
+          head: {
+            'target': head,
+            'state': 'complete',
+            'required_checks_verified': true,
+          },
+        },
+        'validation_policy': {
+          'target': head,
+          'matches': false,
+          'state': 'stale',
+          'reason': 'Policy changed. Validate latest commit.',
+        },
+      };
+      expect(taskValidationNeedsRecheck(task, head), true);
+      expect(taskNextStep(task), 'Policy changed. Validate latest commit.');
+      task['validation_policy'] = {
+        'target': head,
+        'matches': false,
+        'state': 'unavailable',
+        'reason': 'Current policy could not be assessed.',
+      };
+      expect(taskNextStep(task), 'Current policy could not be assessed.');
+      task['validation_policy'] = {'target': 'b' * 40, 'matches': true};
+      expect(taskValidationNeedsRecheck(task, head), true);
+      expect(taskNextStep(task), contains('another commit'));
+      task['validation_policy'] = {'target': head, 'matches': true};
+      expect(taskValidationNeedsRecheck(task, head), false);
+      expect(taskNextStep(task), contains('ready for review'));
+    },
+  );
 }

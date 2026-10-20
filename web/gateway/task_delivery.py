@@ -6,6 +6,19 @@ ACTOR = 'automatic_task_delivery'
 MAX_VALIDATION_REPAIRS = 2
 
 
+def history_entry(flow, **transition):
+    """Review facts and a chat audit pointer, never a replayable execution payload."""
+    fields = ('sha', 'state', 'error', 'agent_report', 'failure_stage', 'chat_id',
+              'superseded_by', 'superseded_at')
+    record = {key: flow[key] for key in fields if key in flow}
+    if 'error' in record:
+        record['error'] = str(record['error'])[:2000]
+    if isinstance(record.get('agent_report'), dict):
+        report = record['agent_report']
+        record['agent_report'] = {key: report[key] for key in ('sha', 'outcome', 'summary', 'candidate') if key in report}
+    return dict(record, **transition)
+
+
 def enabled(task):
     return task.get('await_verification') is True or task.get('auto_publish') is True
 
@@ -71,6 +84,20 @@ def reconcile(service, task):
     if task['state'] not in ('implementing', 'review_ready', 'published', 'pr_open') or pr_repairs.active(task):
         return
     flow = task.get('delivery_workflow') or {}
+    head = task.get('head_sha')
+    if (head and task['state'] != 'implementing' and flow.get('sha') and flow['sha'] != head
+            and flow.get('state') != 'accepting_repair'):
+        # An attention report is evidence about one commit, not a permanent
+        # task-wide failure. Preserve it without replaying its frozen prompt or
+        # notification retries against the new candidate. accept_repair owns its
+        # own crash recovery across capture and must finish that transition first.
+        # Compact existing entries too, including snapshots written by older gateways.
+        history = [history_entry(entry) for entry in (task.get('delivery_history') or [])[-4:]]
+        history.append(history_entry(flow, superseded_by=head, superseded_at=stamp()))
+        task['delivery_history'] = history
+        flow = dict(sha=head, state='waiting_verification', attempt=0, started_at=stamp())
+        task['delivery_workflow'] = flow
+        service.save(task, 'delivery_superseded', ACTOR)
     if flow.get('state') == 'attention':
         if flow.get('notification_pending') and flow.get('notification_retry_after', 0) <= time.time():
             notify_agent(service, task, flow)
@@ -86,10 +113,11 @@ def reconcile(service, task):
         current_run(service.store, run)
         accept_repair(service, task, run, flow, flow['repair_report'])
         return
-    head = task.get('head_sha')
     if not head or task['state'] == 'implementing':
         return
     if flow.get('sha') != head:
+        # Initial/legacy flows without a SHA start here. Superseded SHA-bound
+        # flows reset above, before their old attention/backoff can block us.
         flow = dict(sha=head, state='waiting_verification', attempt=0, started_at=stamp())
         task['delivery_workflow'] = flow
         service.save(task, 'delivery_started', ACTOR)
@@ -234,6 +262,9 @@ def notify_agent(service, task, flow):
             + 'Never push, merge, approve permissions, deploy, read/change credentials or switch publishing destinations. '
             'For publishing/authentication/fork failures, return needs_attention with the operator action required; do not retry GitHub yourself. '
             'Gateway required-check evidence is independent of your earlier reported tests. '
+            'The configured publishing repository may intentionally be a fork of upstream; a different '
+            'origin or repository name alone is not a destination error or proof of missing permissions. '
+            'Use the recorded gateway publication errors and remote evidence to assess those questions. '
             'Return exactly JSON with sha, outcome=reviewed, repaired or needs_attention, and summary (1-2000 characters). '
             'Use needs_attention if evidence is incomplete or inconsistent; do not claim remote checks you did not perform. '
             'Evidence: ' + json.dumps(packet, ensure_ascii=False))

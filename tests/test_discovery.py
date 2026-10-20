@@ -384,6 +384,9 @@ class DedupeTests(unittest.TestCase):
         text = discovery.redact('Authorization: Bearer raw-token https://user:password@host/path?token=abc')
         self.assertNotIn('raw-token', text)
         self.assertNotIn('password@', text)
+        for header in ('Authorization: Bearer alphabeticsecret', 'Authorization: Basic abc'):
+            with self.subTest(header=header):
+                self.assertNotIn(header.split()[-1], discovery.redact(header))
 
     def test_redactor_handles_private_keys_basic_auth_and_block_secrets(self):
         text = discovery.redact('Authorization: Basic dXNlcjpwYXNzd29yZA==\nAWS_SECRET_ACCESS_KEY=abc123\n'

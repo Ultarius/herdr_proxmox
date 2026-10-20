@@ -22,7 +22,8 @@ extension _Canvas on _TaskWorkflowState {
         : blocking != null && _open(task)
         ? ('waiting', 'hourglass')
         : null;
-    final owner = _agent(task);
+    final work = _work(task);
+    final workActivity = work?.activity;
     return el(
       'button',
       [
@@ -54,7 +55,7 @@ extension _Canvas on _TaskWorkflowState {
               _name(task),
               role: _role(task),
               size: 'xs',
-              live: _activity(owner) == 'working',
+              live: workActivity == 'working',
             ),
           badge(_state(task), tone: _tone(task)),
           if (flag != null)
@@ -65,6 +66,11 @@ extension _Canvas on _TaskWorkflowState {
               attributes: {'data-flag': flag.$1, 'title': message},
             ),
         ], classes: 'wf-node__foot task-wf-node-foot'),
+        if (work != null)
+          el('span', [
+            _dot(workActivity!),
+            text(work.label),
+          ], classes: 'wf-node__activity'),
       ],
       classes: 'task-wf-node wf-node',
       attributes: {
@@ -73,13 +79,14 @@ extension _Canvas on _TaskWorkflowState {
         'data-node': id,
         'data-state': '${task['state']}',
         'data-tone': _tone(task),
+        if (work != null) 'data-work': workActivity!,
         if (links.any((link) => link.to == id)) 'data-in': '',
         if (links.any((link) => link.from == id)) 'data-out': '',
         'aria-pressed': '${selected == id}',
         'aria-label':
-            '${task['title']}. ${_state(task)}. ${_name(task)}. $message',
+            '${task['title']}. ${_state(task)}. ${_name(task)}. ${work == null ? '' : '${work.label}. '}$message',
         'title':
-            '$id · ${task['repository'] ?? 'Repository not recorded'}\n$message',
+            '$id · ${task['repository'] ?? 'Repository not recorded'}\n${work == null ? '' : '${work.label}\n'}$message',
         if (highlighted.isNotEmpty && !highlighted.contains(id)) 'data-dim': '',
         if (highlighted.contains(id)) 'data-emphasis': '',
         'style': 'left:${box.x}px;top:${box.y}px;',
@@ -149,7 +156,11 @@ extension _Canvas on _TaskWorkflowState {
       [
         el('title', [
           text(
-            '${link.from} → ${link.to}: ${link.kind == 'follow-up' ? 'recorded follow-up' : 'waiting on execution'}',
+            '${link.from} → ${link.to}: ${link.kind == 'release-membership'
+                ? '${link.state} ${link.reason}'
+                : link.kind == 'follow-up'
+                ? 'recorded follow-up'
+                : 'waiting on execution'}',
           ),
         ]),
         el(
@@ -170,6 +181,7 @@ extension _Canvas on _TaskWorkflowState {
         'data-from': link.from,
         'data-to': link.to,
         'data-kind': link.kind,
+        if (link.kind == 'release-membership') 'data-edge': link.state,
         if (link.kind == 'follow-up' && fromFinished) 'data-edge': 'finished',
         if (active) 'data-emphasis': '',
         if (highlighted.isNotEmpty && !active) 'data-dim': '',
@@ -194,7 +206,7 @@ extension _Canvas on _TaskWorkflowState {
     return el(
       'div',
       [
-        if (tasks.isEmpty)
+        if (boxes.isEmpty)
           el('div', [
             el('span', [icon('workflow')], classes: 'empty__icon'),
             el('p', [
@@ -237,11 +249,20 @@ extension _Canvas on _TaskWorkflowState {
                             ? a.y.compareTo(b.y)
                             : a.column.compareTo(b.column),
                       ))
-                    node(
-                      tasks.firstWhere((task) => _id(task) == box.id),
-                      box,
-                      highlighted,
-                    ),
+                    if (box.kind == 'release')
+                      releaseNode(
+                        component.releases.firstWhere(
+                          (release) => 'release:${release['id']}' == box.id,
+                        ),
+                        box,
+                        highlighted,
+                      )
+                    else
+                      node(
+                        tasks.firstWhere((task) => _id(task) == box.id),
+                        box,
+                        highlighted,
+                      ),
                 ],
                 classes: 'task-wf-stage',
                 attributes: {
@@ -269,7 +290,7 @@ extension _Canvas on _TaskWorkflowState {
             '--wf-content-h:${contentHeight}px;--wf-zoom:$zoom;--wf-scroll-x:${scrollX}px;',
         if (scrollX <= 0) 'data-scroll-start': '',
         if (drag != null) 'data-panning': '',
-        if (tasks.isEmpty) 'data-empty': '',
+        if (boxes.isEmpty) 'data-empty': '',
       },
       events: {
         'scroll': (event) {
@@ -319,7 +340,12 @@ extension _Canvas on _TaskWorkflowState {
           viewport?.removeAttribute('data-panning');
         },
         'keydown': (event) {
-          if ((event as web.KeyboardEvent).key == 'Escape') {
+          if (event.defaultPrevented ||
+              (event as web.KeyboardEvent).isComposing ||
+              composing)
+            return;
+          if (event.key == 'Escape') {
+            if (expanded) return; // The workflow root owns full-screen Escape.
             update(() {
               selected = null;
               agent = '';

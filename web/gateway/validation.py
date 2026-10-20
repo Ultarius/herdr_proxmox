@@ -23,6 +23,7 @@ import time
 import project_git
 from project_files import project_directory
 import toolchain_policy
+from build_queue import BuildQueueBusy
 COMMANDS = ('scripts/validate.sh', 'scripts/build-web.sh')
 BASH = 'bash'
 EVENT_ID = re.compile(r'[a-f0-9]{64}')
@@ -32,6 +33,10 @@ TIMEOUT_SECONDS = 1800
 OUTPUT_LIMIT = 200_000
 HISTORY = 20
 ARTIFACT_LIMIT = 256 * 1024 * 1024
+
+
+class ValidationBusy(ValueError):
+    """Gateway capacity refused submission before any validation was started."""
 
 
 def stamp():
@@ -209,13 +214,15 @@ class ValidationRuns:
             raise ValueError('Retry must be a boolean.')
         with self.lock:
             if self.running() and self.queue is None:
-                raise ValueError('Validation is already running. Wait for it to finish.')
+                raise ValidationBusy('Validation is already running. Wait for it to finish.')
             run = dict(id=secrets.token_hex(16), event_id=event['id'], repository=event.get('repository'),
                        target=target, path=event.get('path'), actor=actor, state='running',
                        started_at=stamp(), finished_at=None, exit_code=None, command=None, note='')
             run['task_id'] = event.get('task_id') or event.get('job_id')
             run['frozen_plan_digest'] = event.get('frozen_plan_digest')
             run['frozen_policy_digest'] = event.get('frozen_policy_digest')
+            if event.get('policy_transition'):
+                run['policy_transition'] = event['policy_transition']
             # Preserve provenance without turning an event waiver into a pass.
             if event.get('state') == 'validation_waived':
                 run['validation_waiver'] = dict(event_id=event['id'], approval=event.get('operator_approval'),
@@ -230,7 +237,10 @@ class ValidationRuns:
                                      for entry in approved['toolchains']) or 'none'
                 run['policy_digest'] = toolchain_policy.digest(approved)
                 run['plan_digest'] = approved.get('plan_digest')
-                run, created = self.queue.enqueue(run, toolchain=toolchain, retry=body.get('retry', False))
+                try:
+                    run, created = self.queue.enqueue(run, toolchain=toolchain, retry=body.get('retry', False))
+                except BuildQueueBusy as error:
+                    raise ValidationBusy(str(error)) from error
                 if not created:
                     return run
             folder = self.root / run['id']
@@ -241,20 +251,27 @@ class ValidationRuns:
         return dict(run)
 
     def _execute(self, run, folder):
+        from operation_metrics import measured
         worktree = folder / 'tree'
         log_path = folder / 'log.txt'
         lines, state, exit_code = [], 'error', None
         try:
             checkout = self._checkout(run['path'])
-            self._worktree(checkout, worktree, run['target'])
+            timings = run.setdefault('timings', {})
+            with measured('workspace.prepare') as timings['workspace']:
+                self._worktree(checkout, worktree, run['target'])
             head = project_git.git(worktree, 'rev-parse', 'HEAD').strip()
             if head != run['target']:
                 raise ValueError('The worktree does not match the exact target commit.')
             # The policy is resolved from the approved checkout, never from the
             # candidate: a candidate must not redefine the rules that judge it.
             policy = toolchain_policy.resolve_committed(checkout)
-            if (run.get('frozen_plan_digest') and (run['frozen_plan_digest'] != policy.get('plan_digest')
-                    or run.get('frozen_policy_digest') != toolchain_policy.digest(policy))):
+            # Releases may freeze a legacy policy without an environment-plan
+            # digest. That policy still binds execution; a plan-bound session
+            # must provide matching plan and policy digests together.
+            if ((run.get('frozen_plan_digest') and (run['frozen_plan_digest'] != policy.get('plan_digest')
+                    or run.get('frozen_policy_digest') != toolchain_policy.digest(policy)))
+                    or (run.get('frozen_policy_digest') and run['frozen_policy_digest'] != toolchain_policy.digest(policy))):
                 run['blocker'] = 'policy_changed'
                 raise ValueError('The approved environment differs from the session policy; inspect and relaunch under the approved plan.')
             if run.get('policy_digest') and run['policy_digest'] != toolchain_policy.digest(policy):
@@ -274,8 +291,9 @@ class ValidationRuns:
                 run['blocker'] = 'environment_unavailable' if policy.get('blockers') else 'validation_unapproved'
                 raise ValueError('; '.join([*policy.get('blockers', []), *policy.get('validation_blockers', [])]))
             from environment_execution import materialize_execution_policy
-            execution_policy, restores = materialize_execution_policy(policy, worktree, folder / 'environment',
-                authorized=policy.get('restore_authorized') is True)
+            with measured('execution.prepare') as timings['environment']:
+                execution_policy, restores = materialize_execution_policy(policy, worktree, folder / 'environment',
+                    authorized=policy.get('restore_authorized') is True)
             if restores:
                 run['environment_restores'] = restores
                 self._write(folder, run)
@@ -299,9 +317,12 @@ class ValidationRuns:
             def evidence(checks):
                 run['checks'] = checks
                 self._write(folder, run)
-            checks, exit_code, timed_out = run_scripts(worktree, commands, folder,
-                self.timeout, BASH, OUTPUT_LIMIT, changed=evidence,
-                environment=(None if policy.get('plan_digest') else toolchain_policy.environment(policy)))
+            with measured('validation.checks') as timings['checks']:
+                checks, exit_code, timed_out = run_scripts(worktree, commands, folder,
+                    self.timeout, BASH, OUTPUT_LIMIT, changed=evidence,
+                    environment=(None if policy.get('plan_digest') else toolchain_policy.environment(policy)))
+                if exit_code != 0 or timed_out:
+                    timings['checks']['status'] = 'failed'
             # Repository scripts can report subchecks, but cannot certify that
             # they left the requested commit and tracked source unchanged.
             checks.extend(self._integrity_checks(worktree, run['target']))
@@ -348,6 +369,7 @@ class ValidationRuns:
                                    policy_digest=run.get('policy_digest'), plan_digest=run.get('plan_digest'),
                                    toolchain_evidence=run.get('toolchain_evidence'),
                                    environment_restores=run.get('environment_restores'),
+                                   timings=run.get('timings', {}),
                                    policy_changes=run.get('policy_changes'),
                                    blocker=run.get('blocker'), note=run.get('note'),
                                    finished_at=run.get('finished_at'),

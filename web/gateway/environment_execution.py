@@ -9,6 +9,7 @@ import subprocess
 
 import environment_adapters
 from environment_providers import invoke
+from operation_metrics import measured
 
 
 def requires_restore(plan):
@@ -34,9 +35,12 @@ def materialize_execution_policy(policy, checkout, caches, *, authorized=False, 
             adapter = environment_adapters.get(entry['name'])
             if entry.get('adapter_version', 1) != adapter.version:
                 raise ValueError('The SDK adapter contract changed; prepare again.')
-            receipt = invoke(adapter.materialize_entry, entry, checkout, caches, authorized=authorized, run=run)
-            if not isinstance(receipt, dict) or receipt.get('state') != 'complete':
-                raise ValueError('The execution materializer did not return a completed restore receipt.')
+            operation = ('dependencies.restore' if entry['restore_recipe'].get('requires_restore') is not False
+                         else 'execution.materialize')
+            with measured(operation):
+                receipt = invoke(adapter.materialize_entry, entry, checkout, caches, authorized=authorized, run=run)
+                if not isinstance(receipt, dict) or receipt.get('state') != 'complete':
+                    raise ValueError('The execution materializer did not return a completed restore receipt.')
             receipts.append(receipt)
     for check in bound.get('recipes', []):
         entries = [entry for entry in bound['toolchains'] if entry.get('component') == check['cwd']]

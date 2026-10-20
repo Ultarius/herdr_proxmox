@@ -1,6 +1,7 @@
 """Prepare meeting sessions without waiting on busy agents or replaying prompts."""
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import uuid
 import threading
 
@@ -65,6 +66,10 @@ def prepare_locked(store, job_id):
             organization = store.get(db, 'organizations', job['organization_id'])
             ids = [*job['group']['members'], job['group_run']['profile_id']]
             profiles = [store.get(db, 'profiles', identity, job['organization_id']) for identity in ids]
+            if job.get('purpose') == 'release_review':
+                repository = Path(job['review_repository']).resolve()
+                if any(p.get('archived') or not p.get('project') or Path(p['project']).resolve() != repository for p in profiles):
+                    raise ValueError('Release review participants changed repository; preparation stopped.')
             jobs = store.job_records()
         # FIFO among meetings. Active non-meeting work has priority; waiting
         # meetings do not hold participant locks between polling cycles.

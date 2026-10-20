@@ -771,7 +771,7 @@ class OrganizationTests(unittest.TestCase):
         job_id = self.action('launch', organization_id=org, profile_id=profile,
                             task_id='a' * 32, worktree_branch='herdr/task-' + 'a' * 12,
                             start_sha=base,
-                            task_prompt='Implement this task. Read ' + deployed + '/references/tools.md. Never push.')
+                            task_prompt='Implement this task. Read ' + deployed + '/references/tools.md. Never push. Context: {{HERDR_TASK_CONTEXT}} Helper: {{HERDR_TASK_COMMIT_HELPER}} Request: {{HERDR_TASK_REVISION_REQUEST}}')
         self.drain()
         job = next(j for j in self.store.snapshot()['jobs'] if j['id'] == job_id)
         self.assertEqual(job['state'], 'persona_sent', job.get('error'))
@@ -784,6 +784,30 @@ class OrganizationTests(unittest.TestCase):
         self.assertIn('.ci-cache/herdr-guidance/', assigned)
         self.assertIn('/references/tools.md', assigned)
         self.assertNotIn(deployed, assigned)
+        context = checkout / '.ci-cache/herdr-guidance' / ('task-' + 'a' * 32) / 'commit-context.json'
+        recorded = json.loads(context.read_text())
+        # Pin the deliberately small credential-bearing launch context contract.
+        self.assertEqual(recorded, dict(task_id='a' * 32, run_id=job_id, token=job['completion_token'],
+                                        checkout_root=str(checkout.resolve())))
+        self.assertIn(context.as_posix(), assigned)
+        self.assertNotIn('{{HERDR_TASK_CONTEXT}}', assigned)
+        self.assertNotIn('{{HERDR_TASK_COMMIT_HELPER}}', assigned)
+        helpers = list((checkout / '.ci-cache/herdr-guidance').glob('*/task_commit_client.py'))
+        self.assertEqual(len(helpers), 1)
+        self.assertIn(helpers[0].as_posix(), assigned)
+        self.assertTrue((helpers[0].parent / 'task_revision_contract.py').is_file())
+        self.assertTrue((helpers[0].parent / 'project_access.py').is_file())
+        self.assertTrue((helpers[0].parent / 'request_identity.py').is_file())
+        self.assertNotIn('{{HERDR_TASK_REVISION_REQUEST}}', assigned)
+        request = context.parent / ('revision-' + job['id'] + '-1.json')
+        self.assertIn(request.as_posix(), assigned)
+        self.assertTrue(subprocess.run(['git', '-C', str(checkout), 'check-ignore', str(request)], capture_output=True).returncode == 0)
+        import sys
+        standalone = subprocess.run([sys.executable, str(helpers[0]), '--help'], cwd=self.root,
+            env={k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}, capture_output=True, text=True, timeout=15)
+        self.assertEqual(standalone.returncode, 0, standalone.stderr)
+        if os.name != 'nt':
+            self.assertEqual(context.stat().st_mode & 0o777, 0o600)
 
     def test_git_launch_defaults_to_separate_committed_worktree(self):
         def git(*args):

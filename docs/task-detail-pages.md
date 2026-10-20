@@ -2,6 +2,28 @@
 
 The Tasks list is a compact index: title, repository, assigned identity, state, next step and last activity. Open task navigates to /tasks/<task-id>, which can be bookmarked or opened directly. The Tasks sidebar section stays selected.
 
+## Live work on the workflow board
+
+An agent's Working indicator describes its live session, not every task assigned
+to that agent. The gateway exposes the task and launch-run identity only after
+verifying that session's alias, pane and conversation. The workflow highlights a
+task only when its task id, current run id and assigned profile all match that
+binding. Older gateways, unavailable snapshots and unmatched or idle sessions do
+not claim active task work.
+
+An active card keeps its lifecycle badge (such as Pull request open), adds a
+visible work phase, and has a distinct working outline. Branch updates can show
+Resolving conflicts · running checks without changing the PR's lifecycle. The
+agent chip names the active task; a filtered-out task is identified as hidden.
+Selecting the agent chip brings its visible active task into view. The Jaspr
+workflow List rows use the same binding so unrelated assignments do not all
+receive a live ring. The Flutter task list and detail page show the same bound
+work phase with an activity icon. Needs attention covers blocked sessions,
+including permission prompts and errors; it does not imply only a question.
+Gateway-owned profile/group labels are discarded unless the live session is
+verified. Ambiguous task claims are suppressed for that snapshot and can recover
+on the next poll; neither dashboard guesses or stops the sessions.
+
 ## Task sections
 
 - Overview shows the original task description, including acceptance criteria and required checks, the assigned identity, completion/blocker information and automation settings. A primary action offers implementation start, exact-commit validation or review when appropriate.

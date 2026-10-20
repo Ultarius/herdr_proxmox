@@ -39,6 +39,10 @@ def redact(value):
                    '[private key omitted]', value)
     value = re.sub(r'(?i)(?:https?://)[^\s"<>]+', '[URL omitted]', value)
     value = re.sub(r'(?i)\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{16,})\b', '[credential omitted]', value)
+    # An explicit authorization header is credential-bearing even when its
+    # value is short or alphabetic; the prose heuristic below does not apply.
+    value = re.sub(r'(?i)(\bauthorization\s*:\s*(?:basic|bearer)\s+)[^\s,;]+',
+                   r'\1[credential omitted]', value)
     # A real Basic/Bearer value has length and a digit or symbol; prose does not.
     value = re.sub(r'(?i)\b(?:basic|bearer)\s+(?=[A-Za-z0-9._~+/=-]{8,})(?=[A-Za-z0-9._~+/=-]*[0-9=+_/.~-])[A-Za-z0-9._~+/=-]+',
                    '[credential omitted]', value)

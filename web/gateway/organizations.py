@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shlex
 import sqlite3
 import subprocess
 import threading
@@ -600,6 +601,7 @@ class OrganizationStore:
                                     reason='' if manual_task else ((outcome.get('skipped') or {}).get(key) or
                                     (outcome.get('deferred') or {}).get(key) or outcome.get('unavailable', ''))))
             job['proposal_details'] = details
+            job['release_plan_outcome'] = outcome.get('release')
         return data
 
     def project(self, value):
@@ -617,6 +619,9 @@ class OrganizationStore:
         result = []
         for agent in agents:
             item = dict(agent)
+            # These are gateway-owned bindings, never assertions from agent list.
+            for key in ('run_id', 'task_id', 'profile_id', 'group_id', 'display_name', 'entity_type'):
+                item.pop(key, None)
             for run in by_alias.get(agent.get('name'), []):
                 if run['kind'] != 'launch' or run['state'] not in ('running', 'persona_sent', 'needs_attention') or run.get('alias') != agent.get('name'):
                     continue
@@ -632,9 +637,21 @@ class OrganizationStore:
                 except ValueError:
                     continue
                 item.update(display_name=profile['name'], entity_type='group' if profile.get('group_id') else 'agent',
-                            profile_id=profile['id'], group_id=profile.get('group_id'))
+                            profile_id=profile['id'], group_id=profile.get('group_id'),
+                            run_id=run['id'], task_id=run.get('task_id'))
                 break
             result.append(item)
+        claims = {}
+        for item in result:
+            if item.get('task_id'):
+                claims.setdefault(item['task_id'], []).append(item)
+        for entries in claims.values():
+            if len(entries) > 1:
+                # Preserve verified session labels, but refuse ambiguous task
+                # attribution. This does not stop or reassign either session.
+                for item in entries:
+                    item.pop('task_id', None)
+                    item.pop('run_id', None)
         return result
 
     def remove(self, db, action, body, org_id):
@@ -1033,7 +1050,7 @@ class OrganizationStore:
                     if not isinstance(context_value, str) or not context_value.strip() or len(context_value) > 20000:
                         raise ValueError('The handover needs bounded context for the next agent.')
                     task_prompt = body.get('task_prompt', '')
-                    if not isinstance(task_prompt, str) or len(task_prompt) > 12000:
+                    if not isinstance(task_prompt, str) or len(task_prompt) > 16000:
                         raise ValueError('Invalid handover task prompt.')
                 elif any(j['kind'] == 'launch' and j['id'] != run['id'] and j.get('profile_id') == run['profile_id'] and j['state'] not in ('released', 'finished') for j in self.job_records()):
                     raise ValueError('Release the current agent binding before continuing an archived session.')
@@ -1645,8 +1662,11 @@ class OrganizationStore:
                     # Never fall back to the shared checkout after a Git/Herdr failure.
                     from repository_lock import repository_lock
                     with repository_lock(project):
-                        created = self.command('worktree', 'create', '--cwd', project, '--branch', branch,
-                                               '--path', str(checkout), '--label', profile['name'], '--no-focus', timeout=120)
+                        from operation_metrics import measured
+                        with measured('workspace.prepare') as timing:
+                            created = self.command('worktree', 'create', '--cwd', project, '--branch', branch,
+                                                   '--path', str(checkout), '--label', profile['name'], '--no-focus', timeout=120)
+                        self.update_job(job_id, workspace_preparation_timing=timing)
                         if job.get('start_sha'):
                             # Pin only this new, clean checkout before starting any
                             # agent. Never reset an existing or live task checkout.
@@ -1667,7 +1687,7 @@ class OrganizationStore:
                 self.wait_for_shell(pane)
                 if job.get('task_prompt') or job.get('task_id'):
                     from worker_guidance import local_bundle
-                    guidance = local_bundle(job.get('worktree_path', project))
+                    guidance = local_bundle(job.get('worktree_path') or job.get('source_project') or project)
                 # Any agent can be asked to save a chat reply: an operator
                 # message, a consultation, or a delegation reply all write under
                 # chat-replies. The launch happens before the chat exists, so
@@ -1737,6 +1757,10 @@ class OrganizationStore:
                     if receipt_directory.is_symlink():
                         raise ValueError('Task receipt directory must not be a symlink.')
                     receipt_directory.mkdir(exist_ok=True)
+                    from task_commit_client import write_private
+                    write_private(receipt_directory / 'commit-context.json', dict(
+                        task_id=job['task_id'], run_id=job['id'], token=job['completion_token'],
+                        checkout_root=str(Path(job.get('worktree_path') or job.get('source_project') or project).resolve())))
                     prompt += ('\nTask completion protocol for this session: after authorized work is committed, write JSON to ' +
                                (receipt_directory / 'receipt.json').as_posix() +
                                ' with outcome=complete, commit=full HEAD SHA, run_id=' + job['id'] +
@@ -1746,7 +1770,9 @@ class OrganizationStore:
                     deployed = (Path(__file__).parent / 'skills/herdr-worktree-integration').resolve().as_posix()
                     task_prompt = job['task_prompt'].replace(deployed, guidance.as_posix())
                     if job.get('task_id'):
-                        task_prompt = task_prompt.replace('{{HERDR_TASK_RECEIPT}}', (receipt_directory / 'receipt.json').as_posix()).replace('{{HERDR_TASK_RUN}}', job['id']).replace('{{HERDR_TASK_TOKEN}}', job['completion_token'])
+                        task_prompt = task_prompt.replace('{{HERDR_TASK_RECEIPT}}', (receipt_directory / 'receipt.json').as_posix()).replace('{{HERDR_TASK_RUN}}', job['id']).replace('{{HERDR_TASK_TOKEN}}', job['completion_token']).replace('{{HERDR_TASK_CONTEXT}}', shlex.quote((receipt_directory / 'commit-context.json').as_posix()))
+                        task_prompt = task_prompt.replace('{{HERDR_TASK_COMMIT_HELPER}}', shlex.quote((guidance / 'task_commit_client.py').as_posix()))
+                        task_prompt = task_prompt.replace('{{HERDR_TASK_REVISION_REQUEST}}', shlex.quote((receipt_directory / ('revision-' + job['id'] + '-1.json')).as_posix()))
                     prompt += '\n\nAssigned task (start now in this checkout):\n' + task_prompt
                 environment_binding = job.get('environment_binding') or {}
                 environment_notice = ('\nInteractive SDK activation is unavailable: ' + environment_binding['reason']

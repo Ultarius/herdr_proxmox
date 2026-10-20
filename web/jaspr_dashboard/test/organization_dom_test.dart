@@ -333,6 +333,114 @@ void main() {
   );
 
   test(
+    'release planning has a separate opt-in and does not enable task execution',
+    () async {
+      var policy = <String, dynamic>{};
+      await mount(
+        const OrganizationAutomation(organizationId: 'org'),
+        response: (request) {
+          if (request.url.path.endsWith('/organizations/automation'))
+            return {'policy': policy};
+          if (request.url.path.endsWith('/tasks/automation')) {
+            policy = Map<String, dynamic>.from(jsonDecode(request.body));
+            return {'policy': policy};
+          }
+          return null;
+        },
+      );
+      await click('Edit policy');
+      expect(policyInput('auto_create_releases').checked, isFalse);
+      policyInput('auto_create_releases').click();
+      await settle();
+      await click('Save');
+      expect(policy['auto_create_releases'], isTrue);
+      expect(policy['auto_queue_proposals'], isFalse);
+      expect(policy['auto_capture'], isFalse);
+      expect(policy['auto_validate'], isFalse);
+      expect(policy['auto_publish'], isFalse);
+      await click('Edit policy');
+      expect(policyInput('auto_create_releases').checked, isTrue);
+      await click('Cancel');
+    },
+  );
+
+  test(
+    'publication routes validate repository overrides and preserve separate grants',
+    () async {
+      var policy = <String, dynamic>{};
+      await mount(
+        const OrganizationAutomation(organizationId: 'org'),
+        response: (request) {
+          if (request.url.path.endsWith('/organizations/automation'))
+            return {'policy': policy};
+          if (request.url.path.endsWith('/tasks/automation')) {
+            policy = Map<String, dynamic>.from(jsonDecode(request.body));
+            return {'policy': policy};
+          }
+          return null;
+        },
+      );
+      await click('Edit policy');
+      final mode =
+          nodes('.dialog-layer [data-field="publication_mode"] select').single
+              as web.HTMLSelectElement;
+      expect(mode.value, 'release');
+      mode.value = 'both';
+      mode.dispatchEvent(web.Event('change', web.EventInit(bubbles: true)));
+      await settle();
+      var overrides = policyInput('publication_repositories');
+      overrides.value = '{bad';
+      overrides.dispatchEvent(web.Event('input', web.EventInit(bubbles: true)));
+      await click('Save');
+      expect(policy, isEmpty);
+      overrides = policyInput('publication_repositories');
+      expect(
+        nodes(
+          '.dialog-layer [data-field="publication_repositories"]',
+        ).single.getAttribute('aria-invalid'),
+        'true',
+      );
+      overrides.value = '{"repo":"task"}';
+      overrides.dispatchEvent(web.Event('input', web.EventInit(bubbles: true)));
+      await click('Save');
+      expect(policy['publication_mode'], 'both');
+      expect(policy['publication_repositories'], {'repo': 'task'});
+      expect(policy['auto_publish'], isFalse);
+    },
+  );
+
+  test(
+    'discussion artifacts explain release creation and point to the board',
+    () async {
+      await mount(
+        const GroupPage(id: 'group'),
+        jobs: [
+          {
+            ...proposalJob(),
+            'result': 'Release proposal',
+            'release_plan_outcome': {
+              'state': 'created',
+              'version': 'alpha.16',
+              'id': 'release-one',
+            },
+          },
+        ],
+      );
+      await click('Artifacts');
+      expect(
+        web.document.body!.textContent,
+        contains('Release plan alpha.16 created'),
+      );
+      expect(
+        nodes(
+          'button',
+        ).where((button) => button.textContent == 'View workflow board'),
+        hasLength(1),
+      );
+    },
+  );
+
+  test(
     'policy rejection stays in the modal, highlights its rule and preserves edits',
     () async {
       var policy = <String, dynamic>{

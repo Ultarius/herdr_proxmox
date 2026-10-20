@@ -188,6 +188,377 @@ void main() {
       : {'workspaces': [], 'agents': []};
 
   test(
+    'live snapshot binding identifies the current task on the board and list',
+    () async {
+      var activeTask = 'task', activeRun = 'current-run';
+      final current = publishedTask()
+        ..['state'] = 'pr_open'
+        ..['title'] = 'Repair delivery contracts'
+        ..['profile_id'] = 'worker'
+        ..['run_id'] = 'current-run'
+        ..['assigned_agent'] = {'id': 'worker', 'name': 'Nora'}
+        ..['pr_repair'] = {'state': 'running', 'kind': 'validation_update'};
+      final other = <String, dynamic>{
+        ...current,
+        'id': 'other-task',
+        'title': 'Other task',
+        'run_id': 'previous-run',
+        'pr_repair': null,
+      };
+      await mount(const TasksPage(), (request) {
+        if (request.url.path.endsWith('/snapshot'))
+          return {
+            'workspaces': [],
+            'agents': [
+              {
+                'name': 'nora-session',
+                'profile_id': 'worker',
+                'agent_status': 'working',
+                'run_id': activeRun,
+                'task_id': activeTask,
+              },
+            ],
+          };
+        if (request.url.path.endsWith('/tasks'))
+          return {
+            'tasks': [other, current],
+            'github': {'configured': true},
+          };
+        return {'workspaces': [], 'agents': []};
+      });
+      expect(
+        elements(
+          '.task-wf-node[data-work=working]',
+        ).single.getAttribute('data-node'),
+        'task',
+      );
+      expect(
+        elements('.agent-chip[data-current-task=task]').single.textContent,
+        contains('Repair delivery contracts'),
+      );
+      // A run can switch tasks without changing its Working activity label.
+      activeTask = 'other-task';
+      activeRun = 'previous-run';
+      connection!.send(DashboardCommand('refresh'));
+      await settle();
+      expect(
+        elements(
+          '.task-wf-node[data-work=working]',
+        ).single.getAttribute('data-node'),
+        'other-task',
+      );
+      activeTask = 'task';
+      activeRun = 'current-run';
+      connection!.send(DashboardCommand('refresh'));
+      await settle();
+      elements(
+        '[role=tab]',
+      ).firstWhere((tab) => tab.textContent!.startsWith('List')).click();
+      await settle();
+      final rows = elements(
+        'tr',
+      ).where((row) => row.querySelector('h2') != null).toList();
+      final active = rows.singleWhere(
+        (row) => row.textContent!.contains('Repair delivery contracts'),
+      );
+      final inactive = rows.singleWhere(
+        (row) => row.textContent!.contains('Other task'),
+      );
+      expect(active.querySelector('[data-live=true]'), isNotNull);
+      expect(
+        active.textContent,
+        contains('Resolving conflicts · running checks'),
+      );
+      expect(inactive.querySelector('[data-live=true]'), isNull);
+    },
+  );
+
+  test(
+    'ambiguous live bindings never pick an arbitrary current task',
+    () async {
+      final current = publishedTask()
+        ..['profile_id'] = 'worker'
+        ..['run_id'] = 'current-run';
+      await mount(const TasksPage(), (request) {
+        if (request.url.path.endsWith('/snapshot'))
+          return {
+            'workspaces': [],
+            'agents': [
+              for (final run in ['current-run', 'unexpected-run'])
+                {
+                  'name': run,
+                  'profile_id': 'worker',
+                  'agent_status': 'working',
+                  'run_id': run,
+                  'task_id': 'task',
+                },
+            ],
+          };
+        return taskResponse(request, current);
+      });
+      expect(elements('.task-wf-node[data-work]'), isEmpty);
+      expect(elements('.agent-chip[data-current-task]'), isEmpty);
+    },
+  );
+
+  test(
+    'freeze failures stay visible inside release details and link changed members',
+    () async {
+      final taskRow = publishedTask()..['head_sha'] = 'a' * 40;
+      final member = <String, dynamic>{
+        'task_id': 'task',
+        'title': 'Task with new commit',
+        'candidate_sha': 'a' * 40,
+        'current_candidate_sha': 'a' * 40,
+        'candidate_changed': false,
+      };
+      final release = <String, dynamic>{
+        'id': 'release-one',
+        'version': 'alpha.15',
+        'repository': 'repo',
+        'state': 'collecting',
+        'edit_version': 1,
+        'members': [member],
+      };
+      await mount(const TasksPage(), (request) {
+        if (request.url.path.endsWith('/releases/freeze')) {
+          member['candidate_changed'] = true;
+          member['current_candidate_sha'] = 'b' * 40;
+          taskRow['head_sha'] = 'b' * 40;
+          throw Exception(
+            'Task with new commit: selected candidate changed. Review Selected changes.',
+          );
+        }
+        if (request.url.path.endsWith('/tasks'))
+          return {
+            'tasks': [taskRow],
+            'releases': [release],
+            'github': {},
+          };
+        return {'workspaces': [], 'agents': []};
+      });
+      elements('[data-node="release:release-one"]').single.click();
+      await settle();
+      await click('Freeze and integrate 1 tasks');
+      await settle();
+      final dialog = elements('dialog').single;
+      expect(
+        dialog.textContent,
+        contains(
+          'Last release action could not complete: Task with new commit',
+        ),
+      );
+      expect(dialog.textContent, contains('Selection needs review'));
+      expect(dialog.textContent, contains('Current candidate ${'b' * 40}'));
+      await click('Review change: Task with new commit');
+      expect(
+        web.document.activeElement?.getAttribute('data-release-member'),
+        'task',
+      );
+    },
+  );
+
+  test(
+    'superseded inspection chat is visible in the activity subtitle',
+    () async {
+      final task = publishedTask()
+        ..['audit'] = [
+          {
+            'action': 'delivery_superseded',
+            'actor': 'gateway',
+            'at': 'now',
+            'head_sha': 'b' * 40,
+            'previous_sha': 'a' * 40,
+            'delivery_chat_id': 'inspection-old',
+          },
+        ];
+      await mount(
+        const TasksPage(taskId: 'task'),
+        (request) => taskResponse(request, task),
+      );
+      await click('Activity & agents');
+      expect(
+        elements('.timeline__time').any(
+          (element) => element.textContent!.contains(
+            'Superseded aaaaaaaa · chat inspection-old',
+          ),
+        ),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'published candidate ignores old delivery attention and offers its draft PR',
+    () async {
+      final task = publishedTask()
+        ..['await_verification'] = true
+        ..['builds'] = {
+          'b' * 40: {
+            'state': 'complete',
+            'target': 'b' * 40,
+            'required_checks_verified': true,
+          },
+        }
+        ..['delivery_workflow'] = {
+          'sha': 'a' * 40,
+          'state': 'attention',
+          'error': 'OLD CANDIDATE FAILURE',
+        };
+      await mount(
+        const TasksPage(taskId: 'task'),
+        (request) => taskResponse(request, task),
+      );
+      final text = web.document.getElementById('task-dom-test')!.textContent!;
+      expect(
+        text,
+        isNot(contains('Delivery needs attention: OLD CANDIDATE FAILURE')),
+      );
+      expect(text, contains('Branch published; open a draft pull request.'));
+      expect(
+        elements(
+          '.task-detail__next .task-detail__actions button',
+        ).any((e) => e.textContent!.contains('Review draft PR')),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'an old-policy pass offers revalidation in the next step and checks view',
+    () async {
+      final task = publishedTask()
+        ..['state'] = 'pr_open'
+        ..['merge_sha'] = 'c' * 40
+        ..['builds'] = {
+          'b' * 40: {
+            'target': 'b' * 40,
+            'state': 'complete',
+            'required_checks_verified': true,
+          },
+        }
+        ..['validation_policy'] = {
+          'target': 'b' * 40,
+          'matches': false,
+          'state': 'stale',
+          'reason':
+              'Recorded checks used a different policy. Validate latest commit under the current approved policy.',
+        };
+      await mount(const TasksPage(taskId: 'task'), (request) {
+        if (request.url.path.endsWith('/tasks/build')) {
+          task['validation_policy'] = null;
+          task['builds'] = {
+            'b' * 40: {'target': 'b' * 40, 'state': 'queued'},
+          };
+          return task;
+        }
+        return taskResponse(request, task);
+      });
+      final next = elements('.task-detail__next').single;
+      expect(next.textContent, contains('different policy'));
+      expect(next.textContent, isNot(contains('ready for review')));
+      expect(
+        next.querySelector('button')?.textContent,
+        'Validate latest commit',
+      );
+      await click('Checks & builds');
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('recorded checks passed; revalidation required'),
+      );
+      await click('Validate latest commit');
+      final request = posts.singleWhere(
+        (post) => post['path'] == '/api/tasks/build',
+      );
+      expect(request['target'], 'b' * 40);
+      expect(request['update_branch'], true);
+      expect(
+        elements(
+          'button',
+        ).where((node) => node.textContent == 'Validate latest commit'),
+        isEmpty,
+      );
+      expect(button('Validation in progress · view build').disabled, false);
+    },
+  );
+
+  test(
+    'current-policy complete evidence does not offer redundant validation',
+    () async {
+      final task = publishedTask()
+        ..['state'] = 'pr_open'
+        ..['builds'] = {
+          'b' * 40: {
+            'target': 'b' * 40,
+            'state': 'complete',
+            'required_checks_verified': true,
+          },
+        }
+        ..['validation_policy'] = {
+          'target': 'b' * 40,
+          'matches': true,
+          'state': 'current',
+        };
+      await mount(
+        const TasksPage(taskId: 'task'),
+        (request) => taskResponse(request, task),
+      );
+      expect(
+        elements(
+          'button',
+        ).where((node) => node.textContent == 'Validate latest commit'),
+        isEmpty,
+      );
+      expect(posts, isEmpty);
+    },
+  );
+
+  test(
+    'validate latest commit authorizes an update and shows saved progress',
+    () async {
+      final task = publishedTask()..['state'] = 'review_ready';
+      await mount(const TasksPage(taskId: 'task'), (request) {
+        if (request.url.path.endsWith('/tasks/build')) {
+          task['pr_repair'] = {
+            'kind': 'validation_update',
+            'state': 'queued',
+            'message': 'Updating task branch before validation',
+            'candidate': 'abcdef0123456789abcdef0123456789abcdef01',
+            'policy_files': ['.github/workflows/ci.yml'],
+          };
+          return task;
+        }
+        return taskResponse(request, task);
+      });
+      await click('Validate latest commit');
+      final request = posts.singleWhere(
+        (post) => post['path'] == '/api/tasks/build',
+      );
+      expect(request['update_branch'], isTrue);
+      expect(request['target'], task['head_sha']);
+      expect(
+        elements(
+          'button',
+        ).any((e) => e.textContent!.contains('View branch update')),
+        isTrue,
+      );
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('Updating task branch before validation'),
+      );
+      await click('View branch update');
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('Updated candidate:'),
+      );
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('Upstream validation files: .github/workflows/ci.yml'),
+      );
+    },
+  );
+
+  test(
     'capture and validation can be enabled independently with the gateway executor',
     () async {
       final task = <String, dynamic>{
@@ -346,6 +717,35 @@ void main() {
       await click('Validate and save');
       await settle();
       expect(posts, isEmpty);
+    },
+  );
+
+  test(
+    'release delivery hides task publication and creates a collecting single-task release',
+    () async {
+      final task = publishedTask()
+        ..['state'] = 'review_ready'
+        ..['publication_mode'] = 'release'
+        ..['task_publication_allowed'] = false
+        ..remove('publish');
+      await mount(const TasksPage(taskId: 'task'), (r) {
+        if (r.url.path == '/api/releases/single')
+          return {
+            'id': 'release-one',
+            'version': 'urgent-task',
+            'state': 'collecting',
+          };
+        return taskResponse(r, task);
+      });
+      final names = elements('button').map((e) => e.textContent).join(' ');
+      expect(names, isNot(contains('Review and publish')));
+      expect(names, isNot(contains('Open draft PR')));
+      await click('Release this task only');
+      final request = posts.single;
+      expect(request['path'], '/api/releases/single');
+      expect(request['task_id'], 'task');
+      expect(request['head_sha'], 'b' * 40);
+      expect(request['request_id'], isNotEmpty);
     },
   );
 
