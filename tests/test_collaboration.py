@@ -4,6 +4,7 @@ import sys
 import re
 import hashlib
 import json
+import subprocess
 import types
 import uuid
 import unittest
@@ -1361,6 +1362,61 @@ class CollaborationTests(unittest.TestCase):
         read = [args for args, _ in self.calls if args[:2] == ('agent', 'read')][-1]
         self.assertEqual(read[read.index('--source') + 1], 'visible')
 
+    def test_folder_request_inspection_is_bound_to_the_current_session_and_status(self):
+        from test_folder_access import prompt
+        run = next(j for j in self.store.snapshot()['jobs'] if j.get('profile_id') == self.max and j['kind'] == 'launch')
+        agent = self.agents[run['alias']]
+        original = self.store.command
+        resumed = False
+        def command(*args, **kwargs):
+            if args[:2] == ('agent', 'read'):
+                if resumed:
+                    agent['agent_status'] = 'working'
+                return dict(output=prompt())
+            return original(*args, **kwargs)
+        self.store.command = command
+        def inspect():
+            return self.store.action('inspect', dict(request_id=uuid.uuid4().hex, organization_id=self.org, profile_id=self.max))
+        agent['agent_status'] = 'blocked'
+        result = inspect()
+        self.assertEqual(result['access_request']['paths'], ['/home/herdr/.cache/*', '/tmp/opencode/client-target/*'])
+        self.assertTrue(result['console_token'])
+        self.assertIsNone(inspect()['reply_job_id'])
+        resumed = True
+        result = inspect()
+        self.assertIsNone(result['access_request'])
+        self.assertIsNone(result['console_token'])
+        # Replacing the session while reading must refuse the whole inspection.
+        def replaced(*args, **kwargs):
+            if args[:2] == ('agent', 'read'):
+                agent['agent_session'] = {'value': 'other-session'}
+                return dict(output=prompt())
+            return original(*args, **kwargs)
+        self.store.command = replaced
+        with self.assertRaises(ValueError):
+            inspect()
+
+    def test_inspection_rereads_visible_prompt_when_idle_session_blocks_during_read(self):
+        from test_folder_access import prompt
+        from collaboration import inspect_output
+        run = next(j for j in self.store.snapshot()['jobs'] if j.get('profile_id') == self.max and j['kind'] == 'launch')
+        agent = self.agents[run['alias']]
+        original = self.store.command
+        sources = []
+        def command(*args, **kwargs):
+            if args[:2] == ('agent', 'read'):
+                sources.append(args[args.index('--source') + 1])
+                agent['agent_status'] = 'blocked'
+                return dict(output='prior reply' if sources[-1] == 'recent-unwrapped' else prompt())
+            return original(*args, **kwargs)
+        agent['agent_status'] = 'idle'
+        self.store.command = command
+        result = inspect_output(self.store, run)
+        self.assertEqual(sources, ['recent-unwrapped', 'visible'])
+        self.assertEqual(result['status'], 'blocked')
+        self.assertTrue(result['console_token'])
+        self.assertEqual(result['access_request']['paths'][0], '/home/herdr/.cache/*')
+
     def test_group_discussion_and_artifact_persist(self):
         group = self.group()
         self.assertTrue(next(g for g in self.store.snapshot()['groups'] if g['id'] == group)['read_only'])
@@ -1386,7 +1442,8 @@ class CollaborationTests(unittest.TestCase):
         member = next(j for j in self.store.snapshot()['jobs']
                       if j['kind'] == 'launch' and j['profile_id'] == self.max)
         checkout = str(self.projects / '.herdr-worktrees' / 'max')
-        self.store.update_job(member['id'], worktree_path=checkout)
+        self.store.update_job(member['id'], worktree_path=checkout,
+                              toolchain_policy=dict(policy=dict(toolchains=[dict(name='node', required='22.0.0', component='client')])))
         self.agents[member['alias']]['cwd'] = str(self.projects / 'different-project')
         job_id = self.action('discuss', organization_id=self.org, group_id=group,
                              prompt='Share the latest work')
@@ -1401,9 +1458,13 @@ class CollaborationTests(unittest.TestCase):
         self.assertEqual(max_context['configured_project'], str(self.projects))
         self.assertEqual(max_context['launch_directory'], checkout)
         self.assertEqual(max_context['herdr_reported_cwd'], str(self.projects / 'different-project'))
+        self.assertEqual(max_context['toolchains'], [dict(name='node', required='22.0.0', component='client',
+                                                        commands=['node', 'npm'], capacity_wrapper=None)])
+        self.assertNotIn('rustup', prompt)
         iris_context = next(c for c in contexts if c['name'] == 'Iris')
         self.assertEqual(iris_context['launch_directory'], str(self.projects))
         self.assertIsNone(iris_context['herdr_reported_cwd'])
+        self.assertEqual(iris_context['toolchains'], [])
 
     def test_live_discussion_inspects_bound_agents_and_incremental_documents(self):
         group = self.group()
@@ -1437,6 +1498,31 @@ class CollaborationTests(unittest.TestCase):
         self.store.update_job(job['runs'][0]['id'], state='released')
         self.assertEqual(inspect()['streams'][1]['status'], 'unavailable')
 
+    def test_group_folder_requests_are_attributed_only_to_the_blocked_binding(self):
+        from test_folder_access import prompt
+        group = self.group()
+        job_id = self.action('discuss', organization_id=self.org, group_id=group)
+        self.drain()
+        job = self.job(job_id)
+        self.store.update_job(job_id, state='running')
+        self.agents[job['runs'][0]['alias']]['agent_status'] = 'blocked'
+        original = self.store.command
+        def command(*args, **kwargs):
+            if args[:2] == ('agent', 'read'):
+                return dict(output='Earlier output\n' * 2000 + prompt())
+            return original(*args, **kwargs)
+        self.store.command = command
+        def inspect():
+            return self.store.action('inspect', dict(request_id=uuid.uuid4().hex, organization_id=self.org, job_id=job_id))
+        result = inspect()
+        requests = [s for s in result['streams'] if s.get('access_request')]
+        self.assertEqual([s['profile_id'] for s in requests], [self.max])
+        self.assertEqual(requests[0]['name'], 'Max')
+        self.assertTrue(requests[0]['output'].endswith(prompt()))
+        self.assertLessEqual(len(requests[0]['output']), 20000)
+        self.agents[job['runs'][0]['alias']]['agent_status'] = 'working'
+        self.assertFalse(any(s.get('access_request') for s in inspect()['streams']))
+
     def test_group_paths_are_saved_in_facilitator_policy(self):
         # This fixture normally uses Codex; change saved profiles before group creation.
         with closing(self.store.connect()) as db, db:
@@ -1454,6 +1540,81 @@ class CollaborationTests(unittest.TestCase):
             facilitator = self.store.get(db, 'profiles', group['facilitator_id'])
         self.assertEqual(group['accessible_paths'], ['~/reference/**'])
         self.assertEqual(facilitator['accessible_paths'], group['accessible_paths'])
+
+    def test_opencode_discussion_and_task_worktrees_do_not_grant_the_source_checkout(self):
+        # Real Git metadata and worktrees reproduce the screenshot: the group
+        # and both members run outside the configured source repository.
+        project = self.projects / 'game'
+        project.mkdir()
+        def git(*args):
+            return subprocess.run(['git', *args], check=True, capture_output=True, timeout=20)
+        git('init', str(project))
+        (project / 'plan.md').write_text('Committed review baseline\n', encoding='utf-8')
+        git('-C', str(project), 'add', 'plan.md')
+        git('-C', str(project), '-c', 'user.name=Test', '-c', 'user.email=test@example.test',
+            'commit', '-m', 'Baseline')
+        original = self.store.command
+        def command(*args, **kwargs):
+            if args[:2] == ('worktree', 'create'):
+                self.calls.append((args, kwargs))
+                git('-C', args[args.index('--cwd') + 1], 'worktree', 'add', '-b',
+                    args[args.index('--branch') + 1], args[args.index('--path') + 1])
+                return {'root_pane': {'pane_id': f'w{900 + len(self.calls)}:p1'}}
+            return original(*args, **kwargs)
+        self.store.command = command
+        members = [self.hire(self.org, name=name, runtime='opencode', project=str(project))
+                   for name in ('Reviewer', 'Architect')]
+        group = self.action('group', organization_id=self.org, name='Source review',
+                            description='Review the committed game plan', members=members)
+        self.drain()
+        launched = next(run for run in self.store.job_records()
+                        if run['kind'] == 'launch' and run['profile'].get('group_id') == group)
+        self.assertEqual(launched['state'], 'persona_sent', launched.get('error'))
+        identifier = self.action('discuss', organization_id=self.org, group_id=group,
+                                 prompt='Review the committed plan')
+        self.drain()
+        discussion = self.job(identifier)
+        self.assertEqual(discussion['state'], 'artifact_ready', discussion.get('error'))
+        checkouts = set()
+        scratches = set()
+        for run in [discussion['group_run'], *discussion['runs']]:
+            run = self.job(run['id'])
+            self.assertEqual(run['workspace_mode'], 'worktree')
+            checkouts.add(run['worktree_path'])
+            scratches.add(run['scratch_directory'])
+            self.assertTrue(Path(run['scratch_directory']).is_relative_to(Path(run['worktree_path'])))
+            self.assertNotEqual(run['worktree_path'], str(project))
+            self.assertEqual(run['source_project'], str(project))
+            path = self.root / 'home/.config/opencode/agents' / ('herdr-dashboard-' + run['profile_id'] + '.md')
+            content = path.read_text(encoding='utf-8')
+            rule = json.loads(next(line.removeprefix('permission: ') for line in content.splitlines()
+                                   if line.startswith('permission: ')))
+            expected = {str(self.store.path.parent / 'chat-replies/**'),
+                        str(self.store.path.parent / 'discussion-artifacts/**')}
+            self.assertEqual(rule, {'external_directory': {p: 'allow' for p in expected}})
+            # The assigned worktree can inspect the same frozen bytes without
+            # switching branches or modifying the source checkout.
+            self.assertEqual(git('-C', run['worktree_path'], 'show', 'HEAD:plan.md').stdout,
+                             b'Committed review baseline\n')
+        self.assertEqual(len(checkouts), 3)
+        self.assertEqual(len(scratches), 3)
+        prompt = next(args[3] for args, _ in self.calls if args[:2] == ('agent', 'prompt')
+                      and 'Workspace context (from saved' in args[3])
+        for scratch in scratches:
+            self.assertIn(json.dumps(scratch), prompt)
+        self.assertIn('Scratch writes for this analysis are permitted even in a read-only discussion', prompt)
+        self.assertIn('missing_toolchain', prompt)
+        self.assertIn("not configured_project", prompt)
+        worker = self.hire(self.org, name='Task worker', runtime='opencode', project=str(project))
+        identifier = self.action('launch', organization_id=self.org, profile_id=worker, task_id='a' * 32,
+                                 worktree_branch='herdr/task-' + 'a' * 12,
+                                 start_sha=git('-C', str(project), 'rev-parse', 'HEAD').stdout.decode().strip(),
+                                 task_prompt='Work in the assigned task checkout')
+        self.drain()
+        run = self.job(identifier)
+        self.assertEqual(run['state'], 'persona_sent', run.get('error'))
+        policy = (self.root / 'home/.config/opencode/agents' / ('herdr-dashboard-' + worker + '.md')).read_text(encoding='utf-8')
+        self.assertNotIn(str(project / '**'), policy)
 
     def test_transcript_download_returns_saved_json_and_checks_scope(self):
         job_id = self.action('discuss', organization_id=self.org, group_id=self.group())

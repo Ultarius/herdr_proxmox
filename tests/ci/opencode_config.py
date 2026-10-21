@@ -57,6 +57,8 @@ def check(binary, gateway):
             return result.stdout
         version = cli('--version').strip()
         output = home / 'outputs'
+        source = home / 'projects/game'
+        source.mkdir(parents=True, exist_ok=True)
         cases = [
             ('default', {}, ('chat-replies',)),
             ('model', dict(provider='herdr-probe', model='probe'), ('chat-replies',)),
@@ -93,6 +95,10 @@ def check(binary, gateway):
                     assert last('external_directory', str(output / folder / '**')) == 'allow', case + ': missing output grant'
                 if case == 'permissions':
                     assert last('external_directory', '/herdr-smoke-shared/**') == 'allow', 'Custom path grant lost'
+                if case == 'discussion':
+                    assert last('external_directory', str(source / '**')) == 'ask', 'Source project access was widened'
+                    assert last('external_directory', str(source.parent / '**')) == 'ask', 'Projects parent allowed'
+                    assert last('external_directory', str(source.parent / 'other/**')) == 'ask', 'Sibling project allowed'
             if case == 'reasoning':
                 assert resolved.get('model') == dict(providerID='herdr-probe', modelID='probe'), 'Reasoning model lost'
                 assert resolved.get('variant') == 'high', 'Reasoning variant lost'

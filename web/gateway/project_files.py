@@ -1,5 +1,5 @@
 """Shared project boundaries and durable background cloning."""
-from contextlib import closing
+from contextlib import closing, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
@@ -48,7 +48,7 @@ def validate_clone(root, body):
         raise ValueError('Project folder must be directly inside the projects directory.')
 
 
-def clone_repository(root, body, prepared=False):
+def clone_repository(root, body, prepared=False, connections=None):
     if not prepared:
         validate_clone(root, body)
     target = root / body['folder']
@@ -58,9 +58,14 @@ def clone_repository(root, body, prepared=False):
     env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0',
            'GIT_SSH_COMMAND': 'ssh -o BatchMode=yes -o StrictHostKeyChecking=yes'}
     try:
-        result = subprocess.run(['git', '-c', 'protocol.file.allow=never', '-c', 'protocol.ext.allow=never',
-                                 'clone', '--', url, str(target)],
-                                capture_output=True, text=True, timeout=120, env=env)
+        connection_id = body.get('connection_id')
+        if connection_id and connections is None:
+            raise ValueError('Repository connections are unavailable on this gateway.')
+        credentials = connections.credentials(connection_id, url) if connection_id else nullcontext(env)
+        with credentials as environment:
+            result = subprocess.run(['git', '-c', 'protocol.file.allow=never', '-c', 'protocol.ext.allow=never',
+                                     'clone', '--', url, str(target)],
+                                    capture_output=True, text=True, timeout=120, env=environment)
         if result.returncode:
             diagnostic = redact(result.stderr or '')
             logging.warning('Git clone failed: %s', diagnostic)
@@ -68,11 +73,14 @@ def clone_repository(root, body, prepared=False):
             raise ValueError(reason + ' The destination folder was retained for inspection.')
     except subprocess.TimeoutExpired as exc:
         raise ValueError('Git clone timed out after two minutes. The destination folder was retained for inspection.') from exc
+    if body.get('connection_id'):
+        connections.bind(body['connection_id'], target)
     return dict(cwd=str(target), message='Repository cloned. Select this project when configuring agents.')
 
 
 class ProjectJobs:
-    def __init__(self, root, path):
+    def __init__(self, root, path, connections=None):
+        self.connections = connections
         self.root = Path(root).resolve()
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,10 +115,16 @@ class ProjectJobs:
         if not isinstance(body, dict):
             raise ValueError('Expected a JSON object.')
         validate_clone(self.root, body)
+        if body.get('connection_id'):
+            if self.connections is None:
+                raise ValueError('Repository connections are unavailable on this gateway.')
+            with self.connections.credentials(body['connection_id'], body['url']):
+                pass
         target = self.root / body['folder']
         target.mkdir()
         job = dict(id=uuid.uuid4().hex, folder=body['folder'], cwd=str(target),
-                   state='queued', error='', created_at=datetime.now(timezone.utc).isoformat())
+                   state='queued', error='', url=body['url'], connection_id=body.get('connection_id'),
+                   created_at=datetime.now(timezone.utc).isoformat())
         self.save(job)
         self.worker.submit(self.execute, job, dict(body))
         return job
@@ -119,7 +133,7 @@ class ProjectJobs:
         job.update(state='running')
         self.save(job)
         try:
-            clone_repository(self.root, body, prepared=True)
+            clone_repository(self.root, body, prepared=True, connections=self.connections)
             job.update(state='completed')
         except (ValueError, OSError, subprocess.TimeoutExpired) as error:
             job.update(state='failed', error=redact(error))

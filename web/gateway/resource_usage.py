@@ -6,8 +6,9 @@ import time
 
 
 class ResourceUsage:
-    def __init__(self, proc='/proc', cgroup='/sys/fs/cgroup'):
+    def __init__(self, proc='/proc', cgroup='/sys/fs/cgroup', storage=None):
         self.proc, self.cgroup = Path(proc), Path(cgroup)
+        self.storage = Path.home() if storage is None else Path(storage)
         self.lock = threading.Lock()
         self.previous = None
         self.processes = {}
@@ -23,6 +24,9 @@ class ResourceUsage:
                 data = self.sample(stamp)
             except (OSError, ValueError, IndexError, KeyError):
                 data = {'available': False, 'error': 'Container metrics unavailable.'}
+            import build_capacity
+            data['build_capacity'] = build_capacity.snapshot(storage=self.storage)
+            data['storage'] = data['build_capacity']['storage']
             self.cached, self.checked = data, stamp
             return data
 
@@ -89,4 +93,4 @@ class ResourceUsage:
                 'swap_used': swap_used, 'swap_total': swap_total, 'processes': rows[:20]}
 
 
-resources = ResourceUsage()
+resources = ResourceUsage(storage=os.environ.get('HERDR_PROJECTS', '/home/herdr/projects'))

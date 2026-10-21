@@ -20,6 +20,7 @@ from organizations import OrganizationStore
 from integration import IntegrationWatcher
 from integration_coordinator import IntegrationCoordinator
 from project_files import ProjectJobs, clone_repository, project_directory
+from repository_connections import RepositoryConnections
 from cli_setup import CliSetup
 import model_catalog
 import team_templates
@@ -463,7 +464,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/api/organizations/templates':
                 self.reply(200, dict(team_templates.snapshot(), saved_templates=self.server.organizations.saved_templates()))
                 return
-            if self.path not in ('/api/snapshot', '/api/organizations', '/api/organizations/directory', '/api/organizations/state', '/api/projects/jobs', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates', '/api/models', '/api/integration', '/api/sdk', '/api/build-service', '/api/projects/toolchains', '/api/validation', '/api/tasks', '/api/github', '/api/discovery'):
+            if self.path not in ('/api/snapshot', '/api/organizations', '/api/organizations/directory', '/api/organizations/state', '/api/projects/jobs', '/api/projects/connections', '/api/cli-setup', '/api/logs', '/api/ssh-access', '/api/dashboard-access', '/api/herdr-server', '/api/updates', '/api/models', '/api/integration', '/api/sdk', '/api/build-service', '/api/projects/toolchains', '/api/validation', '/api/tasks', '/api/github', '/api/discovery'):
                 self.reply(404, {'error': 'Unknown endpoint.'})
                 return
             try:
@@ -483,6 +484,12 @@ class Handler(BaseHTTPRequestHandler):
                         self.reply(403, {'error': 'Only an administrator can view GitHub publishing configuration.'})
                         return
                     self.reply(200, self.server.github.snapshot())
+                    return
+                if self.path == '/api/projects/connections':
+                    if self.operator['role'] != 'admin':
+                        self.reply(403, {'error': 'Only an administrator can view repository connections.'})
+                        return
+                    self.reply(200, self.server.repository_connections.snapshot())
                     return
                 if self.path == '/api/projects/jobs':
                     self.reply(200, self.server.projects.snapshot())
@@ -660,7 +667,7 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'resolve_delegation', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'retry_discussion', 'cancel_discussion', 'remove_agent', 'remove_group', 'session', 'realign_discussion_session')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close', 'verify', 'install_integration')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/knowledge', '/api/updates/install', '/api/updates/check', '/api/updates/alphas', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/build-service/install', '/api/validation/run', '/api/projects/clone', '/api/projects/browse', '/api/projects/git', '/api/projects/toolchain', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/guidance', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/start_proposal', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/publication', '/api/tasks/repair', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build', '/api/tasks/policy', '/api/tasks/complete', '/api/tasks/discuss', '/api/tasks/review_policy', '/api/tasks/proposal', '/api/tasks/assignment', '/api/tasks/automation', '/api/tasks/discovery', '/api/tasks/handover', '/api/tasks/consult', '/api/tasks/acceptance'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/knowledge', '/api/updates/install', '/api/updates/check', '/api/updates/alphas', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/build-service/install', '/api/validation/run', '/api/projects/clone', '/api/projects/connections', '/api/projects/browse', '/api/projects/git', '/api/projects/toolchain', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/guidance', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/start_proposal', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/publication', '/api/tasks/repair', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build', '/api/tasks/policy', '/api/tasks/complete', '/api/tasks/discuss', '/api/tasks/review_policy', '/api/tasks/proposal', '/api/tasks/assignment', '/api/tasks/automation', '/api/tasks/discovery', '/api/tasks/handover', '/api/tasks/consult', '/api/tasks/acceptance'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -782,7 +789,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, result)
             elif self.path == '/api/projects/browse':
                 self.reply(200, project_explorer.browse(PROJECTS, body))
+            elif self.path == '/api/projects/connections':
+                if role != 'admin':
+                    self.reply(403, dict(error='Only an administrator can configure repository connections.'))
+                    return
+                self.reply(200, self.server.repository_connections.action(body, role))
             elif self.path == '/api/projects/clone':
+                if body.get('connection_id') and role != 'admin':
+                    self.reply(403, dict(error='Only an administrator can clone with a managed repository connection.'))
+                    return
                 self.reply(200, self.server.projects.start(body))
             elif self.path == '/api/knowledge':
                 self.reply(200, self.server.contributions.knowledge.action(body, actor, role))
@@ -908,7 +923,9 @@ def main():
     contributions = Contributions(DATABASE.with_name('tasks.sqlite3'), PROJECTS, organizations, github)
     run_logs = RunLogs(DATABASE.parent / 'run-logs', BIN)
     ssh_access = SshAccess()
-    projects = ProjectJobs(PROJECTS, DATABASE.with_name('projects.sqlite3'))
+    repository_connections = RepositoryConnections(DATABASE.parent / 'repository-connections', PROJECTS, github)
+    project_git.REPOSITORY_CONNECTIONS = repository_connections
+    projects = ProjectJobs(PROJECTS, DATABASE.with_name('projects.sqlite3'), repository_connections)
     coordinator = IntegrationCoordinator(DATABASE.with_name('integration.sqlite3'), organizations,
                                          sdk_request=lambda name: sdk_install.install({'toolchain': name}))
     build_queue = None
@@ -965,7 +982,7 @@ def main():
     RUNTIME_EVENTS.start()
     contributions.start()
     try:
-        serve_gateway(bind, 8787, policy, token, {'github': github, 'contributions': contributions, 'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator, 'operators': operators, 'sdk_install': sdk_install, 'build_service_install': build_service_install, 'validation': validation, 'analysis': analysis, 'environments': environments, 'repository_queries': queries}, cookie_secure=secure_setting == '1')
+        serve_gateway(bind, 8787, policy, token, {'github': github, 'repository_connections': repository_connections, 'contributions': contributions, 'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator, 'operators': operators, 'sdk_install': sdk_install, 'build_service_install': build_service_install, 'validation': validation, 'analysis': analysis, 'environments': environments, 'repository_queries': queries}, cookie_secure=secure_setting == '1')
     finally:
         try:
             environments.close()

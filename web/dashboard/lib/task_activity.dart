@@ -74,6 +74,9 @@ String taskNextStep(Map task, {String executor = 'service'}) {
   }
   if (task['automation_error'] != null)
     return 'Automation needs attention: ${task['automation_error']}';
+  if (['implementing', 'review_ready'].contains(task['state']))
+    if (task['automation_wait'] case final Map waiting)
+      return '${waiting['message'] ?? 'Waiting for the assigned agent.'}';
   final delivery = task['delivery_workflow'] as Map?;
   if ((task['await_verification'] == true || task['auto_publish'] == true) &&
       delivery != null &&

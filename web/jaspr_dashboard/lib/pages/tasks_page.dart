@@ -118,6 +118,7 @@ class _TasksPageState extends State<TasksPage> {
   List<Map<String, dynamic>> tasks = [];
   List<Map<String, dynamic>> releases = [];
   Map<String, dynamic> github = {};
+  Map<String, dynamic> storage = {};
   String executor = 'unavailable';
   String section = 'Overview';
   final Set<String> expandedMeetings = {};
@@ -158,6 +159,7 @@ class _TasksPageState extends State<TasksPage> {
           tasks = [];
           releases = [];
           github = {};
+          storage = {};
           error = null;
           readError = null;
           requests.clear();
@@ -258,6 +260,7 @@ class _TasksPageState extends State<TasksPage> {
             readError = detailError;
           }
           github = Map<String, dynamic>.from(data['github'] ?? {});
+          storage = Map<String, dynamic>.from(data['storage'] ?? {});
           releases = List<Map<String, dynamic>>.from(data['releases'] ?? []);
           executor = '${data['executor'] ?? 'unavailable'}';
         });
@@ -1099,7 +1102,7 @@ class _TasksPageState extends State<TasksPage> {
 
   @override
   Component build(BuildContext context) {
-    if (selectedId != null) return _detail();
+    if (selectedId != null) return ui.el('div', [_storageNotice(), _detail()]);
     final open = tasks
         .where((t) => !['merged', 'completed', 'closed'].contains(t['state']))
         .length;
@@ -1142,6 +1145,7 @@ class _TasksPageState extends State<TasksPage> {
           ),
         ],
       ),
+      _storageNotice(),
       ui.el('div', [
         ui.el('p', [
           ui.text(
@@ -1228,6 +1232,10 @@ class _TasksPageState extends State<TasksPage> {
       DiscoveryPanel(coordinator: component.coordinator),
     ], classes: 'task-page task-index');
   }
+
+  Component _storageNotice() => storage['blocked'] == true
+      ? ui.notice('Storage needs attention: ${storage['reason']}', error: true)
+      : Component.fragment([]);
 
   /// Live agent activity by profile id, from the dashboard snapshot.
   Map<String, String> get activity => {

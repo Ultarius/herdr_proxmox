@@ -250,6 +250,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
                             (body?['template_roles'] as List? ?? [])
                                 .isNotEmpty) ||
                         path == 'projects/clone' ||
+                        path == 'projects/connections' ||
                         (path == 'projects/git' &&
                             ['fetch', 'update_base'].contains(body?['action']))
                     ? 135

@@ -17,6 +17,7 @@ void main() {
     addTearDown(tester.view.resetDevicePixelRatio);
     var inspections = 0;
     var reply = 'First reply';
+    var blocked = true;
     var finished = false;
     var interrupted = false;
     var recoveries = 0;
@@ -37,8 +38,12 @@ void main() {
                 {
                   'profile_id': 'facilitator',
                   'name': 'Standup',
-                  'status': 'working',
+                  'status': blocked ? 'blocked' : 'working',
                   'output': 'Coordinating members',
+                  'access_request': {
+                    'source': 'visible_terminal',
+                    'paths': ['/tmp/pinned/*', '/home/herdr/.cache/*'],
+                  },
                 },
               ],
               'artifact_draft': 'Partial action brief',
@@ -94,6 +99,11 @@ void main() {
       () => connection,
       lifecycle: BlocLifecycle.permanent,
     );
+    addTearDown(() async {
+      await tester.pumpWidget(const SizedBox.shrink());
+      await connection.disconnect();
+      await BlocScope.reset();
+    });
     final connected = connection.stream.firstWhere(
       (_) => connection.state.connected,
     );
@@ -110,15 +120,20 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Live discussion · 1 replies'), findsOneWidget);
     expect(find.text('First reply'), findsNothing);
+    expect(find.text('Standup · Requested folder access'), findsOneWidget);
+    expect(find.text('/tmp/pinned/*'), findsOneWidget);
+    expect(find.text('/home/herdr/.cache/*'), findsOneWidget);
     await tester.tap(find.text('Live discussion · 1 replies'));
     await tester.pumpAndSettle();
     expect(find.text('First reply'), findsOneWidget);
     expect(find.text('Partial action brief'), findsNothing);
     reply = 'Updated reply';
+    blocked = false;
     await tester.pump(const Duration(seconds: 1));
     await tester.pumpAndSettle();
     expect(find.text('Updated reply'), findsOneWidget);
     expect(find.text('Standup: working'), findsOneWidget);
+    expect(find.text('Standup · Requested folder access'), findsNothing);
     await tester.tap(find.text('Discussion artifact draft · In progress'));
     await tester.pumpAndSettle();
     expect(find.text('Partial action brief'), findsOneWidget);

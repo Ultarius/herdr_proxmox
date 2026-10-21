@@ -1,4 +1,5 @@
 import 'snapshot_terminal.dart';
+import 'folder_access_panel.dart';
 import 'dart:async';
 
 import 'dart:convert';
@@ -521,7 +522,7 @@ class _GroupPageState extends State<GroupPage> {
   Component liveDiscussion(Json job) {
     final data = live[job['id']] ?? <String, dynamic>{};
 
-    return disclosure(
+    final discussion = disclosure(
       'Live discussion',
       [
         if (data['inspection_error'] != null)
@@ -564,6 +565,8 @@ class _GroupPageState extends State<GroupPage> {
             attributes: {'data-profile-id': '${stream['profile_id']}'},
             children: [
               disclosure('${stream['name']} · ${stream['status']}', [
+                if (stream['scratch_directory'] != null)
+                  note('Session scratch: ${stream['scratch_directory']}'),
                 if ('${stream['error'] ?? ''}'.isNotEmpty)
                   errorLine('Terminal output unavailable: ${stream['error']}'),
                 if ('${stream['output'] ?? ''}'.isEmpty &&
@@ -640,8 +643,15 @@ class _GroupPageState extends State<GroupPage> {
           ),
       ],
       iconName: 'activity',
-      classes: 'group-live',
+      classes: 'group-live__details',
     );
+    return el('div', [
+      // Keep requests visible outside collapsed live terminal output.
+      if (data['inspection_error'] == null)
+        for (final stream in records(data['streams']))
+          folderAccessPanel(stream, name: '${stream['name']}'),
+      discussion,
+    ], classes: 'group-live');
   }
 
   Component discussion(Json job) {

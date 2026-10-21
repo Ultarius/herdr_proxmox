@@ -15,7 +15,7 @@ DELIVERY_BLOCKED = 'blocked'
 DELIVERY_STATES = (DELIVERY_NONE, DELIVERY_UNKNOWN, DELIVERY_SENT, DELIVERY_BLOCKED)
 
 # Refusals that happen before any terminal input is sent.
-_REFUSED = ('agent_blocked', 'agent_not_ready', 'agent_not_found', 'agent_not_running',
+_REFUSED = ('agent_blocked', 'agent_working', 'agent_not_ready', 'agent_not_found', 'agent_not_running',
             'pane_not_found', 'pane_not_running', 'invalid_arguments', 'server_not_running')
 # Failures where input may already have been delivered.
 _AMBIGUOUS = ('timeout', 'agent_prompt_stalled', 'pane_input_failed', 'events_lost')

@@ -38,6 +38,59 @@ Future<void> withDashboardConnection(
 }
 
 void main() {
+  for (final selected in [false, true]) {
+    testWidgets(
+      'disk-full warning is visible in ${selected ? 'task detail' : 'task list'} and recovers',
+      (tester) async {
+        final disk = <String, dynamic>{
+          'blocked': true,
+          'reason': 'Low disk space. Restore storage.',
+        };
+        final task = <String, dynamic>{
+          'id': 'task',
+          'state': 'implementing',
+          'title': 'Original task',
+          'repository': 'repo',
+        };
+        final connection = DashboardBloc(
+          client: MockClient(
+            (request) async => http.Response(
+              jsonEncode(
+                request.url.path.endsWith('/tasks')
+                    ? {
+                        'tasks': [task],
+                        'storage': disk,
+                        'github': {},
+                      }
+                    : request.url.path.endsWith('/tasks/detail')
+                    ? task
+                    : {'workspaces': [], 'agents': []},
+              ),
+              200,
+            ),
+          ),
+        );
+        await withDashboardConnection(tester, connection, () async {
+          BlocScope.register<DashboardBloc>(() => connection);
+          connection.connect('token');
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(body: TasksPage(taskId: selected ? 'task' : null)),
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(
+            find.textContaining('Storage needs attention: Low disk space.'),
+            findsOneWidget,
+          );
+          disk['blocked'] = false;
+          await tester.pump(const Duration(seconds: 15));
+          await tester.pumpAndSettle();
+          expect(find.textContaining('Storage needs attention:'), findsNothing);
+        });
+      },
+    );
+  }
   testWidgets(
     'draft PR previews public text and sends only after confirmation',
     (tester) async {

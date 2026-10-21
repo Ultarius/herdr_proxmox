@@ -5,6 +5,8 @@ import 'package:web/web.dart' as web;
 import 'ui.dart';
 import 'services.dart';
 import 'navigation.dart';
+import 'repository_connections.dart';
+import 'package:herdr_dashboard_state/repository_connections.dart';
 
 String agentName(Map<String, dynamic> agent) =>
     '${agent['display_name'] ?? agent['name'] ?? agent['agent'] ?? agent['pane_id'] ?? 'Agent'}';
@@ -1183,7 +1185,34 @@ class _SystemHealthState extends State<SystemHealth> {
               ),
               usage('health-memory', 'memory-stick', 'Memory', 'memory'),
               usage('health-swap', 'hard-drive', 'Swap', 'swap'),
+              if (d['storage'] case final Map disk)
+                if (disk['available'] == true)
+                  meter(
+                    'health-disk',
+                    'hard-drive',
+                    'Disk',
+                    '${mib(disk['free_bytes'])} MiB available',
+                    ratio(disk['used_bytes'], disk['total_bytes']),
+                    '${mib(disk['free_bytes'])} MiB available on the projects filesystem',
+                  ),
             ], classes: 'meters'),
+            if (d['storage'] case final Map disk)
+              if (disk['blocked'] == true)
+                notice(
+                  'Storage needs attention: ${disk['reason']}',
+                  error: true,
+                ),
+            if (d['build_capacity'] case final Map capacity) ...[
+              el('p', [
+                text(
+                  'Heavy builds: ${capacity['active'] == null ? 'idle' : 'running'}'
+                  ' · ${capacity['waiting'] ?? 0} waiting'
+                  ' · up to ${capacity['compiler_jobs'] ?? 1} compiler jobs per build',
+                ),
+              ], classes: 'health__sampled'),
+              if ('${capacity['waiting_reason'] ?? ''}'.isNotEmpty)
+                notice('${capacity['waiting_reason']} New builds will wait.'),
+            ],
             if ((d['memory_total'] as num) > 0 &&
                 (d['memory_used'] as num) / (d['memory_total'] as num) >= .9)
               notice(
@@ -1221,6 +1250,9 @@ class CloneProjectCard extends StatefulComponent {
 class _CloneProjectCardState extends State<CloneProjectCard> {
   String url = '';
   String folder = '';
+  String connectionId = '';
+  String? unavailableConnection;
+  List<Map<String, dynamic>> connections = [];
   bool busy = false;
   Timer? timer;
   List<Map<String, dynamic>> jobs = [];
@@ -1245,6 +1277,11 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       final next = List<Map<String, dynamic>>.from(data['jobs'] ?? []);
       if (jsonEncode(next) != jsonEncode(jobs)) setState(() => jobs = next);
       final latest = jobs.firstOrNull;
+      if (latest != null &&
+          ['failed', 'interrupted', 'completed'].contains(latest['state']) &&
+          result?.startsWith('Clone queued.') == true) {
+        setState(() => result = null);
+      }
       if (latest?['state'] == 'completed' && latest?['id'] != completed) {
         completed = latest!['id'] as String;
         component.onCloned(latest['cwd'] as String);
@@ -1261,6 +1298,14 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
   }
 
   Future<void> clone() async {
+    if (unavailableConnection != null ||
+        !knownRepositoryConnection(connections, connectionId)) {
+      setState(
+        () => result =
+            'The saved repository connection is unavailable. Refresh connections and select one before cloning.',
+      );
+      return;
+    }
     final connection = dashboardConnection;
     final epoch = connection.generation;
     setState(() {
@@ -1271,6 +1316,7 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       final data = await connection.request('projects/clone', {
         'url': url.trim(),
         'folder': folder.trim(),
+        if (connectionId.isNotEmpty) 'connection_id': connectionId,
       });
       if (!mounted || epoch != connection.generation) return;
       setState(() {
@@ -1283,7 +1329,8 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       if (mounted && epoch == connection.generation)
         setState(() => result = error.toString());
     } finally {
-      if (mounted) setState(() => busy = false);
+      if (mounted && epoch == connection.generation)
+        setState(() => busy = false);
     }
   }
 
@@ -1301,9 +1348,52 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       'Clone a repository into a new folder inside the container’s projects directory. Existing folders are preserved.',
       'p',
     ),
+    if (dashboardConnection.operator.value['role'] == 'admin')
+      RepositoryConnectionsPanel(
+        onChanged: (values) {
+          if (mounted)
+            setState(() {
+              connections = values;
+              if (unavailableConnection != null &&
+                  knownRepositoryConnection(values, unavailableConnection!)) {
+                connectionId = unavailableConnection!;
+                unavailableConnection = null;
+              }
+              if (!values.any((item) => item['id'] == connectionId))
+                if (connectionId.isNotEmpty) {
+                  unavailableConnection = connectionId;
+                  connectionId = '';
+                }
+            });
+        },
+      ),
     el(
       'form',
       [
+        select(
+          'Repository connection',
+          connectionId,
+          {
+            '': 'Container Git credentials / public repository',
+            for (final item in connections)
+              '${item['id']}':
+                  "${item['label']} · ${item['kind']} · ${item['access_state']}",
+          },
+          (value) => setState(() {
+            unavailableConnection = null;
+            connectionId = value;
+            final item = connections
+                .where((item) => item['id'] == value)
+                .firstOrNull;
+            if (item != null) {
+              url = item['kind'] == 'ssh'
+                  ? "git@github.com:${item['repository']}.git"
+                  : "https://github.com/${item['repository']}.git";
+              if (folder.isEmpty)
+                folder = '${item['repository']}'.split('/').last;
+            }
+          }),
+        ),
         field('Repository URL', url, (value) => url = value, required: true),
         field(
           'New folder name',
@@ -1334,9 +1424,34 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
             el('li', [
               el('span', [
                 el('strong', [text(job['folder'] ?? job['url'])]),
-                _text('clone-job__detail', job['detail'] ?? job['cwd'] ?? ''),
+                _text(
+                  'clone-job__detail',
+                  (job['error'] as String? ?? '').isNotEmpty
+                      ? job['error']
+                      : job['detail'] ?? job['cwd'] ?? '',
+                ),
               ], classes: 'clone-job__text'),
               badge('${job['state']}', tone: toneFor('${job['state']}')),
+              if (['failed', 'interrupted'].contains(job['state']) &&
+                  job['url'] != null)
+                button(
+                  'Retry in a new folder',
+                  () => setState(() {
+                    url = '${job['url']}';
+                    connectionId = '${job['connection_id'] ?? ''}';
+                    unavailableConnection =
+                        knownRepositoryConnection(connections, connectionId)
+                        ? null
+                        : connectionId;
+                    if (unavailableConnection != null) connectionId = '';
+                    final previous = '${job['folder']}';
+                    folder =
+                        '${previous.substring(0, previous.length.clamp(0, 70))}-retry';
+                    result =
+                        'The previous folder was preserved. Review the new folder name, then clone again.';
+                  }),
+                  small: true,
+                ),
               if (job['state'] == 'completed')
                 button(
                   'Use project',

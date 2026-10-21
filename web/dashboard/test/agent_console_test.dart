@@ -174,6 +174,14 @@ void main() {
               jsonEncode({
                 'status': status,
                 'output': output,
+                'access_request': {
+                  'source': 'visible_terminal',
+                  'paths': [
+                    '/home/herdr/.cache/*',
+                    '/tmp/opencode/client-target/*',
+                  ],
+                  'truncated': false,
+                },
                 'console_token': status == 'blocked' ? 'reviewed-prompt' : null,
               }),
               200,
@@ -223,6 +231,9 @@ void main() {
       expect(find.text('Backend Developer console'), findsOneWidget);
       expect(find.text(output), findsOneWidget);
       expect(find.text('Requires attention'), findsOneWidget);
+      expect(find.text('Requested folder access'), findsOneWidget);
+      expect(find.text('/home/herdr/.cache/*'), findsOneWidget);
+      expect(find.text('/tmp/opencode/client-target/*'), findsOneWidget);
       await tester.tap(find.text('Confirm selected Allow / Reject'));
       await tester.pumpAndSettle();
       expect(sent?['key'], 'enter');
@@ -290,6 +301,8 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text(output), findsOneWidget);
       expect(find.text('Requires attention'), findsNothing);
+      // Even a retained request field cannot keep folder access visible on work.
+      expect(find.text('Requested folder access'), findsNothing);
       final workingInspections = inspections;
       await tester.pump(const Duration(seconds: 1));
       await tester.pumpAndSettle();

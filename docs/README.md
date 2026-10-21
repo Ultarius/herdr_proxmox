@@ -7,6 +7,8 @@
 - [Model catalog](model-catalog.md) — model selection, reasoning and refresh behavior.
 - [Network troubleshooting](network-troubleshooting.md) — gateway, DNS and failed release checks.
 - [Alpha builds](alpha-builds.md) — install feature-branch builds for testing.
+- [Build capacity](build-capacity.md) — compiler budgets, resource waits and storage recovery.
+- [Repository connections](repository-connections.md) — private GitHub access, deploy keys and project bindings.
 - [Run logs](run-logs.md) — inspect execution and terminal output.
 - [Configuration migration](configuration-migration.md) — backup and move configuration.
 - [Dashboard layout](dashboard-layout.md) — dashboard navigation and layout.

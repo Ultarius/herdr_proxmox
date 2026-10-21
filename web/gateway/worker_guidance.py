@@ -38,28 +38,7 @@ def _local_bundle(checkout, recover):
         files[name] = path.read_bytes()
     digest = hashlib.sha256(b''.join(name.encode() + b'\0' + data for name, data in files.items())).hexdigest()
     relative = '.ci-cache/herdr-guidance/' + digest
-    # Local metadata keeps arbitrary repositories clean without changing tracked rules.
-    exclude = Path(project_git.git(checkout, 'rev-parse', '--path-format=absolute',
-                                   '--git-path', 'info/exclude').strip())
-    if exclude.parent.is_symlink() or exclude.is_symlink():
-        raise ValueError('Git exclusion metadata must not be a symlink.')
-    exclude.parent.mkdir(exist_ok=True)
-    if exclude.exists() and (not exclude.is_file() or exclude.stat().st_size > 1000000):
-        raise ValueError('Git exclusion metadata must be a bounded regular file.')
-    existing = exclude.read_bytes() if exclude.exists() else b''
-    pattern = b'/.ci-cache/herdr-guidance/'
-    if pattern not in existing.splitlines():
-        descriptor, temporary = tempfile.mkstemp(prefix='.herdr-exclude-', dir=exclude.parent)
-        try:
-            with os.fdopen(descriptor, 'wb') as stream:
-                stream.write(existing + (b'\n' if existing and not existing.endswith(b'\n') else b'') + pattern + b'\n')
-                stream.flush()
-                os.fsync(stream.fileno())
-            if exclude.exists():
-                os.chmod(temporary, exclude.stat().st_mode & 0o777)
-            os.replace(temporary, exclude)
-        finally:
-            Path(temporary).unlink(missing_ok=True)
+    ignore_directory(checkout, '.ci-cache/herdr-guidance')
     project_git.git(checkout, 'check-ignore', '--no-index', relative + '/SKILL.md')
     destination = checkout / relative
     for parent in (checkout / '.ci-cache', checkout / '.ci-cache/herdr-guidance', destination, destination / 'references'):
@@ -88,3 +67,34 @@ def _local_bundle(checkout, recover):
         if not path.is_file() or path.stat().st_size != len(data) or path.read_bytes() != data:
             raise ValueError('Worker guidance cache was modified; inspect it before continuing.')
     return destination
+
+
+def ignore_directory(checkout, relative):
+    """Add a gateway-owned cache exclusion while holding the repository lock."""
+    # Local metadata keeps arbitrary repositories clean without changing tracked rules.
+    exclude = Path(project_git.git(checkout, 'rev-parse', '--path-format=absolute',
+                                   '--git-path', 'info/exclude').strip())
+    if exclude.parent.is_symlink() or exclude.is_symlink():
+        raise ValueError('Git exclusion metadata must not be a symlink.')
+    exclude.parent.mkdir(exist_ok=True)
+    if exclude.exists() and (not exclude.is_file() or exclude.stat().st_size > 1000000):
+        raise ValueError('Git exclusion metadata must be a bounded regular file.')
+    existing = exclude.read_bytes() if exclude.exists() else b''
+    top = Path(project_git.git(checkout, 'rev-parse', '--show-toplevel').rstrip('\r\n')).resolve()
+    location = (Path(checkout).resolve().relative_to(top) / relative).as_posix()
+    # A launch can select a repository subdirectory. Anchor the exclusion at
+    # that location and quote glob metacharacters in its actual directory name.
+    location = ''.join('\\' + character if character in '\\*?[]#!' else character for character in location)
+    pattern = ('/' + location.strip('/') + '/').encode('utf-8')
+    if pattern not in existing.splitlines():
+        descriptor, temporary = tempfile.mkstemp(prefix='.herdr-exclude-', dir=exclude.parent)
+        try:
+            with os.fdopen(descriptor, 'wb') as stream:
+                stream.write(existing + (b'\n' if existing and not existing.endswith(b'\n') else b'') + pattern + b'\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+            if exclude.exists():
+                os.chmod(temporary, exclude.stat().st_mode & 0o777)
+            os.replace(temporary, exclude)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
