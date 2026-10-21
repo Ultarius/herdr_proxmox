@@ -227,6 +227,8 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
           '${(requirement['selection_lookup'] as Map)['kind'] == 'rustup' ? 'Rust toolchain' : 'FVM'} lookup: ${(requirement['selection_lookup'] as Map)['directory']} · '
           '${(requirement['selection_lookup'] as Map)['evidence']} · boundary: repository root',
         ),
+      if (requestedComponentNotice(requirement).isNotEmpty)
+        meta(requestedComponentNotice(requirement)),
       for (final conflict in (requirement['conflicts'] as List? ?? []))
         callout([
           calloutText('${(conflict as Map)['reason']}'),
@@ -281,6 +283,11 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
   }
 
   Component componentBlock(Map<String, dynamic> item) {
+    final sourceNotice = sourceComponentNotice(
+      item,
+      analysis,
+      plan: environmentPlan,
+    );
     final ecosystems = (item['ecosystems'] as List? ?? [])
         .map((entry) => '${(entry as Map)['label']}')
         .join(', ');
@@ -288,6 +295,7 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
       (entry) => '${(entry as Map)['label']}',
     );
     return el('section', [
+      if (sourceNotice.isNotEmpty) meta(sourceNotice, classes: 'org-note'),
       el('h3', [
         text(
           '${item['path']}'
@@ -407,18 +415,7 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
             classes: 'org-note',
           ),
           for (final requirement in requirements) readinessRow(requirement),
-          if ((analysis['provisionable'] as List? ?? []).isNotEmpty)
-            meta(
-              'This release can install: '
-              '${(analysis['provisionable'] as List).join(', ')}.',
-              classes: 'org-note',
-            )
-          else
-            meta(
-              'No requirement of this project is installable by this release; a missing tool '
-              'must be provided on the host.',
-              classes: 'org-note',
-            ),
+          meta(projectInstallerSummary(analysis), classes: 'org-note'),
         ],
         for (final item in components) componentBlock(item),
         if (components.isEmpty)
@@ -481,7 +478,7 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
         ],
         for (final check in environmentPlan!['check_candidates'] as List? ?? [])
           button(
-            '${(environmentPlan!['selected_checks'] as List? ?? []).any((item) => item['id'] == check['id']) ? 'Deselect' : 'Approve'} ${check['cwd']}: ${(check['arguments'] as List).join(' ')} (${check['source']})',
+            '${(environmentPlan!['selected_checks'] as List? ?? []).any((item) => item['id'] == check['id']) ? 'Deselect' : 'Approve'} ${check['cwd']}: ${(check['arguments'] as List).join(' ')} (${recipeEvidenceLabel(check as Map)})',
             () {
               final ids = [
                 for (final item

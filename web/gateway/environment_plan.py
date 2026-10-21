@@ -37,6 +37,8 @@ import dependency_constraints
 import environment_capabilities
 import project_requirements
 
+# Descriptive schema version, not a compatibility gate. The digest identifies
+# executable policy changes; adapter versions enforce SDK contract compatibility.
 PLAN_VERSION = 2
 
 # States a single capability requirement can be in. These are the only words a
@@ -244,17 +246,44 @@ def measurements(report):
     return measure
 
 
-def scoped_requirements(report):
+def source_components(report):
+    """Heuristically waive inferred JS/TS beside non-Node manifest projects.
+
+    Other inferred languages remain SDK requirements. An actual Node manifest
+    or an operator's Node override always takes precedence over this exemption.
+    """
+    components = report.get('components') or []
+    manifests = [item for item in components if item.get('basis') == 'manifest']
+    required = {environment_capabilities.capability_for(req['tool'])
+                for item in manifests for req in item.get('requirements', [])}
+    overridden = {environment_capabilities.capability_for(req['tool'])
+                  for req in report.get('requirements', []) if req.get('override')}
+    if not manifests or 'node' in required or 'node' in overridden:
+        return []
+    return [dict(path=item['path'], capability='node', basis='inferred',
+                 reason='Inferred JS/TS beside a non-Node project is treated as source-only. '
+                        'This heuristic can include Node servers or tools: add a package.json '
+                        'or a Node.js override if this component needs a Node runtime.')
+            for item in components if item.get('basis') == 'inferred'
+            and any(environment_capabilities.capability_for(req['tool']) == 'node'
+                    for req in item.get('requirements', []))]
+
+
+def scoped_requirements(report, *, sources=None):
     """Keep each component's SDK selection, instead of flattening a monorepo."""
     if not report.get('components'):
         return report.get('requirements') or []
     overrides = {environment_capabilities.capability_for(item['tool']): item.get('override')
                  for item in report.get('requirements', []) if item.get('override')}
     found = {}
+    sources = source_components(report) if sources is None else sources
+    assets = {(item['path'], item['capability']) for item in sources}
     for component in report['components']:
         for requirement in component['requirements']:
             tool = requirement['tool']
             capability = environment_capabilities.capability_for(tool)
+            if (component['path'], capability) in assets:
+                continue
             key = (component['path'], capability)
             item = found.setdefault(key, dict(tool=tool, label=requirement['label'],
                 purpose=requirement.get('purpose', ''), notation=requirement.get('notation', 'semver'),
@@ -290,9 +319,14 @@ def build(report, release_entries=None, measure=None, plan_id=None):
         revision = source.get('revision') or ''
         preview = False
     release_entries = release_catalog_view(release_entries)
+    # Effective reports already carry the classification displayed by the UI.
+    # Raw discovery reports are also accepted by portable parser/planner callers.
+    sources = report.get('source_components')
+    if sources is None:
+        sources = source_components(report)
 
     requirements = []
-    for requirement in scoped_requirements(report):
+    for requirement in scoped_requirements(report, sources=sources):
         tool = requirement.get('tool') or ''
         capability_record = environment_capabilities.describe(tool)
         capability = capability_record['id']
@@ -319,6 +353,7 @@ def build(report, release_entries=None, measure=None, plan_id=None):
         host=environment_capabilities.host(),
         policy_revision=report.get('analyzer') or source.get('analyzer') or 0,
         requirements=requirements,
+        source_components=sources,
         blockers=[_blocker(item) for item in requirements if item['state'] != READY],
         at=now(),
     )
@@ -398,7 +433,8 @@ def bindings(plan, receipt=None):
                     entry['restore_recipe'] = recipes[0]
                     entry['protected_inputs'] = sorted(recipes[0].get('inputs', {}))
                 import environment_providers
-                if adapter.materialize_entry or environment_providers.get(adapter.provider).verify_entry:
+                if (adapter.materialize_entry or adapter.component_commands
+                        or environment_providers.get(adapter.provider).verify_entry):
                     entry['artifact_receipt'] = matches[0]
                 if adapter.companion:
                     version = matches[0]['probe'].get(adapter.companion + '_version')

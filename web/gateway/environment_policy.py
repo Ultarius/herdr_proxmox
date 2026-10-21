@@ -127,7 +127,9 @@ class EnvironmentPolicies:
                      or Path(name).name.lower() == 'nuget.config'
                      or name.endswith(('.cargo/config', '.cargo/config.toml', '.config/dotnet-tools.json'))]
         protected = sorted(set(protected) | {name for entry in policy['toolchains']
-            for name in entry.get('protected_inputs', [])})
+            for name in entry.get('protected_inputs', [])}
+            | {recipe['evidence'].split('#')[0] for recipe in policy.get('recipes', [])
+               if recipe.get('evidence')})
         policy['declarations'] = {}
         for name in protected:
             entry = entries.get(name)
@@ -136,7 +138,7 @@ class EnvironmentPolicies:
             if entry['kind'] != 'blob' or entry['mode'] not in ('100644', '100755'):
                 raise ValueError('A protected project declaration is not a committed regular file: ' + name)
             if entry['size'] > project_requirements.MAX_MANIFEST_BYTES:
-                raise ValueError('A protected project declaration exceeds the manifest size limit: ' + name)
+                raise ValueError('A protected project declaration or recipe evidence exceeds the 256 KiB limit: ' + name)
             policy['declarations'][name] = entry['blob']
         policy['lockfiles'] = legacy['lockfiles']
         policy['checks'] = legacy['checks']

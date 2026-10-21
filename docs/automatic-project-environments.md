@@ -11,6 +11,15 @@ Implemented now:
 
 - Immutable, evidence-bearing plans per component, with persisted identities.
   Different components can select different versions of one SDK.
+- JS/TS source-only components beside non-Node manifest-backed projects are
+  treated as assets rather than mandatory Node runtimes. The report and plan
+  expose this decision as `source_components`; both dashboards use that decision.
+  A Node manifest anywhere in the repository or an explicit Node override retains
+  the Node gates. Inferred Python, Go, Rust and other languages keep their SDK
+  requirements, as do manifest-free JavaScript repositories.
+  This is a heuristic that can also exempt a source-only Node server or tool;
+  the dashboard notice explicitly tells operators to declare or override that
+  runtime when needed.
 - Committed discovery applies the same dependency tree, build output and vendor
   exclusions as the working-tree walk, so a vendored third-party tree cannot
   become this project's runtime requirement or move a repository off Herdr's own
@@ -32,6 +41,15 @@ Implemented now:
   .NET SDK and Rust toolchain versions on Linux glibc x64/arm64. Installations
   coexist by artifact identity; acquisition runs without root and changes no
   global SDK selection. Rust prepares the compiler, Cargo and host standard library.
+  Minimal Rust profiles can also request `rustfmt` and `clippy`: their exact-version
+  publisher archives are independently checksummed and their commands are probed.
+- Cargo projects can propose headless build/test pairs from an exact
+  `cargo test --no-default-features` or `cargo build --no-default-features` in a
+  fenced README example. Both proposals carry that README as evidence, including
+  the companion operation derived from it. Shell expressions,
+  extra arguments and graphical smoke commands are not imported. These are still
+  proposals requiring administrator approval (or the separate automatic-check
+  permission). The README is frozen as a protected policy input when selected.
 - Durable jobs, leases, restart recovery, cancellation fencing, atomic staging
   and reuse probes. Manual preparation requires the clean checkout's exact HEAD.
   Automatic preparation exports only the recorded commit's SDK-selection blobs
@@ -76,7 +94,7 @@ mixed-project preparation job. Existing host measurements are reused, including
 alternative measured executable versions; absence of an adapter never erases them.
 
 Current refusals are explicit: unresolved/moving SDK versions, Rust extra targets,
-optional components and non-minimal profiles, custom .NET SDK search paths,
+optional components other than rustfmt/clippy and non-minimal profiles, custom .NET SDK search paths,
 unsupported executor platforms, and capabilities without a managed adapter. A
 mixed .NET/Node project remains blocked until both capabilities can be prepared.
 
@@ -91,7 +109,8 @@ Run `python3 tests/ci/project_environments.py` as an unprivileged Linux glibc
 user, or dispatch CI with **run_project_environments** enabled. The same job now
 runs on release-producing pushes on x64 and arm64 and is a prerequisite of publication. It
 downloads pinned fixture SDKs and performs a real .NET restore/build and offline
-Cargo test in disposable repositories. Its results qualify adapters; they do not
+Cargo test plus real rustfmt/Clippy acquisition, probes and commands in disposable
+repositories. Its results qualify adapters; they do not
 turn SDK receipts into project validation evidence. Qualification also runs the
 actual product validation engine and publication evidence gate. Missing SDK receipts
 cause the existing unverified directory to be quarantined for inspection and

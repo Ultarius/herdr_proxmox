@@ -22,6 +22,7 @@ import threading
 import time
 
 import dependency_constraints
+import environment_capabilities
 import project_inventory
 import project_requirements
 
@@ -30,10 +31,9 @@ import project_requirements
 WORKING_TREE_TTL = 30.0
 CACHE_LIMIT = 64
 # Bumped whenever a change alters what a report means, so old entries are unused
-# rather than reinterpreted. Version 6 makes committed trees skip ignored
-# dependency/build directories, as the working-tree walk always has, and keeps
-# per-source Python constraint notation through assessment.
-ANALYZER_VERSION = 6
+# rather than reinterpreted. Version 7 includes bounded README headless Cargo
+# proposals alongside declared manifests and the source-only component census.
+ANALYZER_VERSION = 7
 
 
 def stamp():
@@ -242,6 +242,7 @@ class ProjectAnalysis:
                            'disagreement is recorded.'))
 
         for entry in resolved.values():
+            entry['capability'] = environment_capabilities.capability_for(entry['tool'])
             override = entry['override']
             # A selected SDK is evidence too. Ignoring it would call any
             # installed Flutter satisfactory even when FVM pins another one.
@@ -309,9 +310,18 @@ class ProjectAnalysis:
                     detail='SDK selection for the recorded lookup context has not been assessed.')
 
         ordered = [resolved[name] for name in sorted(resolved)]
+        import environment_plan
+        assets = environment_plan.source_components(dict(report, requirements=ordered))
+        asset_keys = {(item['path'], item['capability']) for item in assets}
+        # Asset observations remain in the component census, but must not be
+        # presented as required host runtimes alongside the plan's exemption.
+        ordered = [entry for entry in ordered if not (
+            entry['components'] and all(
+                (path, environment_capabilities.capability_for(entry['tool'])) in asset_keys
+                for path in entry['components']))]
         installable = [entry['tool'] for entry in ordered
                        if entry['assessment']['provisionable']]
-        return dict(report, requirements=ordered, provisionable=installable,
+        return dict(report, requirements=ordered, source_components=assets, provisionable=installable,
                     project_requirement=dict(
                         source='working_tree' if report['source']['scope'] == 'working_tree' else 'committed',
                         revision=report['source']['revision'],

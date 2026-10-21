@@ -10,6 +10,7 @@ import json
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import subprocess
 import tomllib
 
 
@@ -45,6 +46,8 @@ class Adapter:
     companion_label: str = ''
     capacity_variables: tuple = ()
     capacity_wrapper: str = ''
+    component_commands: tuple = ()
+    component_verifier: object = None
 
     def root(self, executable):
         return Path(executable).parents[self.root_parents]
@@ -61,6 +64,14 @@ class Adapter:
         if name == Path(self.executable).name or name in self.aliases:
             return str(executable)
         return str(Path(executable).with_name(name))
+
+    def bound_commands(self, entry):
+        """Advertise optional commands only when their receipt probe succeeded."""
+        receipt = entry.get('artifact_receipt') or {}
+        verified = (receipt.get('probe') or {}).get('components') or {}
+        optional = {command: probe for probe, commands in self.component_commands for command in commands}
+        return [command for command in self.commands
+                if command not in optional or optional[command] in verified]
 
     def matches_evidence_path(self, entry, observed, receipts):
         if self.evidence_path:
@@ -87,10 +98,18 @@ def node_check(item):
         ['npm', 'run', 'build'], ['npm', 'run', 'test'])
 
 
+def rust_check(item):
+    from project_requirements import HEADLESS_CARGO_SOURCE
+    return (item['source'] in ('convention', HEADLESS_CARGO_SOURCE)
+            and item['arguments'] in (['cargo', 'test'], ['cargo', 'build'],
+                                     ['cargo', 'test', '--no-default-features'],
+                                     ['cargo', 'build', '--no-default-features']))
+
+
 def dotnet_candidate(arguments, directory, paths):
     projects = sorted(name for name in paths if PurePosixPath(name).parent.as_posix() == directory
-                      and name.endswith(('.sln', '.slnx', '.csproj', '.fsproj', '.vbproj')))
-    solutions = [name for name in projects if name.endswith(('.sln', '.slnx'))]
+                      and name.lower().endswith(('.sln', '.slnx', '.csproj', '.fsproj', '.vbproj')))
+    solutions = [name for name in projects if name.lower().endswith(('.sln', '.slnx'))]
     projects = solutions or projects
     # Never guess between competing entry points in the same directory.
     return [*arguments, PurePosixPath(projects[0]).name] if len(projects) == 1 else None
@@ -114,12 +133,17 @@ def dotnet(version, target, read, artifact):
     return url, [artifact(item['url'], item.get('hash'), 'sha512', component='sdk')]
 
 
-def rust(version, target, read, artifact):
+RUST_COMPONENTS = {'rustfmt': 'rustfmt-preview', 'clippy': 'clippy-preview'}
+
+
+def rust(version, target, read, artifact, *, components=()):
+    if not isinstance(components, (list, tuple)) or any(not isinstance(name, str) or name not in RUST_COMPONENTS for name in components):
+        raise ValueError('Only rustfmt and clippy are supported optional Rust components.')
     url = 'https://static.rust-lang.org/dist/channel-rust-' + version + '.toml'
     data = tomllib.loads(read(url).decode('utf-8'))
     triple = ('x86_64' if target['architecture'] == 'x64' else 'aarch64') + '-unknown-linux-gnu'
     archives = []
-    for package in ('rustc', 'cargo', 'rust-std'):
+    for package in ('rustc', 'cargo', 'rust-std', *(RUST_COMPONENTS[name] for name in sorted(set(components)))):
         item = data.get('pkg', {}).get(package, {}).get('target', {}).get(triple, {})
         if not item.get('available'):
             raise ValueError(f'Rust {version} has no {package} artifact for {triple}.')
@@ -146,6 +170,26 @@ def rust_components(archive, prefix, stage, index, remaining, unpack):
     return total
 
 
+def verify_rust_components(specification, root, run=None):
+    """Rust publisher packages must supply runnable requested add-ons."""
+    runner = subprocess.run if run is None else run
+    requested = {entry.get('component') for entry in specification.get('archives', [])}
+    result = {}
+    for package, command, companion in (('rustfmt-preview', 'rustfmt', 'cargo-fmt'),
+                                         ('clippy-preview', 'clippy-driver', 'cargo-clippy')):
+        if package not in requested:
+            continue
+        executable = Path(root) / 'bin' / command
+        if not executable.is_file() or not executable.with_name(companion).is_file():
+            raise ValueError(f'The requested Rust component {command} is missing.')
+        observed = runner([str(executable), '--version'], cwd=root,
+                          capture_output=True, text=True, timeout=30)
+        if observed.returncode or not re.search(r'\d+\.\d+\.\d+', observed.stdout or ''):
+            raise ValueError(f'The requested Rust component {command} did not report a version.')
+        result[command] = observed.stdout.strip()[:500]
+    return result
+
+
 ADAPTERS = {
     'python': Adapter('python', 'bin/python3', ('python', 'python3'), ('--version',), ('--version',),
         r'^Python ([0-9]+\.[0-9]+\.[0-9]+)\s*$', 1, ('.python-version',),
@@ -165,14 +209,18 @@ ADAPTERS = {
         candidate_arguments=dotnet_candidate, cache_directories=('dotnet',),
         cache_variables=(('DOTNET_CLI_HOME', '{caches}/dotnet'), ('DOTNET_CLI_TELEMETRY_OPTOUT', '1'),
                          ('DOTNET_SKIP_FIRST_TIME_EXPERIENCE', '1'))),
-    'rust-toolchain': Adapter('rust-toolchain', 'bin/rustc', ('rustc', 'cargo'), ('-Vv',), ('-Vv',),
+    'rust-toolchain': Adapter('rust-toolchain', 'bin/rustc',
+        ('rustc', 'cargo', 'rustfmt', 'cargo-fmt', 'clippy-driver', 'cargo-clippy'), ('-Vv',), ('-Vv',),
         r'^release: ([0-9]+\.[0-9]+\.[0-9]+)$', 1, ('rust-toolchain', 'rust-toolchain.toml'),
         companion='cargo', companion_label='Cargo', companion_pattern=r'^cargo ([0-9]+\.[0-9]+\.[0-9]+)\b',
         resolver=rust, unpacker=rust_components, variables=(('RUSTC', '{executable}'),),
-        dispatch_variables=(('RUSTC', ''),), automatic_check=native_check,
+        dispatch_variables=(('RUSTC', ''),), automatic_check=rust_check, version=2,
         cache_directories=('cargo',), cache_variables=(('CARGO_HOME', '{caches}/cargo'),),
         capacity_variables=(('CARGO_BUILD_JOBS', 'HERDR_BUILD_JOBS'), ('RUST_TEST_THREADS', 'HERDR_TEST_THREADS')),
-        capacity_wrapper='cargo'),
+        capacity_wrapper='cargo',
+        component_commands=(('rustfmt', ('rustfmt', 'cargo-fmt')),
+                            ('clippy-driver', ('clippy-driver', 'cargo-clippy'))),
+        component_verifier=verify_rust_components),
     'node': Adapter('node', 'bin/node', ('node', 'npm'), ('--version',), ('--version',),
         r'^v([0-9]+\.[0-9]+\.[0-9]+)\s*$', 1, companion='npm', assisted=True, automatic_check=node_check),
 }
@@ -202,7 +250,7 @@ def session_tools(toolchains):
     for entry in toolchains:
         adapter = ADAPTERS.get(entry['name'])
         result.append(dict(name=entry['name'], required=entry.get('required'), component=entry.get('component'),
-                           commands=list(adapter.commands) if adapter else [],
+                           commands=adapter.bound_commands(entry) if adapter else [],
                            capacity_wrapper=(adapter.capacity_wrapper or None) if adapter else None))
     return result
 

@@ -353,6 +353,8 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
               '${(item['selection_lookup'] as Map)['kind'] == 'rustup' ? 'Rust toolchain' : 'FVM'} lookup: ${(item['selection_lookup'] as Map)['directory']} · '
               '${(item['selection_lookup'] as Map)['evidence']} · boundary: repository root',
             ),
+          if (requestedComponentNotice(item).isNotEmpty)
+            Text(requestedComponentNotice(item)),
         ],
       ),
     );
@@ -407,7 +409,14 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
     final source = report['source'] as Map? ?? {};
     final components = report['components'] as List? ?? [];
     final requirements = loaded?.requirements ?? const <Map<String, dynamic>>[];
-    final provisionable = report['provisionable'] as List? ?? [];
+    final sourceNotices = {
+      for (final component in components)
+        component['path']: sourceComponentNotice(
+          component as Map,
+          report,
+          plan: environmentPlan,
+        ),
+    };
     return Card(
       child: ExpansionTile(
         title: const Text('Discovered requirements'),
@@ -453,12 +462,7 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                         'is not a verdict; only the evaluator decides satisfaction.',
                       ),
                       for (final item in requirements) readiness(item),
-                      Text(
-                        provisionable.isEmpty
-                            ? 'No requirement of this project is installable by this release; '
-                                  'a missing tool must be provided on the host.'
-                            : 'This release can install: ${provisionable.join(', ')}.',
-                      ),
+                      Text(projectInstallerSummary(report)),
                     ],
                     if (components.isEmpty)
                       const Text(
@@ -473,6 +477,8 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                       Text(
                         'Languages: ${(component['languages'] as List? ?? []).map((e) => e['label']).join(', ')}',
                       ),
+                      if (sourceNotices[component['path']]!.isNotEmpty)
+                        Text(sourceNotices[component['path']]!),
                       for (final item
                           in component['requirements'] as List? ?? [])
                         requirement(item as Map),
@@ -491,7 +497,7 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                           'Candidate command: ${(command['command'] as List).join(' ')} (${command['source']})',
                         ),
                       for (final finding in additionalComponentFindings(
-                        component as Map,
+                        component,
                       ))
                         Text('${finding['what']}: ${finding['reason']}'),
                     ],
@@ -579,7 +585,7 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                         in environmentPlan!['check_candidates'] as List? ?? [])
                       CheckboxListTile(
                         title: Text(
-                          '${check['cwd']}: ${(check['arguments'] as List).join(' ')} (${check['source']})',
+                          '${check['cwd']}: ${(check['arguments'] as List).join(' ')} (${recipeEvidenceLabel(check as Map)})',
                         ),
                         value:
                             (environmentPlan!['selected_checks'] as List? ?? [])

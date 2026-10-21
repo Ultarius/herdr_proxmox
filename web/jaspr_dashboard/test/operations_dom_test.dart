@@ -201,6 +201,85 @@ void main() {
     return {'workspaces': [], 'agents': []};
   }
 
+  for (final overridden in [false, true]) {
+    test(
+      'asset notice follows gateway classification and override=$overridden',
+      () async {
+        final sources = overridden
+            ? []
+            : [
+                {
+                  'path': 'assets/dev',
+                  'reason':
+                      'This heuristic can include Node servers or tools: add a Node.js override if needed.',
+                },
+              ];
+        await mount(const ProjectAnalysisCard(path: 'repo'), (request) {
+          if (request.url.path.endsWith('/environment/plan'))
+            return {
+              'digest': 'plan',
+              'source_components': sources,
+              'requirements': [],
+              'selected_checks': [],
+              'check_candidates': [
+                {
+                  'id': '.:build',
+                  'cwd': '.',
+                  'arguments': ['cargo', 'build', '--no-default-features'],
+                  'source': 'README#headless-cargo',
+                  'derived': true,
+                  'evidence': 'README.md',
+                },
+              ],
+            };
+          if (request.url.path.endsWith('/analysis'))
+            return {
+              'source_components': sources,
+              'requirements': overridden
+                  ? [
+                      {
+                        'tool': 'node',
+                        'label': 'Node.js',
+                        'components': ['assets/dev'],
+                        'override': {'constraint': '20.19.2'},
+                        'assessment': {'verdict': 'missing'},
+                      },
+                    ]
+                  : [],
+              'components': [
+                {
+                  'path': '.',
+                  'basis': 'manifest',
+                  'requirements': [
+                    {
+                      'tool': 'rust-toolchain',
+                      'established': true,
+                      'selection_lookup': {
+                        'components': ['rustfmt', 'clippy'],
+                      },
+                    },
+                  ],
+                },
+                {'path': 'assets/dev', 'basis': 'inferred', 'requirements': []},
+              ],
+            };
+          return {'workspaces': [], 'agents': []};
+        });
+        var content = web.document
+            .getElementById('operations-test')!
+            .textContent!;
+        expect(content.contains('Source-only component:'), !overridden);
+        expect(content, contains('Requested SDK components: rustfmt, clippy'));
+        await click('Plan environment');
+        content = web.document.getElementById('operations-test')!.textContent!;
+        expect(content.contains('Source-only component:'), !overridden);
+        expect(content, contains('Evidence: README.md'));
+        expect(content, contains('Derived companion'));
+        if (!overridden) expect(content, contains('Node servers or tools'));
+      },
+    );
+  }
+
   test(
     'discovery displays source, inherited SDK evidence and host readiness',
     () async {
@@ -303,7 +382,7 @@ void main() {
       expect(content, isNot(contains("Instance of 'Text'")));
       expect(
         content,
-        contains('No requirement of this project is installable'),
+        contains('No matching SDK is in the bundled installer catalog'),
       );
       await click('Re-analyse');
       expect(

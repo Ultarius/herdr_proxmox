@@ -693,6 +693,17 @@ def component_ecosystems(names):
     return found
 
 
+def ecosystem_evidence(present, ecosystem):
+    """Return an actual marker path using the discovery registry's casing rules."""
+    markers = {name.lower() for name in ecosystem['markers']}
+    suffixes = tuple(name.lower() for name in ecosystem.get('suffix_markers', ()))
+    evidence = next((path for name, path in sorted(present.items())
+                     if name.lower() in markers or name.lower().endswith(suffixes)), None)
+    if evidence is None:
+        raise ValueError('No committed manifest evidence for ecosystem ' + ecosystem['id'])
+    return evidence
+
+
 def census(paths):
     """The census' own verdict per path, computed once for the whole project.
 
@@ -900,6 +911,44 @@ def dotnet_sdk(component, paths, read, context=None):
     return requirement
 
 
+HEADLESS_CARGO_SOURCE = 'README#headless-cargo'
+
+
+def documented_rust_checks(directory, paths, read):
+    """Propose bounded headless Cargo commands from fenced project docs.
+
+    Documentation is evidence, never approval. Ignore shell expressions, extra
+    arguments and graphical/smoke commands; the operator still selects checks.
+    """
+    prefix = '' if directory == '.' else directory + '/'
+    for name in ('README.md', 'README.markdown'):
+        path = prefix + name
+        if path not in paths:
+            continue
+        document = _bounded(read, path)
+        if document is None:
+            continue
+        fenced, commands = False, []
+        for line in document.splitlines():
+            if line.strip().startswith('```'):
+                fenced = not fenced
+                continue
+            match = re.fullmatch(r'cargo (test|build) --no-default-features', line.strip()) if fenced else None
+            if match and match[1] not in {item['purpose'] for item in commands}:
+                commands.append(dict(command=['cargo', match[1], '--no-default-features'],
+                                     purpose=match[1], source=HEADLESS_CARGO_SOURCE, evidence=path))
+        if commands:
+            # Either documented operation establishes the feature selection for
+            # its companion. Preserve the README dependency on derived checks.
+            for purpose in ('test', 'build'):
+                if purpose not in {item['purpose'] for item in commands}:
+                    commands.append(dict(command=['cargo', purpose, '--no-default-features'],
+                                         purpose=purpose, source=HEADLESS_CARGO_SOURCE,
+                                         evidence=path, derived=True))
+            return commands
+    return []
+
+
 def analyse(root, inventory=None, read=None, lookup_context=None):
     """What this project says about itself, component by component."""
     import project_inventory
@@ -963,6 +1012,8 @@ def analyse(root, inventory=None, read=None, lookup_context=None):
             for entry in _frameworks(ecosystem, present, read):
                 frameworks.setdefault(entry['id'], entry)
             provided = _scripts(ecosystem, present, read)
+            if ecosystem['id'] == 'rust':
+                provided.extend(documented_rust_checks(path, classification, read))
             declared = {entry['purpose'] for entry in provided}
             component['candidate_commands'].extend(provided)
             checks = ecosystem.get('checks', ())
@@ -976,7 +1027,7 @@ def analyse(root, inventory=None, read=None, lookup_context=None):
                     continue
                 component['candidate_commands'].append(dict(
                     command=list(command), purpose=purpose, source='convention',
-                    evidence=ecosystem['markers'][0]))
+                    evidence=ecosystem_evidence(present, ecosystem)))
         component['frameworks'] = [frameworks[name] for name in sorted(frameworks)]
         component['evidence']['lockfiles'] = sorted(lockfiles)
         component['configured_tooling'] = [

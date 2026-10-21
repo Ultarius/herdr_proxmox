@@ -41,10 +41,12 @@ def main():
                 'Api/App.cs': 'public class Example { public int Answer => 42; }',
             },
             'rust': {
-                'rust-toolchain.toml': '[toolchain]\nchannel="1.85.1"\nprofile="minimal"\n',
+                'rust-toolchain.toml': '[toolchain]\nchannel="1.97.1"\nprofile="minimal"\n'
+                    'components=["rustfmt","clippy"]\n',
                 'Cargo.toml': '[package]\nname="herdr-environment-smoke"\nversion="0.1.0"\n'
                     'edition="2021"\nrust-version="1.70"\n',
-                'src/lib.rs': '#[test] fn works() { assert_eq!(2 + 2, 4); }',
+                'src/lib.rs': '#[test]\nfn works() {\n    let actual: u32 = [2, 2].iter().sum();\n'
+                    '    assert_eq!(actual, 4);\n}\n',
             },
         }.items():
             checkout = projects / name
@@ -92,8 +94,17 @@ def main():
                 command([str(executable), 'restore', 'Api/App.csproj', '--ignore-failed-sources'], checkout, environment)
                 command([str(executable), 'build', 'Api/App.csproj', '--no-restore'], checkout, environment)
             else:
+                # Real optional publisher archives and executable probes, on
+                # both release architectures; no synthetic tarball or runner.
+                packages = {item['component'] for item in receipt['specification']['archives']}
+                if not {'rustfmt-preview', 'clippy-preview'}.issubset(packages):
+                    raise RuntimeError('Rust optional publisher archives were not acquired.')
+                if set(receipt['probe'].get('components', {})) != {'rustfmt', 'clippy-driver'}:
+                    raise RuntimeError('Real optional Rust command probes are missing.')
                 environment.update(RUSTC=str(executable), CARGO_HOME=str(root / 'cargo'))
                 command([str(executable.parent / 'cargo'), 'test', '--offline'], checkout, environment)
+                command([str(executable.parent / 'cargo'), 'fmt', '--', '--check'], checkout, environment)
+                command([str(executable.parent / 'cargo'), 'clippy', '--offline', '--all-targets', '--', '-D', 'warnings'], checkout, environment)
             print(f'{name}: real SDK preparation and project commands passed', flush=True)
 
 

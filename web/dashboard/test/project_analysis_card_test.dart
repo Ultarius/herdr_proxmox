@@ -8,6 +8,176 @@ import 'package:herdr_dashboard/project_analysis_card.dart';
 import 'package:herdr_dashboard_state/project_analysis.dart';
 
 void main() {
+  for (final overridden in [false, true]) {
+    testWidgets(
+      'renders asset decision, SDK add-ons and recipe evidence (override=$overridden)',
+      (tester) async {
+        final sources = overridden
+            ? []
+            : [
+                {
+                  'path': 'assets/dev',
+                  'reason':
+                      'This heuristic can include Node servers or tools: add a Node.js override if needed.',
+                },
+              ];
+        final connection = DashboardBloc(
+          client: MockClient((request) async {
+            if (request.url.path.endsWith('/environment/plan')) {
+              return http.Response(
+                jsonEncode({
+                  'digest': 'plan',
+                  'source_components': sources,
+                  'requirements': [],
+                  'selected_checks': [],
+                  'check_candidates': [
+                    {
+                      'id': '.:build',
+                      'cwd': '.',
+                      'arguments': ['cargo', 'build', '--no-default-features'],
+                      'source': 'README#headless-cargo',
+                      'derived': true,
+                      'evidence': 'README.md',
+                    },
+                  ],
+                }),
+                200,
+              );
+            }
+            if (request.url.path.endsWith('/analysis')) {
+              return http.Response(
+                jsonEncode({
+                  'source_components': sources,
+                  'requirements': overridden
+                      ? [
+                          {
+                            'tool': 'node',
+                            'label': 'Node.js',
+                            'components': ['assets/dev'],
+                            'override': {'constraint': '20.19.2'},
+                            'assessment': {'verdict': 'missing'},
+                          },
+                        ]
+                      : [],
+                  'components': [
+                    {
+                      'path': '.',
+                      'basis': 'manifest',
+                      'requirements': [
+                        {
+                          'tool': 'rust-toolchain',
+                          'established': true,
+                          'selection_lookup': {
+                            'components': ['rustfmt', 'clippy'],
+                          },
+                        },
+                      ],
+                    },
+                    {
+                      'path': 'assets/dev',
+                      'basis': 'inferred',
+                      'requirements': [],
+                    },
+                  ],
+                }),
+                200,
+              );
+            }
+            return http.Response('{"workspaces":[],"agents":[]}', 200);
+          }),
+        );
+        BlocScope.register<DashboardBloc>(() => connection);
+        connection.connect('token');
+        await tester.pumpAndSettle();
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: ProjectAnalysisCard(path: 'repo')),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Discovered requirements'));
+        await tester.pumpAndSettle();
+        expect(
+          find.textContaining('Source-only component:'),
+          overridden ? findsNothing : findsOneWidget,
+        );
+        expect(
+          find.text('Requested SDK components: rustfmt, clippy'),
+          findsOneWidget,
+        );
+        if (overridden)
+          expect(find.textContaining('· override'), findsOneWidget);
+        await tester.ensureVisible(find.text('Plan environment'));
+        await tester.tap(find.text('Plan environment'));
+        await tester.pumpAndSettle();
+        expect(find.textContaining('Evidence: README.md'), findsOneWidget);
+        expect(find.textContaining('Derived companion'), findsOneWidget);
+        if (!overridden)
+          expect(find.textContaining('Node servers or tools'), findsOneWidget);
+        expect(
+          find.textContaining('Source-only component:'),
+          overridden ? findsNothing : findsOneWidget,
+        );
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await connection.disconnect();
+        await BlocScope.reset();
+      },
+    );
+  }
+
+  test(
+    'source helpers and bundled installer notes do not overstate SDK support',
+    () {
+      expect(
+        projectInstallerSummary({'provisionable': []}),
+        contains('Plan environment'),
+      );
+      expect(
+        projectInstallerSummary({'provisionable': []}),
+        isNot(contains('must be provided on the host')),
+      );
+      final component = {'path': 'assets/dev', 'basis': 'inferred'};
+      final report = {
+        'source_components': [
+          null,
+          'invalid',
+          {
+            'path': 'assets/dev',
+            'capability': 'node',
+            'reason': 'JS/TS asset.',
+          },
+        ],
+      };
+      expect(
+        sourceComponentNotice(component, report),
+        contains('does not block'),
+      );
+      expect(sourceComponentNotice({'path': '.'}, report), isEmpty);
+      expect(
+        sourceComponentNotice(
+          component,
+          report,
+          plan: {'source_components': []},
+        ),
+        isEmpty,
+      );
+      expect(sourceComponentNotice(component, {}), isEmpty);
+      expect(
+        sourceComponentNotice(component, {
+          ...report,
+          'requirements': [
+            {
+              'tool': 'node',
+              'override': {'constraint': '20.19.2'},
+            },
+          ],
+        }, plan: report),
+        isEmpty,
+      );
+    },
+  );
+
   test('SDK readiness never claims dependency or test verification', () {
     expect(environmentJobLabel({'state': 'ready'}), contains('have not run'));
     expect(
@@ -210,7 +380,7 @@ void main() {
     );
     expect(
       find.textContaining(
-        'No requirement of this project is installable by this release',
+        'No matching SDK is in the bundled installer catalog',
       ),
       findsOneWidget,
     );

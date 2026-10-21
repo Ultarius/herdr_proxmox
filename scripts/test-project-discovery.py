@@ -23,7 +23,7 @@ MODULES = (
     'test_dependency_constraints', 'test_dotnet_resolution',
     'test_integration_coordinator', 'test_environment_plan', 'test_environment_preparation',
     'test_environment_guardrails', 'test_environment_admission', 'test_environment_adoption',
-    'test_environment_python', 'test_environment_contracts',
+    'test_environment_python', 'test_environment_contracts', 'test_rust_project_environment',
 )
 
 

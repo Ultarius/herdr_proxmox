@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'web/gateway'))
 import environment_plan
+import environment_adapters
 import environment_policy
 import environment_launch
 import environment_dispatch
@@ -40,7 +41,8 @@ class ClaimTests(unittest.TestCase):
                 (root / name).write_text('SDK double')
             spec = {'capability': 'rust-toolchain'}
             plan = dict(digest='plan', revision='a' * 40, requirements=[dict(capability='rust-toolchain',
-                label='Rust', version='1.85.1', components=['.'], artifact=spec)])
+                label='Rust', version='1.85.1', components=['.'], artifact=spec,
+                adapter_version=environment_adapters.get('rust-toolchain').version)])
             receipt = dict(state='ready', digest='plan', revision='a' * 40, receipts=[dict(
                 capability='rust-toolchain', version='1.85.1', components=['.'], specification=spec,
                 probe=dict(executable=str(root / 'rustc'), cargo_version='1.85.0'))])

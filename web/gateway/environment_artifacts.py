@@ -88,7 +88,7 @@ def artifact(url, value, algorithm, **fields):
     return dict(url=trusted_url(url), hash=value.lower(), algorithm=algorithm, **fields)
 
 
-def resolve(capability, version, target=None, read=metadata):
+def resolve(capability, version, target=None, read=metadata, *, components=()):
     """Resolve an exact SDK through publisher metadata, not a release-wide pin."""
     if not isinstance(version, str) or not VERSION.fullmatch(version):
         raise ValueError('Acquisition requires a resolved three-part SDK version.')
@@ -101,13 +101,25 @@ def resolve(capability, version, target=None, read=metadata):
         raise ValueError('This provider requires the full requirement declarations; use resolve_requirement.')
     if adapter.resolver is None:
         raise ValueError(f'No trusted artifact provider exists for {capability}.')
-    url, archives = adapter.resolver(version, target, read, artifact)
+    if components:
+        if capability != 'rust-toolchain':
+            raise ValueError('This SDK does not support optional archive components.')
+        url, archives = adapter.resolver(version, target, read, artifact, components=components)
+    else:
+        url, archives = adapter.resolver(version, target, read, artifact)
     return dict(provider_version=PROVIDER_VERSION, capability=capability,
                 version=version, target=target, metadata=url, archives=archives)
 
 
 def identity(specification):
     return hashlib.sha256(json.dumps(specification, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def verify_components(specification, root, run=None):
+    """The adapter verifies its optional components before reuse/publication."""
+    from environment_providers import invoke
+    verifier = environment_adapters.get(specification['capability']).component_verifier
+    return invoke(verifier, specification, root, run=run) if verifier else {}
 
 
 def unpack(archive, destination, limit=EXTRACT_LIMIT):
@@ -183,24 +195,30 @@ def acquire_archives(specification, store, fetch=download, verify=None, cancelle
     if final.is_symlink():
         raise ValueError('The managed SDK installation must not be a symlink.')
     receipt_path = final / 'herdr-receipt.json'
+    def quarantine_final():
+        quarantine = store / ('.unverified-' + key + '-' + uuid.uuid4().hex)
+        if final.resolve().parent != store.resolve() or quarantine.resolve().parent != store.resolve():
+            raise ValueError('The unverified SDK lies outside the managed store.')
+        final.rename(quarantine)
+
     if final.exists():
         try:
             receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
         except FileNotFoundError:
             # Preserve the unverified tree for inspection, then acquire afresh.
             # Never certify existing bytes merely because their directory exists.
-            quarantine = store / ('.unverified-' + key + '-' + uuid.uuid4().hex)
-            if final.resolve().parent != store.resolve() or quarantine.resolve().parent != store.resolve():
-                raise ValueError('The unverified SDK lies outside the managed store.')
-            final.rename(quarantine)
+            quarantine_final()
         except (OSError, ValueError) as error:
             raise ValueError('The existing SDK receipt could not be read; inspect the managed installation.') from error
         else:
             if not isinstance(receipt, dict) or receipt.get('artifact_id') != key or receipt.get('specification') != specification:
                 raise ValueError('The existing SDK has an incompatible receipt.')
+            # Published paths can already be bound by active plans. A failed
+            # reuse probe refuses this acquisition, never moves the installation.
             measured = verify(specification['capability'], final)
+            measured['components'] = verify_components(specification, final)
             if specification['version'] not in measured['versions']:
-                raise ValueError('The existing SDK no longer matches its receipt.')
+                raise ValueError('The existing SDK no longer matches its receipt; inspect the published installation.')
             return dict(receipt, probe=measured)
     with tempfile.TemporaryDirectory(prefix='.acquiring-', dir=store) as folder:
         stage = Path(folder)
@@ -225,6 +243,7 @@ def acquire_archives(specification, store, fetch=download, verify=None, cancelle
                 raise ValueError('No trusted archive layout is registered for this SDK.')
             unpacked_bytes += adapter.unpacker(archive, prefix, stage, index, EXTRACT_LIMIT - unpacked_bytes, unpack)
         measured = verify(specification['capability'], prefix)
+        measured['components'] = verify_components(specification, prefix)
         if specification['version'] not in measured['versions']:
             raise ValueError('The acquired SDK does not report the requested version.')
         measured = dict(measured, executable=str(final / Path(measured['executable']).relative_to(prefix)))
@@ -233,5 +252,6 @@ def acquire_archives(specification, store, fetch=download, verify=None, cancelle
         if cancelled():
             raise ValueError('SDK acquisition was cancelled before publication.')
         prefix.rename(final)
-    # Staging paths never escape into the persisted executable binding.
-    return dict(receipt, probe=verify(specification['capability'], final))
+    # All probes succeeded before publication. The receipt already rebases the
+    # executable to the immutable final path; repeat probes only on later reuse.
+    return receipt

@@ -7,6 +7,48 @@
 typedef ProjectAnalysisRequest =
     Future<dynamic> Function(String path, [Map<String, dynamic>? body]);
 
+String projectInstallerSummary(Map analysis) {
+  final bundled = analysis['provisionable'] as List? ?? [];
+  return bundled.isEmpty
+      ? 'No matching SDK is in the bundled installer catalog. Use Plan environment '
+            'to check project-specific SDK preparation.'
+      : 'The bundled installer can provide: ${bundled.join(', ')}. '
+            'Use Plan environment for project-specific SDK preparation.';
+}
+
+String sourceComponentNotice(Map component, Map report, {Map? plan}) {
+  final sources = (plan ?? report)['source_components'];
+  if (sources is! List) return '';
+  for (final item in sources.whereType<Map>()) {
+    if (item['path'] == component['path']) {
+      final requirements = report['requirements'];
+      if (requirements is List &&
+          requirements.whereType<Map>().any(
+            (requirement) =>
+                requirement['override'] is Map &&
+                (requirement['capability'] ?? requirement['tool']) ==
+                    item['capability'],
+          ))
+        return '';
+      return 'Source-only component: ${item['reason']} '
+          'It does not block SDK preparation in this environment.';
+    }
+  }
+  return '';
+}
+
+String requestedComponentNotice(Map requirement) {
+  final lookup = requirement['selection_lookup'];
+  final components = lookup is Map ? lookup['components'] : null;
+  return components is List && components.isNotEmpty
+      ? 'Requested SDK components: ${components.join(', ')}'
+      : '';
+}
+
+String recipeEvidenceLabel(Map check) =>
+    '${check['source']}${check['derived'] == true ? ' · Derived companion' : ''}'
+    '${check['evidence'] == null || check['evidence'] == '' ? '' : ' · Evidence: ${check['evidence']}'}';
+
 bool environmentPlanCanPrepare(Map? plan) =>
     plan?['preparation_version'] == 1 &&
     (plan?['requirements'] as List? ?? []).isNotEmpty &&
