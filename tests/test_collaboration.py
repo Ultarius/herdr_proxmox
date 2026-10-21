@@ -1302,6 +1302,37 @@ class CollaborationTests(unittest.TestCase):
         reply = self.store.path.parent / 'chat-replies' / job_id / job['delivery']['reply_name']
         self.assertTrue(reply.is_file())
 
+    def test_post_prompt_block_preserves_exact_saved_reply_for_inspected_recovery(self):
+        import collaboration
+        from herdr_errors import HerdrError
+        original = collaboration.current_run
+        calls = 0
+        def blocked_after_reply(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            value = original(*args, **kwargs)
+            if calls == 2:
+                raise HerdrError('A decision appeared after prompt completion', code='agent_blocked', delivery='none')
+            return value
+        with patch('collaboration.current_run', side_effect=blocked_after_reply):
+            job_id = self.action('chat', organization_id=self.org, profile_id=self.max, prompt='Inspect results')
+            self.drain()
+        job = self.job(job_id)
+        self.assertEqual(job['state'], 'needs_attention')
+        self.assertEqual(job['delivery']['stage'], 'blocked')
+        self.assertEqual(job['delivery']['previous_stage'], 'command_returned')
+        name = job['delivery']['reply_name']
+        self.assertRegex(name, r'^reply-[a-f0-9]{12}\.md$')
+        reply = self.store.path.parent / 'chat-replies' / job_id / name
+        self.assertTrue(reply.is_file())
+        before = len([args for args, _ in self.calls if args[:2] == ('agent', 'prompt')])
+        self.assertEqual(self.store.resolve_coordinator_report(job_id, self.max, 'recover'), 'recovered')
+        recovered = self.job(job_id)
+        self.assertEqual(recovered['state'], 'answered')
+        self.assertEqual(recovered['delivery']['stage'], 'reply_verified')
+        self.assertEqual(recovered['result'], reply.read_bytes().decode('utf-8').strip())
+        self.assertEqual(len([args for args, _ in self.calls if args[:2] == ('agent', 'prompt')]), before)
+
     def test_a_stale_reply_file_cannot_satisfy_a_new_attempt(self):
         # A legacy reply.md (or a late write) is never accepted for an attempt
         # that was told to write a different file.

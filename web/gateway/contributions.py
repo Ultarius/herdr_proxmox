@@ -1242,6 +1242,13 @@ class Contributions:
             return False, str(error)
         return True, ''
 
+    @staticmethod
+    def handoff_candidate(task, run):
+        """Display eligibility only; launch still verifies the checkout and live session."""
+        return bool(task and run.get('state') == 'persona_sent' and not task_delivery.pending(task)
+                    and (task.get('state') == 'completed' or (task.get('state') in HANDOFF_TASK_STATES
+                         and (task.get('completion_receipt') or {}).get('commit') == task.get('head_sha'))))
+
     def finish_execution(self, task, run, request_id, actor):
         """Archive, close and mark a verified-finished execution. Idempotent by request ID."""
         self.store.manage_session(dict(mode='finish', job_id=run['id'], organization_id=task['organization_id'],
@@ -2077,10 +2084,7 @@ class Contributions:
                 pane_id=blocking.get('pane_id'),
                 task_id=blocking.get('task_id'), task_title=(blocking_task or {}).get('title', ''),
                 task_state=(blocking_task or {}).get('state', ''),
-                handoff_ready=bool(blocking.get('state') == 'persona_sent' and blocking_task and (
-                    blocking_task.get('state') == 'completed' or (
-                        blocking_task.get('state') in HANDOFF_TASK_STATES
-                        and (blocking_task.get('completion_receipt') or {}).get('commit') == blocking_task.get('head_sha')))))
+                handoff_ready=self.handoff_candidate(blocking_task, blocking))
         else:
             task['blocking_execution'] = None
         task['launch_retryable'] = self.retryable_preflight(next((j for j in jobs if j.get('id') == task.get('run_id')), None))
@@ -2304,9 +2308,13 @@ class Contributions:
                 task = None
             if task is None:
                 return dict(state='attention', action='inspect', run_id=active['id'], detail='The execution references a missing task; inspect its run.')
-            receipt = (task or {}).get('completion_receipt') or {}
-            if task and (task.get('state') == 'completed' or (task.get('state') in HANDOFF_TASK_STATES
-                        and receipt.get('commit') == task.get('head_sha'))):
+            if task_delivery.pending(task):
+                flow = task.get('delivery_workflow') or {}
+                detail = (flow.get('error') if flow.get('state') == 'attention' or flow.get('revalidation_wait') else None)
+                return dict(state='attention' if flow.get('state') == 'attention' else 'occupied',
+                            action='inspect', run_id=active['id'], task_id=task['id'], task_title=task.get('title', ''),
+                            detail=detail or 'The previous task is waiting for verification and agent delivery inspection. Open it to inspect delivery before handoff.')
+            if self.handoff_candidate(task, active):
                 return dict(state='handoff', action='handoff', run_id=active['id'], task_id=task['id'],
                             task_title=task.get('title', ''),
                             detail='The previous task has recorded completion evidence; verify the checkout and session before handoff.')

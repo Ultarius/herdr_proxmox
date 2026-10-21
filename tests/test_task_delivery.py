@@ -204,6 +204,61 @@ class RevalidationTests(unittest.TestCase):
         self.store.job_record.assert_called_once_with('old-inspection')
         self.store.snapshot.assert_not_called()
 
+    def test_handoff_preview_waits_for_gateway_inspection_acceptance_not_just_receipt(self):
+        self.run.update(kind='launch', task_id=self.task['id'])
+        self.assertFalse(self.service.handoff_candidate(self.task, self.run))
+        availability = self.service.availability('worker', self.jobs)
+        self.assertEqual(availability['state'], 'attention')
+        self.assertEqual(availability['action'], 'inspect')
+        self.assertEqual(availability['task_id'], self.task['id'])
+        self.assertEqual(availability['detail'], 'Old agent blocked')
+        self.task['delivery_workflow'].update(state='waiting_agent', error='')
+        self.save()
+        self.assertFalse(self.service.handoff_candidate(self.task, self.run))
+        self.assertEqual(self.service.availability('worker', self.jobs)['state'], 'occupied')
+        self.task['delivery_workflow'].update(state='complete', result_kind='success')
+        self.save()
+        self.assertTrue(self.service.handoff_candidate(self.task, self.run))
+        self.assertEqual(self.service.availability('worker', self.jobs)['state'], 'handoff')
+
+    def test_explicit_reply_recovery_resumes_attention_and_finishes_existing_inspection(self):
+        self.task['delivery_workflow'].update(result_kind='success',
+            validation=dict(run_id='new-passing-run', state='complete', required_checks_verified=True))
+        self.reply.update(recovered_at='operator-recovery', delivery=dict(stage='reply_verified', recovered=True),
+            result=json.dumps(dict(sha='a' * 40, outcome='reviewed', summary='Inspected passing evidence.')))
+        self.save()
+        task = self.advance()
+        self.assertEqual(task['delivery_workflow']['state'], 'complete')
+        self.assertEqual(task['delivery_workflow']['chat_id'], 'old-inspection')
+        self.assertFalse(task_delivery.pending(task))
+        self.store.action.assert_not_called()
+        self.service.validation.submit.assert_not_called()
+
+    def test_recovered_reply_still_checks_candidate_and_does_not_loop_after_refusal(self):
+        self.task['delivery_workflow'].update(result_kind='success',
+            validation=dict(run_id='new-passing-run', state='complete', required_checks_verified=True))
+        self.reply.update(recovered_at='operator-recovery', delivery=dict(stage='reply_verified', recovered=True),
+            result=json.dumps(dict(sha='b' * 40, outcome='reviewed', summary='A different candidate.')))
+        self.save()
+        task = self.advance()
+        self.assertEqual(task['delivery_workflow']['state'], 'attention')
+        self.assertIn('exact SHA', task['delivery_workflow']['error'])
+        self.assertTrue(task_delivery.pending(task))
+        count = len(task['audit'])
+        self.assertEqual(len(self.advance()['audit']), count)
+        self.store.action.assert_not_called()
+
+    def test_unaccepted_or_wrong_session_reply_cannot_resume_attention(self):
+        self.task['delivery_workflow'].update(result_kind='success')
+        for changes in (dict(), dict(recovered_at='recovery', delivery=dict(stage='blocked', recovered=True)),
+                        dict(recovered_at='recovery', delivery=dict(stage='reply_verified', recovered=True),
+                             runs=[dict(id='another-session')])):
+            with self.subTest(changes=changes):
+                self.reply.update(changes)
+                self.save()
+                self.assertEqual(self.advance()['delivery_workflow']['state'], 'attention')
+        self.store.action.assert_not_called()
+
     def test_new_inspection_still_requires_the_original_session_to_be_ready(self):
         from herdr_errors import HerdrError
         with patch('collaboration.current_run', side_effect=HerdrError('Live permission prompt',

@@ -77,6 +77,44 @@ class ReportRepairTests(unittest.TestCase):
         self.assertEqual(job['delivery']['stage'], 'reply_verified')
         self.assertTrue(job['delivery']['recovered'])
 
+    def test_inspected_recovery_can_restore_lost_reply_name_without_sending_input(self):
+        name = 'reply-ad4c62528259.md'
+        self.save_reply('Reviewed saved inspection', name=name)
+        self.store.update_job(self.report['id'], delivery=dict(stage='blocked', code='agent_blocked'))
+        body = dict(job_id=self.report['id'], organization_id=self.org, inspected=True)
+        before = len(self.calls)
+        # Lost metadata never causes automatic selection of an arbitrary file.
+        with self.assertRaisesRegex(ValueError, 'Reply recovery failed'):
+            self.store.recover_chat(body, 'reviewer')
+        self.assertEqual(self.store.recover_chat(dict(body, reply_name=name), 'reviewer'),
+                         {'resolution': 'recovered'})
+        job = self.store.job_record(self.report['id'])
+        self.assertEqual(job['state'], 'answered')
+        self.assertEqual(job['result'], 'Reviewed saved inspection')
+        self.assertEqual(job['reply_name'], name)
+        self.assertEqual(job['delivery']['reply_name'], name)
+        self.assertTrue(job['delivery']['reply_name_restored'])
+        self.assertEqual(job['recovered_by'], 'reviewer')
+        self.assertFalse(any(call[0:2] == ('agent', 'prompt') for call in self.calls[before:]))
+
+    def test_explicit_reply_recovery_keeps_inspection_filename_and_session_guards(self):
+        name = 'reply-ad4c62528259.md'
+        self.save_reply('Reviewed saved inspection', name=name)
+        body = dict(job_id=self.report['id'], organization_id=self.org, inspected=True, reply_name=name)
+        with self.assertRaisesRegex(ValueError, 'Inspect'):
+            self.store.recover_chat(dict(body, inspected=False), 'reviewer')
+        for invalid in ('../' + name, '/tmp/' + name, '', ['reply.md']):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'exact saved reply'):
+                self.store.recover_chat(dict(body, reply_name=invalid), 'reviewer')
+        self.store.update_job(self.report['id'], delivery=dict(reply_name='reply-abcdefabcdef.md'))
+        with self.assertRaisesRegex(ValueError, 'cannot replace'):
+            self.store.recover_chat(body, 'reviewer')
+        self.store.update_job(self.report['id'], delivery=dict(stage='blocked'))
+        with patch('collaboration.current_run', side_effect=ValueError('Original session is blocked')):
+            with self.assertRaisesRegex(ValueError, 'Original session is blocked'):
+                self.store.recover_chat(body, 'reviewer')
+        self.assertEqual(self.store.job_record(self.report['id'])['state'], 'needs_attention')
+
     def test_recovery_refuses_an_unexpected_reply_file_name(self):
         self.store.update_job(self.report['id'],
                               delivery=dict(stage='session_idle_reply_pending', reply_name='../escape.md'))

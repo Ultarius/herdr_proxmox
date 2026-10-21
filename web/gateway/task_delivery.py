@@ -207,6 +207,18 @@ def reconcile(service, task):
         return
     if revalidation == 'refreshed':
         flow = task['delivery_workflow']
+    if (flow.get('state') == 'attention' and flow.get('result_kind') == 'success'
+            and not flow.get('inspection_verified') and flow.get('sha') == head and flow.get('chat_id')):
+        reply = inspection_job(service, task, flow) or {}
+        recovered_at = reply.get('recovered_at')
+        if (reply.get('state') == 'answered' and (reply.get('delivery') or {}).get('stage') == 'reply_verified'
+                and (reply.get('delivery') or {}).get('recovered') is True and recovered_at
+                and flow.get('recovered_inspection_at') != recovered_at
+                and reply.get('runs') and reply['runs'][0].get('id') == task.get('run_id')):
+            # Explicit reply recovery is permission to re-read this inspection,
+            # not to declare delivery complete. All checks below still apply.
+            flow.update(state='waiting_agent', recovered_inspection_at=recovered_at)
+            service.save(task, 'delivery_inspection_recovered', ACTOR)
     if flow.get('state') == 'attention':
         if flow.get('notification_pending') and flow.get('notification_retry_after', 0) <= time.time():
             notify_agent(service, task, flow)

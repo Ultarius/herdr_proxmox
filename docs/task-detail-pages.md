@@ -76,3 +76,36 @@ would permit checks under inputs different from those in the candidate.
 Build-event identities now include the frozen policy digest. A submission after
 upgrade may create one additional event rather than reuse an older event. Old
 events and their independently identified validation runs remain available.
+
+## Recover a saved delivery inspection
+
+A passing build and a saved worker review do not by themselves release the
+worker reservation. The gateway must accept the inspection reply. If a status
+probe fails after the worker writes its reply, the chat remains interrupted and
+retains its exact reply filename. Inspect the original conversation, resolve any
+pending decision, and use **Recover saved reply** in Org chart → Chat. Recovery
+checks that the original session is unchanged and idle, reads the saved file,
+and records the accepting operator without sending another prompt. Task delivery
+then reconciles the accepted report; validation does not need rerunning. Handoff
+is offered only after that delivery barrier clears.
+
+Older gateways could overwrite the filename when recording a blocked status.
+Installing the fix prevents further loss but does not reconstruct old records.
+After inspecting such a job's saved file, an authenticated operator can provide
+its exact filename to `POST /api/organizations/recover`:
+
+```json
+{
+  "chat": true,
+  "inspected": true,
+  "organization_id": "<organization ID>",
+  "job_id": "<interrupted chat job ID>",
+  "reply_name": "reply-abcdefabcdef.md"
+}
+```
+
+The filename must be `reply-<12 lowercase hex digits>.md` or legacy `reply.md`,
+inside that job's reply directory. Recovery never guesses among files, follows
+reply symlinks, or replaces an existing attempt filename. The original session
+checks still apply. Do not mark the job answered or the task complete by editing
+SQLite: reply recovery and task reconciliation perform the remaining checks.

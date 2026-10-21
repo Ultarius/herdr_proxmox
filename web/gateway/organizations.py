@@ -1161,7 +1161,8 @@ class OrganizationStore:
             job = self.get(db, 'jobs', text(body, 'job_id', 40), text(body, 'organization_id', 40))
         if job['kind'] != 'chat':
             raise ValueError('Select an interrupted chat reply.')
-        resolution = self.resolve_coordinator_report(job['id'], job['profile_id'], 'recover')
+        resolution = self.resolve_coordinator_report(job['id'], job['profile_id'], 'recover',
+                                                     reply_name=body.get('reply_name'))
         if not job.get('recovered_by'):
             self.update_job(job['id'], recovered_by=actor)
         return {'resolution': resolution}
@@ -1228,7 +1229,7 @@ class OrganizationStore:
         finally:
             lock.release()
 
-    def resolve_coordinator_report(self, job_id, profile_id, mode):
+    def resolve_coordinator_report(self, job_id, profile_id, mode, *, reply_name=None):
         """Recover output or retire uncertain delivery under the agent's lock.
 
         Never send terminal input here. The coordinator queues a new, auditable
@@ -1236,6 +1237,9 @@ class OrganizationStore:
         """
         if mode not in ('recover', 'fresh'):
             raise ValueError('Unsupported report repair mode.')
+        if reply_name is not None and (mode != 'recover' or not isinstance(reply_name, str)
+                                      or not re.fullmatch(r'reply-[a-f0-9]{12}\.md|reply\.md', reply_name)):
+            raise ValueError('Select an exact saved reply file name, without a directory.')
         with self.lock:
             lock = self.agent_locks.setdefault(profile_id, threading.RLock())
         if not lock.acquire(blocking=False):
@@ -1245,6 +1249,9 @@ class OrganizationStore:
                 job = self.get(db, 'jobs', job_id)
                 if job['kind'] != 'chat' or job.get('profile_id') != profile_id:
                     raise ValueError('Select an interrupted chat reply for the matching agent.')
+                recorded_name = (job.get('delivery') or {}).get('reply_name') or job.get('reply_name')
+                if reply_name is not None and recorded_name and reply_name != recorded_name:
+                    raise ValueError('Recovery cannot replace the reply file recorded for this attempt.')
                 if job['state'] == 'answered' and mode == 'recover':
                     return 'recovered'
                 if job['state'] == 'superseded' and mode == 'fresh':
@@ -1266,17 +1273,19 @@ class OrganizationStore:
                     raise ValueError('Reply directories must not be symlinks.')
                 try:
                     # Read the attempt's own reply file. Legacy jobs without
-                    # per-attempt evidence keep their original reply.md. Recovery
-                    # only reads: it never quarantines or rewrites the reply.
-                    name = (job.get('delivery') or {}).get('reply_name') or 'reply.md'
+                    # per-attempt evidence keep their original reply.md unless an
+                    # inspecting operator explicitly names a file. Never guess
+                    # between files or override a recorded attempt binding.
+                    name = recorded_name or reply_name or 'reply.md'
                     if not re.fullmatch(r'reply-[a-f0-9]{12}\.md|reply\.md', str(name)):
                         raise ValueError('unsupported reply file name in job delivery evidence')
                     reply = read_contribution(directory / name, label='chat reply')
                 except (ValueError, OSError) as error:
                     raise ValueError(f'Reply recovery failed for job {job_id}: {error}') from error
-                self.update_job(job_id, state='answered', result=reply, result_format='markdown',
+                self.update_job(job_id, state='answered', result=reply, result_format='markdown', reply_name=name,
                                 previous_error=job.get('error', ''), error='', recovered_at=now(),
-                                delivery=dict(job.get('delivery') or {}, stage='reply_verified',
+                                delivery=dict(job.get('delivery') or {}, stage='reply_verified', reply_name=name,
+                                              reply_name_restored=bool(reply_name and not recorded_name),
                                               recovered=True, bytes=len(reply.encode('utf-8'))))
                 return 'recovered'
             if runs:
@@ -1870,8 +1879,18 @@ class OrganizationStore:
                 except Exception:
                     pass  # Unavailable evidence must not claim delivery certainty.
             if job['kind'] in ('launch', 'chat', 'delegate') and delivery in ('blocked', 'unknown') and code:
-                self.update_job(job_id, delivery=dict(stage='blocked' if delivery == 'blocked' else 'unknown',
-                                                      code=code, at=now()))
+                # A post-prompt status check can fail after the reply was saved.
+                # Retain its exact attempt filename and submission evidence so
+                # inspected recovery can read that file without another prompt.
+                try:
+                    with self.lock, closing(self.connect()) as db:
+                        saved = self.get(db, 'jobs', job_id).get('delivery') or {}
+                except (ValueError, OSError, sqlite3.Error):
+                    saved = {}
+                if not isinstance(saved, dict):
+                    saved = {}
+                self.update_job(job_id, delivery=dict(saved, previous_stage=saved.get('stage'),
+                    stage='blocked' if delivery == 'blocked' else 'unknown', code=code, at=now()))
             if job['kind'] == 'chat':
                 # Diagnostics must never replace the original failure with their own.
                 try:
