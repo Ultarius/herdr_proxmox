@@ -105,6 +105,18 @@ class _UpdateState extends OperationsState<UpdateCard> {
             ]),
     if (info['error'] != null)
       callout('danger', 'octagon-alert', [text(info['error'])]),
+    if (info['recovery_error'] != null)
+      callout('danger', 'octagon-alert', [
+        text('Recovery failed: ${info['recovery_error']}'),
+      ]),
+    if (info['backup_verification'] is Map)
+      callout('info', 'info', [
+        text(
+          info['backup_verification']['method'] == 'manifest'
+              ? 'Backup contents verified against its manifest.'
+              : 'Legacy backup checked using build identity, required files and database integrity.',
+        ),
+      ]),
     if (info['deployment_mode'] == 'local')
       callout('info', 'info', [
         text(

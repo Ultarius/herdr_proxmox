@@ -728,6 +728,33 @@ void main() {
     },
   );
   test(
+    'update recovery shows backup verification and recovery failure',
+    () async {
+      await mount(
+        const UpdateCard(),
+        (r) => r.url.path == '/api/updates'
+            ? {
+                'state': 'failed',
+                'supported': true,
+                'latest': 'v0.0.55',
+                'available': true,
+                'error': 'Update failed.',
+                'recovery_error': 'Storage quota exceeded.',
+                'backup_verification': {'method': 'manifest', 'file_count': 12},
+              }
+            : {'workspaces': [], 'agents': []},
+      );
+      expect(
+        web.document.body!.textContent,
+        contains('Backup contents verified against its manifest.'),
+      );
+      expect(
+        web.document.body!.textContent,
+        contains('Recovery failed: Storage quota exceeded.'),
+      );
+    },
+  );
+  test(
     'SDK progress shows the phase and falls back when no percentage is known',
     () async {
       var state = 'running';

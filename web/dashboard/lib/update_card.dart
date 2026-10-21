@@ -163,6 +163,14 @@ class _UpdateCardState extends State<UpdateCard> {
                 'Update complete. Reload this page to use the new dashboard.',
               ),
             if (info!['error'] != null) Text('${info!['error']}'),
+            if (info!['recovery_error'] != null)
+              Text('Recovery failed: ${info!['recovery_error']}'),
+            if (info!['backup_verification'] is Map)
+              Text(
+                info!['backup_verification']['method'] == 'manifest'
+                    ? 'Backup contents verified against its manifest.'
+                    : 'Legacy backup checked using build identity, required files and database integrity.',
+              ),
             if (info!['deployment_mode'] == 'local')
               const Text(
                 'Release installation is disabled while a local build is deployed.',

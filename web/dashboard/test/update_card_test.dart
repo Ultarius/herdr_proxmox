@@ -7,6 +7,68 @@ import 'package:herdr_dashboard/dashboard_bloc.dart';
 import 'package:herdr_dashboard/update_card.dart';
 
 void main() {
+  testWidgets('update recovery shows the backup check and recovery error', (
+    tester,
+  ) async {
+    final bloc = DashboardBloc(
+      client: MockClient(
+        (request) async => http.Response(
+          jsonEncode(
+            request.url.path.endsWith('/updates')
+                ? {
+                    'installed': 'v0.0.55',
+                    'latest': 'v0.0.55',
+                    'state': 'failed',
+                    'supported': true,
+                    'available': true,
+                    'error': 'Update failed.',
+                    'recovery_error': 'Storage quota exceeded.',
+                    'backup_verification': {
+                      'method': 'manifest',
+                      'file_count': 12,
+                    },
+                  }
+                : {'workspaces': [], 'agents': []},
+          ),
+          200,
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        ),
+      ),
+    );
+    BlocScope.register<DashboardBloc>(() => bloc);
+    var cleaned = false;
+    Future<void> cleanup() async {
+      if (cleaned) return;
+      cleaned = true;
+      await tester.pumpWidget(const SizedBox.shrink());
+      await bloc.disconnect();
+      await BlocScope.reset();
+    }
+
+    addTearDown(cleanup);
+    try {
+      bloc.connect('token');
+      await tester.pump(const Duration(milliseconds: 110));
+      await tester.pumpAndSettle();
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(body: SingleChildScrollView(child: UpdateCard())),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Backup contents verified against its manifest.'),
+        findsOneWidget,
+      );
+      expect(
+        find.text('Recovery failed: Storage quota exceeded.'),
+        findsOneWidget,
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+
   testWidgets(
     'failed lookup distinguishes previous install and shows recovery advice',
     (tester) async {
