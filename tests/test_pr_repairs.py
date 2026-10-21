@@ -295,8 +295,11 @@ class RepairTests(unittest.TestCase):
             self.assertEqual(event['policy_transition'], transition)
             self.assertEqual(frozen['digest'], 'original-agent-policy')
             with patch('toolchain_policy.evidence_matches', return_value=True):
-                self.assertTrue(self.service.policy_matches(task, dict(
-                    plan_digest='approved-plan', policy_digest=transition['digest'])))
+                evidence = dict(target=head, plan_digest='approved-plan', policy_digest=transition['digest'])
+                self.assertTrue(self.service.policy_matches(task, evidence))
+                self.assertFalse(self.service.policy_matches(task, dict(evidence, target=self.upstream)))
+                self.assertFalse(self.service.policy_matches(task, {key: value for key, value in evidence.items()
+                                                                    if key != 'target'}))
             changed = copy.deepcopy(task)
             changed['head_sha'] = 'a' * 40
             self.assertIsNone(pr_repairs.validation_binding(changed))

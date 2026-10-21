@@ -47,11 +47,28 @@ automatically** in the organization policy. No Node preparation permission is
 needed solely because browser assets or a source-only helper were detected.
 
 Existing sessions pin their launch environment. After changing the plan or an
-adapter contract, create/prepare a fresh plan; if validation reports that the
-session policy differs, inspect and relaunch the assigned task under that plan.
-Preparing a different environment does not silently rewrite an old session's
-permissions or evidence. Resolve pending permission prompts in the agent console
-before resuming delivery.
+adapter contract, create/prepare a fresh plan. For a captured task that reports a
+session-policy mismatch, open **Checks & builds → Review validation environment**.
+Review the full candidate SHA, approved project commit, prepared SDKs and selected
+checks, then choose **Approve for this candidate**. Click **Validate latest
+commit** to run them. Approval does not itself execute checks or change the agent
+session. The existing task, candidate and old build evidence are retained.
+
+The administrator's transition is recorded against the task execution, candidate
+revision, approved commit and plan/policy digests. Approval rechecks the review;
+candidate or policy changes require another review. Candidate changes to protected
+manifests, lockfiles or selected README evidence still block validation. A
+candidate needs no independent SDK preparation receipt merely to compare its
+committed recipe evidence with the approved plan.
+
+This approval never applies to the merged result. If protected inputs changed
+upstream since the task's base, update the branch first; approving a new execution
+plan does not waive that source mismatch. The dashboard distinguishes this case
+from a session-policy mismatch and shows when the current candidate is approved.
+
+Pending permission prompts in the agent console are separate from this validation
+approval. Resolve those before asking the agent to resume delivery. New validation
+logs include the frozen and current approved policy digests to diagnose mismatches.
 
 ## Discovery and approval boundaries
 

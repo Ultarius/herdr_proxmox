@@ -187,6 +187,94 @@ void main() {
       ? task
       : {'workspaces': [], 'agents': []};
 
+  test(
+    'environment recovery reviews exact candidate and requires explicit approval',
+    () async {
+      final task = publishedTask()
+        ..addAll({
+          'state': 'review_ready',
+          'run_id': 'old-run',
+          'builds': {
+            'b' * 40: {
+              'state': 'error',
+              'blocker': 'policy_changed',
+              'recovery': 'review_validation_environment',
+            },
+          },
+        });
+      final review = {
+        'task_id': 'task',
+        'candidate': 'b' * 40,
+        'approved_commit': 'a' * 40,
+        'previous_plan_digest': 'old-plan',
+        'plan_digest': 'prepared-plan',
+        'review_digest': 'review-token',
+        'toolchains': [
+          {'name': 'rust-toolchain', 'required': '1.97.1', 'component': '.'},
+        ],
+        'recipes': [
+          {
+            'cwd': '.',
+            'arguments': ['cargo', 'test', '--no-default-features'],
+            'evidence': 'README.md',
+          },
+        ],
+      };
+      await mount(const TasksPage(taskId: 'task'), (request) {
+        if (request.url.path.endsWith('/validation_environment')) {
+          final body = jsonDecode(request.body) as Map;
+          if (body['mode'] == 'approve')
+            task['validation_environment_status'] = {'state': 'approved'};
+          return body['mode'] == 'review'
+              ? {...task, 'validation_environment_review': review}
+              : task;
+        }
+        return taskResponse(request, task);
+      });
+      await click('Checks & builds');
+      await click('Review validation environment');
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('Candidate: ${'b' * 40}'),
+      );
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('cargo test --no-default-features'),
+      );
+      await click('Cancel');
+      expect(posts.where((p) => p['mode'] == 'approve'), isEmpty);
+      await click('Review validation environment');
+      await click('Approve for this candidate');
+      final approval = posts.singleWhere((p) => p['mode'] == 'approve');
+      expect(approval['candidate'], 'b' * 40);
+      expect(approval['review_digest'], 'review-token');
+      expect(approval['inspected'], true);
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('Validation environment approved for this candidate.'),
+      );
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        isNot(contains('Review validation environment')),
+      );
+      task['validation_environment_status'] = {
+        'state': 'unavailable',
+        'reason': 'Upstream validation inputs changed; update the task branch.',
+      };
+      await click('Refresh task');
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('Upstream validation inputs changed'),
+      );
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        isNot(contains('Review validation environment')),
+      );
+      expect(posts.where((p) => '${p['path']}'.endsWith('/build')), isEmpty);
+      expect(posts.where((p) => '${p['path']}'.contains('/input')), isEmpty);
+    },
+  );
+
   for (final selected in [false, true]) {
     test(
       'low storage remains visible on ${selected ? 'task detail' : 'workflow'} and clears after recovery',

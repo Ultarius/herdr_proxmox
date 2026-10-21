@@ -44,3 +44,35 @@ New tasks preserve the assigned profile snapshot and each task launch preserves 
 Tests exercise direct route parsing, list/detail/back navigation, four sections, participant/session history, grouped activity, read-only commit selection, stale build separation, missing task/history states, mobile and desktop layouts, both themes, exact merge parents, historical identity preservation, immutable storage during detail reads, authenticated commit inspection, invalid commit rejection and storage failure handling. Existing explicit publication and operator-role tests remain in place.
 
 Task detail inspection and GitHub publication retain the existing access model: authenticated operators can inspect task evidence; mutation and publishing remain administrator-controlled. Deployment is still separate.
+
+## Recover validation after an environment change
+
+When a captured candidate was implemented under an older session policy, SDK
+preparation alone does not authorize validation under a different policy. The
+**Checks & builds** section offers **Review validation environment** for a
+session-policy mismatch on an open `review_ready`, `published` or `pr_open`
+task. The machine-readable recovery hint distinguishes this from protected-input
+changes and a policy that changed while a build was queued. An administrator reviews the candidate SHA, prepared
+SDKs, selected recipes and approved project commit before approving validation
+of that exact candidate. **Validate latest commit** then runs the checks.
+
+This records a candidate-scoped validation transition. It retains the original
+session policy, candidate commit, task ID and prior build evidence. Changes to
+the candidate, execution or approved environment invalidate the transition;
+protected candidate inputs are still checked. Agent permission prompts are a
+separate issue and are not answered by this action.
+
+The dialog includes the execution ID, candidate revision and previous approval.
+Reviews are transient: reload requires another review, while saved approvals
+persist and appear as **Validation environment approved for this candidate**.
+The approval cannot authorize a merge result, even when it shares the candidate
+SHA. Missing legacy binding identities are reported as missing, not as digests.
+
+The approved checkout remains the authority for execution inputs. When upstream
+protected inputs changed since the task base, update the task branch against
+upstream before reviewing and validating. Comparing only against the old base
+would permit checks under inputs different from those in the candidate.
+
+Build-event identities now include the frozen policy digest. A submission after
+upgrade may create one additional event rather than reuse an older event. Old
+events and their independently identified validation runs remain available.

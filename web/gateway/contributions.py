@@ -32,6 +32,7 @@ from session_ownership import reserves as session_reserves
 import toolchain_policy
 import pr_repairs
 import task_delivery
+import task_validation_environment
 MAX_INSTANCES_PER_TEMPLATE = 2
 
 SHA = re.compile(r'[a-f0-9]{40}|[a-f0-9]{64}')
@@ -1084,7 +1085,11 @@ class Contributions:
                 return False
         if approved.get('plan_digest') and task.get('run_id'):
             try:
-                frozen = pr_repairs.validation_binding(task) or self.frozen_environment(task)
+                target = evidence.get('target')
+                transition = task_validation_environment.binding(task, target, approved)
+                if target == task.get('head_sha') and task['state'] != 'merged':
+                    transition = transition or pr_repairs.validation_binding(task)
+                frozen = transition or self.frozen_environment(task)
             except (OSError, ValueError, sqlite3.Error):
                 return False
             if (not frozen or frozen.get('plan_digest') != evidence.get('plan_digest')
@@ -1833,6 +1838,11 @@ class Contributions:
         task['updated_at'] = stamp()
         entry = dict(action=action, actor=actor, at=task['updated_at'],
                      state=task['state'], head_sha=task.get('head_sha'))
+        if action == 'validation_environment_approved':
+            approval = task['validation_environment']
+            entry.update(approval_id=approval['id'], candidate=approval['candidate'],
+                         plan_digest=approval['plan_digest'], policy_digest=approval['digest'],
+                         detail='Approved the prepared environment for validation of this exact candidate; session policy retained.')
         if action == 'delivery_superseded' and task.get('delivery_history'):
             previous = task['delivery_history'][-1]
             entry.update(previous_sha=previous.get('sha'), delivery_chat_id=previous.get('chat_id'),
@@ -2099,6 +2109,7 @@ class Contributions:
             # Discovery is revision-cached by the resolver; approval and prepared
             # environment receipts can change without a repository HEAD change.
             task['validation_policy'] = self.validation_policy(task)
+            task['validation_environment_status'] = task_validation_environment.status(self, task)
         return task
 
     @staticmethod
@@ -2938,6 +2949,8 @@ class Contributions:
                 raise ValueError('Repository remote changed; inspect the task before continuing.')
         if action == 'repair':
             return pr_repairs.request(self, task, body, actor)
+        elif action == 'validation_environment':
+            return task_validation_environment.action(self, task, body, actor)
         elif action == 'launch':
             return self.launch_task(task, actor, body.get('inspected_general_session'), body.get('as_instance') is True)
         elif action == 'complete':
@@ -3401,13 +3414,16 @@ class Contributions:
                 event['task_revision_id'] = task['candidate_revision']
             approved = toolchain_policy.resolve_committed(repository)
             if approved.get('plan_digest') and task.get('run_id'):
-                transition = pr_repairs.validation_binding(task)
+                transition = task_validation_environment.binding(task, target, approved)
+                if target == task.get('head_sha') and task['state'] != 'merged':
+                    transition = transition or pr_repairs.validation_binding(task)
                 frozen = transition or self.frozen_environment(task) or {}
                 if transition:
                     event['policy_transition'] = dict(transition)
-                event.update(frozen_plan_digest=frozen.get('plan_digest') or 'unavailable',
-                             frozen_policy_digest=frozen.get('digest') or 'unavailable')
-                event_id = hashlib.sha256((event_id + ':' + task['run_id'] + ':' + event['frozen_plan_digest']).encode()).hexdigest()
+                event.update(environment_binding_required=True,
+                             frozen_plan_digest=frozen.get('plan_digest'), frozen_policy_digest=frozen.get('digest'))
+                event_id = hashlib.sha256((event_id + ':' + task['run_id'] + ':' + (event['frozen_plan_digest'] or 'missing')
+                                           + ':' + (event['frozen_policy_digest'] or 'missing')).encode()).hexdigest()
                 event['id'] = event_id
             with closing(self.connect()) as db, db:
                 db.execute('INSERT OR IGNORE INTO build_events VALUES (?,?)', (event_id, json.dumps(event)))

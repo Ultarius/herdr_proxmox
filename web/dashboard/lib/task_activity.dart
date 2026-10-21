@@ -199,6 +199,9 @@ const activityLabels = {
   'complete': 'Task marked done',
   'discuss': 'Group review requested',
   'validation_update_queued': 'Task branch update queued before validation',
+  'validation_environment_error': 'Validation environment review failed',
+  'validation_environment_approved':
+      'Prepared environment approved for candidate validation',
   'delivery_superseded':
       'Previous candidate delivery report retained as history',
   'review_policy': 'Automatic group review policy changed',

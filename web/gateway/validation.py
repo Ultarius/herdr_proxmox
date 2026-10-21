@@ -43,6 +43,24 @@ def stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
+def environment_comparison(run, policy):
+    """Missing bindings fail closed; legacy sentinels are not policy identities."""
+    plan, frozen = run.get('frozen_plan_digest'), run.get('frozen_policy_digest')
+    legacy_missing = 'unavailable' in (plan, frozen)
+    plan = None if plan == 'unavailable' else plan
+    frozen = None if frozen == 'unavailable' else frozen
+    missing = legacy_missing or bool(run.get('environment_binding_required') and (not plan or not frozen))
+    transition = run.get('policy_transition') or {}
+    target_mismatch = (transition.get('kind') == 'candidate_validation'
+                       and transition.get('candidate') != run.get('target'))
+    current = toolchain_policy.digest(policy)
+    matches = not (missing or target_mismatch or (plan and (plan != policy.get('plan_digest') or frozen != current))
+                   or (frozen and frozen != current))
+    return dict(frozen_plan_digest=plan, frozen_policy_digest=frozen,
+                approved_plan_digest=policy.get('plan_digest'), approved_policy_digest=current,
+                binding_missing=missing, target_mismatch=target_mismatch, matches=matches)
+
+
 def toolchain_message(mismatch):
     """The refusal an agent can act on: what was required, and what was found.
 
@@ -221,6 +239,7 @@ class ValidationRuns:
             run['task_id'] = event.get('task_id') or event.get('job_id')
             run['frozen_plan_digest'] = event.get('frozen_plan_digest')
             run['frozen_policy_digest'] = event.get('frozen_policy_digest')
+            run['environment_binding_required'] = event.get('environment_binding_required', False)
             if event.get('policy_transition'):
                 run['policy_transition'] = event['policy_transition']
             # Preserve provenance without turning an event waiver into a pass.
@@ -266,25 +285,32 @@ class ValidationRuns:
             # The policy is resolved from the approved checkout, never from the
             # candidate: a candidate must not redefine the rules that judge it.
             policy = toolchain_policy.resolve_committed(checkout)
-            # Releases may freeze a legacy policy without an environment-plan
-            # digest. That policy still binds execution; a plan-bound session
-            # must provide matching plan and policy digests together.
-            if ((run.get('frozen_plan_digest') and (run['frozen_plan_digest'] != policy.get('plan_digest')
-                    or run.get('frozen_policy_digest') != toolchain_policy.digest(policy)))
-                    or (run.get('frozen_policy_digest') and run['frozen_policy_digest'] != toolchain_policy.digest(policy))):
-                run['blocker'] = 'policy_changed'
-                raise ValueError('The approved environment differs from the session policy; inspect and relaunch under the approved plan.')
+            run['environment_comparison'] = environment_comparison(run, policy)
             if run.get('policy_digest') and run['policy_digest'] != toolchain_policy.digest(policy):
                 run['blocker'] = 'policy_changed'
+                run['recovery'] = 'retry_validation'
                 raise ValueError('Approved policy changed while this build was queued. Submit verification again.')
             run['policy'] = policy
             run['policy_digest'] = toolchain_policy.digest(policy)
             run['plan_digest'] = policy.get('plan_digest')
-            run['policy_changes'] = toolchain_policy.changes(policy, toolchain_policy.resolve_committed(worktree))
+            try:
+                run['policy_changes'] = toolchain_policy.changes(policy, toolchain_policy.candidate_policy(worktree, policy))
+            except ValueError:
+                run.update(blocker='policy_changed', recovery='review_protected_inputs')
+                raise
             if run['policy_changes']:
                 run['blocker'] = 'policy_changed'
+                run['recovery'] = 'review_protected_inputs'
                 raise ValueError('Candidate changes protected toolchain policy files; explicit review is required: '
                                  + ', '.join(run['policy_changes']))
+            if not run['environment_comparison']['matches']:
+                run.update(blocker='policy_changed', recovery='review_validation_environment')
+                lines.append('Environment policy comparison: ' + json.dumps(run['environment_comparison'], sort_keys=True) + '\n')
+                reason = ('The recorded session environment binding is missing. '
+                          if run['environment_comparison']['binding_missing'] else
+                          'The approved environment differs from the session policy. ')
+                raise ValueError(reason +
+                                 'Open Checks & builds and choose Review validation environment for this candidate.')
             # Probe the real executables before running anything. A declared pin
             # cannot prove which SDK runs, so verification measures it.
             if policy.get('blockers') or policy.get('validation_blockers'):
@@ -371,7 +397,9 @@ class ValidationRuns:
                                    environment_restores=run.get('environment_restores'),
                                    timings=run.get('timings', {}),
                                    policy_changes=run.get('policy_changes'),
-                                   blocker=run.get('blocker'), note=run.get('note'),
+                                   environment_comparison=run.get('environment_comparison'),
+                                   policy_transition=run.get('policy_transition'),
+                                   blocker=run.get('blocker'), recovery=run.get('recovery'), note=run.get('note'),
                                    finished_at=run.get('finished_at'),
                                    actor=run.get('actor')))
 

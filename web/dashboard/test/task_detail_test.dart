@@ -9,6 +9,133 @@ import 'package:herdr_dashboard/tasks_page.dart';
 import 'package:herdr_dashboard/routes.dart';
 
 void main() {
+  testWidgets(
+    'candidate environment recovery previews before approval without launching work',
+    (tester) async {
+      final posts = <Map<String, dynamic>>[];
+      final task = {
+        'id': 'task',
+        'title': 'Existing implementation',
+        'state': 'review_ready',
+        'repository': 'repo',
+        'head_sha': 'b' * 40,
+        'base_sha': 'a' * 40,
+        'run_id': 'old-run',
+        'builds': {
+          'b' * 40: {
+            'state': 'error',
+            'blocker': 'policy_changed',
+            'recovery': 'review_validation_environment',
+          },
+        },
+      };
+      final review = {
+        'task_id': 'task',
+        'candidate': 'b' * 40,
+        'approved_commit': 'a' * 40,
+        'previous_plan_digest': 'old-plan',
+        'plan_digest': 'prepared-plan',
+        'review_digest': 'review-token',
+        'toolchains': [
+          {'name': 'rust-toolchain', 'required': '1.97.1', 'component': '.'},
+        ],
+        'recipes': [
+          {
+            'cwd': '.',
+            'arguments': ['cargo', 'test', '--no-default-features'],
+            'evidence': 'README.md',
+          },
+        ],
+      };
+      final connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.method == 'POST')
+            posts.add({
+              ...jsonDecode(request.body) as Map<String, dynamic>,
+              'path': request.url.path,
+            });
+          if (request.url.path.endsWith('/validation_environment')) {
+            final body = jsonDecode(request.body) as Map;
+            if (body['mode'] == 'approve')
+              task['validation_environment_status'] = {'state': 'approved'};
+            return http.Response(
+              jsonEncode(
+                body['mode'] == 'review'
+                    ? {...task, 'validation_environment_review': review}
+                    : task,
+              ),
+              200,
+            );
+          }
+          if (request.url.path.endsWith('/tasks/detail'))
+            return http.Response(jsonEncode(task), 200);
+          if (request.url.path.endsWith('/tasks'))
+            return http.Response(
+              jsonEncode({
+                'tasks': [task],
+                'github': {},
+                'executor': 'service',
+              }),
+              200,
+            );
+          return http.Response('{"workspaces":[],"agents":[]}', 200);
+        }),
+      );
+      BlocScope.register<DashboardBloc>(() => connection);
+      connection.connect('token');
+      connection.operator.value = {'role': 'admin'};
+      await tester.pumpAndSettle();
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(body: TasksPage(taskId: 'task')),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Checks & builds'));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('Review validation environment'));
+      await tester.tap(find.text('Review validation environment'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Candidate: ${'b' * 40}'), findsOneWidget);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(posts.where((p) => p['mode'] == 'approve'), isEmpty);
+      await tester.tap(find.text('Review validation environment'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Approve for this candidate'));
+      await tester.pumpAndSettle();
+      final approval = posts.singleWhere((p) => p['mode'] == 'approve');
+      expect(approval['candidate'], 'b' * 40);
+      expect(approval['review_digest'], 'review-token');
+      expect(find.text('Review validation environment'), findsNothing);
+      expect(
+        find.text('Validation environment approved for this candidate.'),
+        findsOneWidget,
+      );
+      task['validation_environment_status'] = {
+        'state': 'unavailable',
+        'reason': 'Upstream validation inputs changed; update the task branch.',
+      };
+      await tester.scrollUntilVisible(
+        find.byTooltip('Refresh task'),
+        -300,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.tap(find.byTooltip('Refresh task'));
+      await tester.pumpAndSettle();
+      expect(
+        find.textContaining('Upstream validation inputs changed'),
+        findsOneWidget,
+      );
+      expect(find.text('Review validation environment'), findsNothing);
+      expect(posts.where((p) => '${p['path']}'.endsWith('/build')), isEmpty);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await connection.disconnect();
+      await BlocScope.reset();
+    },
+  );
+
   test('legacy JSON participant identity uses a typed lookup', () {
     final task =
         jsonDecode('{"participants":[{"name":"Maya at launch"}]}') as Map;
