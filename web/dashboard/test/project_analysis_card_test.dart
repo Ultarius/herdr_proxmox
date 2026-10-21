@@ -8,6 +8,210 @@ import 'package:herdr_dashboard/project_analysis_card.dart';
 import 'package:herdr_dashboard_state/project_analysis.dart';
 
 void main() {
+  testWidgets(
+    'a late status response cannot replace the newly selected project',
+    (tester) async {
+      final delayed = Completer<http.Response>();
+      http.Response status(String revision) => http.Response(
+        jsonEncode({
+          'project': revision,
+          'revision': revision,
+          'plan_current': false,
+          'prepared': {
+            'current': true,
+            'revision': revision,
+            'requirements': [],
+            'selected_checks': [],
+          },
+        }),
+        200,
+      );
+      final connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.url.path.endsWith('/environment')) {
+            return request.url.queryParameters['path'] == 'first'
+                ? delayed.future
+                : status('second-commit');
+          }
+          return http.Response(
+            '{"components":[],"requirements":[],"workspaces":[],"agents":[]}',
+            200,
+          );
+        }),
+      );
+      BlocScope.register<DashboardBloc>(() => connection);
+      connection.connect('token');
+      await tester.pumpAndSettle();
+      Widget page(String path) => MaterialApp(
+        home: Scaffold(body: ProjectAnalysisCard(path: path)),
+      );
+      await tester.pumpWidget(page('first'));
+      await tester.pumpAndSettle();
+      await tester.pumpWidget(page('second'));
+      await tester.pumpAndSettle();
+      delayed.complete(status('first-commit'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Discovered requirements'));
+      await tester.pumpAndSettle();
+      expect(find.text('Commit: second-commit'), findsOneWidget);
+      expect(find.text('Commit: first-commit'), findsNothing);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await connection.disconnect();
+      await BlocScope.reset();
+    },
+  );
+
+  for (final state in ['ready', 'older', 'unavailable', 'queued']) {
+    testWidgets(
+      'restores saved environment ($state) without preparing or running checks',
+      (tester) async {
+        var statusReads = 0;
+        var polled = false;
+        final writes = <String>[];
+        final plan = {
+          'digest': 'saved-plan',
+          'preparation_version': 1,
+          'requirements': [
+            {
+              'capability': 'rust-toolchain',
+              'label': 'Rust toolchain',
+              'version': '1.97.1',
+              'components': ['.'],
+              'state': 'acquire',
+              'artifact': {},
+              'activation': 'available',
+            },
+          ],
+          'selected_checks': [],
+          'check_candidates': [],
+        };
+        final connection = DashboardBloc(
+          client: MockClient((request) async {
+            if (request.method == 'POST' &&
+                request.url.path.contains('/environment'))
+              writes.add(request.url.path);
+            if (request.url.path.endsWith('/environment')) {
+              if (request.url.queryParameters.containsKey('job')) {
+                polled = true;
+                return http.Response(
+                  '{"id":"saved-job","digest":"saved-plan","state":"ready"}',
+                  200,
+                );
+              }
+              statusReads++;
+              if (state == 'unavailable')
+                return http.Response('{"error":"store unavailable"}', 503);
+              return http.Response(
+                jsonEncode({
+                  'project': 'repo',
+                  'revision': 'current-commit',
+                  'plan_current': state != 'older',
+                  'plan': plan,
+                  'job': {
+                    'id': 'saved-job',
+                    'digest': 'saved-plan',
+                    'state': state == 'queued' && !polled ? 'queued' : 'ready',
+                  },
+                  'prepared': state == 'queued' && !polled
+                      ? null
+                      : {
+                          'current': state != 'older',
+                          'revision': state == 'older'
+                              ? 'old-commit'
+                              : 'current-commit',
+                          'requirements': plan['requirements'],
+                          'selected_checks': [
+                            {'id': 'test'},
+                            {'id': 'build'},
+                          ],
+                        },
+                }),
+                200,
+              );
+            }
+            if (request.url.path.endsWith('/analysis'))
+              return http.Response(
+                jsonEncode({
+                  'components': [
+                    {'path': '.', 'requirements': []},
+                  ],
+                  'requirements': [
+                    {
+                      'tool': 'rust',
+                      'label': 'Rust',
+                      'constraint': '>=1.97.1',
+                      'assessment': {
+                        'verdict': 'missing',
+                        'detail': 'No host executable.',
+                      },
+                    },
+                  ],
+                }),
+                200,
+              );
+            return http.Response('{"workspaces":[],"agents":[]}', 200);
+          }),
+        );
+        BlocScope.register<DashboardBloc>(() => connection);
+        connection.connect('token');
+        await tester.pumpAndSettle();
+        connection.operator.value = {'role': 'operator'};
+        Future<void> open() async {
+          await tester.pumpWidget(
+            const MaterialApp(
+              home: Scaffold(body: ProjectAnalysisCard(path: 'repo')),
+            ),
+          );
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('Discovered requirements'));
+          await tester.pumpAndSettle();
+        }
+
+        await open();
+        if (state == 'queued') {
+          expect(find.text('SDK preparation queued'), findsOneWidget);
+          await tester.pump(const Duration(seconds: 2));
+          await tester.pumpAndSettle();
+        }
+        if (state == 'unavailable') {
+          expect(
+            find.textContaining('Saved environment status unavailable'),
+            findsOneWidget,
+          );
+          expect(
+            find.text('No prepared environment for this commit'),
+            findsNothing,
+          );
+        } else if (state == 'older') {
+          expect(find.text('Prepared for an earlier commit'), findsOneWidget);
+          expect(find.text('Commit: current-commit'), findsOneWidget);
+          expect(find.text('Prepared commit: old-commit'), findsOneWidget);
+          expect(find.byIcon(Icons.warning_amber_rounded), findsOneWidget);
+          expect(find.text('Prepare SDKs'), findsNothing);
+          expect(find.text('Prepared for this commit'), findsNothing);
+        } else {
+          expect(find.text('Prepared for this commit'), findsOneWidget);
+          expect(find.text('2 approved validation checks'), findsOneWidget);
+          expect(
+            find.textContaining('SDK preparation recorded'),
+            findsOneWidget,
+          );
+          await tester.pumpWidget(const SizedBox.shrink());
+          await open();
+          expect(find.text('Prepared for this commit'), findsOneWidget);
+          expect(statusReads, greaterThanOrEqualTo(2));
+        }
+        expect(find.textContaining('Not found on host'), findsOneWidget);
+        expect(writes, isEmpty);
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await connection.disconnect();
+        await BlocScope.reset();
+      },
+    );
+  }
+
   for (final overridden in [false, true]) {
     testWidgets(
       'renders asset decision, SDK add-ons and recipe evidence (override=$overridden)',
@@ -21,26 +225,46 @@ void main() {
                       'This heuristic can include Node servers or tools: add a Node.js override if needed.',
                 },
               ];
+        Map<String, dynamic>? savedPlan;
         final connection = DashboardBloc(
           client: MockClient((request) async {
-            if (request.url.path.endsWith('/environment/plan')) {
+            if (request.url.path.endsWith('/environment'))
               return http.Response(
                 jsonEncode({
-                  'digest': 'plan',
-                  'source_components': sources,
-                  'requirements': [],
-                  'selected_checks': [],
-                  'check_candidates': [
-                    {
-                      'id': '.:build',
-                      'cwd': '.',
-                      'arguments': ['cargo', 'build', '--no-default-features'],
-                      'source': 'README#headless-cargo',
-                      'derived': true,
-                      'evidence': 'README.md',
-                    },
-                  ],
+                  'project': 'repo',
+                  'revision': 'head',
+                  'plan_current': true,
+                  'plan': savedPlan,
+                  'job': null,
+                  'active_jobs': [],
+                  'prepared': null,
                 }),
+                200,
+              );
+            if (request.url.path.endsWith('/environment/plan')) {
+              return http.Response(
+                jsonEncode(
+                  savedPlan = {
+                    'digest': 'plan',
+                    'source_components': sources,
+                    'requirements': [],
+                    'selected_checks': [],
+                    'check_candidates': [
+                      {
+                        'id': '.:build',
+                        'cwd': '.',
+                        'arguments': [
+                          'cargo',
+                          'build',
+                          '--no-default-features',
+                        ],
+                        'source': 'README#headless-cargo',
+                        'derived': true,
+                        'evidence': 'README.md',
+                      },
+                    ],
+                  },
+                ),
                 200,
               );
             }
@@ -179,7 +403,10 @@ void main() {
   );
 
   test('SDK readiness never claims dependency or test verification', () {
-    expect(environmentJobLabel({'state': 'ready'}), contains('have not run'));
+    expect(
+      environmentJobLabel({'state': 'ready'}),
+      contains('recorded separately'),
+    );
     expect(
       environmentPlanCanPrepare({
         'preparation_version': 1,
@@ -362,8 +589,8 @@ void main() {
     );
     expect(find.textContaining('SDK lookup: Api'), findsOneWidget);
     expect(find.textContaining('partial scan'), findsOneWidget);
-    expect(find.text('Host readiness'), findsOneWidget);
-    expect(find.textContaining('· missing'), findsOneWidget);
+    expect(find.text('Host SDK discovery'), findsOneWidget);
+    expect(find.textContaining('· Not found on host'), findsOneWidget);
     expect(find.textContaining('Component: Api'), findsOneWidget);
     expect(
       find.textContaining('Installed — required version unknown'),

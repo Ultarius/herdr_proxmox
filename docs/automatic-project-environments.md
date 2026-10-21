@@ -37,6 +37,32 @@ Implemented now:
 - Explicit administrator actions in both project explorer dashboards:
   **Plan environment**, then **Prepare SDKs**, with progress, cancellation and
   retry. Discovery still starts without entering a tool name.
+- Both dashboards restore saved preparation on opening the project. **Project
+  environment** shows the successful preparation for the checkout's exact HEAD,
+  its SDK versions, component scopes and approved check count. **Host SDK
+  discovery** separately reports executables found on the host PATH or configured
+  installer paths: **Not found on host** does not mean a prepared project SDK is
+  missing. **Repository requirements** describes declarations, and labels waived
+  asset runtimes **Source only**. A historical receipt is explicitly **Prepared
+  for an earlier commit**, never a binding for the current one. Plans and running
+  jobs for the current commit survive reopening; a newer, unprepared proposal
+  does not hide the previously prepared environment. Lookup errors are shown as
+  unavailable, not as absence of preparation.
+  The read-only `GET /api/projects/environment?path=<project>` returns these
+  saved records without planning, downloading, executing SDK probes or approving
+  checks. Opening the page sends no preparation POST. Active jobs resume polling;
+  project and connection guards discard responses from an old selection.
+  Active preparations are listed across all plans for the current project and
+  commit. Creating or editing a proposal preserves those runs; each can be
+  cancelled explicitly. A newer pending plan is labelled separately from the
+  prepared binding. Administrator actions reload saved status, including when a
+  request returns an already-finished job. Discovery renders independently of
+  the status lookup. A failed lookup clears preparation controls and polling;
+  an action failure keeps the last known status and identifies the failed action.
+  The two dashboards share this controller. Read-only operators receive compact
+  status and progress summaries; editable plans and full job details are returned
+  to administrators. Status metadata is read in one SQLite snapshot, and both the
+  current and historical preparation commit are shown when they differ.
 - Trusted publisher metadata and checksummed acquisition for exact, three-part
   .NET SDK and Rust toolchain versions on Linux glibc x64/arm64. Installations
   coexist by artifact identity; acquisition runs without root and changes no

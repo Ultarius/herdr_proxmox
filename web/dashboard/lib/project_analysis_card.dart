@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/project_environment.dart';
 import 'package:juice/juice.dart';
 import 'package:herdr_dashboard_state/project_analysis.dart';
 import 'dashboard_bloc.dart';
@@ -17,108 +18,44 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
   bool refreshing = false;
   bool saving = false;
   int requestId = 0;
-  Map<String, dynamic>? environmentPlan;
-  Map<String, dynamic>? environmentJob;
-  Timer? environmentTimer;
-  int environmentGeneration = 0;
+  late final ProjectEnvironmentController environment;
+  Map<String, dynamic>? get environmentPlan => environment.plan;
+  Map<String, dynamic>? get environmentJob => environment.job;
+  Map<String, dynamic>? get environmentStatus => environment.status;
+  String? get environmentFailure => environment.lookupError;
+  bool get environmentBusy => saving || environment.busy || environment.loading;
 
   @override
   void dispose() {
-    environmentTimer?.cancel();
+    environment.dispose();
     super.dispose();
+  }
+
+  void initializeEnvironment() {
+    environment = ProjectEnvironmentController(
+      request: connection.request,
+      onUpdate: () {
+        if (mounted) setState(() {});
+      },
+      mounted: () => mounted && connection.state.connected,
+      connectionGeneration: () => connection.generation,
+    );
   }
 
   Future<void> environmentAction(
     String operation, {
     List<String>? checks,
+    String? jobId,
   }) async {
-    if (!admin || saving) return;
-    final epoch = connection.generation;
-    final path = widget.path;
-    final generation = ++environmentGeneration;
-    bool current() =>
-        mounted &&
-        connection.generation == epoch &&
-        widget.path == path &&
-        generation == environmentGeneration;
-    setState(() {
-      saving = true;
-      failure = null;
-    });
-    try {
-      final result = Map<String, dynamic>.from(
-        await connection.request(
-              'projects/environment/$operation',
-              switch (operation) {
-                'plan' => {'path': path},
-                'cancel' => {'id': environmentJob!['id']},
-                'authorize-restore' => {
-                  'digest': environmentPlan!['digest'],
-                  'allowed':
-                      environmentPlan!['restore_permission']?['allowed'] !=
-                      true,
-                },
-                'select' => {
-                  'digest': environmentPlan!['digest'],
-                  'checks': checks,
-                },
-                _ => {'digest': environmentPlan!['digest'], 'retry': true},
-              },
-            )
-            as Map,
-      );
-      if (!current()) return;
-      setState(() {
-        if (operation == 'plan' ||
-            operation == 'select' ||
-            operation == 'authorize-restore') {
-          environmentPlan = result;
-          environmentJob = null;
-        } else {
-          environmentJob = result;
-        }
-      });
-      environmentTimer?.cancel();
-      if (['queued', 'running'].contains(environmentJob?['state'])) {
-        var polling = false;
-        environmentTimer = Timer.periodic(const Duration(seconds: 2), (
-          timer,
-        ) async {
-          if (!current()) {
-            timer.cancel();
-            return;
-          }
-          if (polling) return;
-          polling = true;
-          try {
-            final job = Map<String, dynamic>.from(
-              await connection.request(
-                    'projects/environment?job=${environmentJob!['id']}',
-                  )
-                  as Map,
-            );
-            if (!current()) return;
-            setState(() => environmentJob = job);
-            if (!['queued', 'running'].contains(job['state'])) timer.cancel();
-          } catch (error) {
-            timer.cancel();
-            if (current()) setState(() => failure = '$error');
-          } finally {
-            polling = false;
-          }
-        });
-      }
-    } catch (error) {
-      if (current()) setState(() => failure = '$error');
-    } finally {
-      if (current()) setState(() => saving = false);
-    }
+    if (!admin || environmentBusy) return;
+    await environment.action(operation, checks: checks, jobId: jobId);
   }
 
   @override
   void initState() {
     super.initState();
     connection = BlocScope.get<DashboardBloc>();
+    initializeEnvironment();
     refresh();
   }
 
@@ -126,9 +63,7 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
   void didUpdateWidget(covariant ProjectAnalysisCard oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.path != widget.path) {
-      environmentTimer?.cancel();
-      environmentGeneration++;
-      environmentPlan = environmentJob = null;
+      environment.reset(widget.path);
       saving = false;
       requestId++;
       loaded = null;
@@ -144,24 +79,26 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
     if (refreshing || !connection.state.connected) return;
     refreshing = true;
     final epoch = connection.generation;
-    final current = ++requestId;
+    final id = ++requestId;
+    final path = widget.path;
+    unawaited(environment.load(path));
     try {
       final result = await loadProjectAnalysis(
         connection.request,
-        widget.path,
+        path,
         force: force,
       );
-      if (mounted && epoch == connection.generation && current == requestId) {
+      if (mounted && epoch == connection.generation && id == requestId)
         setState(() {
           loaded = result;
+
           failure = null;
         });
-      }
     } catch (error) {
-      if (mounted && epoch == connection.generation && current == requestId)
+      if (mounted && epoch == connection.generation && id == requestId)
         setState(() => failure = '$error');
     } finally {
-      if (mounted && epoch == connection.generation && current == requestId)
+      if (mounted && epoch == connection.generation && id == requestId)
         setState(() => refreshing = false);
     }
   }
@@ -311,11 +248,13 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
     }
   }
 
-  Widget requirement(Map item) {
+  Widget requirement(Map item, {bool sourceOnly = false}) {
     final conflicts = item['conflicts'] as List? ?? [];
     final resolution = item['resolution'] as Map?;
     final state = conflicts.isNotEmpty
         ? 'Conflict'
+        : sourceOnly
+        ? 'Source only'
         : item['established'] != true
         ? 'Unresolved'
         : 'Declared';
@@ -382,7 +321,7 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
             '${assessment['provisionable'] == true ? ' · installable' : ''}',
             style: TextStyle(
               fontWeight: FontWeight.bold,
-              color: verdict == 'violated' || verdict == 'missing'
+              color: verdict == 'violated'
                   ? Theme.of(context).colorScheme.error
                   : null,
             ),
@@ -411,12 +350,11 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
     final requirements = loaded?.requirements ?? const <Map<String, dynamic>>[];
     final sourceNotices = {
       for (final component in components)
-        component['path']: sourceComponentNotice(
-          component as Map,
-          report,
-          plan: environmentPlan,
-        ),
+        component['path']: sourceComponentNotice(component as Map, report),
     };
+    final view = environmentStatus == null
+        ? null
+        : ProjectEnvironmentView(environmentStatus!);
     return Card(
       child: ExpansionTile(
         title: const Text('Discovered requirements'),
@@ -451,19 +389,98 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                     Text(
                       'Boundary: ${source['boundary'] ?? 'repository root'} · cache ${source['cache_seconds'] ?? 0}s',
                     ),
+                    const Divider(),
+                    Text(
+                      'Project environment',
+                      style: Theme.of(context).textTheme.titleSmall,
+                    ),
+                    if (environment.actionError != null)
+                      Text(
+                        environment.actionError!,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    if (environment.loading)
+                      const Text('Loading saved environment status…')
+                    else if (environmentFailure != null)
+                      Text(
+                        'Saved environment status unavailable: $environmentFailure',
+                      )
+                    else if (view != null) ...[
+                      Row(
+                        children: [
+                          Icon(
+                            view.current
+                                ? Icons.check_circle_outline
+                                : view.prepared != null
+                                ? Icons.warning_amber_rounded
+                                : Icons.info_outline,
+                            color: view.prepared != null && !view.current
+                                ? Colors.orange
+                                : view.current
+                                ? Theme.of(context).colorScheme.primary
+                                : null,
+                          ),
+                          const SizedBox(width: 8),
+                          Flexible(
+                            child: Text(
+                              view.label,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      Text(view.detail),
+                      Text('Commit: ${view.revision}'),
+                      if (view.prepared != null && !view.current)
+                        Text('Prepared commit: ${view.preparedRevision}'),
+                      if (view.pendingPlanDetail != null)
+                        Text(view.pendingPlanDetail!),
+                      for (final sdk in view.sdks) Text(sdk),
+                      if (view.prepared != null) Text(view.checks),
+                    ],
+                    for (final job in environment.activeJobs) ...[
+                      Text(environmentJobLabel(job)),
+                      Text('Preparation job: ${job['id']}'),
+                      if (admin)
+                        TextButton(
+                          onPressed: environmentBusy
+                              ? null
+                              : () => environmentAction(
+                                  'cancel',
+                                  jobId: '${job['id']}',
+                                ),
+                          child: Text(
+                            environment.activeJobs.length == 1
+                                ? 'Cancel SDK preparation'
+                                : 'Cancel preparation ${job['id']}',
+                          ),
+                        ),
+                    ],
+                    if (environmentJob != null &&
+                        !environment.activeJobs.any(
+                          (job) => job['id'] == environmentJob!['id'],
+                        ))
+                      Text(environmentJobLabel(environmentJob!)),
                     if (requirements.isNotEmpty) ...[
                       const Divider(),
                       Text(
-                        'Host readiness',
+                        'Host SDK discovery',
                         style: Theme.of(context).textTheme.titleSmall,
                       ),
-                      Text(
-                        'Whether this machine can provide each requirement. A measured version '
-                        'is not a verdict; only the evaluator decides satisfaction.',
-                      ),
+                      const Text(hostSdkExplanation),
                       for (final item in requirements) readiness(item),
                       Text(projectInstallerSummary(report)),
                     ],
+                    const Divider(),
+                    Text(
+                      'Repository requirements',
+                      style: Theme.of(context).textTheme.titleSmall,
+                    ),
+                    const Text(repositoryRequirementExplanation),
                     if (components.isEmpty)
                       const Text(
                         'No component was recognised. Review the coverage and unresolved findings below.',
@@ -481,7 +498,11 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                         Text(sourceNotices[component['path']]!),
                       for (final item
                           in component['requirements'] as List? ?? [])
-                        requirement(item as Map),
+                        requirement(
+                          item as Map,
+                          sourceOnly:
+                              sourceNotices[component['path']]!.isNotEmpty,
+                        ),
                       if ((component['frameworks'] as List? ?? []).isNotEmpty)
                         Text(
                           'Frameworks: ${(component['frameworks'] as List).map((e) => e['label']).join(', ')}',
@@ -530,7 +551,7 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                     children: [
                       if (admin)
                         TextButton(
-                          onPressed: saving || refreshing
+                          onPressed: environmentBusy || refreshing
                               ? null
                               : () => environmentAction('plan'),
                           child: const Text('Plan environment'),
@@ -577,7 +598,7 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                         value:
                             environmentPlan!['restore_permission']?['allowed'] ==
                             true,
-                        onChanged: saving || !admin
+                        onChanged: environmentBusy || !admin
                             ? null
                             : (_) => environmentAction('authorize-restore'),
                       ),
@@ -590,7 +611,7 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                         value:
                             (environmentPlan!['selected_checks'] as List? ?? [])
                                 .any((item) => item['id'] == check['id']),
-                        onChanged: saving || !admin
+                        onChanged: environmentBusy || !admin
                             ? null
                             : (selected) {
                                 final ids = [
@@ -611,10 +632,12 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                     for (final item
                         in environmentPlan!['requirements'] as List? ?? [])
                       Text(
-                        '${item['components']}: ${item['capability']} ${item['version']} · ${item['state']} · ${item['reason']} · Activation: ${item['activation'] ?? 'unavailable'} ${item['activation_reason'] ?? ''}',
+                        preparationRequirementSummary(
+                          item as Map,
+                          environmentPlan!,
+                          environmentJob,
+                        ),
                       ),
-                    if (environmentJob != null)
-                      Text(environmentJobLabel(environmentJob!)),
                     if (environmentPlanCanPrepare(environmentPlan) &&
                         ![
                           'queued',
@@ -622,20 +645,10 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                           'ready',
                         ].contains(environmentJob?['state']))
                       TextButton(
-                        onPressed: saving || !admin
+                        onPressed: environmentBusy || !admin
                             ? null
                             : () => environmentAction('prepare'),
                         child: const Text('Prepare SDKs'),
-                      ),
-                    if ([
-                      'queued',
-                      'running',
-                    ].contains(environmentJob?['state']))
-                      TextButton(
-                        onPressed: saving || !admin
-                            ? null
-                            : () => environmentAction('cancel'),
-                        child: const Text('Cancel SDK preparation'),
                       ),
                   ],
                 ],

@@ -49,6 +49,38 @@ class EnvironmentPreparation:
         if self.thread:
             self.thread.join(timeout=35)
 
+    @staticmethod
+    def job_view(job, *, details=False):
+        if job is None or details:
+            return job
+        result = {key: job[key] for key in ('id', 'state', 'revision', 'created_at', 'finished_at') if key in job}
+        if job.get('state') == 'failed':
+            result['error'] = 'Ask an administrator to inspect the preparation error.'
+        return result
+
+    def status(self, project, *, details=False):
+        """Saved preparation at the checkout HEAD, without planning or probing SDKs."""
+        checkout = self.analysis.project(project)
+        project = checkout.relative_to(self.analysis.root.absolute()).as_posix()
+        revision = project_git.git(checkout, 'rev-parse', '--verify', 'HEAD^{commit}').strip()
+        plan, job, active, prepared_plan, prepared_job = self.store.status_records(project, revision)
+        current = bool(prepared_plan and prepared_plan['revision'] == revision)
+        for saved in (plan, prepared_plan):
+            if saved and environment_plan.digest(saved) != saved.get('digest'):
+                raise ValueError('The saved environment plan failed its integrity check.')
+        prepared = None
+        if prepared_plan:
+            prepared = dict(revision=prepared_plan['revision'],
+                job_id=prepared_job['id'], finished_at=prepared_job.get('finished_at'), current=current,
+                requirements=[{key: item.get(key) for key in ('capability', 'label', 'version', 'components')}
+                              for item in prepared_plan['requirements']],
+                selected_check_count=len(prepared_plan.get('selected_checks', [])))
+        return dict(project=project, revision=revision, plan=plan if details else None,
+                    job=self.job_view(job, details=details), prepared=prepared,
+                    active_jobs=[self.job_view(item, details=details) for item in active],
+                    pending_plan=bool(current and plan and plan['digest'] != prepared_plan['digest']),
+                    plan_current=bool(plan and plan['revision'] == revision))
+
     def plan(self, project, revision=None):
         checkout = self.analysis.project(project)
         revision = revision or project_git.git(checkout, 'rev-parse', '--verify', 'HEAD^{commit}').strip()

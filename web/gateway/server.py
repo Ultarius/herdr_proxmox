@@ -447,8 +447,17 @@ class Handler(BaseHTTPRequestHandler):
                     self.reply(503, {'error': 'Environment preparation is unavailable.'})
                     return
                 identifier = (query.get('job') or [''])[0]
+                if 'path' in query:
+                    try:
+                        self.reply(200, preparation.status(query['path'][0],
+                            details=self.operator.get('role') == 'admin'))
+                    except (ValueError, OSError, sqlite3.Error) as error:
+                        self.reply(400, {'error': str(error)[:500]})
+                    return
                 result = preparation.store.job(identifier) if identifier else preparation.store.get(
                     (query.get('plan') or [''])[0])
+                if identifier and self.operator.get('role') != 'admin':
+                    result = preparation.job_view(result)
                 self.reply(200 if result else 404, result or {'error': 'No environment record has that identity.'})
                 return
             if self.path == '/api/build':

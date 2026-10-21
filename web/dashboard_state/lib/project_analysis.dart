@@ -2,10 +2,68 @@
 ///
 /// The gateway resolves one view — discovery, any operator override, the
 /// disagreement between them and the host assessment — so the cards read a
-/// single answer rather than joining two endpoints and risking a different
-/// picture from the one provisioning acts on.
+/// single requirement answer. Saved SDK preparation is loaded separately from
+/// its execution authority, with its exact commit and lookup errors preserved.
 typedef ProjectAnalysisRequest =
     Future<dynamic> Function(String path, [Map<String, dynamic>? body]);
+
+const hostSdkExplanation =
+    'Executables found on the gateway host PATH or in its configured installer. '
+    'Project SDKs are isolated and shown separately above; a missing host SDK '
+    'does not block validation using a prepared project environment.';
+const repositoryRequirementExplanation =
+    'Required and Selected describe repository declarations, not installation status.';
+
+class ProjectEnvironmentView {
+  const ProjectEnvironmentView(this.status);
+  final Map status;
+  Map? get prepared =>
+      status['prepared'] is Map ? status['prepared'] as Map : null;
+  bool get current => prepared?['current'] == true;
+  String get label => current
+      ? 'Prepared for this commit'
+      : prepared != null
+      ? 'Prepared for an earlier commit'
+      : 'No prepared environment for this commit';
+  String get detail => current
+      ? 'Validation uses the saved project SDK bindings and verifies them again when it runs. '
+            'Build and test results are recorded separately in Checks & builds.'
+      : prepared != null
+      ? 'The saved preparation belongs to another commit. Use Plan environment to review '
+            'and prepare the current commit before validation.'
+      : 'Use Plan environment to review SDKs and validation checks. Opening this page '
+            'does not prepare SDKs or run project commands.';
+  String get revision => '${status['revision'] ?? ''}';
+  String get preparedRevision => '${prepared?['revision'] ?? ''}';
+  String? get pendingPlanDetail => status['pending_plan'] == true
+      ? 'A newer plan is pending preparation. Validation continues to use the saved prepared environment.'
+      : null;
+  List<String> get sdks => [
+    for (final item
+        in (prepared?['requirements'] as List? ?? []).whereType<Map>())
+      '${item['label'] ?? item['capability']} ${item['version'] ?? ''}'
+          ' · Components: ${(item['components'] as List? ?? []).join(', ')}',
+  ];
+  String get checks {
+    final count =
+        prepared?['selected_check_count'] ??
+        (prepared?['selected_checks'] as List? ?? []).length;
+    return '$count approved validation ${count == 1 ? 'check' : 'checks'}';
+  }
+}
+
+String preparationRequirementSummary(Map item, Map plan, Map? job) {
+  final ready = job?['state'] == 'ready' && job?['digest'] == plan['digest'];
+  return '${item['components']}: ${item['label'] ?? item['capability']} ${item['version']} · '
+      '${ready
+          ? 'SDK preparation recorded'
+          : item['state'] == 'ready'
+          ? 'SDK available'
+          : 'Planned action: ${item['state']}'}'
+      '${item['reason'] == null || item['reason'] == '' ? '' : ' · ${item['reason']}'}'
+      ' · Activation: ${item['activation'] ?? 'unavailable'}'
+      '${item['activation_reason'] == null || item['activation_reason'] == '' ? '' : ' · ${item['activation_reason']}'}';
+}
 
 String projectInstallerSummary(Map analysis) {
   final bundled = analysis['provisionable'] as List? ?? [];
@@ -61,7 +119,7 @@ bool environmentPlanCanPrepare(Map? plan) =>
 
 String environmentJobLabel(Map job) => switch (job['state']) {
   'ready' =>
-    'SDKs prepared. Dependency restore and project checks have not run.',
+    'SDK preparation completed. Build and test results are recorded separately in Checks & builds.',
   'queued' => 'SDK preparation queued',
   'running' => 'Acquiring and verifying SDKs',
   'cancelled' => 'SDK preparation cancelled',
@@ -98,6 +156,7 @@ class ProjectAnalysisLoad {
   /// An executable without a version rule proves availability, not compatibility.
   String readinessLabel(Map<String, dynamic> requirement) {
     final verdict = '${assessmentOf(requirement)['verdict'] ?? 'unknown'}';
+    if (verdict == 'missing') return 'Not found on host';
     if (verdict != 'satisfied') return verdict;
     final override = requirement['override'] as Map?;
     final declarations = override == null
