@@ -25,6 +25,7 @@ MODULES = (
     'test_environment_guardrails', 'test_environment_admission', 'test_environment_adoption',
     'test_environment_python', 'test_environment_contracts', 'test_rust_project_environment',
     'test_task_validation_environment',
+    'test_task_delivery',
 )
 
 

@@ -2698,7 +2698,12 @@ class _TasksPageState extends State<TasksPage> {
                     ),
                   if (task['delivery_workflow']['state'] == 'attention')
                     TextButton(
-                      onPressed: admin && !busy && task['auto_validate'] == true
+                      onPressed:
+                          admin &&
+                              !busy &&
+                              task['auto_validate'] == true &&
+                              task['delivery_workflow']['revalidation_wait']?['inspection_pending'] !=
+                                  true
                           ? () => act('policy', {
                               'task_id': task['id'],
                               'auto_capture': taskAutoCapture(task),

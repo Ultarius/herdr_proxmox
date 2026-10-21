@@ -344,6 +344,18 @@ class OrganizationStore:
         with self.lock, closing(self.connect()) as db:
             return self.get(db, 'jobs', job_id)
 
+    def job_for_request(self, request_id):
+        """Recover a committed enqueue without repeating the request or reading all jobs."""
+        with self.lock, closing(self.connect()) as db:
+            row = db.execute('SELECT response FROM requests WHERE key=?', (request_id,)).fetchone()
+            if row is None:
+                return None  # Job and request receipt commit in the same transaction.
+            identifier = json.loads(row['response'])['id']
+            try:
+                return self.get(db, 'jobs', identifier)
+            except ValueError:
+                return dict(id=identifier, state='unavailable')  # Receipt survives a removed job.
+
     def profile_records(self):
         """Narrow durable profile read with no runtime queries or integration callbacks."""
         with self.lock, closing(self.connect()) as db:

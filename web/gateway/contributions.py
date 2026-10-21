@@ -1843,11 +1843,15 @@ class Contributions:
             entry.update(approval_id=approval['id'], candidate=approval['candidate'],
                          plan_digest=approval['plan_digest'], policy_digest=approval['digest'],
                          detail='Approved the prepared environment for validation of this exact candidate; session policy retained.')
-        if action == 'delivery_superseded' and task.get('delivery_history'):
+        if action in ('delivery_superseded', 'delivery_revalidated') and task.get('delivery_history'):
             previous = task['delivery_history'][-1]
             entry.update(previous_sha=previous.get('sha'), delivery_chat_id=previous.get('chat_id'),
+                previous_validation_run=(previous.get('validation') or {}).get('run_id'),
+                validation_run=previous.get('superseded_by_validation'),
                 detail='Previous delivery report superseded for ' + str(previous.get('sha')) +
                        ('. Inspection chat retained for audit: ' + str(previous['chat_id']) if previous.get('chat_id') else ''))
+            if action == 'delivery_revalidated':
+                entry['detail'] += '. Validation ' + str(entry['previous_validation_run']) + ' superseded by ' + str(entry['validation_run']) + '.'
         if (action.startswith('pr_repair_') or action.startswith('validation_update_')) and task.get('pr_repair'):
             repair = task['pr_repair']
             entry.update(repair_id=repair['id'], repair_state=repair['state'],
@@ -3160,6 +3164,8 @@ class Contributions:
                 created = self.enqueue_assignment(created, actor)
                 self.save(created, 'assignment_queued', actor)
         elif action == 'policy':
+            if body.get('retry_delivery') is True:
+                task_delivery.check_inspection_retry(self, task)
             if task['state'] in ('merged', 'closed', 'completed') and not stopping_delivery:
                 raise ValueError('A terminal task can stop delivery automation, but cannot enable it.')
             capture = body.get('auto_capture', body.get('auto_validate', task.get('auto_capture', task.get('auto_validate', False))))

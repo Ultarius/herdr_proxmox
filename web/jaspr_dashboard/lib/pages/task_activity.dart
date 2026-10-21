@@ -93,6 +93,9 @@ String taskNextStep(Map task, {String executor = 'service'}) {
         return 'Waiting for GitHub mergeability and CI checks; the task agent remains reserved.';
       case 'notifying_agent':
       case 'waiting_agent':
+        if (delivery['revalidation_wait']?['inspection_pending'] == true) {
+          return '${delivery['error'] ?? 'Waiting for the previous delivery inspection.'}';
+        }
         if (delivery['repair_allowed'] == true) {
           return 'Waiting for the agent to repair failed checks or report an operator issue.';
         }
@@ -202,6 +205,10 @@ const activityLabels = {
   'validation_environment_error': 'Validation environment review failed',
   'validation_environment_approved':
       'Prepared environment approved for candidate validation',
+  'delivery_revalidated':
+      'New validation superseded the failed delivery inspection',
+  'delivery_revalidation_waiting':
+      'Passing validation awaits the previous inspection',
   'delivery_superseded':
       'Previous candidate delivery report retained as history',
   'review_policy': 'Automatic group review policy changed',
@@ -256,10 +263,18 @@ String activitySubtitle(Map entry) {
   final metadata =
       '${entry['actor'] == 'automatic_task_policy' ? 'Task automation' : entry['actor']} · ${entry['at']}'
       '${shortSha(entry['head_sha']).isEmpty ? (entry['state'] == null ? '' : ' · ${entry['state']}') : ' · ${shortSha(entry['head_sha'])}'}';
-  if (entry['action'] != 'delivery_superseded') return metadata;
+  if (![
+    'delivery_superseded',
+    'delivery_revalidated',
+  ].contains(entry['action'])) {
+    return metadata;
+  }
   final previous = shortSha(entry['previous_sha']);
   final chat = '${entry['delivery_chat_id'] ?? ''}';
-  return '$metadata\nSuperseded ${previous.isEmpty ? 'candidate' : previous}${chat.isEmpty ? '' : ' · chat $chat'}';
+  final validation = '${entry['validation_run'] ?? ''}';
+  final previousValidation = '${entry['previous_validation_run'] ?? ''}';
+  return '$metadata\nSuperseded ${previous.isEmpty ? 'candidate' : previous}${chat.isEmpty ? '' : ' · chat $chat'}'
+      '${validation.isEmpty ? '' : ' · validation ${previousValidation.isEmpty ? '' : '$previousValidation → '}$validation'}';
 }
 
 /// Which section holds an entry's evidence. The activity list is the index.
@@ -289,6 +304,8 @@ String activitySection(Object? action) {
     case 'build':
     case 'build_result':
     case 'build_evidence_mismatch':
+    case 'delivery_revalidated':
+    case 'delivery_revalidation_waiting':
       return 'Checks & builds';
     default:
       return 'Overview';

@@ -10,6 +10,7 @@ import unittest
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 import uuid
+from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -19,6 +20,21 @@ spec.loader.exec_module(gateway)
 
 
 class OrganizationTests(unittest.TestCase):
+    def test_job_request_lookup_distinguishes_unsubmitted_pending_and_removed_jobs(self):
+        organization = self.organization()
+        identifier, request = uuid.uuid4().hex, uuid.uuid4().hex
+        job = dict(id=identifier, organization_id=organization, kind='chat', state='queued')
+        self.assertIsNone(self.store.job_for_request(request))
+        with self.store.lock, closing(self.store.connect()) as db, db:
+            self.store.put(db, 'jobs', job)
+            db.execute('INSERT INTO requests VALUES (?,?,?)', (request, 'fixture', json.dumps(dict(id=identifier))))
+        before = len(self.calls)
+        self.assertEqual(self.store.job_for_request(request), job)
+        with self.store.lock, closing(self.store.connect()) as db, db:
+            db.execute('DELETE FROM jobs WHERE id=?', (identifier,))
+        self.assertEqual(self.store.job_for_request(request), dict(id=identifier, state='unavailable'))
+        self.assertEqual(len(self.calls), before)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

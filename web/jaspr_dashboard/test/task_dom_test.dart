@@ -275,6 +275,40 @@ void main() {
     },
   );
 
+  for (final pending in [true, false]) {
+    test(
+      'delivery retry is ${pending ? 'disabled' : 'available'} for an old inspection',
+      () async {
+        final task = publishedTask()
+          ..addAll({
+            'state': 'review_ready',
+            'await_verification': true,
+            'auto_validate': true,
+            'delivery_workflow': {
+              'sha': 'b' * 40,
+              'state': 'attention',
+              'error': 'Previous inspection requires recovery.',
+              'revalidation_wait': {'inspection_pending': pending},
+            },
+          });
+        await mount(
+          const TasksPage(taskId: 'task'),
+          (request) => taskResponse(request, task),
+        );
+        await click('Automation settings');
+        expect(
+          button('Retry verification and delivery inspection').disabled,
+          pending,
+        );
+        if (pending) {
+          button('Retry verification and delivery inspection').click();
+          await settle();
+          expect(posts, isEmpty);
+        }
+      },
+    );
+  }
+
   for (final selected in [false, true]) {
     test(
       'low storage remains visible on ${selected ? 'task detail' : 'workflow'} and clears after recovery',
