@@ -28,8 +28,10 @@ Read only the resources needed for the current request, before taking its action
   Verify incorporation, conflicts and operation state. Run required checks;
   static inspection and a successful web build cannot replace a missing check.
 - **Missing task tool:** read [tool acquisition](references/tools.md) before
-  installing. Use pinned, integrity-verified task-local tools within existing
-  permissions. Agents share the herdr account/home; do not overwrite shared tools.
+  taking action. Use the prepared project SDK; report missing or mismatching
+  SDKs for dashboard environment preparation. Acquire auxiliary tools only when
+  explicitly authorized, within the session allocation and existing permissions.
+  Agents share the herdr account/home; do not overwrite shared tools.
 - **Integration reply:** read [report contract](references/report.md). Use the
   exact JSON schema supplied in this request and its reply delivery instructions.
 

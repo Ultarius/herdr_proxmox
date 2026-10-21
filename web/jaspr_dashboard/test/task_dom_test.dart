@@ -187,6 +187,40 @@ void main() {
       ? task
       : {'workspaces': [], 'agents': []};
 
+  for (final selected in [false, true]) {
+    test(
+      'low storage remains visible on ${selected ? 'task detail' : 'workflow'} and clears after recovery',
+      () async {
+        final disk = <String, dynamic>{
+          'blocked': true,
+          'reason': 'Low disk space. Restore storage.',
+        };
+        final task = publishedTask();
+        await mount(TasksPage(taskId: selected ? 'task' : null), (request) {
+          final response = taskResponse(request, task);
+          if (request.url.path.endsWith('/tasks')) response['storage'] = disk;
+          return response;
+        });
+        expect(
+          elements('.notice').any(
+            (e) => e.textContent!.contains(
+              'Storage needs attention: Low disk space.',
+            ),
+          ),
+          true,
+        );
+        disk['blocked'] = false;
+        await click(selected ? 'Refresh task' : 'Refresh tasks');
+        expect(
+          elements(
+            '.notice',
+          ).any((e) => e.textContent!.contains('Storage needs attention:')),
+          false,
+        );
+      },
+    );
+  }
+
   test(
     'live snapshot binding identifies the current task on the board and list',
     () async {

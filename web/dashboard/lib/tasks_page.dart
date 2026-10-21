@@ -125,6 +125,7 @@ class _TasksPageState extends State<TasksPage> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
   List<Map<String, dynamic>> tasks = [];
   Map<String, dynamic> github = {};
+  Map<String, dynamic> storage = {};
   String executor = 'unavailable';
   String section = 'Overview';
   final Set<String> expandedMeetings = {};
@@ -169,6 +170,7 @@ class _TasksPageState extends State<TasksPage> {
         setState(() {
           tasks = [];
           github = {};
+          storage = {};
           error = null;
           readError = null;
           requests.clear();
@@ -269,6 +271,7 @@ class _TasksPageState extends State<TasksPage> {
             readError = detailError;
           }
           github = Map<String, dynamic>.from(data['github'] ?? {});
+          storage = Map<String, dynamic>.from(data['storage'] ?? {});
           executor = '${data['executor'] ?? 'unavailable'}';
         });
       }
@@ -1050,6 +1053,7 @@ class _TasksPageState extends State<TasksPage> {
             padding: const EdgeInsets.all(20),
             children: [
               Text('Tasks', style: Theme.of(context).textTheme.headlineLarge),
+              _storageNotice(),
               const SizedBox(height: 8),
               const Text(
                 'Develop in a task branch, review the exact commit, publish and open a draft pull request. Merge on GitHub. Updating the base and deploying are separate operations.',
@@ -1165,6 +1169,16 @@ class _TasksPageState extends State<TasksPage> {
       if (mounted) await refresh();
     }
   }
+
+  Widget _storageNotice() => storage['blocked'] == true
+      ? Padding(
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          child: Text(
+            'Storage needs attention: ${storage['reason']}',
+            style: TextStyle(color: Theme.of(context).colorScheme.error),
+          ),
+        )
+      : const SizedBox.shrink();
 
   Future<void> backToTasks() async {
     if (widget.coordinator != null) {
@@ -2349,6 +2363,7 @@ class _TasksPageState extends State<TasksPage> {
     return ListView(
       padding: const EdgeInsets.all(20),
       children: [
+        _storageNotice(),
         Align(
           alignment: Alignment.centerLeft,
           child: TextButton.icon(

@@ -1,7 +1,9 @@
 import importlib.util
 import json
 import hashlib
+import io
 import shutil
+import stat
 import tarfile
 from pathlib import Path
 import tempfile
@@ -22,6 +24,480 @@ worker_spec.loader.exec_module(worker)
 
 
 class UpdateTests(unittest.TestCase):
+    def legacy_backup(self, state, name='backup-1'):
+        backup = state / name
+        for relative, contents in {
+            'web/gateway/server.py': 'gateway', 'web/public/index.html': 'dashboard',
+            'config/token': 'saved token', 'VERSION': 'v0.0.55',
+            'BUILD.json': json.dumps({'build_id': 'v0.0.55', 'deployment_mode': 'release'}),
+        }.items():
+            path = backup / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(contents)
+        return backup
+
+    def setUp(self):
+        # Deployment tests must not depend on the developer machine's disk.
+        disk = patch.object(worker.shutil, 'disk_usage', return_value=MagicMock(free=10**12))
+        disk.start()
+        self.addCleanup(disk.stop)
+        inodes = patch.object(worker.os, 'statvfs', return_value=MagicMock(f_files=10**6, f_favail=10**6), create=True)
+        inodes.start()
+        self.addCleanup(inodes.stop)
+
+    def test_manifest_refuses_changed_added_or_missing_files_before_restore(self):
+        for mutation in ('changed', 'added', 'missing'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as folder:
+                state = Path(folder)
+                backup = self.legacy_backup(state)
+                (backup / 'manifest.json').write_text(json.dumps(worker.backup_inventory(backup)))
+                self.assertEqual(worker.verify_backup(backup)['method'], 'manifest')
+                if mutation == 'changed':
+                    (backup / 'config/token').write_text('wrong token')
+                elif mutation == 'added':
+                    (backup / 'config/extra').write_text('unexpected')
+                else:
+                    (backup / 'web/gateway/server.py').unlink()
+                with patch.object(worker, 'service') as service, patch.object(worker.shutil, 'rmtree') as remove:
+                    with self.assertRaisesRegex(ValueError, 'manifest does not match'):
+                        worker.restore(backup)
+                    service.assert_not_called()
+                    remove.assert_not_called()
+
+    def test_legacy_backup_requires_a_valid_completion_witness(self):
+        for witness in ('missing', 'invalid', 'empty', 'valid'):
+            with self.subTest(witness=witness), tempfile.TemporaryDirectory() as folder, \
+                    patch.object(worker, 'ROOT', Path(folder) / 'installed'):
+                backup = self.legacy_backup(Path(folder))
+                identity = backup / 'BUILD.json'
+                if witness == 'missing':
+                    identity.unlink()
+                elif witness == 'invalid':
+                    identity.write_text('{')
+                elif witness == 'empty':
+                    identity.write_text('{}')
+                if witness == 'valid':
+                    self.assertEqual(worker.verify_backup(backup)['method'], 'legacy-witness')
+                else:
+                    with self.assertRaisesRegex(ValueError, 'Legacy backup is unverified'):
+                        worker.verify_backup(backup)
+
+    def test_legacy_backup_cannot_retain_a_newer_installer(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder)
+            backup = self.legacy_backup(state)
+            root = state / 'installed'
+            (root / 'install').mkdir(parents=True)
+            with patch.object(worker, 'ROOT', root), patch.object(worker, 'service') as service:
+                with self.assertRaisesRegex(ValueError, 'refusing a mixed deployment'):
+                    worker.restore(backup)
+                service.assert_not_called()
+
+    def test_corrupt_backup_database_is_refused_without_changing_live_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder)
+            backup = self.legacy_backup(state)
+            (backup / 'config/organizations.sqlite3').write_bytes(b'truncated database')
+            before = {p.relative_to(backup): p.read_bytes() for p in backup.rglob('*') if p.is_file()}
+            with patch.object(worker, 'ROOT', state / 'installed'), patch.object(worker, 'service') as service:
+                with self.assertRaisesRegex(ValueError, 'configuration database is invalid'):
+                    worker.restore(backup)
+                service.assert_not_called()
+            self.assertEqual(before, {p.relative_to(backup): p.read_bytes() for p in backup.rglob('*') if p.is_file()})
+
+    def test_sqlite_validation_includes_wal_without_writing_backup_sidecars(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder)
+            database = config / 'organizations.sqlite3'
+            connection = worker.sqlite3.connect(database)
+            try:
+                connection.execute('PRAGMA journal_mode=WAL')
+                connection.execute('CREATE TABLE evidence (value TEXT)')
+                connection.commit()
+                connection.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                connection.execute("INSERT INTO evidence VALUES ('committed WAL evidence')")
+                connection.commit()
+                before = {p.name: p.read_bytes() for p in config.iterdir()}
+                self.assertTrue(before['organizations.sqlite3-wal'])
+                worker.verify_config(config)
+                self.assertEqual(before, {p.name: p.read_bytes() for p in config.iterdir()})
+            finally:
+                connection.close()
+
+    def test_rollback_selects_verified_legacy_backup_and_records_sidecar(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            state = Path(folder)
+            backup = self.legacy_backup(state, 'backup-2')
+            incomplete = self.legacy_backup(state, 'backup-10')
+            (incomplete / 'BUILD.json').unlink()
+            self.legacy_backup(state, 'backup-99.partial')
+            before = worker.backup_inventory(backup)
+            mocks.enter_context(patch.object(worker, 'STATE', state))
+            mocks.enter_context(patch.object(worker, 'ROOT', state / 'installed'))
+            mocks.enter_context(patch.object(worker, 'CONFIG', state / 'config'))
+            mocks.enter_context(patch.object(worker, 'deployment_storage'))
+            mocks.enter_context(patch.object(worker, 'service'))
+            mocks.enter_context(patch.object(worker, 'backup_current', return_value=state / 'backup-100'))
+            restored = mocks.enter_context(patch.object(worker, 'restore', side_effect=worker.verify_backup))
+            mocks.enter_context(patch.object(worker, 'wait_for_ready'))
+            mocks.enter_context(patch.object(worker, 'warn'))
+            worker.rollback()
+            restored.assert_called_once_with(backup)
+            saved = json.loads((state / 'status.json').read_text())
+            self.assertEqual(saved['backup_verification']['method'], 'legacy-witness')
+            self.assertEqual(saved['skipped_backups'][0]['backup'], 'backup-10')
+            registry = json.loads((state / 'backups.json').read_text())
+            self.assertEqual(registry['backup-2']['method'], 'legacy-witness')
+            self.assertEqual(before, worker.backup_inventory(backup))
+            # Certificates must not bypass a fresh content check.
+            (backup / 'config/token').write_text('changed after certification')
+            with self.assertRaisesRegex(ValueError, 'changed since certification'):
+                worker.verify_backup(backup)
+            (backup / 'config/token').write_text('saved token')
+            (backup / 'BUILD.json').write_text('{')
+            with self.assertRaisesRegex(ValueError, 'Legacy backup is unverified'):
+                worker.verify_backup(backup)
+
+    def test_failure_after_build_identity_never_publishes_partial_backup(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            state = Path(folder)
+            root = self.legacy_backup(state, 'installed')
+            mocks.enter_context(patch.object(worker, 'ROOT', root))
+            mocks.enter_context(patch.object(worker, 'CONFIG', root / 'config'))
+            mocks.enter_context(patch.object(worker, 'STATE', state))
+            mocks.enter_context(patch.object(worker, 'backup_inventory', side_effect=OSError(28, 'No space left on device')))
+            with self.assertRaisesRegex(OSError, 'No space left on device'):
+                worker.backup_current()
+            self.assertFalse(list(state.glob('backup-*')))
+
+    def test_enospc_does_not_claim_that_available_space_proves_a_quota(self):
+        for error in (OSError(28, 'No space left on device'),
+                      shutil.Error([('source', 'destination', '[Errno 28] No space left on device')])):
+            message = worker.failure_message(error)
+            self.assertIn('could not allocate filesystem space', message)
+            self.assertNotIn('exceeded a storage quota', message)
+            self.assertIn('free space alone does not identify the cause', message)
+
+    def test_failed_backup_is_never_a_rollback_candidate(self):
+        for cleanup_fails in (False, True):
+            with self.subTest(cleanup_fails=cleanup_fails), tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+                base = Path(folder)
+                root, config, state = base / 'installed', base / 'config', base / 'state'
+                for path in (root / 'web', config, state):
+                    path.mkdir(parents=True)
+                (root / 'web/server.py').write_text('gateway')
+                (config / 'token').write_text('original token')
+                for name, value in [('ROOT', root), ('CONFIG', config), ('STATE', state)]:
+                    mocks.enter_context(patch.object(worker, name, value))
+                original_copy = shutil.copytree
+                def copy(source, destination, **kwargs):
+                    if source == config:
+                        destination.mkdir()
+                        (destination / 'token').write_text('truncated')
+                        raise OSError(28, 'No space left on device')
+                    return original_copy(source, destination, **kwargs)
+                mocks.enter_context(patch.object(worker.shutil, 'copytree', side_effect=copy))
+                if cleanup_fails:
+                    mocks.enter_context(patch.object(worker.shutil, 'rmtree', side_effect=OSError('cleanup failed')))
+                mocks.enter_context(patch.object(worker, 'warn'))
+                with self.assertRaisesRegex(OSError, 'No space left on device'):
+                    worker.backup_current()
+                self.assertEqual(len(list(state.glob('*.partial'))), int(cleanup_fails))
+                with patch.object(worker, 'service') as service:
+                    with self.assertRaisesRegex(ValueError, 'No deployment backup'):
+                        worker.rollback()
+                    service.assert_not_called()
+                self.assertEqual((config / 'token').read_text(), 'original token')
+
+    def test_backup_publishes_only_after_the_last_copy(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            base = Path(folder)
+            root, config, state = base / 'installed', base / 'config', base / 'state'
+            for path in (root / 'web', config, state):
+                path.mkdir(parents=True)
+            (config / 'token').write_text('saved token')
+            (root / 'VERSION').write_text('v0.0.55')
+            for name, value in [('ROOT', root), ('CONFIG', config), ('STATE', state)]:
+                mocks.enter_context(patch.object(worker, name, value))
+            original_tree, original_file = shutil.copytree, shutil.copy2
+            def unpublished():
+                self.assertTrue(list(state.glob('*.partial')))
+                self.assertFalse(any(worker.re.fullmatch(r'backup-[0-9]+', p.name) for p in state.iterdir()))
+            def tree(source, destination, **kwargs):
+                unpublished()
+                return original_tree(source, destination, **kwargs)
+            def file(source, destination, **kwargs):
+                unpublished()
+                return original_file(source, destination, **kwargs)
+            mocks.enter_context(patch.object(worker.shutil, 'copytree', side_effect=tree))
+            mocks.enter_context(patch.object(worker.shutil, 'copy2', side_effect=file))
+            backup = worker.backup_current()
+            self.assertEqual((backup / 'config/token').read_text(), 'saved token')
+            self.assertEqual((backup / 'VERSION').read_text(), 'v0.0.55')
+            self.assertFalse(list(state.glob('*.partial')))
+
+    def test_upgrade_budgets_config_only_in_backup_and_accounts_for_metadata(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            base = Path(folder)
+            root, config, state, source = (base / name for name in ('installed', 'config', 'state', 'source'))
+            for path in (root, config, state, source):
+                path.mkdir()
+            for name, value in [('ROOT', root), ('CONFIG', config), ('STATE', state)]:
+                mocks.enter_context(patch.object(worker, name, value))
+            mib = 1024 * 1024
+            sizes = {root / 'web': 20 * mib, config: 100 * mib, source / 'web': 15 * mib}
+            mocks.enter_context(patch.object(worker, 'footprint', side_effect=lambda path: (sizes.get(path, 0), 1)))
+            mocks.enter_context(patch.object(worker.shutil, 'disk_usage', return_value=MagicMock(free=worker.STORAGE_RESERVE + 140 * mib)))
+            worker.deployment_storage(source)
+            with self.assertRaisesRegex(ValueError, 'Not enough disk space'):
+                worker.deployment_storage(source, config)
+            sizes[source / 'VERSION'] = 10 * mib
+            with self.assertRaisesRegex(ValueError, 'Not enough disk space'):
+                worker.deployment_storage(source)
+
+    def test_storage_samples_each_destination_and_reports_both_shortages(self):
+        with tempfile.TemporaryDirectory() as folder:
+            first, second = Path(folder) / 'first', Path(folder) / 'second'
+            first.mkdir()
+            second.mkdir()
+            with patch.object(worker.shutil, 'disk_usage', side_effect=lambda path:
+                              MagicMock(free=0 if path == second else 10**12)), \
+                    patch.object(worker.os, 'statvfs', return_value=MagicMock(f_files=100, f_favail=0)):
+                # First verify different destination reports on one device.
+                with patch.object(worker.os, 'statvfs', return_value=MagicMock(f_files=0)):
+                    with self.assertRaisesRegex(ValueError, 'second'):
+                        worker.require_storage([(first, 10, 1), (second, 10, 1)])
+                with self.assertRaises(ValueError) as failure:
+                    worker.require_storage([(second, 10, 1)])
+                self.assertIn('MiB available', str(failure.exception))
+                self.assertIn('free inodes', str(failure.exception))
+
+    def test_footprint_refuses_symlinks_and_explains_disappearing_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            child = root / 'file'
+            child.write_text('contents')
+            original = Path.lstat
+            with patch.object(Path, 'lstat', lambda path: MagicMock(st_mode=stat.S_IFLNK) if path == child else original(path)):
+                with self.assertRaisesRegex(ValueError, 'symbolic link'):
+                    worker.footprint(root)
+            def disappearing(path):
+                if path == child:
+                    raise FileNotFoundError(path)
+                return original(path)
+            with patch.object(Path, 'lstat', disappearing):
+                with self.assertRaisesRegex(ValueError, 'changed while measuring'):
+                    worker.footprint(root)
+
+    def test_failure_reporting_cannot_mask_the_primary_error(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            base = Path(folder)
+            request = base / 'request.json'
+            request.write_text('{}')
+            mocks.enter_context(patch.object(worker, 'STATE', base / 'state'))
+            mocks.enter_context(patch.object(worker, 'REQUEST', request))
+            mocks.enter_context(patch.object(worker.os, 'geteuid', return_value=0, create=True))
+            mocks.enter_context(patch.object(worker, 'read_request', side_effect=ValueError('primary refusal')))
+            mocks.enter_context(patch.object(worker, 'status', side_effect=OSError(28, 'No space left on device')))
+            mocks.enter_context(patch.object(Path, 'unlink', side_effect=OSError('request cleanup failed')))
+            with patch.object(worker, 'warn') as warn:
+                with self.assertRaisesRegex(ValueError, 'primary refusal'):
+                    worker.main()
+            output = ' '.join(str(c.args[0]) for c in warn.call_args_list)
+            self.assertIn('primary refusal', output)
+            self.assertIn('request cleanup failed', output)
+            self.assertIn('recovery details', output)
+
+    def test_running_status_disk_failure_is_diagnosed_before_any_installation(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            base = Path(folder)
+            request = base / 'request.json'
+            request.write_text('{"version":"v0.0.55"}')
+            for name, value in [('ROOT', base / 'installed'), ('STATE', base / 'state'), ('REQUEST', request)]:
+                mocks.enter_context(patch.object(worker, name, value))
+            mocks.enter_context(patch.object(worker.os, 'geteuid', return_value=0, create=True))
+            failure = OSError(28, 'No space left on device')
+            mocks.enter_context(patch.object(worker, 'status', side_effect=failure))
+            service = mocks.enter_context(patch.object(worker, 'service'))
+            with patch.object(worker, 'warn') as warn:
+                with self.assertRaises(OSError) as caught:
+                    worker.main()
+            self.assertIs(caught.exception, failure)
+            self.assertIn('expand the container disk', warn.call_args_list[0].args[0])
+            service.assert_not_called()
+
+    def test_audit_failure_does_not_invalidate_saved_status(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(worker, 'STATE', Path(folder)):
+            original = Path.open
+            def open_path(path, *args, **kwargs):
+                if path.name == 'audit.jsonl':
+                    raise OSError(28, 'No space left on device')
+                return original(path, *args, **kwargs)
+            with patch.object(Path, 'open', open_path), patch.object(worker, 'warn') as warn:
+                worker.status('complete', backup='retained')
+            self.assertEqual(json.loads((Path(folder) / 'status.json').read_text())['backup'], 'retained')
+            warn.assert_called_once()
+
+    def test_download_uses_announced_size_but_keeps_streamed_limits(self):
+        for length in ('7', None, '3'):
+            with self.subTest(length=length), tempfile.TemporaryDirectory() as folder:
+                response = MagicMock()
+                response.__enter__.return_value = response
+                response.headers = {} if length is None else {'Content-Length': length}
+                response.read.side_effect = io.BytesIO(b'content').read
+                target = Path(folder) / 'archive'
+                with patch.object(worker, 'urlopen', return_value=response), patch.object(worker, 'require_storage') as capacity:
+                    worker.download('https://example.test/archive', target, 1000)
+                self.assertEqual(target.read_bytes(), b'content')
+                self.assertEqual(capacity.call_args_list[0].args[0], [(target.parent, int(length) if length else 1000, 1)])
+                self.assertEqual(capacity.call_count, 2 if length == '3' else 1)
+        with tempfile.TemporaryDirectory() as folder:
+            response = MagicMock()
+            response.__enter__.return_value = response
+            target = Path(folder) / 'archive'
+            for headers in ({'Content-Length': '1001'}, {}):
+                response.headers = headers
+                response.read.side_effect = io.BytesIO(b'x' * 1001).read
+                with patch.object(worker, 'urlopen', return_value=response), patch.object(worker, 'require_storage'):
+                    with self.assertRaisesRegex(ValueError, 'size limit'):
+                        worker.download('https://example.test/archive', target, 1000)
+
+    def test_quota_exceeded_has_storage_recovery_guidance(self):
+        for error in (OSError(worker.errno.EDQUOT, 'Disk quota exceeded'),
+                      shutil.Error([('source', 'destination', '[Errno 122] Disk quota exceeded')])):
+            self.assertIn('storage quota', worker.failure_message(error))
+            self.assertIn('allowance', worker.failure_message(error))
+
+    def test_rollback_safety_restore_failure_preserves_primary_error(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            state = Path(folder)
+            backup = state / 'backup-1'
+            safety = state / 'backup-2'
+            (backup / 'web').mkdir(parents=True)
+            (backup / 'config').mkdir()
+            mocks.enter_context(patch.object(worker, 'STATE', state))
+            mocks.enter_context(patch.object(worker, 'deployment_storage'))
+            mocks.enter_context(patch.object(worker, 'verify_backup', return_value={'method': 'manifest'}))
+            mocks.enter_context(patch.object(worker, 'record_backup_verification'))
+            mocks.enter_context(patch.object(worker, 'backup_current', return_value=safety))
+            mocks.enter_context(patch.object(worker, 'service'))
+            primary = ValueError('primary rollback failure')
+            mocks.enter_context(patch.object(worker, 'restore', side_effect=[primary, OSError(28, 'No space left on device')]))
+            mocks.enter_context(patch.object(worker, 'warn'))
+            with self.assertRaisesRegex(ValueError, 'primary rollback failure') as caught:
+                worker.rollback()
+            self.assertIs(caught.exception, primary)
+            self.assertEqual(primary.recovery_backup, str(safety))
+            self.assertIn('expand the container disk', primary.recovery_error)
+
+    def test_storage_sums_allocations_on_the_same_filesystem(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(worker.shutil, 'disk_usage', return_value=MagicMock(free=worker.STORAGE_RESERVE + 25)):
+                with self.assertRaisesRegex(ValueError, 'Not enough disk space'):
+                    worker.require_storage([(Path(folder), 10, 1), (Path(folder) / 'new', 20, 1)])
+            with patch.object(worker.os, 'statvfs', return_value=MagicMock(f_files=10000, f_favail=1025)):
+                with self.assertRaisesRegex(ValueError, 'free inodes'):
+                    worker.require_storage([(Path(folder), 0, 2)])
+
+    def test_storage_failure_keeps_running_installation_and_previous_backup(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            base = Path(folder)
+            root, state, config = base / 'installed', base / 'state', base / 'config'
+            for path in (root / 'web', state, config):
+                path.mkdir(parents=True)
+            (root / 'web/server.py').write_text('original')
+            (state / 'status.json').write_text(json.dumps({'backup': 'previous-backup'}))
+            request = base / 'request.json'
+            request.write_text('{"version":"v0.0.55"}')
+            package = base / 'package'
+            package.mkdir()
+            (package / 'VERSION').write_text('v0.0.55')
+            for name, value in [('ROOT', root), ('STATE', state), ('CONFIG', config), ('REQUEST', request)]:
+                mocks.enter_context(patch.object(worker, name, value))
+            mocks.enter_context(patch.object(worker.os, 'geteuid', return_value=0, create=True))
+            download = mocks.enter_context(patch.object(worker, 'download'))
+            mocks.enter_context(patch.object(worker, 'sha256', return_value='a' * 64))
+            mocks.enter_context(patch.object(worker, 'extract', return_value=package))
+            mocks.enter_context(patch.object(worker, 'release_identity', return_value={}))
+            mocks.enter_context(patch.object(worker.subprocess, 'run'))
+            # A valid checksum is still required before the installation check.
+            download.side_effect = lambda url, target, limit: target.write_text('a' * 64 + '  herdr-proxmox.tar.gz')
+            mocks.enter_context(patch.object(worker.shutil, 'disk_usage', side_effect=lambda path:
+                                            MagicMock(free=0 if Path(path) == root else 10**12)))
+            service = mocks.enter_context(patch.object(worker, 'service'))
+            backup = mocks.enter_context(patch.object(worker, 'backup_current'))
+            replace = mocks.enter_context(patch.object(worker, 'replace_install'))
+            with self.assertRaisesRegex(ValueError, 'expand the container disk'):
+                worker.main()
+            service.assert_not_called()
+            backup.assert_not_called()
+            replace.assert_not_called()
+            self.assertEqual((root / 'web/server.py').read_text(), 'original')
+            saved = json.loads((state / 'status.json').read_text())
+            self.assertEqual((saved['state'], saved['backup'], saved['rolled_back']), ('failed', 'previous-backup', False))
+
+    def test_copytree_disk_full_error_is_actionable(self):
+        error = shutil.Error([('source', 'destination', '[Errno 28] No space left on device')])
+        self.assertIn('expand the container disk', worker.failure_message(error))
+
+    def test_failed_recovery_retains_primary_error_and_backup(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            base = Path(folder)
+            request = base / 'request.json'
+            request.write_text('{"version":"v0.0.55"}')
+            source = base / 'package'
+            source.mkdir()
+            (source / 'VERSION').write_text('v0.0.55')
+            backup_path = base / 'backup-1'
+            for name, value in [('ROOT', base / 'installed'), ('STATE', base / 'state'), ('REQUEST', request)]:
+                mocks.enter_context(patch.object(worker, name, value))
+            mocks.enter_context(patch.object(worker.os, 'geteuid', return_value=0, create=True))
+            download = mocks.enter_context(patch.object(worker, 'download'))
+            download.side_effect = lambda url, target, limit: target.write_text('a' * 64 + '  herdr-proxmox.tar.gz')
+            mocks.enter_context(patch.object(worker, 'sha256', return_value='a' * 64))
+            mocks.enter_context(patch.object(worker, 'extract', return_value=source))
+            mocks.enter_context(patch.object(worker, 'release_identity', return_value={}))
+            mocks.enter_context(patch.object(worker, 'deployment_storage'))
+            mocks.enter_context(patch.object(worker.subprocess, 'run'))
+            mocks.enter_context(patch.object(worker, 'service'))
+            mocks.enter_context(patch.object(worker, 'backup_current', return_value=backup_path))
+            mocks.enter_context(patch.object(worker, 'replace_install', side_effect=OSError(28, 'No space left on device')))
+            restored = mocks.enter_context(patch.object(worker, 'restore', side_effect=ValueError('recovery unavailable')))
+            with self.assertRaisesRegex(OSError, 'No space left on device'):
+                worker.main()
+            restored.assert_called_once_with(backup_path)
+            saved = json.loads((base / 'state/status.json').read_text())
+            self.assertFalse(saved['rolled_back'])
+            self.assertEqual(saved['backup'], str(backup_path))
+            self.assertEqual(saved['recovery_error'], 'recovery unavailable')
+            self.assertIn('expand the container disk', saved['error'])
+
+    def test_extraction_refuses_low_storage_before_writing_package_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            staging = Path(folder)
+            archive = staging / 'release.tar'
+            with tarfile.open(archive, 'w') as package:
+                package.add(staging, arcname='herdr-proxmox', recursive=False)
+            with patch.object(worker.shutil, 'disk_usage', return_value=MagicMock(free=0)):
+                with self.assertRaisesRegex(ValueError, 'Not enough disk space'):
+                    worker.extract(archive, staging)
+            self.assertFalse((staging / 'herdr-proxmox').exists())
+
+    def test_rollback_refuses_low_storage_before_stopping_service(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder)
+            (state / 'backup-1/web').mkdir(parents=True)
+            (state / 'backup-1/config').mkdir()
+            with patch.object(worker, 'STATE', state), patch.object(worker, 'ROOT', state / 'installed'), \
+                    patch.object(worker, 'CONFIG', state / 'config'), \
+                    patch.object(worker, 'verify_backup', return_value={'method': 'manifest'}), \
+                    patch.object(worker, 'record_backup_verification'), \
+                    patch.object(worker.shutil, 'disk_usage', return_value=MagicMock(free=0)), \
+                    patch.object(worker, 'service') as service:
+                with self.assertRaisesRegex(ValueError, 'Not enough disk space'):
+                    worker.rollback()
+                service.assert_not_called()
+
     def test_missing_routes_are_diagnosed_without_modifying_network(self):
         error = updates.URLError(updates.socket.gaierror(-3, 'DNS unavailable'))
         def command(args, **kwargs):
@@ -164,6 +640,8 @@ class UpdateTests(unittest.TestCase):
             (old / 'config').mkdir()
             safety = state / 'backup-2'
             mocks.enter_context(patch.object(worker, 'STATE', state))
+            mocks.enter_context(patch.object(worker, 'verify_backup', return_value={'method': 'manifest'}))
+            mocks.enter_context(patch.object(worker, 'record_backup_verification'))
             service = mocks.enter_context(patch.object(worker, 'service'))
             def backup():
                 service.assert_called_with('stop')
@@ -261,7 +739,11 @@ class UpdateTests(unittest.TestCase):
             (root / 'install/web-install.sh').write_text('old installer')
             (root / '.fvmrc').write_text('{"flutter":"1.2.3"}')
             config.mkdir()
-            (config / 'organizations.sqlite3').write_bytes(b'original database')
+            with worker.sqlite3.connect(config / 'organizations.sqlite3') as database:
+                database.execute('CREATE TABLE evidence (value TEXT)')
+                database.execute("INSERT INTO evidence VALUES ('original database')")
+            database.close()
+            original_database = (config / 'organizations.sqlite3').read_bytes()
             request.write_text('{"version":"v0.2.0"}')
             package = base / 'herdr-proxmox'
             for name in ('web/gateway/server.py', 'web/public/index.html', 'web/public/main.dart.js', 'web/public/dashboard/index.html'):
@@ -304,7 +786,7 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual(json.loads((root / '.fvmrc').read_text())['flutter'], '1.2.3')
             self.assertEqual((root / 'VERSION').read_text(), 'v0.1.0')
             self.assertEqual((root / 'web/gateway/server.py').read_text(), 'old gateway')
-            self.assertEqual((config / 'organizations.sqlite3').read_bytes(), b'original database')
+            self.assertEqual((config / 'organizations.sqlite3').read_bytes(), original_database)
             self.assertTrue(json.loads((state / 'status.json').read_text())['rolled_back'])
             self.assertEqual([call.args[0] for call in service.call_args_list], ['stop', 'start', 'stop', 'start'])
 
@@ -336,6 +818,33 @@ class UpdateTests(unittest.TestCase):
                 for version in ('v1.2.0', 'v1.10.0'):
                     (root / 'VERSION').write_text(version)
                     self.assertFalse(service.snapshot()['available'])
+
+    def test_failed_same_version_release_can_be_retried(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            queue = root / 'queue'
+            queue.mkdir()
+            state = root / 'status.json'
+            (root / 'VERSION').write_text('v0.0.55')
+            service = updates.Updates(root, queue, state)
+            with patch.object(updates, 'latest_release', return_value={'tag_name': 'v0.0.55', 'html_url': ''}):
+                # Cover the legacy worker status shown by existing containers.
+                for mode in (None, 'release'):
+                    state.write_text(json.dumps({'state': 'failed', **({'mode': mode} if mode else {})}))
+                    self.assertTrue(service.snapshot()['available'])
+                    self.assertEqual(service.install({'version': 'v0.0.55'})['state'], 'queued')
+                    self.assertEqual(json.loads((queue / 'request.json').read_text())['version'], 'v0.0.55')
+                    with self.assertRaisesRegex(ValueError, 'already running'):
+                        service.install({'version': 'v0.0.55'})
+                    (queue / 'request.json').unlink()
+                for mode in ('alpha', 'local', 'rollback', 'provenance'):
+                    state.write_text(json.dumps({'state': 'failed', 'mode': mode}))
+                    self.assertFalse(service.snapshot()['available'])
+                state.write_text(json.dumps({'state': 'failed', 'mode': 'release', 'version': 'v0.0.54'}))
+                self.assertFalse(service.snapshot()['available'])
+                state.write_text(json.dumps({'state': 'failed', 'mode': 'release'}))
+                (root / 'VERSION').write_text('v0.0.56')
+                self.assertFalse(service.snapshot()['available'])
 
     def test_promote_and_rollback_queue_fixed_requests_only(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -465,6 +974,8 @@ class UpdateTests(unittest.TestCase):
             old = state / 'backup-1'
             (old / 'web/gateway').mkdir(parents=True)
             (old / 'web/gateway/server.py').write_text('old gateway')
+            (old / 'web/public').mkdir()
+            (old / 'web/public/index.html').write_text('old dashboard')
             (old / 'config').mkdir()
             (old / 'config/token').write_text('old secret')
             (old / 'VERSION').write_text('v0.1.0')

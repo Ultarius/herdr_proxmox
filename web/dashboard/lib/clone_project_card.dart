@@ -1,6 +1,8 @@
 import 'package:juice/juice.dart';
 import 'dart:convert';
 import 'dashboard_bloc.dart';
+import 'repository_connections.dart';
+import 'package:herdr_dashboard_state/repository_connections.dart';
 
 class CloneProjectCard extends StatefulWidget {
   const CloneProjectCard({super.key, required this.onCloned});
@@ -12,6 +14,9 @@ class CloneProjectCard extends StatefulWidget {
 class _CloneProjectCardState extends State<CloneProjectCard> {
   final url = TextEditingController();
   final folder = TextEditingController();
+  String connectionId = '';
+  String? unavailableConnection;
+  List<Map<String, dynamic>> connections = [];
   bool busy = false;
   Timer? timer;
   List<Map<String, dynamic>> jobs = [];
@@ -36,6 +41,11 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       final next = List<Map<String, dynamic>>.from(data['jobs'] ?? []);
       if (jsonEncode(next) != jsonEncode(jobs)) setState(() => jobs = next);
       final latest = jobs.firstOrNull;
+      if (latest != null &&
+          ['failed', 'interrupted', 'completed'].contains(latest['state']) &&
+          result?.startsWith('Clone queued.') == true) {
+        setState(() => result = null);
+      }
       if (latest?['state'] == 'completed' && latest?['id'] != completed) {
         completed = latest!['id'] as String;
         widget.onCloned(latest['cwd'] as String);
@@ -62,6 +72,14 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
   }
 
   Future<void> clone() async {
+    if (unavailableConnection != null ||
+        !knownRepositoryConnection(connections, connectionId)) {
+      setState(
+        () => result =
+            'The saved repository connection is unavailable. Refresh connections and select one before cloning.',
+      );
+      return;
+    }
     final connection = BlocScope.get<DashboardBloc>();
     final epoch = connection.generation;
     setState(() {
@@ -72,6 +90,7 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       final data = await connection.request('projects/clone', {
         'url': url.text.trim(),
         'folder': folder.text.trim(),
+        if (connectionId.isNotEmpty) 'connection_id': connectionId,
       });
       if (!mounted || epoch != connection.generation) return;
       setState(() {
@@ -84,7 +103,8 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       if (mounted && epoch == connection.generation)
         setState(() => result = error.toString());
     } finally {
-      if (mounted) setState(() => busy = false);
+      if (mounted && epoch == connection.generation)
+        setState(() => busy = false);
     }
   }
 
@@ -104,6 +124,67 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
             'Clone a repository into a new folder inside the container’s projects directory. Existing folders are preserved.',
           ),
           const SizedBox(height: 16),
+          if (BlocScope.get<DashboardBloc>().operator.value['role'] == 'admin')
+            RepositoryConnectionsPanel(
+              onChanged: (values) {
+                if (mounted)
+                  setState(() {
+                    connections = values;
+                    if (unavailableConnection != null &&
+                        knownRepositoryConnection(
+                          values,
+                          unavailableConnection!,
+                        )) {
+                      connectionId = unavailableConnection!;
+                      unavailableConnection = null;
+                    }
+                    if (!values.any((item) => item['id'] == connectionId))
+                      if (connectionId.isNotEmpty) {
+                        unavailableConnection = connectionId;
+                        connectionId = '';
+                      }
+                  });
+              },
+            ),
+          DropdownButtonFormField<String>(
+            isExpanded: true,
+            key: ValueKey(connectionId),
+            initialValue: knownRepositoryConnection(connections, connectionId)
+                ? connectionId
+                : '',
+            decoration: const InputDecoration(
+              labelText: 'Repository connection',
+            ),
+            items: [
+              const DropdownMenuItem(
+                value: '',
+                child: Text('Container Git credentials / public repository'),
+              ),
+              for (final item in connections)
+                DropdownMenuItem(
+                  value: '${item['id']}',
+                  child: Text(
+                    "${item['label']} · ${item['kind']} · ${item['access_state']}",
+                  ),
+                ),
+            ],
+            onChanged: busy
+                ? null
+                : (value) => setState(() {
+                    unavailableConnection = null;
+                    connectionId = value ?? '';
+                    final item = connections
+                        .where((item) => item['id'] == value)
+                        .firstOrNull;
+                    if (item != null) {
+                      url.text = item['kind'] == 'ssh'
+                          ? "git@github.com:${item['repository']}.git"
+                          : "https://github.com/${item['repository']}.git";
+                      if (folder.text.isEmpty)
+                        folder.text = '${item['repository']}'.split('/').last;
+                    }
+                  }),
+          ),
           TextField(
             key: const PageStorageKey('clone-url-field'),
             controller: url,
@@ -127,7 +208,7 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
           ),
           const SizedBox(height: 12),
           const Text(
-            'Private repositories use Git credentials already configured in the container. SSH requires a configured key and trusted host. Cloning may take up to two minutes.',
+            'Select a managed repository connection, or use existing container Git credentials. Cloning may take up to two minutes.',
           ),
           const SizedBox(height: 16),
           FilledButton.icon(
@@ -156,7 +237,27 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
                     ? job['error'] as String
                     : job['cwd'] as String,
               ),
-              trailing: job['state'] == 'completed'
+              trailing:
+                  ['failed', 'interrupted'].contains(job['state']) &&
+                      job['url'] != null
+                  ? TextButton(
+                      onPressed: () => setState(() {
+                        url.text = '${job['url']}';
+                        connectionId = '${job['connection_id'] ?? ''}';
+                        unavailableConnection =
+                            knownRepositoryConnection(connections, connectionId)
+                            ? null
+                            : connectionId;
+                        if (unavailableConnection != null) connectionId = '';
+                        final previous = '${job['folder']}';
+                        folder.text =
+                            '${previous.substring(0, previous.length.clamp(0, 70))}-retry';
+                        result =
+                            'The previous folder was preserved. Review the new folder name, then clone again.';
+                      }),
+                      child: const Text('Retry in a new folder'),
+                    )
+                  : job['state'] == 'completed'
                   ? TextButton(
                       onPressed: () => widget.onCloned(job['cwd'] as String),
                       child: const Text('Use project'),
@@ -166,7 +267,10 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
           if (result != null)
             Padding(
               padding: const EdgeInsets.only(top: 12),
-              child: SelectableText(result!),
+              child: SelectableText(
+                result!,
+                key: const PageStorageKey('clone-result-message'),
+              ),
             ),
         ],
       ),

@@ -3,6 +3,23 @@ import 'package:juice/juice.dart';
 import 'package:herdr_dashboard/task_activity.dart';
 
 void main() {
+  test('working capture waits are distinct from automation errors', () {
+    final task = <String, dynamic>{
+      'state': 'implementing',
+      'automation_wait': {
+        'message': 'Waiting for the assigned agent completion receipt.',
+      },
+    };
+    expect(
+      taskNextStep(task),
+      'Waiting for the assigned agent completion receipt.',
+    );
+    task['automation_error'] = 'No completion receipt. Open assigned agent.';
+    expect(
+      taskNextStep(task),
+      contains('Automation needs attention: No completion receipt.'),
+    );
+  });
   test('validation uses the candidate until the task is merged', () {
     final task = <String, dynamic>{
       'state': 'pr_open',

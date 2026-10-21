@@ -96,3 +96,13 @@ class PermissionTests(unittest.TestCase):
                                                 home / 'outputs', home), [])
             self.assertFalse((home / 'evil.md').exists())
             self.assertFalse((home / 'a').exists())
+
+    def test_output_grants_do_not_add_source_checkout_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            prepare_permissions(dict(id='source', runtime='opencode'), home / 'outputs', home,
+                                output_directories=('discussion-artifacts',))
+            content = (home / '.config/opencode/agents/herdr-dashboard-source.md').read_text(encoding='utf-8')
+            rule = json.loads(next(line.removeprefix('permission: ') for line in content.splitlines()
+                                   if line.startswith('permission: ')))
+            self.assertEqual(rule, {'external_directory': {str(home / 'outputs/discussion-artifacts/**'): 'allow'}})

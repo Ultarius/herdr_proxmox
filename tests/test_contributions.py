@@ -1219,6 +1219,56 @@ class ContributionTests(unittest.TestCase):
             self.service.advance_automatic()
         self.assertEqual(self.service.validation.submit.call_count, 1)
 
+    def test_working_wait_is_transient_and_idle_without_receipt_is_actionable(self):
+        from herdr_errors import HerdrError, parse_error
+        parsed = parse_error('{"error":{"code":"agent_working","message":"Working"}}')
+        self.assertEqual(parsed.delivery, 'none')
+        task = self.candidate()
+        task.update(state='implementing', auto_capture=True, auto_validate=True,
+                    automation_error='Old working error')
+        task.pop('head_sha')
+        self.service.save(task, 'policy', 'admin')
+        run = self.store.snapshot.return_value['jobs'][0]
+        run.update(profile_id='worker', completion_token='handoff-token')
+        self.service.validation = MagicMock()
+        self.service.validation.snapshot.return_value = dict(executor='service')
+        self.service.validation.submit.return_value = dict(id='build1', state='queued', checks=[])
+        with patch('collaboration.current_run', side_effect=HerdrError('Agent working', 'agent_working', 'agent get', 'none')):
+            self.service.advance_automatic()
+            self.service.advance_automatic()
+        waiting = self.service.get(task['id'])
+        self.assertNotIn('automation_error', waiting)
+        self.assertEqual(waiting['automation_wait']['kind'], 'working')
+        self.store.action.assert_not_called()  # No prompt was replayed.
+        with patch('collaboration.current_run'):
+            self.service.advance_automatic()
+        idle = self.service.get(task['id'])
+        self.assertNotIn('automation_wait', idle)
+        self.assertIn('Idle does not mean complete', idle['automation_error'])
+        self.service.validation.submit.assert_not_called()
+        self._receipt(task)
+        with patch('collaboration.current_run'):
+            self.service.advance_automatic()
+            self.service.advance_automatic()
+        captured = self.service.get(task['id'])
+        self.assertNotIn('automation_error', captured)
+        self.assertNotIn('automation_wait', captured)
+        self.assertEqual(self.service.validation.submit.call_count, 1)
+
+    def test_blocked_and_ambiguous_working_failures_still_require_attention(self):
+        from herdr_errors import HerdrError
+        task = self.candidate()
+        task.update(state='implementing', auto_capture=True)
+        task.pop('head_sha')
+        self.service.save(task, 'policy', 'admin')
+        for code, delivery in (('agent_blocked', 'none'), ('agent_working', 'unknown'), ('timeout', 'unknown')):
+            with patch('collaboration.current_run', side_effect=HerdrError('Inspect original session', code, 'agent get', delivery)):
+                self.service.advance_automatic()
+            saved = self.service.get(task['id'])
+            self.assertIn('Inspect original session', saved['automation_error'])
+            self.assertNotIn('automation_wait', saved)
+        self.store.action.assert_not_called()
+
     def test_automatic_receipt_rejects_stale_token_and_allows_gateway_validation(self):
         task = self.candidate()
         task.update(auto_capture=True, auto_validate=True, state='implementing')

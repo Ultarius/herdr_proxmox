@@ -212,6 +212,23 @@ delivery and the operator, and rejects a console response if its inspected
 prompt changed, the agent stopped being blocked, or its conversation was
 replaced. Retained output is bounded and may omit earlier work.
 
+Both dashboards show **Requested folder access** above the agent console and
+outside collapsed live discussions, naming the requesting group participant and
+listing the explicit path patterns from a blocked OpenCode external-directory
+prompt. These are observations of terminal text, not verified filesystem events
+or an access history. The list clears on the next successful inspection when the
+agent resumes or the folder prompt disappears. Unknown, incomplete or wrapped
+prompt layouts remain available in the raw console; oversized pattern lists are
+explicitly marked as incomplete. No permission is approved or saved by the panel.
+Inspection errors hide the summary until a fresh request can be observed.
+Review the selected runtime option in the console before confirming it.
+
+**Allow dashboard outputs** grants reply/artifact folder access, not all of
+`~/.cache` or `/tmp`. The panel points to **Additional accessible path globs** in
+**Edit persona** or **Edit group** for future launches. Saved settings require
+relaunch; the panel does not claim to know the runtime's remembered **Allow
+always** decisions or grant broader access automatically.
+
 Launch creates a separate workspace/root pane, waits for the shell, then starts
 a unique Herdr alias and sends the saved organization instructions and persona
 as the first conversation prompt. This follows Agent Team's prompt convention;
@@ -616,8 +633,69 @@ without creating a pointless commit or PR.
 
 ## Fixing stale projects from a discussion
 
+Each new agent launch allocates `.ci-cache/herdr-scratch/<execution-id>` inside
+its assigned checkout. Git repositories receive a local `info/exclude` entry,
+without changing tracked ignore rules; a tracked reserved scratch path is refused.
+The gateway exports `TMPDIR`, `TMP`, `TEMP` and `HERDR_SCRATCH` in the newly owned
+shell and waits for its activation marker before starting the agent. Failure
+stops launch. Scratch is per execution, retained across an inspected restart of
+the same execution, and never automatically deleted with potentially useful
+diagnostics. Non-Git sessions also receive scratch space. These directories do
+not isolate agents sharing the same Unix account.
+
+Sessions receive neutral `HERDR_BUILD_JOBS` and `HERDR_TEST_THREADS` budget
+signals. Adapter-derived command guidance follows their frozen SDK bindings.
+Only sessions bound to `rust-toolchain` receive a Cargo wrapper and Rust budget
+aliases; sessions without a bound policy receive generic guidance. Interactive
+wrappers currently support Cargo only. Gateway validation shares its capacity
+lane across every toolchain and recipe; the console
+reports queued/running state and **System health** shows waiting work and the
+current budget. See [Build capacity](build-capacity.md) for resource thresholds,
+scope, recovery and the distinction from hard container limits.
+
+Launch instructions, the agent console, each live discussion terminal and the
+facilitator's member workspace context name each session's scratch path in both
+dashboards. Temporary pinned review copies must use that path and
+preserve repository-relative file names, or use direct `git show` reads instead.
+Read-only discussions allow those scratch writes without authorizing source
+changes or installation. No general `/tmp` or home-cache access is granted.
+
+Any missing project SDK is an environment blocker, not a reason for
+the project agent to bootstrap a replacement. Use **Plan environment** and
+**Prepare SDKs** in the project's environment card, or enable the organization's
+**Prepare supported project SDKs before agent launch** policy. Verified preparation
+is adopted by a new launch. Project agents retain the Herdr coordination CLI;
+they receive no dashboard administrator credentials or new provisioning authority.
+For an already-blocked shared SDK-cache bootstrap, reject/cancel that operation
+and prepare the environment before relaunching. The gateway never auto-answers
+these permission prompts, and old sessions do not gain the new scratch exports.
+
+Worktree launches do not automatically grant external-directory access to the
+main checkout, including discussion sessions. Read pinned committed evidence with
+`git show <SHA>:<path>` from each participant's own `launch_directory`: worktrees
+share Git objects, so this does not require changing the source checkout. The
+configured source path in workspace context identifies the repository, not a
+permission grant or the directory to use for file access.
+
+Only protocol output folders and explicitly configured accessible paths are
+added to OpenCode's external-directory rules. These rules inherit other tool
+permissions; they are not read-only grants. Discussion scope is an instruction,
+not filesystem confinement. Operators should consider edit and shell permissions
+when explicitly allowing external paths. Existing sessions retain their original
+runtime permissions until relaunched; updating Herdr cannot revoke their saved
+Allow always decisions.
+
+Session scratch and any installed wrappers require a writable assigned checkout and
+Git exclusion metadata. Read-only mounts and tracked reserved scratch paths are
+refused explicitly; use a writable project clone/worktree for managed sessions.
+There is no implicit fallback to a shared home or temporary directory. This keeps
+scratch inside the session's existing directory grant. General conversation does
+not require Git project content, but its launch still needs writable scratch.
+
 To answer a blocked member's permission prompt, expand **Live discussion**, then
-the member's terminal, and choose **Respond to permission or question**. Review
+the member's terminal, and choose **Respond to permission or question**. The live
+view retains the tail (up to 20,000 characters) so current permission prompts
+remain visible instead of older history. Review
 the selected OpenCode option before confirming. For a dashboard output directory,
 select **Allow once** with the terminal controls if needed. Confirmation sends
 Enter only if the original conversation is still blocked on the exact inspected

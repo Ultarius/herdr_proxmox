@@ -1,4 +1,5 @@
 import 'snapshot_terminal.dart';
+import 'folder_access_panel.dart';
 import 'dart:async';
 
 import '../services.dart';
@@ -357,7 +358,8 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
       '${profile?['model'] ?? ''}',
     ].where((part) => part.isNotEmpty).join(' / ');
 
-    final project = '${profile?['project'] ?? ''}';
+    final project =
+        '${inspection?['launch_directory'] ?? profile?['project'] ?? ''}';
 
     final cadence = agentConsoleRefreshInterval(status).inSeconds;
 
@@ -400,6 +402,8 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
           ),
           ('Model', model.isEmpty ? none() : text(model)),
           ('Workspace', project.isEmpty ? none() : mono(project)),
+          if ('${inspection?['scratch_directory'] ?? ''}'.isNotEmpty)
+            ('Session scratch', mono(inspection!['scratch_directory'])),
           if (delivery != null)
             (
               'Terminal response',
@@ -438,6 +442,8 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
             ),
           ],
         ),
+
+      if (error == null) folderAccessPanel(inspection),
 
       if (blocked)
         callout(

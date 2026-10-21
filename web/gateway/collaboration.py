@@ -11,6 +11,7 @@ from organizations import now, text
 from session_ownership import active as session_active, reserves as session_reserves
 from permissions import accessible_paths, permission_mode, prepare_permissions
 from herdr_errors import HerdrError, parse_completion
+from folder_access import folder_access_request
 
 # Backstop for a wedged socket, not a work budget. Herdr's settled-state wait
 # decides when a discussion has finished; this only prevents a hung call from
@@ -45,12 +46,27 @@ def active_run(store, db, organization_id, profile_id):
     return json.loads(row['data'])
 
 
-def inspect_output(store, run, current=None):
-    """Read frozen bindings without holding the store lock during CLI calls."""
+def inspect_terminal(store, run):
+    """Observe one bound console, re-reading a new blocked prompt if necessary."""
     agent = store.identity(run, ready=False, agent=store.command('agent', 'get', run['alias'], timeout=2).get('agent'))
     status = agent.get('agent_status', agent.get('state', 'unknown'))
     source = 'recent-unwrapped' if status in ('idle', 'done') else 'visible'
     output = store.command('agent', 'read', run['alias'], '--source', source, '--lines', '160', timeout=2)
+    agent = store.identity(run, ready=False, agent=store.command('agent', 'get', run['alias'], timeout=2).get('agent'))
+    status = agent.get('agent_status', agent.get('state', 'unknown'))
+    if status == 'blocked' and source != 'visible':
+        # An idle session can block between the two status reads. Recent history
+        # is not the prompt: read the visible panel and recheck its binding.
+        source = 'visible'
+        output = store.command('agent', 'read', run['alias'], '--source', source, '--lines', '160', timeout=2)
+        agent = store.identity(run, ready=False, agent=store.command('agent', 'get', run['alias'], timeout=2).get('agent'))
+        status = agent.get('agent_status', agent.get('state', 'unknown'))
+    return output['output'], status, source
+
+
+def inspect_output(store, run, current=None):
+    """Read frozen bindings without holding the store lock during CLI calls."""
+    output, status, source = inspect_terminal(store, run)
     # The agent may still be writing its reply. Bound the preview and refuse
     # symlinks in this agent-controlled output.
     draft = ''
@@ -58,8 +74,11 @@ def inspect_output(store, run, current=None):
         path = store.path.parent / 'chat-replies' / current['id'] / 'reply.md'
         if path.is_file() and not path.is_symlink() and path.stat().st_size <= 40000:
             draft = path.read_text(encoding='utf-8', errors='replace')[:40000]
-    return dict(output=output['output'], status=status, reply_draft=draft,
-                console_token=console_token(run, output['output']) if status == 'blocked' else None,
+    return dict(output=output, status=status, reply_draft=draft,
+                launch_directory=run.get('worktree_path') or run.get('source_project'),
+                scratch_directory=run.get('scratch_directory'),
+                access_request=folder_access_request(output, status) if source == 'visible' else None,
+                console_token=console_token(run, output) if status == 'blocked' and source == 'visible' else None,
                 reply_job_id=current['id'] if current else None)
 
 
@@ -806,20 +825,17 @@ def inspect_discussion(store, db, body, org_id):
                       status='unavailable', output='', error=error or '')
         if run is None:
             return stream
+        stream['scratch_directory'] = run.get('scratch_directory')
         if run['state'] in ('queued', 'running'):
             stream.update(status='starting', error='Session is starting; waiting for readiness.')
             return stream
         try:
-            response = store.command('agent', 'get', run['alias'], timeout=2)
-            agent = store.identity(run, ready=False, agent=response.get('agent'))
-            status = agent.get('agent_status', agent.get('state', 'unknown'))
-            output = store.command('agent', 'read', run['alias'], '--source',
-                                   'visible' if status not in ('idle', 'done') else 'recent-unwrapped',
-                                   '--lines', '160', timeout=2)['output']
-            # Do not publish output if a binding changed during the CLI read.
-            store.identity(run, ready=False, agent=store.command('agent', 'get', run['alias'], timeout=1).get('agent'))
-            stream.update(status=status, output=output[:20000],
-                          console_token=console_token(run, output) if status == 'blocked' else None)
+            output, status, source = inspect_terminal(store, run)
+            # Retain the end containing the current permission prompt rather
+            # than earlier history. The token still binds the complete read.
+            stream.update(status=status, output=output[-20000:],
+                          access_request=folder_access_request(output, status) if source == 'visible' else None,
+                          console_token=console_token(run, output) if status == 'blocked' and source == 'visible' else None)
         except (ValueError, OSError, subprocess.TimeoutExpired) as error:
             stream['error'] = str(error)
         return stream
@@ -918,10 +934,14 @@ def execute(store, job):
     # previous attempt can never be mistaken for this one's.
     attempt = uuid.uuid4().hex
     def workspace_context(run):
+        from session_workspace import toolchains
+        from environment_adapters import session_tools
         live = store.identity(run)
         return {'name': run['profile']['name'], 'alias': run['alias'],
                 'configured_project': run['profile']['project'],
                 'launch_directory': run.get('worktree_path') or run['profile']['project'],
+                'scratch_directory': run.get('scratch_directory'),
+                'toolchains': session_tools(toolchains(run)),
                 'herdr_reported_cwd': live.get('cwd') if isinstance(live.get('cwd'), str) else None}
 
     contexts = [workspace_context(group_run), *(workspace_context(r) for r in job['runs'])]
@@ -954,7 +974,8 @@ def execute(store, job):
     store.update_job(job['id'], progress='Group agent coordinating members')
     discussion_policy = (
         'This is a read-only advisory discussion: do not modify projects or execute recommended actions. '
-        'Tell every member to follow this same restriction. Artifact and transcript output writes are allowed. '
+        'Tell every member to follow this same restriction. Artifact, transcript and assigned scratch writes are allowed; '
+        'source changes and SDK installation are not authorized. '
         if job['group'].get('read_only', True) else
         'Project changes may be proposed or performed only within the user message authorization. '
     )
@@ -973,6 +994,16 @@ def execute(store, job):
         "Pass relevant cited knowledge IDs to members. Challenge stale or conflicting claims using current evidence.\n"
         f"Workspace context (from saved launch settings and live Herdr bindings): {json.dumps(contexts)}\n"
         "Each member has its own working directory, potentially a separate worktree. Do not assume a shared checkout. "
+        "Read repository files and pinned Git objects from that member's launch_directory, not configured_project. "
+        "Worktrees share committed objects: use git show <pinned SHA>:<path> in your assigned checkout. "
+        "configured_project identifies the source repository and does not grant access to the main checkout. "
+        "Pass each member its own scratch_directory from this context. Temporary review files and pinned copies "
+        "belong there, with repository-relative paths preserved; do not hardcode /tmp/pin or /tmp/pinned. "
+        "Scratch writes for this analysis are permitted even in a read-only discussion. "
+        "Pass each member its own toolchains metadata and prepared commands; use session-provided wrappers on PATH when present. "
+        "Do not infer another member's SDK or claim an interactive capacity wrapper exists without its binding. "
+        "Use prepared SDKs only; missing SDKs are missing_toolchain evidence to report, never a request to bootstrap "
+        "a language toolchain or version manager, or install into a shared home cache. Ask the operator to prepare the project environment. "
         "Before project-specific commands, ask the relevant member to confirm pwd and use its assigned launch directory. "
         "If it differs, report the mismatch; do not silently inspect another project. "
         "The projects folder is an allowed directory boundary, not a requirement to put a repository at its root. "

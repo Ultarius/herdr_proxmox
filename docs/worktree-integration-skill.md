@@ -134,6 +134,15 @@ and rejects modified existing copies. It preserves tracked ignore rules and gran
 no broader CLI permissions. Unsafe Git exclusion metadata fails preparation.
 Existing sessions/prompts keep their old paths until a new request is prepared.
 
+The tool reference routes missing project SDKs through the project's managed
+environment preparation, using the recorded SDK binding for checks. It does not
+authorize a worker to bootstrap a language toolchain/version manager or replace
+an SDK in a home cache. Report `missing_toolchain` with actual evidence; the administrator prepares the SDK and
+a new launch adopts it. Auxiliary tool acquisition still needs explicit task
+authority and a session-local destination. See [automatic project environments](automatic-project-environments.md).
+New launches export their ignored checkout-local scratch path as `TMPDIR` and
+`HERDR_SCRATCH`; temporary snapshots belong there, outside candidate changes.
+
 
 ### Local exclusion and recovery
 

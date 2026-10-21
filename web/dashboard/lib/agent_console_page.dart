@@ -1,6 +1,7 @@
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'organization_bloc.dart';
+import 'folder_access_panel.dart';
 
 Duration agentConsoleRefreshInterval(String? status) => switch (status) {
   'working' || 'running' || 'busy' || 'thinking' => const Duration(seconds: 1),
@@ -267,6 +268,10 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
                         ),
                         if (profile != null)
                           Text('${profile!['role']} · ${profile!['runtime']}'),
+                        if (inspection?['scratch_directory'] != null)
+                          SelectableText(
+                            'Session scratch: ${inspection!['scratch_directory']}',
+                          ),
                         const SizedBox(height: 12),
                         if (!bloc.state.connected)
                           const Text('Connect on the dashboard first.'),
@@ -289,6 +294,8 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
                           if ('${delivery['error'] ?? ''}'.isNotEmpty)
                             Text('${delivery['error']}'),
                         ],
+                        if (error == null)
+                          FolderAccessPanel(inspection: inspection),
                         if (blocked)
                           Card(
                             child: Padding(

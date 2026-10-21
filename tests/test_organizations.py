@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shlex
 import tempfile
 import threading
 import unittest
@@ -45,6 +46,14 @@ class OrganizationTests(unittest.TestCase):
             self.assertEqual(len(args), 4)
             self.assertEqual(args[2], '--pane')
             return {'process_info': {'shell_pid': 42, 'foreground_process_group_id': 42}}
+        if args[:2] == ('pane', 'run'):
+            # Simulate the shell's ordered activation acknowledgement. Real
+            # shell/process inheritance is exercised by native environment CI.
+            words = shlex.split(args[3])
+            self.assertEqual(words[-5:-3], ['printf', '%s'])
+            self.assertEqual(words[-2], '>')
+            Path(words[-1]).write_text(words[-3], encoding='ascii')
+            return {}
         if args[:2] == ('workspace', 'create'):
             return {'root_pane': {'pane_id': f'w{len(self.calls)}:p1'}}
         if args[:2] == ('agent', 'start'):
@@ -554,6 +563,87 @@ class OrganizationTests(unittest.TestCase):
         self.assertTrue(granted, 'the launch must prepare permissions')
         self.assertTrue(all('chat-replies' in dirs for dirs in granted), granted)
 
+    def test_launch_activates_scratch_before_start_and_explains_sdk_provisioning(self):
+        org = self.organization()
+        profile = self.hire(org, runtime='opencode')
+        identifier = self.action('launch', organization_id=org, profile_id=profile)
+        self.drain()
+        run = next(j for j in self.store.job_records() if j['id'] == identifier)
+        self.assertEqual(run['state'], 'persona_sent', run.get('error'))
+        scratch = Path(run['scratch_directory'])
+        self.assertTrue(scratch.is_relative_to(self.projects))
+        self.assertTrue(scratch.is_dir())
+        activation = next(i for i, (args, _) in enumerate(self.calls) if args[:2] == ('pane', 'run'))
+        start = next(i for i, (args, _) in enumerate(self.calls) if args[:2] == ('agent', 'start'))
+        self.assertLess(activation, start)
+        for key in ('TMPDIR', 'TMP', 'TEMP', 'HERDR_SCRATCH'):
+            self.assertIn('export ' + key + '=', self.calls[activation][0][3])
+        prompt = next(args[3] for args, _ in self.calls if args[:2] == ('agent', 'prompt'))
+        self.assertIn(str(scratch), prompt)
+        self.assertIn('Prepare SDKs', prompt)
+        self.assertIn('not dashboard administrator authorization', prompt)
+
+    def test_scratch_activation_failure_never_starts_agent_or_sends_task(self):
+        org = self.organization()
+        profile = self.hire(org)
+        with patch('environment_launch.activate_shell', side_effect=ValueError('Scratch activation not confirmed')):
+            identifier = self.action('launch', organization_id=org, profile_id=profile)
+            self.drain()
+        run = next(j for j in self.store.job_records() if j['id'] == identifier)
+        self.assertEqual(run['state'], 'needs_attention')
+        self.assertIn('no agent was started', run['error'])
+        self.assertFalse(any(args[:2] in (('agent', 'start'), ('agent', 'prompt')) for args, _ in self.calls))
+
+    def test_prepared_process_verification_includes_cargo_wrapper_and_scratch_exports(self):
+        org = self.organization()
+        profile = self.hire(org)
+        frozen = dict(policy=dict(toolchains=[dict(name='rust-toolchain', label='Rust', required='1.99.0',
+            declared_by='rust-toolchain.toml', executables=['/prepared-sdk/bin/rustc'])]), digest='approved')
+        def configure(store, job, policy, pane, workspace):
+            store.update_job(job['id'], environment_binding=dict(state='requested',
+                environment=dict(PATH='/prepared-sdk/bin:/usr/bin')))
+            return pane, workspace
+        def verify(store, job):
+            expected = job['environment_binding']['environment']
+            commands = str(Path(job['scratch_directory']) / 'commands')
+            self.assertEqual(expected['PATH'], commands + os.pathsep + '/prepared-sdk/bin:/usr/bin')
+            self.assertIn(expected['CARGO_BUILD_JOBS'], ('1', '2'))
+            self.assertEqual(expected['RUST_TEST_THREADS'], '1')
+            self.assertEqual(expected['HERDR_BUILD_JOBS'], expected['CARGO_BUILD_JOBS'])
+            self.assertEqual(expected['TMPDIR'], job['scratch_directory'])
+        with patch.object(self.store, 'frozen_policy', return_value=frozen), \
+                patch('environment_launch.configure', side_effect=configure), \
+                patch('environment_launch.verify_process', side_effect=verify) as probe:
+            identifier = self.action('launch', organization_id=org, profile_id=profile)
+            self.drain()
+        job = next(j for j in self.store.job_records() if j['id'] == identifier)
+        self.assertEqual(job['state'], 'persona_sent', job.get('error'))
+        probe.assert_called_once()
+
+    def test_empty_policy_preserves_prepared_path_without_rust_exports(self):
+        org = self.organization()
+        profile = self.hire(org)
+        frozen = dict(policy=dict(toolchains=[]), digest='approved')
+        def configure(store, job, policy, pane, workspace):
+            store.update_job(job['id'], environment_binding=dict(state='requested',
+                environment=dict(PATH='/prepared-sdk/bin:/usr/bin')))
+            return pane, workspace
+        def verify(store, job):
+            expected = job['environment_binding']['environment']
+            self.assertEqual(expected['PATH'], '/prepared-sdk/bin:/usr/bin')
+            self.assertNotIn('CARGO_BUILD_JOBS', expected)
+            self.assertNotIn('RUST_TEST_THREADS', expected)
+            self.assertEqual(expected['HERDR_TEST_THREADS'], '1')
+            self.assertFalse((Path(job['scratch_directory']) / 'commands').exists())
+        with patch.object(self.store, 'frozen_policy', return_value=frozen), \
+                patch('environment_launch.configure', side_effect=configure), \
+                patch('environment_launch.verify_process', side_effect=verify) as probe:
+            identifier = self.action('launch', organization_id=org, profile_id=profile)
+            self.drain()
+        job = next(j for j in self.store.job_records() if j['id'] == identifier)
+        self.assertEqual(job['state'], 'persona_sent', job.get('error'))
+        probe.assert_called_once()
+
     def test_created_pane_recovers_from_authoritative_checkout_records(self):
         def command(*args, **kwargs):
             if args == ('workspace', 'list'):
@@ -892,7 +982,8 @@ class OrganizationTests(unittest.TestCase):
         self.assertFalse(any(args[:2] == ('worktree', 'create') for args, _ in self.calls))
 
     def test_worktree_can_be_explicitly_disabled(self):
-        (self.projects / '.git').mkdir()
+        # Scratch allocation uses the real repository's local exclusion file.
+        subprocess.run(['git', 'init', str(self.projects)], check=True, capture_output=True)
         org = self.organization()
         profile = self.hire(org, use_worktree=False)
         job_id = self.action('launch', organization_id=org, profile_id=profile)

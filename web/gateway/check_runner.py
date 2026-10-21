@@ -5,6 +5,7 @@ from pathlib import Path
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import time
 
@@ -53,7 +54,45 @@ def read_report(path, script):
 
 
 def run_scripts(tree, commands, folder, timeout, bash, output_limit, changed=None, environment=None):
-    checks, tail = [], bytearray()
+    import build_capacity
+    queued = bytearray()
+    def capacity(data):
+        if data['state'] == 'waiting':
+            message = 'Herdr build queued: ' + data['reason']
+            queued.extend((message + '\n').encode())
+            del queued[:-output_limit]
+            publish_log(folder, queued)
+            if changed:
+                changed([dict(id='herdr:build-capacity', name='Build capacity', required=False,
+                              source='runner', status='not_run', exit_code=None, duration_ms=0,
+                              summary=message, phase='waiting_capacity')])
+    # Production execution is Linux. Windows cannot inherit the cooperative
+    # lane descriptor into its check children; holding it would self-deadlock a
+    # nested Cargo wrapper. Native Windows checks use only the compiler budget.
+    if sys.platform == 'win32':
+        limits = build_capacity.budget(storage=tree)
+        if (limits.get('storage') or {}).get('blocked'):
+            raise ValueError(limits['storage']['reason'] + ' No checks ran.')
+        return _run_scripts(tree, commands, folder, timeout, bash, output_limit, changed,
+                            environment, dict(fd=None, budget=limits))
+    with build_capacity.claim(changed=capacity, sample=lambda: build_capacity.budget(storage=tree)) as lease:
+        return _run_scripts(tree, commands, folder, timeout, bash, output_limit, changed,
+                            environment, lease, bytes(queued))
+
+
+def publish_log(folder, contents):
+    try:
+        temporary = folder / 'log.tmp'
+        temporary.write_bytes(contents)
+        temporary.replace(folder / 'log.txt')
+    except OSError:
+        pass  # Capacity/console observation must still work on a full disk.
+
+
+def _run_scripts(tree, commands, folder, timeout, bash, output_limit, changed, environment, lease, queued=b''):
+    import build_capacity
+    initial = f"Herdr build running: budget {lease['budget']['compiler_jobs']} compiler job(s), 1 test thread (tool support varies).\n"
+    checks, tail = [], bytearray(queued + initial.encode())
     deadline = time.monotonic() + timeout
     timed_out = False
     def log(chunk, force=False):
@@ -64,12 +103,7 @@ def run_scripts(tree, commands, folder, timeout, bash, output_limit, changed=Non
         if not force and now - log.published < 1:
             return
         log.published = now
-        try:
-            temporary = folder / 'log.tmp'
-            temporary.write_bytes(tail)
-            temporary.replace(folder / 'log.txt')
-        except OSError:
-            pass  # Always drain stdout, even when log storage fails.
+        publish_log(folder, tail)
     log.published = 0
     for index, script in enumerate(commands):
         recipe = script if isinstance(script, dict) else None
@@ -86,6 +120,10 @@ def run_scripts(tree, commands, folder, timeout, bash, output_limit, changed=Non
             environment_for_check.update(environment_adapters.execution_caches(bound, folder, create=True))
         else:
             environment_for_check = environment
+            bound = []
+        capacity_environment = build_capacity.variables(lease)
+        import environment_adapters
+        capacity_environment.update(environment_adapters.capacity_environment(bound, capacity_environment))
         check = dict(id=identifier, name=identifier, command=' '.join(arguments), required=True,
                      source='runner', status='not_run', exit_code=None, duration_ms=0, summary='')
         checks.append(check)
@@ -100,7 +138,9 @@ def run_scripts(tree, commands, folder, timeout, bash, output_limit, changed=Non
                 process = subprocess.Popen(arguments, cwd=cwd, stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT, start_new_session=os.name != 'nt',
                     env=dict(os.environ if environment_for_check is None else environment_for_check,
-                             CI='1', GIT_TERMINAL_PROMPT='0', HERDR_CHECK_REPORT=str(report.resolve())))
+                             **capacity_environment,
+                             CI='1', GIT_TERMINAL_PROMPT='0', HERDR_CHECK_REPORT=str(report.resolve())),
+                    **({'pass_fds': (lease['fd'],)} if os.name != 'nt' else {}))
                 def collect(proc=process):
                     while chunk := proc.stdout.read(4096):
                         log(chunk)

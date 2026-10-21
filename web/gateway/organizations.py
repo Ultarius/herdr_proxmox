@@ -4,6 +4,7 @@ from contextlib import closing, nullcontext
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -1697,6 +1698,8 @@ class OrganizationStore:
                 output_directories = ['chat-replies']
                 if profile.get('group_id') or job.get('session_purpose') == 'discussion':
                     output_directories.append('discussion-artifacts')
+                # Worktrees share committed Git objects. Evidence is read from
+                # the assigned checkout; no implicit main-checkout access grant.
                 arguments = launch_arguments(profile) + prepare_permissions(
                     profile, self.path.parent, output_directories=tuple(output_directories))
                 # Native resume uses adapter arguments validated before they were
@@ -1736,6 +1739,26 @@ class OrganizationStore:
                         # Restoring an environment may take minutes. Recheck
                         # permission and task ownership before starting the agent.
                         self.require_environment_continuation(continuation)
+                from session_workspace import prepare as prepare_scratch, environment as scratch_environment, install_wrappers
+                from environment_launch import activate_shell
+                job = self.update_job(job_id, launch_stage='scratch_binding')
+                scratch = prepare_scratch(job.get('worktree_path') or project, job['id'], repository=repository)
+                job = self.update_job(job_id, scratch_directory=str(scratch))
+                # Export only in this newly owned shell. The activation barrier
+                # must complete before agent.start; gateway process env is not
+                # inherited by the daemon's agent process.
+                commands = install_wrappers(scratch, job)
+                exports = scratch_environment(scratch, job)
+                # Expand the already-prepared shell PATH, never the gateway's
+                # different SDK selection. activate_shell normally quotes values;
+                # its explicit path prefix preserves that shell inheritance.
+                activate_shell(self, pane, exports, scratch, path_prefix=commands)
+                binding_record = job.get('environment_binding') or {}
+                if binding_record.get('state') == 'requested':
+                    expected = dict(binding_record['environment'], **exports)
+                    if commands is not None:
+                        expected['PATH'] = str(commands) + os.pathsep + expected['PATH']
+                    job = self.update_job(job_id, environment_binding=dict(binding_record, environment=expected))
                 job = self.update_job(job_id, launch_stage='agent_starting')
                 self.command('agent', 'start', job['alias'], '--kind', profile['runtime'], '--pane', pane, '--timeout', '60000', *(['--', *arguments] if arguments else []), timeout=70)
                 agent = self.identity(job)
@@ -1777,6 +1800,8 @@ class OrganizationStore:
                 environment_binding = job.get('environment_binding') or {}
                 environment_notice = ('\nInteractive SDK activation is unavailable: ' + environment_binding['reason']
                                       if environment_binding.get('state') == 'unavailable' else '')
+                from session_workspace import guidance as scratch_guidance, tool_guidance
+                environment_notice += scratch_guidance(job) + tool_guidance()
                 if profile.get('group_id'):
                     # Do not deliver an imperative group description as the startup task.
                     # Purpose, roster and output paths arrive together in the discussion.
@@ -1850,7 +1875,7 @@ class OrganizationStore:
                 detail += ' Launch failed during preflight; no workspace or pane was created and no terminal input was sent.'
             elif job['kind'] == 'launch' and job.get('launch_stage') == 'workspace_preparing':
                 detail += ' Launch failed while preparing the workspace; no agent was started and no terminal input was sent.'
-            elif job['kind'] == 'launch' and job.get('launch_stage') == 'environment_binding':
+            elif job['kind'] == 'launch' and job.get('launch_stage') in ('environment_binding', 'scratch_binding'):
                 detail += ' Launch failed while binding the prepared environment; no agent was started. Inspect the recorded panes before retrying.'
             elif delivery == 'blocked':
                 detail += ' The agent needs a decision; no prompt input was sent. Inspect the session and choose an action.'

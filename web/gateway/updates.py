@@ -242,6 +242,12 @@ class Updates:
             newer = bool(latest) and (installed == 'unknown' or bool(ALPHA.fullmatch(installed)) or (bool(re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', installed))
                 and tuple(map(int, latest[1:].split('.'))) > tuple(map(int, installed[1:].split('.'))))
             )
+            # A failed copy can leave VERSION at the target release. Allow an
+            # explicit repair retry, while successful same-version installs and
+            # downgrades remain unavailable. Older workers omitted mode.
+            retry = bool(latest and installed == latest and raw.get('state') == 'failed'
+                         and raw.get('version') in (None, latest)
+                         and raw.get('mode') in (None, 'release'))
             identity_path = self.root / 'BUILD.json'
             identity = None
             if identity_path.exists():
@@ -256,7 +262,7 @@ class Updates:
                 isinstance(identity, dict) and identity.get('deployment_mode') != 'local'
                 and re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', str(identity.get('build_id', '')))
                 and not re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', str(source_sha or '')))
-            return dict(status, installed=installed, latest=latest, available=newer,
+            return dict(status, installed=installed, latest=latest, available=newer or retry,
                         supported=self.queue.is_dir() and not local_mode,
                         local_supported=self.queue.is_dir(),
                         source_sha=source_sha if isinstance(source_sha, str) else None,

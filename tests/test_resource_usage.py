@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'web/gateway'))
 from resource_usage import ResourceUsage
@@ -43,6 +44,18 @@ class ResourceUsageTests(unittest.TestCase):
             data = monitor.snapshot()
             self.assertFalse(data['available'])
             self.assertIs(monitor.snapshot(), data)
+
+    def test_storage_sample_survives_unavailable_process_metrics(self):
+        with tempfile.TemporaryDirectory() as root:
+            monitor = ResourceUsage(Path(root) / 'missing', root, storage=root)
+            with patch('build_capacity.storage_status', return_value=dict(available=True, blocked=True,
+                       free_bytes=0, reason='Low disk space.')) as probe:
+                result = monitor.snapshot()
+            self.assertFalse(result['available'])
+            self.assertTrue(result['storage']['blocked'])
+            self.assertEqual(probe.call_args.args[0], Path(root))
+            probe.assert_called_once()
+            self.assertIs(result['build_capacity']['storage'], result['storage'])
 
     def test_missing_memtotal_returns_unavailable_instead_of_keyerror(self):
         with tempfile.TemporaryDirectory() as root:

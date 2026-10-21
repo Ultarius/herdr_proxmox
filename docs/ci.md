@@ -7,6 +7,14 @@ Every push and pull request runs Bash syntax checks, mocked installer and cleanu
 tests, gateway unit tests, workflow linting, and the pinned Flutter/Jaspr release
 build with analysis and tests. Built web assets are passed between jobs.
 
+Run the Jaspr browser suite from `web/jaspr_dashboard` with
+`dart test --platform chrome --concurrency=1`, matching CI. Focus and animation
+checks share a browser viewport and can fail nondeterministically with default
+parallelism, including in unrelated test files. `scripts/build-web.sh` runs the
+VM tests; CI runs the browser suite separately. Before merging gateway changes,
+also run `python3 scripts/test-project-discovery.py --all` on native Linux; the
+runner refuses unsupported filesystem capabilities and fails on any skipped test.
+
 Pushing a `v*` tag additionally publishes a GitHub release after the installer
 checks and web build pass. It contains `herdr-proxmox.tar.gz` (matching installer,
 complete gateway and compiled UI) and its SHA-256 checksum. The remote `--web`

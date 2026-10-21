@@ -151,8 +151,8 @@ a.agent__name:hover { text-decoration: underline; text-underline-offset: 3px; }
   margin-left: auto; font-family: var(--font-mono); font-size: var(--text-xs-size); line-height: var(--text-xs-leading); font-weight: var(--weight-regular);
   color: var(--color-text-secondary); font-variant-numeric: tabular-nums; white-space: nowrap;
 }
-/* Wide card: the three meters sit side by side (each needs ~230px for its value) */
-@container health (min-width: 760px) { .meters { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-8); } }
+/* Four meters use a balanced 2 x 2 layout; each needs room for its value. */
+@container health (min-width: 760px) { .meters { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-8); } }
 .health > .notice { margin: var(--space-4) 0 0; }
 /* The processes disclosure bleeds to the card edges like the template's */
 .overview-health .processes { margin: var(--space-5) calc(-1 * var(--space-5)) calc(-1 * var(--space-5)); border-top: 1px solid var(--color-border); }
@@ -232,3 +232,11 @@ details.overview-disclosure > .overview-disclosure__summary {
   .runtime__tile::after { forced-color-adjust: none; background: CanvasText; }
   .status[data-shape="hollow"]::before { background: transparent; border-color: CanvasText; }
 }
+
+/* Outbound repository credentials are separate from inbound SSH access. */
+.repository-connections { margin-block: var(--space-4); padding: var(--space-4); border: 1px solid var(--color-border); border-radius: var(--radius-md); min-width: 0; }
+.repository-connections > summary { cursor: pointer; font-weight: var(--weight-semibold); }
+.repository-connections > p { margin-top: var(--space-3); color: var(--color-text-secondary); }
+.repository-connection { margin-top: var(--space-4); padding-top: var(--space-4); border-top: 1px solid var(--color-border); }
+.repository-connection > :is(.btn, a) { margin: var(--space-1) var(--space-2) var(--space-1) 0; }
+.repository-connection pre { padding: var(--space-3); background: var(--color-surface-sunken); border-radius: var(--radius-md); overflow-wrap: anywhere; }

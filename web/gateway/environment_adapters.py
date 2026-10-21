@@ -43,6 +43,8 @@ class Adapter:
     cache_directories: tuple = ()
     candidate_arguments: object = None
     companion_label: str = ''
+    capacity_variables: tuple = ()
+    capacity_wrapper: str = ''
 
     def root(self, executable):
         return Path(executable).parents[self.root_parents]
@@ -168,7 +170,9 @@ ADAPTERS = {
         companion='cargo', companion_label='Cargo', companion_pattern=r'^cargo ([0-9]+\.[0-9]+\.[0-9]+)\b',
         resolver=rust, unpacker=rust_components, variables=(('RUSTC', '{executable}'),),
         dispatch_variables=(('RUSTC', ''),), automatic_check=native_check,
-        cache_directories=('cargo',), cache_variables=(('CARGO_HOME', '{caches}/cargo'),)),
+        cache_directories=('cargo',), cache_variables=(('CARGO_HOME', '{caches}/cargo'),),
+        capacity_variables=(('CARGO_BUILD_JOBS', 'HERDR_BUILD_JOBS'), ('RUST_TEST_THREADS', 'HERDR_TEST_THREADS')),
+        capacity_wrapper='cargo'),
     'node': Adapter('node', 'bin/node', ('node', 'npm'), ('--version',), ('--version',),
         r'^v([0-9]+\.[0-9]+\.[0-9]+)\s*$', 1, companion='npm', assisted=True, automatic_check=node_check),
 }
@@ -183,6 +187,24 @@ def get(capability):
 
 def commands():
     return {command: adapter.capability for adapter in ADAPTERS.values() for command in adapter.commands}
+
+
+def capacity_environment(toolchains, budget):
+    """Translate neutral budget signals only for declared, supported adapters."""
+    return {variable: budget[source] for entry in toolchains
+            if (adapter := ADAPTERS.get(entry.get('name'))) is not None
+            for variable, source in adapter.capacity_variables}
+
+
+def session_tools(toolchains):
+    """Bound command metadata for prompts; no executable paths or inferred SDKs."""
+    result = []
+    for entry in toolchains:
+        adapter = ADAPTERS.get(entry['name'])
+        result.append(dict(name=entry['name'], required=entry.get('required'), component=entry.get('component'),
+                           commands=list(adapter.commands) if adapter else [],
+                           capacity_wrapper=(adapter.capacity_wrapper or None) if adapter else None))
+    return result
 
 
 def execution_caches(entries, caches, *, create=False):

@@ -87,6 +87,10 @@
 .console-facts dt { font-size: var(--text-xs-size); line-height: var(--text-xs-leading); }
 .console-response { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--space-1-5); }
 .console-key { font-family: var(--font-mono); font-size: var(--text-xs-size); }
+.folder-access { min-width: 0; margin-block: var(--space-3); }
+.folder-access__paths { grid-column: 2; min-width: 0; margin: 0; padding-left: var(--space-4); }
+.folder-access__paths li { margin-block: var(--space-2); }
+.folder-access__paths code { white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* ---- Card bodies laid out as a column with even gaps ------------------------- */
 :is(.ssh-card, .access-card, .toolchain-card, .logs-saved, .git-tree, .git-overview, .explorer-files, .explorer-preview, .knowledge-card) > .card__body {

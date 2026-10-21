@@ -53,8 +53,10 @@ def task_tool_guidance():
     if resource.is_symlink() or not resource.is_file():
         raise ValueError('Worker skill tool reference is missing or unsafe; reinstall the dashboard release.')
     return ('Before obtaining missing task tools, read ' + resource.resolve().as_posix() + '. '
-            'Pin and verify tools within existing permissions in task-specific environments; '
-            'agents share the herdr account. Report actual checks and installation failures. '
+            'Use the frozen prepared SDKs; report missing_toolchain instead of bootstrapping or switching a project SDK. '
+            'Project SDK provisioning uses dashboard environment preparation, not a shared home cache. '
+            'Only explicitly authorized auxiliary tools may be acquired in this session\'s allocated directories. '
+            'Agents share the herdr account. Report actual checks and installation failures. '
             'If the reference cannot be read, report its exact path; do not broaden permissions.')
 
 # A background status poll must never hold a task long, and must never wait
@@ -542,7 +544,8 @@ class Contributions:
                         continue  # Delivery owns any repair commit until the verified chat reply arrives.
                     run = next((j for j in runs if j['id'] == task.get('run_id')), None)
                     if run and run['state'] in ('queued', 'running'):
-                        raise ValueError('Preparing workspace and starting the assigned agent.')
+                        self.automation_wait(task, 'starting', 'Preparing workspace and starting the assigned agent.')
+                        continue
                     if not run or run['state'] not in ('persona_sent', 'finished'):
                         raise ValueError('Agent launch needs attention: ' + str((run or {}).get('error') or 'Awaiting the original task session.'))
                     path = self.tree_for(task)
@@ -550,7 +553,8 @@ class Contributions:
                         from collaboration import current_run
                         current_run(self.store, run)
                     if any(session_reserves(j, task['profile_id']) for j in runs):
-                        raise ValueError('Awaiting queued or running agent work.')
+                        self.automation_wait(task, 'busy', 'Waiting for queued or running agent work to finish.')
+                        continue
                     with repository_lock(path):
                         if project_git.git(path, 'symbolic-ref', '--short', 'HEAD').strip() != task['branch']:
                             raise ValueError('Task branch changed; inspect before continuing.')
@@ -567,6 +571,8 @@ class Contributions:
                             if receipt['outcome'] == 'no_changes':
                                 if project_git.merge_state(path) or project_git.git(path, 'status', '--porcelain=v1', '--untracked-files=all').strip():
                                     raise ValueError('A no-changes receipt requires a clean checkout without unfinished Git operations.')
+                                task.pop('automation_wait', None)
+                                task.pop('automation_error', None)
                                 task.update(state='completed', auto_capture=False, auto_validate=False, auto_review=False, completion=dict(
                                     outcome='no_changes', candidate=head, upstream=head, validation='not_applicable',
                                     reason=str(receipt.get('reason') or 'The assigned agent verified that no code changes are required.')[:2000],
@@ -605,7 +611,8 @@ class Contributions:
                     if task.get('auto_validate') and head not in task.get('builds', {}):
                         self.perform('build', {'target': head}, task['id'], 'automatic_task_policy')
                     task = self.get(task['id'])
-                    if task.pop('automation_error', None) is not None:
+                    had_wait = task.pop('automation_wait', None) is not None
+                    if task.pop('automation_error', None) is not None or had_wait:
                         self.save(task, 'automation_resumed', 'automatic_task_policy')
             except Busy:
                 continue
@@ -613,12 +620,28 @@ class Contributions:
                 try:
                     with self.operation('task:' + listed['id'], timeout=0):
                         task = self.get(listed['id'])
+                        # Proven pre-send work is a wait, not a failed task or
+                        # permission to replay an agent prompt. Blocked/unknown
+                        # delivery and invalid receipts still require inspection.
+                        if (isinstance(error, HerdrError) and error.code == 'agent_working'
+                                and error.delivery == 'none'):
+                            self.automation_wait(task, 'working',
+                                'The assigned agent is working. Candidate capture waits for its completion receipt.')
+                            continue
                         message = str(error)[:500]
-                        if task.get('automation_error') != message:
+                        if task.get('automation_error') != message or task.get('automation_wait'):
+                            task.pop('automation_wait', None)
                             task['automation_error'] = message
                             self.save(task, 'automation_waiting', 'automatic_task_policy')
                 except (ValueError, OSError, sqlite3.Error):
                     continue
+
+    def automation_wait(self, task, kind, message):
+        previous = task.get('automation_wait') or {}
+        had_error = task.pop('automation_error', None) is not None
+        if had_error or previous.get('kind') != kind or previous.get('message') != message:
+            task['automation_wait'] = dict(kind=kind, message=message, since=stamp())
+            self.save(task, 'automation_waiting', 'automatic_task_policy')
 
     def reconcile_completed(self, task_ids=None):
         ids = self.select_task_ids("json_extract(data, '$.state')='review_ready'", task_ids)
@@ -1147,6 +1170,10 @@ class Contributions:
         receipt_path = path / '.ci-cache/herdr-guidance' / ('task-' + task['id']) / 'receipt.json'
         if any(parent.is_symlink() for parent in (receipt_path.parent, receipt_path.parent.parent, path / '.ci-cache')):
             raise ValueError('Completion receipt directories must not be symlinks.')
+        if not receipt_path.exists():
+            raise ValueError('No completion receipt has been recorded for this task. Idle does not mean complete. '
+                             'Open the assigned agent, resolve failed checks or disk/tooling errors, '
+                             'and ask it to finish this task and write its completion receipt.')
         from collaboration import read_contribution
         receipt = json.loads(read_contribution(receipt_path, label='task completion receipt'))
         if not isinstance(receipt, dict) or receipt.get('outcome') not in ('complete', 'no_changes'):
@@ -1927,7 +1954,9 @@ class Contributions:
         if role != 'admin':
             automation = {organization: {k: v for k, v in policy.items() if k in AUTOMATION_DEFAULTS}
                           for organization, policy in automation.items()}
+        import build_capacity
         return dict(tasks=tasks, releases=self.releases.snapshot({task['id']: task for task in tasks}),
+                    storage=build_capacity.storage_status(self.projects),
                     github=github, executor=executor, automation=automation)
 
     def awaiting_candidate(self, task, common_dirs=None):
@@ -2628,6 +2657,7 @@ class Contributions:
                         self.store.futures.add(future)
                         future.add_done_callback(self.store._finished)
                     task.pop('automation_error', None)
+                    task.pop('automation_wait', None)
                     return self.save(task, 'launch_preflight_retry', actor)
                 return task
             reservations = [j for j in jobs if j.get('kind') == 'launch' and j.get('task_id') == task['id']]
@@ -3157,6 +3187,9 @@ class Contributions:
             if stopping_delivery and old:
                 old.update(state='cancelled', cancelled_by=actor, cancelled_at=stamp())
             task.update(settings)
+            if not task.get('auto_capture') and not task.get('auto_validate'):
+                task.pop('automation_wait', None)
+                task.pop('automation_error', None)
         elif action == 'candidate':
             path = self.tree_for(task)
             run = next((j for j in self.store.snapshot(live_status=False)['jobs'] if j['id'] == task.get('run_id')), None)

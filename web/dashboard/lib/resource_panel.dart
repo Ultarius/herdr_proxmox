@@ -145,6 +145,18 @@ class _ResourcePanelState extends State<ResourcePanel> {
                               'Swap ${bytes(d['swap_used'])} / ${bytes(d['swap_total'])}',
                               style: Theme.of(context).textTheme.bodySmall,
                             ),
+                            if (d['storage'] case final Map disk)
+                              if (disk['available'] == true) ...[
+                                const SizedBox(height: 12),
+                                meter(
+                                  Icons.disc_full_outlined,
+                                  'Disk ${bytes(disk['free_bytes'])} available',
+                                  ratio(
+                                    disk['used_bytes'],
+                                    disk['total_bytes'],
+                                  ),
+                                ),
+                              ],
                           ],
                         ),
                       ),
@@ -153,6 +165,24 @@ class _ResourcePanelState extends State<ResourcePanel> {
                   );
                 },
               ),
+              if (d['build_capacity'] case final Map capacity) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'Heavy builds: ${capacity['active'] == null ? 'idle' : 'running'}'
+                  ' · ${capacity['waiting'] ?? 0} waiting'
+                  ' · up to ${capacity['compiler_jobs'] ?? 1} compiler jobs per build',
+                ),
+                if ('${capacity['waiting_reason'] ?? ''}'.isNotEmpty)
+                  Text('${capacity['waiting_reason']} New builds will wait.'),
+              ],
+              if (d['storage'] case final Map disk)
+                if (disk['blocked'] == true)
+                  Text(
+                    'Storage needs attention: ${disk['reason']}',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
               if ((d['memory_total'] as num) > 0 &&
                   (d['memory_used'] as num) / (d['memory_total'] as num) >= .9)
                 Padding(

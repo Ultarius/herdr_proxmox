@@ -4,6 +4,7 @@ Status and diffs only read the repository. An explicit fetch updates
 remote-tracking branches; it never switches branches or changes working files.
 """
 from datetime import datetime, timezone
+from contextlib import nullcontext
 import re
 from urllib.parse import urlsplit
 import os
@@ -15,6 +16,8 @@ from project_files import project_directory
 from repository_lock import common_directory, repository_lock
 from operation_metrics import measured
 
+
+REPOSITORY_CONNECTIONS = None
 
 def git(path, *arguments, timeout=15, index_file=None, output_limit=1_000_000):
     # Compound callers (snapshots and base updates) hold this reentrant lock
@@ -43,8 +46,13 @@ def _run_git(path, *arguments, timeout=15, index_file=None, output_limit=1_000_0
         environment['GIT_INDEX_FILE'] = str(index_file)
     environment.update(GIT_AUTHOR_NAME='Herdr recovery', GIT_AUTHOR_EMAIL='recovery@herdr.local',
                        GIT_COMMITTER_NAME='Herdr recovery', GIT_COMMITTER_EMAIL='recovery@herdr.local')
+    credentials = (REPOSITORY_CONNECTIONS.checkout_credentials(path)
+                   if REPOSITORY_CONNECTIONS is not None and 'fetch' in arguments else nullcontext(None))
     try:
-        result = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false',
+        with credentials as selected_environment:
+            if selected_environment is not None:
+                environment.update(selected_environment)
+            result = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false',
                              '-C', str(path), *arguments], capture_output=True, timeout=timeout, env=environment)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ValueError('Git is unavailable or the checkout inspection timed out.') from error

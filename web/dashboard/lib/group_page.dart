@@ -8,6 +8,7 @@ import 'collaboration_panel.dart';
 import 'artifact_download.dart';
 import 'routes.dart';
 import 'remove_entry_dialog.dart';
+import 'folder_access_panel.dart';
 
 /// Job states that keep a group conversation live. Shared so the poll interval
 /// and the live-streaming guard cannot drift apart.
@@ -435,7 +436,7 @@ class _GroupPageState extends State<GroupPage> {
     final streams = data['streams'] as List? ?? [];
     final parts = data['contributions'] as List? ?? [];
     final draft = data['artifact_draft'] as String? ?? '';
-    return Card(
+    final discussion = Card(
       child: ExpansionTile(
         key: PageStorageKey('discussion-live-${job['id']}'),
         leading: const Icon(Icons.forum_outlined),
@@ -491,6 +492,10 @@ class _GroupPageState extends State<GroupPage> {
                 'Live terminal output · May include earlier messages and CLI controls',
               ),
               children: [
+                if (stream['scratch_directory'] != null)
+                  SelectableText(
+                    'Session scratch: ${stream['scratch_directory']}',
+                  ),
                 SizedBox(
                   height: 220,
                   child: SingleChildScrollView(
@@ -556,6 +561,19 @@ class _GroupPageState extends State<GroupPage> {
             ),
         ],
       ),
+    );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // Keep requests visible outside collapsed live terminal output.
+        if (data['inspection_error'] == null)
+          for (final stream in streams)
+            FolderAccessPanel(
+              inspection: stream as Map,
+              name: '${stream['name']}',
+            ),
+        discussion,
+      ],
     );
   }
 

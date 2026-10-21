@@ -110,7 +110,7 @@ def configure(store, job, frozen, pane, workspace):
     return bound_pane, bound_workspace
 
 
-def activate_shell(store, pane, environment, caches):
+def activate_shell(store, pane, environment, caches, path_prefix=None):
     """Reapply exports after startup files, with an execution barrier.
 
     pane.run acknowledges queue admission, not execution. A fresh marker written
@@ -120,6 +120,8 @@ def activate_shell(store, pane, environment, caches):
     token = uuid.uuid4().hex
     marker = caches / ('activated-' + token)
     commands = ['export ' + key + '=' + shlex.quote(value) for key, value in sorted(environment.items())]
+    if path_prefix is not None:
+        commands.append('export PATH=' + shlex.quote(str(path_prefix)) + ':"$PATH"')
     commands.append('printf %s ' + shlex.quote(token) + ' > ' + shlex.quote(str(marker)))
     store.command('pane', 'run', pane, ' && '.join(commands))
     deadline = time.monotonic() + 10

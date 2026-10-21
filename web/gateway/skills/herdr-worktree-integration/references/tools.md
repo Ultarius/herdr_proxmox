@@ -1,45 +1,51 @@
 ## Missing tools and validation failures
 
-A tool needed for your task is yours to obtain within the task's existing
-permissions and owner restrictions. Pin the version required by the repository's
-CI or lockfile. Prefer a task-specific, versioned cache under `$HOME` rather
-than changing shared executables on PATH.
+Use the project's frozen, prepared SDK bindings for every build and check.
+If the required compiler/runtime/package manager is absent or reports another
+version, stop those checks and report `missing_toolchain`. Include the component,
+required version, attempted command and actual error. A check that never ran is
+`not_run`; a check that ran and failed is `failed`. Never weaken checks or claim
+that static inspection substitutes for an unavailable required check.
 
-For a released binary, download over HTTPS and verify the publisher's SHA-256
-checksum before extracting only the needed files. Reject absolute paths, `..`
-paths and symlinks in the archive. Package-manager installs must use their
-integrity verification: Go's checksum database (do not disable it), or
-locked/hash-verified packages in a task virtual environment. `go install
-<module>@<exact version>` requires compatible Go; if Go is absent, prefer a
-verified prebuilt binary over bootstrapping an unrelated toolchain. Never
-execute a downloaded shell script as an installation shortcut.
+Project SDK provisioning belongs to the dashboard's environment preparation
+service. The administrator can open the project's environment card, choose
+**Plan environment**, then **Prepare SDKs**, or enable **Prepare supported project
+SDKs before agent launch** in organization automation. The gateway verifies the
+installation before a new launch adopts it. The environment plan identifies the
+acquisition method and required authorization for each supported adapter;
+separately authorized preparation agents handle supported assisted capabilities.
+Recognition of a tool does not imply that an installer is supported.
+Report unresolved versions or unsupported/native prerequisites to the operator.
 
-Keep installations inside the task's directories. Agents currently share the
-`herdr` Unix user and its home: user-space installation is not agent isolation.
-Avoid overwriting shared tools, `pip install --user`, modifying shell startup
-files, global CLI configuration or shared package environments. Do not install
-into `/opt`, `/usr/local`, or another task's directories, and do not use sudo or
-system package managers. Use a virtual environment or task-specific prefix.
-Scope PATH to the check command or invoke the tool by absolute path.
-Keep downloads out of candidate commits; prefer a task cache outside the checkout.
+Do not bootstrap a language toolchain or version manager, download a replacement
+project SDK into a home cache, change the selected SDK or bypass an environment
+blocker with a local install.
+Do not run `bash /opt/herdr-web/install/dev-tools-install.sh`. The Herdr CLI
+provides session/coordination commands; it does not grant dashboard administrator
+authority. Do not search for tokens, invent a provisioning CLI command, or call
+administrator APIs using credentials found on the machine.
 
-Run the check for real. Report the exact commands, actual exit status, version,
-integrity/checksum source and install location in your report. Integration
-requests use `tests.summary` for that evidence, or `reason` when blocked. A
-passing web build never substitutes for a missing required check. Do not edit
-checks, weaken assertions or substitute a different tool.
+For an auxiliary tool outside the pinned project SDK, installation requires
+explicit task authorization and an allocated session-local destination. Without
+that authority, report the missing capability. When authorized, pin the exact
+version, use HTTPS and verify publisher checksums or package-manager integrity.
+Prefer a verified prebuilt binary over bootstrapping another toolchain. Never
+execute a downloaded shell script as a shortcut. Reject absolute paths, `..`
+entries and symlinks before extracting an archive. Scope PATH to the check command
+or invoke the tool by absolute path. Report the version, source, verification,
+location and actual installation/check result. Keep attempts bounded.
 
-If installation fails, stop bounded attempts and report the actual blocker,
-including the tool/version, source, failing command and error (redact credentials).
-Offline downloads, unsupported architectures, unavailable releases, missing disk
-space and permission denials can block even user-space installation. Missing
-required tools mean `missing_toolchain`; permission denials mean
-`missing_permissions`. A check that never ran remains `not_run`. A check that ran
-and failed remains `failed`, even if a later tool installation also fails.
-Do not retry indefinitely or broaden permissions to bypass a failure.
+Use the session's supplied `HERDR_SCRATCH` / `TMPDIR` for temporary review files,
+downloads and pinned snapshots. Prefer direct `git show <SHA>:<path>` reads when
+no temporary copy is needed; preserve repository-relative paths in snapshots.
+Do not hardcode `/tmp/pin`, `/tmp/pinned`, or a shared home cache. Scratch writes
+for authorized analysis are allowed during read-only discussions; source changes,
+installation and execution still require their own authority. Never stage or
+commit scratch contents.
 
-Ask the platform for provisioning when a tool needs root, changes shared system
-state, or is the project's pinned build toolchain. The fixed-purpose SDK service
-installs Flutter/Dart only; it cannot provision arbitrary task tools. Agents do
-not run `bash /opt/herdr-web/install/dev-tools-install.sh`. Report unsupported
-platform requirements to the operator, with the reason local installation failed.
+Agents share the `herdr` Unix user, home and installed tools; session directories
+are not OS isolation. Do not overwrite shared executables, use `pip install
+--user`, edit shell startup files/global CLI settings, install into `/opt` or
+`/usr/local`, use sudo/system package managers, or enter another task's caches.
+Permission denials mean `missing_permissions`: report the exact path/operation,
+stop bounded attempts and do not request broader access as a workaround.

@@ -14,6 +14,7 @@ import 'package:herdr_jaspr_dashboard/services.dart';
 import 'package:herdr_jaspr_dashboard/terminal.dart';
 import 'package:herdr_jaspr_dashboard/ui.dart' as ui;
 import 'package:herdr_jaspr_dashboard/pages/group_page.dart';
+import 'package:herdr_jaspr_dashboard/pages/agent_console_page.dart';
 import 'package:herdr_jaspr_dashboard/pages/snapshot_terminal.dart';
 
 class _Host extends StatefulComponent {
@@ -362,6 +363,93 @@ void main() {
         true,
       );
       expect(nodes('canvas'), isEmpty);
+    },
+  );
+
+  test(
+    'folder requests name each blocked participant outside closed terminals and clear on resume',
+    () async {
+      var blocked = true;
+      await mountGroup((request) async {
+        if (request.url.path == '/api/organizations/history')
+          return ok(history());
+        if (request.url.path == '/api/organizations/inspect') {
+          return ok({
+            'streams': [
+              {
+                ...stream(
+                  'alice',
+                  'Raw console',
+                  status: blocked ? 'blocked' : 'working',
+                ),
+                'access_request': {
+                  'source': 'visible_terminal',
+                  'paths': [
+                    '/home/herdr/.cache/*',
+                    '/tmp/opencode/<literal>/*',
+                  ],
+                },
+              },
+              stream('bob', 'Working elsewhere'),
+            ],
+          });
+        }
+        return ok({'workspaces': [], 'agents': []});
+      });
+      await until(
+        () => contents('.folder-access').contains('/home/herdr/.cache/*'),
+      );
+      final panel = nodes('.folder-access').single;
+      expect(panel.closest('details'), isNull);
+      expect(panel.textContent, contains('Alice · Requested folder access'));
+      expect(
+        contents('.folder-access code'),
+        contains('/tmp/opencode/<literal>/*'),
+      );
+      expect(nodes('.folder-access literal'), isEmpty);
+      expect(
+        panel.getBoundingClientRect().height,
+        greaterThan(0),
+      );
+      blocked = false;
+      await until(() => nodes('.folder-access').isEmpty);
+    },
+  );
+
+  test(
+    'agent console shows explicit folders and clears them after prompt resolution',
+    () async {
+      var blocked = true;
+      var failed = false;
+      connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.url.path == '/api/organizations/inspect') {
+            if (failed) return http.Response('Inspection unavailable', 503);
+            return ok({
+              'status': blocked ? 'blocked' : 'working',
+              'output': 'Raw console',
+              'access_request': {
+                'source': 'visible_terminal',
+                'paths': ['/tmp/pinned/*'],
+              },
+            });
+          }
+          if (request.url.path.startsWith('/api/organizations'))
+            return ok(history());
+          return ok({'workspaces': [], 'agents': []});
+        }),
+      );
+      BlocScope.register<DashboardBloc>(() => connection!);
+      connection!.connect('test');
+      await until(() => connection!.state.connected);
+      mount(const AgentConsolePage(id: 'alice'));
+      await until(() => contents('.folder-access').contains('/tmp/pinned/*'));
+      failed = true;
+      await until(() => nodes('.folder-access').isEmpty);
+      failed = false;
+      await until(() => nodes('.folder-access').isNotEmpty);
+      blocked = false;
+      await until(() => nodes('.folder-access').isEmpty);
     },
   );
 
