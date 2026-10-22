@@ -41,6 +41,24 @@ BASH = usable_bash()
 
 
 class ValidationRunTests(unittest.TestCase):
+    def test_storage_finalization_diagnostics_survive_authoritative_queue_results(self):
+        from unittest.mock import Mock
+        identity = 'e' * 32
+        folder = self.runs.root / identity
+        folder.mkdir(parents=True)
+        original = dict(id=identity, event_id='a' * 64, state='complete', target=self.target,
+                        checks=[dict(id='test', status='passed')])
+        self.runs._write(folder, original)
+        self.runs.queue = Mock()
+        self.runs.queue.get.return_value = dict(original)
+        self.runs.update_storage_finish(identity, dict(state='pending', error='cache busy'))
+        observed = self.runs.storage_records()[0]
+        self.assertEqual(observed['storage_finish']['state'], 'pending')
+        self.assertEqual(observed['checks'], original['checks'])
+        self.assertEqual(observed['state'], 'complete')
+        self.assertNotIn('storage_finish', self.runs.queue.get.return_value)
+        self.runs.queue.finish.assert_not_called()
+
     def test_full_service_queue_is_a_typed_capacity_wait(self):
         from unittest.mock import Mock
         from build_queue import BuildQueueBusy

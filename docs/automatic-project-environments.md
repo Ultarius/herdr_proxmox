@@ -1,5 +1,9 @@
 # Automatic project environments: implementation plan
 
+New plans also freeze the adapter's build mode. Compact builds, managed output
+retention and scoped dependency-download reuse are described in
+[Managed build storage](managed-build-storage.md).
+
 Status: partially implemented in the current changeset, 2026-10-17. The full
 automatic launch/validation path below remains the target, not a shipped claim.
 

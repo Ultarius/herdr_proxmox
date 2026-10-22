@@ -53,7 +53,7 @@ def read_report(path, script):
     return result
 
 
-def run_scripts(tree, commands, folder, timeout, bash, output_limit, changed=None, environment=None):
+def run_scripts(tree, commands, folder, timeout, bash, output_limit, changed=None, environment=None, storage_projects=None, storage_bindings=None):
     import build_capacity
     queued = bytearray()
     def capacity(data):
@@ -74,10 +74,10 @@ def run_scripts(tree, commands, folder, timeout, bash, output_limit, changed=Non
         if (limits.get('storage') or {}).get('blocked'):
             raise ValueError(limits['storage']['reason'] + ' No checks ran.')
         return _run_scripts(tree, commands, folder, timeout, bash, output_limit, changed,
-                            environment, dict(fd=None, budget=limits))
+                            environment, dict(fd=None, budget=limits), storage_projects=storage_projects, storage_bindings=storage_bindings)
     with build_capacity.claim(changed=capacity, sample=lambda: build_capacity.budget(storage=tree)) as lease:
         return _run_scripts(tree, commands, folder, timeout, bash, output_limit, changed,
-                            environment, lease, bytes(queued))
+                            environment, lease, bytes(queued), storage_projects=storage_projects, storage_bindings=storage_bindings)
 
 
 def publish_log(folder, contents):
@@ -89,7 +89,7 @@ def publish_log(folder, contents):
         pass  # Capacity/console observation must still work on a full disk.
 
 
-def _run_scripts(tree, commands, folder, timeout, bash, output_limit, changed, environment, lease, queued=b''):
+def _run_scripts(tree, commands, folder, timeout, bash, output_limit, changed, environment, lease, queued=b'', *, storage_projects=None, storage_bindings=None):
     import build_capacity
     initial = f"Herdr build running: budget {lease['budget']['compiler_jobs']} compiler job(s), 1 test thread (tool support varies).\n"
     checks, tail = [], bytearray(queued + initial.encode())
@@ -117,10 +117,18 @@ def _run_scripts(tree, commands, folder, timeout, bash, output_limit, changed, e
             import environment_adapters
             bound = recipe.get('bindings') or []
             environment_for_check = toolchain_policy.environment(dict(toolchains=bound))
-            environment_for_check.update(environment_adapters.execution_caches(bound, folder, create=True))
+            environment_for_check.update(environment_adapters.execution_caches(
+                [entry for entry in bound if not entry.get('storage_contract')], folder, create=True))
+            import execution_storage
+            storage_binding = execution_storage.prepare(bound, tree,
+                lane='validation', execution_id=folder.name, projects=storage_projects)
+            environment_for_check.update(storage_binding['environment'])
+            if storage_bindings is not None and storage_binding.get('objects'):
+                storage_bindings.append(storage_binding)
         else:
             environment_for_check = environment
             bound = []
+            storage_binding = None
         capacity_environment = build_capacity.variables(lease)
         import environment_adapters
         capacity_environment.update(environment_adapters.capacity_environment(bound, capacity_environment))
@@ -135,7 +143,7 @@ def _run_scripts(tree, commands, folder, timeout, bash, output_limit, changed, e
             report = folder / f'checks-{index}.jsonl'
             started = time.monotonic()
             try:
-                process = subprocess.Popen(arguments, cwd=cwd, stdout=subprocess.PIPE,
+                process = build_capacity.start_process(arguments, cwd=cwd, stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT, start_new_session=os.name != 'nt',
                     env=dict(os.environ if environment_for_check is None else environment_for_check,
                              **capacity_environment,
@@ -147,8 +155,12 @@ def _run_scripts(tree, commands, folder, timeout, bash, output_limit, changed, e
                 reader = threading.Thread(target=collect, daemon=True)
                 reader.start()
                 try:
-                    check['exit_code'] = process.wait(timeout=remaining)
+                    check['exit_code'] = build_capacity.wait_for_process(process, timeout=remaining,
+                        storage=tree, environment=environment_for_check)
                     check['status'] = 'passed' if check['exit_code'] == 0 else 'failed'
+                except build_capacity.StorageLimitExceeded as error:
+                    check.update(status='failed', summary=str(error), blocker='storage_pressure')
+                    log(('\n' + str(error) + '\n').encode(), force=True)
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     check.update(status='failed', summary='Validation timeout exceeded.')
@@ -161,6 +173,7 @@ def _run_scripts(tree, commands, folder, timeout, bash, output_limit, changed, e
                     elif process.poll() is None:
                         process.kill()
                     process.wait()
+                    build_capacity.release_process_storage(process)
                     reader.join(5)
                     if not reader.is_alive():
                         process.stdout.close()
@@ -168,6 +181,8 @@ def _run_scripts(tree, commands, folder, timeout, bash, output_limit, changed, e
                 check.update(status='unavailable', summary=str(error)[:500])
             finally:
                 check['duration_ms'] = max(0, int((time.monotonic() - started) * 1000))
+                if storage_binding:
+                    execution_storage.finish(storage_binding, tree)
             try:
                 checks.extend(read_report(report, identifier))
             except (ValueError, OSError, UnicodeError) as error:
@@ -175,6 +190,15 @@ def _run_scripts(tree, commands, folder, timeout, bash, output_limit, changed, e
                     command='', exit_code=None, duration_ms=0, summary=str(error)[:500], required=True, source='runner'))
         if changed:
             changed(list(checks))
+        if check.get('blocker') == 'storage_pressure':
+            for pending in commands[index + 1:]:
+                pending_id = pending['id'] if isinstance(pending, dict) else pending
+                checks.append(dict(id=pending_id, name=pending_id, command='', required=True,
+                    source='runner', status='not_run', exit_code=None, duration_ms=0,
+                    summary='Storage pressure stopped this validation; no further checks ran.'))
+            if changed:
+                changed(list(checks))
+            break
     if required_passed(checks):
         exit_code = 0
     else:

@@ -1490,7 +1490,7 @@ class CollaborationTests(unittest.TestCase):
         self.assertEqual(max_context['launch_directory'], checkout)
         self.assertEqual(max_context['herdr_reported_cwd'], str(self.projects / 'different-project'))
         self.assertEqual(max_context['toolchains'], [dict(name='node', required='22.0.0', component='client',
-                                                        commands=['node', 'npm'], capacity_wrapper=None)])
+                                                        commands=['node', 'npm'])])
         self.assertNotIn('rustup', prompt)
         iris_context = next(c for c in contexts if c['name'] == 'Iris')
         self.assertEqual(iris_context['launch_directory'], str(self.projects))

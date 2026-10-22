@@ -45,9 +45,30 @@ class Adapter:
     candidate_arguments: object = None
     companion_label: str = ''
     capacity_variables: tuple = ()
-    capacity_wrapper: str = ''
     component_commands: tuple = ()
     component_verifier: object = None
+    build_profiles: tuple = ()
+    output_variables: tuple = ()
+    download_cache: object = None
+    shared_downloads: bool = False
+    build_guidance: tuple = ()
+    output_guidance: tuple = ()
+    capacity_guidance: str = ''
+    capacity_installer: object = None
+    legacy_output_directories: tuple = ()
+
+    def build_environment(self, entry):
+        """Execution settings are frozen with the plan, never inferred for old policies."""
+        mode = entry.get('build_mode')
+        if mode is None or not self.build_profiles:
+            return {}
+        profiles = dict(self.build_profiles)
+        if mode not in profiles:
+            raise ValueError('Unknown build mode for ' + self.capability)
+        return dict(profiles[mode])
+
+    def output_environment(self, directory):
+        return {key: value.format(outputs=directory) for key, value in self.output_variables}
 
     def root(self, executable):
         return Path(executable).parents[self.root_parents]
@@ -217,12 +238,25 @@ ADAPTERS = {
         dispatch_variables=(('RUSTC', ''),), automatic_check=rust_check, version=2,
         cache_directories=('cargo',), cache_variables=(('CARGO_HOME', '{caches}/cargo'),),
         capacity_variables=(('CARGO_BUILD_JOBS', 'HERDR_BUILD_JOBS'), ('RUST_TEST_THREADS', 'HERDR_TEST_THREADS')),
-        capacity_wrapper='cargo',
+        capacity_installer='build_capacity:install_cargo',
+        capacity_guidance='Cargo commands use the session PATH wrapper, which queues heavy work and caps compiler/test parallelism.',
+        build_profiles=(('compact', (('CARGO_PROFILE_DEV_DEBUG', 'line-tables-only'),
+                                    ('CARGO_PROFILE_TEST_DEBUG', 'line-tables-only'),
+                                    ('CARGO_INCREMENTAL', '0'))),
+                        ('full', (('CARGO_PROFILE_DEV_DEBUG', '2'),
+                                  ('CARGO_PROFILE_TEST_DEBUG', '2'), ('CARGO_INCREMENTAL', '1')))),
+        output_variables=(('CARGO_TARGET_DIR', '{outputs}'),), download_cache='package_cache:cargo', shared_downloads=True,
+        build_guidance=(('compact', 'Rust compact mode keeps file/line backtraces and disables incremental compilation. '
+                         'Assertions and overflow checks retain the project\'s profile settings.'),
+                        ('full', 'Rust full mode enables full debugger information and incremental compilation; it uses more disk.')),
+        output_guidance=('Use CARGO_TARGET_DIR for compiler output. Do not force Cargo back into target/ or create duplicate target directories.',),
+        legacy_output_directories=('target/debug',),
         component_commands=(('rustfmt', ('rustfmt', 'cargo-fmt')),
                             ('clippy-driver', ('clippy-driver', 'cargo-clippy'))),
         component_verifier=verify_rust_components),
     'node': Adapter('node', 'bin/node', ('node', 'npm'), ('--version',), ('--version',),
-        r'^v([0-9]+\.[0-9]+\.[0-9]+)\s*$', 1, companion='npm', assisted=True, automatic_check=node_check),
+        r'^v([0-9]+\.[0-9]+\.[0-9]+)\s*$', 1, companion='npm', assisted=True, automatic_check=node_check,
+        download_cache='package_cache:npm'),
 }
 
 
@@ -249,10 +283,30 @@ def session_tools(toolchains):
     result = []
     for entry in toolchains:
         adapter = ADAPTERS.get(entry['name'])
-        result.append(dict(name=entry['name'], required=entry.get('required'), component=entry.get('component'),
-                           commands=adapter.bound_commands(entry) if adapter else [],
-                           capacity_wrapper=(adapter.capacity_wrapper or None) if adapter else None))
+        record = dict(name=entry['name'], required=entry.get('required'), component=entry.get('component'),
+                      commands=adapter.bound_commands(entry) if adapter else [])
+        optional = dict(build_mode=entry.get('build_mode'),
+                        build_guidance=dict(adapter.build_guidance).get(entry.get('build_mode'), '') if adapter else '',
+                        capacity_guidance=adapter.capacity_guidance if adapter else '')
+        record.update({key: value for key, value in optional.items() if value})
+        result.append(record)
     return result
+
+
+def install_wrappers(entries, directory):
+    """Adapters install their command brokers into one execution-owned PATH root."""
+    from environment_providers import invoke
+    directories = {invoke(adapter.capacity_installer, directory) for name in dict.fromkeys(entry['name'] for entry in entries)
+                   if (adapter := get(name)).capacity_installer}
+    directories.discard(None)
+    if len(directories) > 1:
+        raise ValueError('Adapter command wrappers did not agree on one execution PATH directory.')
+    return next(iter(directories), None)
+
+
+def legacy_output_contracts():
+    """Only release-owned adapter declarations may identify old disposable roots."""
+    return [(name, relative) for name, adapter in ADAPTERS.items() for relative in adapter.legacy_output_directories]
 
 
 def execution_caches(entries, caches, *, create=False):

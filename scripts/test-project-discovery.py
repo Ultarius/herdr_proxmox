@@ -26,6 +26,8 @@ MODULES = (
     'test_environment_python', 'test_environment_contracts', 'test_rust_project_environment',
     'test_task_validation_environment',
     'test_task_delivery',
+    'test_workspace_storage', 'test_execution_storage', 'test_package_cache',
+    'test_storage_service', 'test_storage_regressions',
 )
 
 

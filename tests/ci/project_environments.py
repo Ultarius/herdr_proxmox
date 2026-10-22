@@ -31,6 +31,7 @@ def main():
         raise SystemExit('Run SDK smoke tests as an unprivileged user.')
     with tempfile.TemporaryDirectory(prefix='herdr-real-environments-') as folder:
         root = Path(folder)
+        os.environ['HERDR_WORKSPACE_STORAGE_ROOT'] = str(root / 'build-storage')
         projects = root / 'projects'
         projects.mkdir()
         for name, files in {

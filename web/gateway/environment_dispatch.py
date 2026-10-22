@@ -56,11 +56,13 @@ def conflicting(toolchains):
     return {name for name, values in selected.items() if len(values) != 1}
 
 
-def install(policy, checkout, caches):
+def install(policy, checkout, caches, *, execution_environment=None):
     root = Path(caches) / 'dispatch'
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = dict(version=1, checkout=str(Path(checkout).absolute()), caches=str(Path(caches).absolute()),
                    plan_digest=policy['plan_digest'], toolchains=policy['toolchains'])
+    if execution_environment:
+        payload['execution_environment'] = execution_environment
     encoded = environment_plan.canonical(payload)
     digest = hashlib.sha256(encoded.encode()).hexdigest()
     manifest = root / 'bindings.json'
@@ -96,8 +98,15 @@ def main(arguments):
         if len(companions) != 1:
             raise ValueError('The component has no verified companion binding for ' + tool)
     environment = toolchain_policy.environment(dict(toolchains=[entry]))
-    cache = Path(manifest['caches']) / hashlib.sha256(entry['component'].encode()).hexdigest()[:20]
-    environment.update(adapter.cache_environment(cache, create=True))
+    # The prepared shell owns the execution cache/output paths. Dispatch must
+    # not replace them with fresh per-component caches on every command.
+    if manifest.get('execution_environment'):
+        # Preserve exact gateway allocations, including custom storage mounts.
+        # Agent processes never infer a new store or acquire GC authority.
+        environment.update(manifest['execution_environment'])
+    else:
+        cache = Path(manifest['caches']) / hashlib.sha256(entry['component'].encode()).hexdigest()[:20]
+        environment.update(adapter.cache_environment(cache, create=True))
     os.execve(executable, [executable, *forwarded], environment)
 
 

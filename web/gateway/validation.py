@@ -135,11 +135,32 @@ class ValidationRuns:
                     if queued['state'] in ('queued', 'running'):
                         run['state'] = queued['state']
                     else:
-                        runs[index] = queued
+                        runs[index] = dict(queued)
+                        if run.get('storage_finish'):
+                            runs[index]['storage_finish'] = run['storage_finish']
         return sorted(runs, key=lambda run: str(run.get('started_at', '')), reverse=True)
 
     def running(self):
         return [run for run in self._history() if run.get('state') == 'running']
+
+    def storage_records(self):
+        """All durable run identities; no feedback delivery or history truncation."""
+        return self._history()
+
+    def update_storage_finish(self, identity, value):
+        """Persist retention diagnostics without rewriting build/queue evidence."""
+        if not isinstance(identity, str) or not RUN_ID.fullmatch(identity):
+            raise ValueError('Invalid validation run ID.')
+        folder = self.root / identity
+        if folder.is_symlink():
+            raise ValueError('Validation storage diagnostics cannot follow a linked run.')
+        run = self._read(folder)
+        authoritative = self.queue.get(identity) if self.queue is not None else run
+        if (not run or run.get('id') != identity or not authoritative or
+                authoritative.get('state') not in ('complete', 'failed', 'error', 'cancelled', 'interrupted')):
+            raise ValueError('Storage finalization requires a terminal validation run.')
+        run['storage_finish'] = value
+        self._write(folder, run)
 
     def snapshot(self):
         runs = self._history()
@@ -344,9 +365,11 @@ class ValidationRuns:
                 run['checks'] = checks
                 self._write(folder, run)
             with measured('validation.checks') as timings['checks']:
+                storage_bindings = []
                 checks, exit_code, timed_out = run_scripts(worktree, commands, folder,
                     self.timeout, BASH, OUTPUT_LIMIT, changed=evidence,
-                    environment=(None if policy.get('plan_digest') else toolchain_policy.environment(policy)))
+                    environment=(None if policy.get('plan_digest') else toolchain_policy.environment(policy)),
+                    storage_projects=self.projects, storage_bindings=storage_bindings)
                 if exit_code != 0 or timed_out:
                     timings['checks']['status'] = 'failed'
             # Repository scripts can report subchecks, but cannot certify that
@@ -375,6 +398,12 @@ class ValidationRuns:
             lines.append(f'Validation could not run: {error}\n')
         finally:
             self._cleanup(checkout=locals().get('checkout'), worktree=worktree)
+            try:
+                import execution_storage
+                for identity in {binding['execution_id'] for binding in locals().get('storage_bindings', [])}:
+                    execution_storage.close_execution(identity, projects=self.projects)
+            except (OSError, ValueError):
+                pass
             run.update(state=state, exit_code=exit_code, finished_at=stamp())
             content = ''.join(lines)[-OUTPUT_LIMIT:]
             try:

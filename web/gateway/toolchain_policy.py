@@ -332,6 +332,7 @@ def environment(policy, base=None):
             import environment_adapters
             value.update(environment_adapters.get(entry['name']).environment(
                 entry['executables'][0], entry.get('execution_environment')))
+            value.update(environment_adapters.get(entry['name']).build_environment(entry))
     if directories:
         value['PATH'] = os.pathsep.join([*directories, value.get('PATH', '')]).strip(os.pathsep)
     return value

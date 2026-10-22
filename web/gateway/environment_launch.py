@@ -79,9 +79,23 @@ def configure(store, job, frozen, pane, workspace):
     workspace = workspace or (pane.split(':', 1)[0] if is_pane_id(pane) else None)
     if not workspace or not is_pane_id(pane, workspace):
         raise ValueError('The assigned shell has no verifiable workspace identity.')
-    environment_adapters.execution_caches(runtime['policy']['toolchains'], caches, create=True)
+    environment_adapters.execution_caches([entry for entry in runtime['policy']['toolchains']
+        if not entry.get('storage_contract')], caches, create=True)
+    import execution_storage
+    store.update_job(job['id'], storage_preparation=dict(state='allocating'))
+    try:
+        storage = execution_storage.prepare(runtime['policy']['toolchains'], checkout,
+                                            lane='agent', execution_id=job['id'], projects=getattr(store, 'projects', None))
+    except BaseException:
+        store.update_job(job['id'], storage_preparation=dict(state='failed', no_agent_started=True))
+        raise
+    store.update_job(job['id'], storage_preparation=dict(state='complete'))
+    record['environment'].update(storage['environment'])
+    if storage['outputs'] or storage['manifest'].get('caches'):
+        store.update_job(job['id'], storage_binding=storage)
     if record['selection'] == 'component_dispatch':
-        launchers, digest = environment_dispatch.install(runtime['policy'], checkout, caches)
+        launchers, digest = environment_dispatch.install(runtime['policy'], checkout, caches,
+            execution_environment=storage['environment'])
         record['environment']['PATH'] = str(launchers) + os.pathsep + record['environment']['PATH']
         record['dispatcher_digest'] = digest
     arguments = []

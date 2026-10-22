@@ -7,6 +7,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'web/gateway'))
 from permissions import accessible_paths, prepare_permissions, permission_mode
 
 class PermissionTests(unittest.TestCase):
+    def test_managed_grants_cover_only_exact_execution_roots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            owned = home / 'storage' / 'objects' / ('a' * 64) / 'data'
+            pool = home / 'storage' / 'objects' / ('b' * 64) / 'data'
+            profile = dict(id='managed', runtime='opencode')
+            prepare_permissions(profile, home / 'outputs', home,
+                                managed_directories=(str(owned), str(pool), str(owned)), managed_root=home / 'storage')
+            contents = (home / '.config/opencode/agents/herdr-dashboard-managed.md').read_text()
+            rule = json.loads(next(line.removeprefix('permission: ') for line in contents.splitlines() if line.startswith('permission: ')))
+            self.assertEqual(set(rule['external_directory']), {str(owned / '**'), str(pool / '**')})
+            self.assertNotIn(str(home / 'storage' / '**'), rule['external_directory'])
+            with self.assertRaisesRegex(ValueError, 'exact absolute'):
+                prepare_permissions(profile, home, home, managed_directories=(str(owned / '*'),))
+            with self.assertRaisesRegex(ValueError, 'outside the verified'):
+                prepare_permissions(profile, home, home, managed_directories=(str(home / 'other'),), managed_root=home / 'storage')
+
     def test_policies_are_per_agent_and_defaults_do_not_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

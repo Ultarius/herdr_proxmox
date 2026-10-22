@@ -17,6 +17,18 @@ on:
 permissions:
   contents: read
 
+env:
+  # Reviewed minor version; setup-python supplies its current patch release.
+  CI_PRIMARY_PYTHON: '3.12'
+
+# Only PR runs supersede one another. Unique groups preserve every push/manual
+# run, including release publication and provisioning/cleanup sequences.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Add feature regressions to discovered suites, not new feature-specific jobs.
+# Separate jobs represent a different runtime, trust boundary or real install.
 jobs:
   checks:
     name: Installer and gateway checks
@@ -26,24 +38,83 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Bootstrap the pinned primary Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: ${{ env.CI_PRIMARY_PYTHON }}
+      - name: Check the primary Python runtime against the project declaration
+        run: |
+          echo "HERDR_CHECK_REPORT=$RUNNER_TEMP/ci-checks.jsonl" >> "$GITHUB_ENV"
+          python3 scripts/ci.py runtime
       - name: Bash syntax and mock tests
         shell: bash
         run: |
           git ls-files -z -- '*.sh' > "$RUNNER_TEMP/shell-scripts"
           while IFS= read -r -d '' script; do bash -n "$script"; done < "$RUNNER_TEMP/shell-scripts"
-          bash tests/host.sh
-          bash tests/build-web.sh
-          bash tests/agents.sh
-          bash tests/proxmox-ci.sh
+          python3 scripts/check-evidence.py host-fixtures bash tests/host.sh
+          python3 scripts/check-evidence.py web-build-fixtures bash tests/build-web.sh
+          python3 scripts/check-evidence.py agent-fixtures bash tests/agents.sh
+          python3 scripts/check-evidence.py proxmox-fixtures bash tests/proxmox-ci.sh
       - name: Python compile and gateway tests
         run: |
-          python3 -m compileall -q web/gateway tests/ci
-          python3 scripts/test-project-discovery.py --all
+          python3 scripts/check-evidence.py python-compile python3 -m compileall -q web/gateway scripts tests
+          python3 scripts/check-evidence.py gateway-tests python3 scripts/test-project-discovery.py --all
       - name: Lint GitHub workflow definitions
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= .github/workflows/ci.yml
+        run: python3 scripts/check-evidence.py workflow-lint go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= .github/workflows/ci.yml
+      - name: Summarize measured check times
+        if: always()
+        run: python3 scripts/ci.py summarize --report "$HERDR_CHECK_REPORT" --summary "$GITHUB_STEP_SUMMARY" --label 'Installer and gateway checks'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: gateway-check-timings
+          path: ${{ env.HERDR_CHECK_REPORT }}
+          if-no-files-found: warn
+          retention-days: 7
+
+  python-compatibility:
+    name: Minimum supported Python checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Bootstrap runtime selection with the pinned primary Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: ${{ env.CI_PRIMARY_PYTHON }}
+      - name: Select the minimum runtime from pyproject.toml
+        id: runtime
+        run: |
+          echo "HERDR_CHECK_REPORT=$RUNNER_TEMP/ci-checks.jsonl" >> "$GITHUB_ENV"
+          python3 scripts/ci.py runtime --select-only --github-output "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        if: steps.runtime.outputs.compatibility_needed == 'true'
+        with:
+          python-version: ${{ steps.runtime.outputs.minimum }}
+      - name: Verify the complete discovered suite on the minimum runtime
+        if: steps.runtime.outputs.compatibility_needed == 'true'
+        run: |
+          python scripts/check-evidence.py python-compile python -m compileall -q web/gateway scripts tests
+          python scripts/check-evidence.py gateway-tests python scripts/test-project-discovery.py --all
+      - name: Minimum runtime already covered by the primary job
+        if: steps.runtime.outputs.compatibility_needed == 'false'
+        run: echo 'The primary job runs this Python version; no duplicate suite is needed.'
+      - name: Summarize measured compatibility times
+        if: always() && steps.runtime.outputs.compatibility_needed == 'true'
+        run: python3 scripts/ci.py summarize --report "$HERDR_CHECK_REPORT" --summary "$GITHUB_STEP_SUMMARY" --label 'Minimum supported Python checks'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && steps.runtime.outputs.compatibility_needed == 'true'
+        with:
+          name: python-compatibility-timings
+          path: ${{ env.HERDR_CHECK_REPORT }}
+          if-no-files-found: warn
+          retention-days: 7
 
   project-environments:
     name: Real project SDK preparation
+    needs: [checks, python-compatibility]
     # The exact release commit must pass clean-host SDK qualification before publication.
     if: (github.event_name == 'workflow_dispatch' && inputs.run_project_environments) || (github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || (startsWith(github.ref, 'refs/heads/alpha/') && startsWith(github.event.head_commit.message, 'alpha:'))))
     strategy:
@@ -74,6 +145,7 @@ jobs:
       - name: Install the project's declared Flutter from its official repository
         shell: bash
         run: |
+          echo "HERDR_CHECK_REPORT=$RUNNER_TEMP/ci-checks.jsonl" >> "$GITHUB_ENV"
           # .fvmrc is the single source of the version. Pinning it here too
           # would be a second copy to forget when the project moves.
           version=$(python3 -c 'import json; print(json.load(open(".fvmrc"))["flutter"])')
@@ -89,16 +161,26 @@ jobs:
       - name: Validate preserved Flutter contracts and build Jaspr dashboard
         run: bash scripts/build-web.sh
       - name: Analyze all repository package contexts
-        run: dart analyze
+        run: python3 scripts/check-evidence.py repository-analysis dart analyze
       - name: Verify native DOM workflows in Chrome
         working-directory: web/jaspr_dashboard
         # Focus and requestAnimationFrame checks share one browser viewport.
-        run: dart test --platform chrome --concurrency=1
+        run: python3 ../../scripts/check-evidence.py browser-tests dart test --platform chrome --concurrency=1
       - name: Verify request IDs in compiled JavaScript
         working-directory: web/dashboard
         run: |
-          dart compile js test/request_id_web_check.dart -O2 -o "$RUNNER_TEMP/request-id-check.js"
-          node -e 'globalThis.self=globalThis; globalThis.crypto=require("node:crypto").webcrypto; require(process.argv[1])' "$RUNNER_TEMP/request-id-check.js"
+          python3 ../../scripts/check-evidence.py request-id-compile dart compile js test/request_id_web_check.dart -O2 -o "$RUNNER_TEMP/request-id-check.js"
+          python3 ../../scripts/check-evidence.py request-id-runtime node -e 'globalThis.self=globalThis; globalThis.crypto=require("node:crypto").webcrypto; require(process.argv[1])' "$RUNNER_TEMP/request-id-check.js"
+      - name: Summarize measured web check times
+        if: always()
+        run: python3 scripts/ci.py summarize --report "$HERDR_CHECK_REPORT" --summary "$GITHUB_STEP_SUMMARY" --label 'Web build and browser checks'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: web-check-timings
+          path: ${{ env.HERDR_CHECK_REPORT }}
+          if-no-files-found: warn
+          retention-days: 7
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: web-assets
@@ -108,7 +190,7 @@ jobs:
 
   release:
     name: Publish installable dashboard release
-    needs: [checks, web, project-environments]
+    needs: [checks, python-compatibility, web, project-environments]
     if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || (startsWith(github.ref, 'refs/heads/alpha/') && startsWith(github.event.head_commit.message, 'alpha:')))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -165,7 +247,7 @@ jobs:
 
   debian-install:
     name: Real Debian provisioning smoke
-    needs: [checks, web]
+    needs: [checks, python-compatibility, web]
     # Execute vendor installers on the trusted default branch, never on PR jobs.
     if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-24.04

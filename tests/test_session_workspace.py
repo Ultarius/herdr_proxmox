@@ -143,7 +143,9 @@ class SessionWorkspaceTests(unittest.TestCase):
             context = environment_adapters.session_tools(session_workspace.toolchains(run))
         self.assertEqual(context[1]['name'], 'other-sdk')
         self.assertEqual(context[1]['commands'], [])
-        self.assertIsNone(context[1]['capacity_wrapper'])
+        self.assertNotIn('capacity_guidance', context[1])
+        for entry in context:
+            self.assertNotIn('capacity_wrapper', entry)
 
     def test_real_shell_inherits_tmpdir_without_mutating_gateway_environment(self):
         bash = shutil.which('bash')

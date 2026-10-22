@@ -1118,7 +1118,20 @@ class OrganizationStore:
                     self.close_identity(run, ready=not allow_busy)  # Recheck ownership before closure.
                     self.command('pane', 'close', run['pane_id'], timeout=10)
                 terminal = 'finished' if mode == 'finish' else 'released'
+                storage_finish = None
+                if run.get('storage_binding'):
+                    # Keep the launch active until harvest and owner closure
+                    # finish. Retention must not infer idleness from a pane
+                    # closure while the broker is still using its private cache.
+                    import execution_storage
+                    try:
+                        result = execution_storage.finish(run['storage_binding'], run.get('worktree_path') or
+                            run.get('source_project'), close=True)
+                        storage_finish = dict(state='complete', warnings=result.get('errors', []))
+                    except (OSError, ValueError) as error:
+                        storage_finish = dict(state='pending', error=str(error)[:500])
                 run = self.update_job(run['id'], state=terminal, session_closed_at=now(),
+                    **({'storage_finish': storage_finish} if storage_finish else {}),
                     session_closed_by=actor, session_archive_id=saved['id'], session_close_status=status,
                     session_request_id=request_id, session_request_mode=mode,
                     session_close_identity='agent_session' if run.get('agent_session') else 'pane_checkout',
@@ -1719,18 +1732,6 @@ class OrganizationStore:
                 output_directories = ['chat-replies']
                 if profile.get('group_id') or job.get('session_purpose') == 'discussion':
                     output_directories.append('discussion-artifacts')
-                # Worktrees share committed Git objects. Evidence is read from
-                # the assigned checkout; no implicit main-checkout access grant.
-                arguments = launch_arguments(profile) + prepare_permissions(
-                    profile, self.path.parent, output_directories=tuple(output_directories))
-                # Native resume uses adapter arguments validated before they were
-                # recorded; free-form command text is never executed here.
-                resume_args = job.get('resume_args')
-                if isinstance(resume_args, list) and resume_args and all(isinstance(a, str) and 0 < len(a) <= 200 for a in resume_args):
-                    arguments = arguments + [str(a) for a in resume_args][:20]
-                # Record the exact executable arguments sent to Herdr, separately
-                # from the editable profile and any later in-TUI model changes.
-                job = self.update_job(job_id, launch_arguments=arguments)
                 # Frozen before the agent starts, so the session's policy is the
                 # one that applied when the work began.
                 admitted = (job.get('environment_admission') or {}).get('state') == 'ready'
@@ -1762,6 +1763,21 @@ class OrganizationStore:
                         self.require_environment_continuation(continuation)
                 from session_workspace import prepare as prepare_scratch, environment as scratch_environment, install_wrappers
                 from environment_launch import activate_shell
+                # Allocate the environment first, then grant only its exact owned
+                # output/cache roots. Never grant the whole storage registry or
+                # another checkout merely because Git objects are shared.
+                import execution_storage
+                permission_options = dict(output_directories=tuple(output_directories))
+                managed = tuple(execution_storage.grants(job.get('storage_binding'), projects=self.projects))
+                if managed:
+                    permission_options['managed_directories'] = managed
+                    permission_options['managed_root'] = execution_storage.root()
+                arguments = launch_arguments(profile) + prepare_permissions(
+                    profile, self.path.parent, **permission_options)
+                resume_args = job.get('resume_args')
+                if isinstance(resume_args, list) and resume_args and all(isinstance(a, str) and 0 < len(a) <= 200 for a in resume_args):
+                    arguments = arguments + [str(a) for a in resume_args][:20]
+                job = self.update_job(job_id, launch_arguments=arguments)
                 job = self.update_job(job_id, launch_stage='scratch_binding')
                 scratch = prepare_scratch(job.get('worktree_path') or project, job['id'], repository=repository)
                 job = self.update_job(job_id, scratch_directory=str(scratch))

@@ -345,8 +345,11 @@ def build(report, release_entries=None, measure=None, plan_id=None):
             installed=installed, artifacts=artifacts,
         ))
 
+    import execution_storage
     plan = dict(
         plan_version=PLAN_VERSION,
+        storage_version=1,
+        build_mode=execution_storage.settings()['build_mode'],
         project=report.get('project') or '',
         revision=revision,
         preview=preview,
@@ -397,6 +400,8 @@ def bindings(plan, receipt=None):
     No receipt means an explicit missing binding, never an empty policy. This
     names verified installation paths; only execution-time probes prove reuse.
     """
+    if plan.get('storage_version') not in (None, 1):
+        raise ValueError('The execution storage contract changed; prepare a compatible plan.')
     valid = bool(receipt and receipt.get('state') == 'ready'
                  and receipt.get('digest') == plan['digest']
                  and receipt.get('revision') == plan['revision'])
@@ -421,6 +426,12 @@ def bindings(plan, receipt=None):
                          rule=dict(evidence=item.get('evidence', []), override=item.get('override')),
                          adapter_version=item.get('adapter_version', 1),
                          executables=[executable] if executable else [], source='prepared' if executable else 'unavailable')
+            import environment_adapters
+            adapter = environment_adapters.ADAPTERS.get(item['capability'])
+            if adapter and adapter.build_profiles and plan.get('build_mode'):
+                entry['build_mode'] = plan['build_mode']
+            if adapter and (adapter.output_variables or adapter.download_cache) and plan.get('storage_version') == 1:
+                entry['storage_contract'] = 1
             if executable:
                 import environment_adapters
                 adapter = environment_adapters.get(item['capability'])

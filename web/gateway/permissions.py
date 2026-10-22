@@ -30,7 +30,7 @@ def permission_mode(body, runtime):
     return mode
 
 
-def prepare_permissions(profile, output_root, home=None, output_directories=()):
+def prepare_permissions(profile, output_root, home=None, output_directories=(), managed_directories=(), managed_root=None):
     # The profile id is interpolated into a file name, so a crafted id with a
     # separator or '..' would write outside the agent directory.
     if not isinstance(profile.get('id'), str) or not IDENTITY.fullmatch(profile['id']):
@@ -51,6 +51,23 @@ def prepare_permissions(profile, output_root, home=None, output_directories=()):
         # answer, and the meeting never finalizes.
         granted = tuple(output_directories)
     paths = [str(root / folder / '**') for folder in granted] + paths
+    for directory in managed_directories:
+        path = Path(directory)
+        if not path.is_absolute() or '..' in path.parts or any(c in str(path) for c in ('\0', '\n', '\r', '*', '?')):
+            raise ValueError('Managed execution grants require exact absolute directory paths.')
+        if managed_root is None:
+            raise ValueError('Managed execution grants require a verified storage root.')
+        base = Path(managed_root).absolute() / 'objects'
+        try:
+            relative = path.relative_to(base)
+        except ValueError:
+            raise ValueError('A managed grant is outside the verified storage root.') from None
+        if len(relative.parts) != 2 or not re.fullmatch(r'[a-f0-9]{64}', relative.parts[0]) or relative.parts[1] != 'data':
+            raise ValueError('Managed grants cover only registered data children, never control directories.')
+        from workspace_storage import _safe_chain
+        _safe_chain(path)
+        paths.append(str(path / '**'))
+    paths = list(dict.fromkeys(paths))
     if mode == 'default' and not paths and not variant:
         return []
     name = 'herdr-dashboard-' + profile['id']

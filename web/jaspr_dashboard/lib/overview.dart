@@ -6,6 +6,7 @@ import 'ui.dart';
 import 'services.dart';
 import 'navigation.dart';
 import 'repository_connections.dart';
+import 'storage_panel.dart';
 import 'package:herdr_dashboard_state/repository_connections.dart';
 
 String agentName(Map<String, dynamic> agent) =>
@@ -1247,6 +1248,7 @@ class _SystemHealthState extends State<SystemHealth> {
           ], classes: 'health'),
           processes(d['processes'] as List? ?? []),
         ],
+        const StoragePanel(key: ValueKey('managed-storage')),
       ],
       iconName: 'cpu',
       classes: 'overview-grid__wide overview-health',
