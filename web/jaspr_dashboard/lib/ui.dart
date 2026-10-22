@@ -9,16 +9,109 @@ Component text(Object? value) => Component.text('${value ?? ''}');
 Component el(
   String tag,
   List<Component> children, {
+  Key? key,
   String? classes,
   Map<String, String>? attributes,
   Map<String, EventCallback>? events,
-}) => Component.element(
-  tag: tag,
+}) => tag == 'details'
+    ? disclosureElement(
+        children,
+        key: key,
+        classes: classes,
+        attributes: attributes,
+        events: events,
+      )
+    : Component.element(
+        key: key,
+        tag: tag,
+        classes: classes,
+        attributes: attributes,
+        events: events,
+        children: children,
+      );
+
+/// A native disclosure that remembers user toggles during background renders.
+/// `attributes['open']` is an initial default; supply [open] only when the
+/// calling component owns the open state (including its summary interaction).
+Component disclosureElement(
+  List<Component> children, {
+  Key? key,
+  String? classes,
+  Map<String, String>? attributes,
+  Map<String, EventCallback>? events,
+  bool? open,
+}) => _Disclosure(
+  key: key,
   classes: classes,
   attributes: attributes,
   events: events,
+  open: open,
   children: children,
 );
+
+class _Disclosure extends StatefulComponent {
+  const _Disclosure({
+    super.key,
+    this.classes,
+    this.attributes,
+    this.events,
+    this.open,
+    required this.children,
+  });
+  final String? classes;
+  final Map<String, String>? attributes;
+  final Map<String, EventCallback>? events;
+  final bool? open;
+  final List<Component> children;
+
+  bool get declaredOpen => attributes?.containsKey('open') == true;
+
+  @override
+  State<_Disclosure> createState() => _DisclosureState();
+}
+
+class _DisclosureState extends State<_Disclosure> {
+  late bool open;
+  web.HTMLDetailsElement? element;
+
+  @override
+  void initState() {
+    super.initState();
+    open = component.open ?? component.declaredOpen;
+  }
+
+  @override
+  Component build(BuildContext context) {
+    // A parent update can arrive before the browser's queued toggle event.
+    // Read uncontrolled state from the clicked element so an update cannot
+    // undo the click. Controlled callers update their state synchronously.
+    final renderedOpen = component.open ?? element?.open ?? open;
+    return Component.element(
+      tag: 'details',
+      classes: component.classes,
+      attributes: {...?component.attributes, if (renderedOpen) 'open': ''}
+        ..removeWhere((name, _) => name == 'open' && !renderedOpen),
+      events: {
+        ...?component.events,
+        'click': (event) {
+          if (!mounted) return;
+          element = event.currentTarget as web.HTMLDetailsElement;
+          component.events?['click']?.call(event);
+        },
+        'toggle': (event) {
+          if (!mounted) return;
+          if (event.target == event.currentTarget) {
+            element = event.currentTarget as web.HTMLDetailsElement;
+            final value = element!.open;
+            if (value != open) setState(() => open = value);
+          }
+          component.events?['toggle']?.call(event);
+        },
+      },
+      children: component.children,
+    );
+  }
+}
 
 /// Phase 2 button. [variant] is primary, secondary, ghost or danger
 /// (`primary: true` is kept for existing callers). An [iconName] is drawn

@@ -18,6 +18,9 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
   bool refreshing = false;
   bool saving = false;
   int requestId = 0;
+  final expanded = <String, bool>{};
+  int settingsRequest = 0;
+  int repositoryRequest = 0;
   late final ProjectEnvironmentController environment;
   Map<String, dynamic>? get environmentPlan => environment.plan;
   Map<String, dynamic>? get environmentJob => environment.job;
@@ -48,6 +51,11 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
     String? jobId,
   }) async {
     if (!admin || environmentBusy) return;
+    if (operation == 'plan')
+      setState(() {
+        expanded['settings'] = true;
+        settingsRequest++;
+      });
     await environment.action(operation, checks: checks, jobId: jobId);
   }
 
@@ -64,6 +72,9 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.path != widget.path) {
       environment.reset(widget.path);
+      expanded.clear();
+      settingsRequest = 0;
+      repositoryRequest = 0;
       saving = false;
       requestId++;
       loaded = null;
@@ -90,6 +101,10 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
       );
       if (mounted && epoch == connection.generation && id == requestId)
         setState(() {
+          if (!expanded.containsKey('repository') &&
+              !projectEvidenceNeedsAttention(loaded?.report ?? {}) &&
+              projectEvidenceNeedsAttention(result.report))
+            repositoryRequest++;
           loaded = result;
 
           failure = null;
@@ -341,6 +356,27 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
     );
   }
 
+  Widget section(
+    String id,
+    String title,
+    List<Widget> children, {
+    bool initiallyOpen = false,
+  }) => ExpansionTile(
+    key: PageStorageKey(
+      'project-environment-${widget.path}-$id-${id == 'settings'
+          ? settingsRequest
+          : id == 'repository'
+          ? repositoryRequest
+          : 0}',
+    ),
+    title: Text(title),
+    initiallyExpanded: expanded[id] ?? initiallyOpen,
+    onExpansionChanged: (value) => expanded[id] = value,
+    childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+    expandedCrossAxisAlignment: CrossAxisAlignment.start,
+    children: children,
+  );
+
   @override
   Widget build(BuildContext context) {
     final report = loaded?.report ?? {};
@@ -357,7 +393,8 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
         : ProjectEnvironmentView(environmentStatus!);
     return Card(
       child: ExpansionTile(
-        title: const Text('Discovered requirements'),
+        key: PageStorageKey('project-environment-${widget.path}'),
+        title: const Text('Project environment'),
         subtitle: Text(
           refreshing
               ? 'Analysing repository…'
@@ -369,6 +406,7 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
           ConstrainedBox(
             constraints: const BoxConstraints(maxHeight: 340),
             child: SingleChildScrollView(
+              key: PageStorageKey('project-environment-scroll-${widget.path}'),
               padding: const EdgeInsets.all(16),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -381,19 +419,6 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                       ),
                     )
                   else if (loaded != null) ...[
-                    Text(
-                      'Source: ${source['scope']}'
-                      '${'${source['revision'] ?? ''}'.isEmpty ? '' : ' · ${source['revision']}'}'
-                      ' · assessed ${source['at']}',
-                    ),
-                    Text(
-                      'Boundary: ${source['boundary'] ?? 'repository root'} · cache ${source['cache_seconds'] ?? 0}s',
-                    ),
-                    const Divider(),
-                    Text(
-                      'Project environment',
-                      style: Theme.of(context).textTheme.titleSmall,
-                    ),
                     if (environment.actionError != null)
                       Text(
                         environment.actionError!,
@@ -407,41 +432,64 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                       Text(
                         'Saved environment status unavailable: $environmentFailure',
                       )
-                    else if (view != null) ...[
-                      Row(
-                        children: [
-                          Icon(
-                            view.current
-                                ? Icons.check_circle_outline
-                                : view.prepared != null
-                                ? Icons.warning_amber_rounded
-                                : Icons.info_outline,
-                            color: view.prepared != null && !view.current
-                                ? Colors.orange
-                                : view.current
+                    else if (view != null)
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: Theme.of(
+                            context,
+                          ).colorScheme.surfaceContainerLow,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: view.current
                                 ? Theme.of(context).colorScheme.primary
-                                : null,
+                                : Theme.of(context).colorScheme.outlineVariant,
                           ),
-                          const SizedBox(width: 8),
-                          Flexible(
-                            child: Text(
-                              view.label,
-                              style: const TextStyle(
-                                fontWeight: FontWeight.bold,
-                              ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Icon(
+                                  view.current
+                                      ? Icons.check_circle_outline
+                                      : view.prepared != null
+                                      ? Icons.warning_amber_rounded
+                                      : Icons.info_outline,
+                                  color: view.prepared != null && !view.current
+                                      ? Colors.orange
+                                      : view.current
+                                      ? Theme.of(context).colorScheme.primary
+                                      : null,
+                                ),
+                                const SizedBox(width: 8),
+                                Flexible(
+                                  child: Text(
+                                    view.label,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
-                          ),
-                        ],
+                            for (final sdk in view.sdks)
+                              Text(
+                                sdk,
+                                style: Theme.of(context).textTheme.titleMedium,
+                              ),
+                            if (view.prepared != null) Text(view.checks),
+                            Text(view.detail),
+                            Text('Commit: ${view.revision}'),
+                            if (view.prepared != null && !view.current)
+                              Text('Prepared commit: ${view.preparedRevision}'),
+                            if (view.pendingPlanDetail != null)
+                              Text(view.pendingPlanDetail!),
+                          ],
+                        ),
                       ),
-                      Text(view.detail),
-                      Text('Commit: ${view.revision}'),
-                      if (view.prepared != null && !view.current)
-                        Text('Prepared commit: ${view.preparedRevision}'),
-                      if (view.pendingPlanDetail != null)
-                        Text(view.pendingPlanDetail!),
-                      for (final sdk in view.sdks) Text(sdk),
-                      if (view.prepared != null) Text(view.checks),
-                    ],
                     for (final job in environment.activeJobs) ...[
                       Text(environmentJobLabel(job)),
                       Text('Preparation job: ${job['id']}'),
@@ -461,90 +509,114 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                         ),
                     ],
                     if (environmentJob != null &&
+                        environmentJob!['state'] != 'ready' &&
                         !environment.activeJobs.any(
                           (job) => job['id'] == environmentJob!['id'],
                         ))
                       Text(environmentJobLabel(environmentJob!)),
-                    if (requirements.isNotEmpty) ...[
-                      const Divider(),
-                      Text(
-                        'Host SDK discovery',
-                        style: Theme.of(context).textTheme.titleSmall,
-                      ),
-                      const Text(hostSdkExplanation),
-                      for (final item in requirements) readiness(item),
-                      Text(projectInstallerSummary(report)),
-                    ],
-                    const Divider(),
-                    Text(
-                      'Repository requirements',
-                      style: Theme.of(context).textTheme.titleSmall,
-                    ),
-                    const Text(repositoryRequirementExplanation),
-                    if (components.isEmpty)
+                    if (projectEvidenceNeedsAttention(report))
                       const Text(
-                        'No component was recognised. Review the coverage and unresolved findings below.',
+                        'Repository evidence needs review. Open Repository requirements for the findings.',
                       ),
-                    for (final component in components) ...[
-                      const Divider(),
-                      Text(
-                        '${component['path']}${component['basis'] == 'inferred' ? ' (inferred from source)' : ''}',
-                        style: Theme.of(context).textTheme.titleSmall,
-                      ),
-                      Text(
-                        'Languages: ${(component['languages'] as List? ?? []).map((e) => e['label']).join(', ')}',
-                      ),
-                      if (sourceNotices[component['path']]!.isNotEmpty)
-                        Text(sourceNotices[component['path']]!),
-                      for (final item
-                          in component['requirements'] as List? ?? [])
-                        requirement(
-                          item as Map,
-                          sourceOnly:
-                              sourceNotices[component['path']]!.isNotEmpty,
-                        ),
-                      if ((component['frameworks'] as List? ?? []).isNotEmpty)
+                    section(
+                      'repository',
+                      'Repository requirements',
+                      [
                         Text(
-                          'Frameworks: ${(component['frameworks'] as List).map((e) => e['label']).join(', ')}',
+                          'Source: ${source['scope']}'
+                          '${'${source['revision'] ?? ''}'.isEmpty ? '' : ' · ${source['revision']}'}'
+                          ' · assessed ${source['at']}',
                         ),
-                      for (final tool
-                          in component['configured_tooling'] as List? ?? [])
                         Text(
-                          'Configured tooling: ${tool['id']} (${tool['evidence']})',
+                          'Boundary: ${source['boundary'] ?? 'repository root'} · cache ${source['cache_seconds'] ?? 0}s',
                         ),
-                      for (final command
-                          in component['candidate_commands'] as List? ?? [])
-                        Text(
-                          'Candidate command: ${(command['command'] as List).join(' ')} (${command['source']})',
-                        ),
-                      for (final finding in additionalComponentFindings(
-                        component,
-                      ))
-                        Text('${finding['what']}: ${finding['reason']}'),
-                    ],
-                    for (final finding in report['unresolved'] as List? ?? [])
-                      Text('${finding['what']}: ${finding['reason']}'),
-                    Text(
-                      'Scanned ${coverage['files']} files in ${coverage['directories']} directories · '
-                      '${coverage['unknown'] ?? 0} unrecognised${coverage['truncated'] == true ? ' · scan incomplete' : ''}',
-                    ),
-                    if ((coverage['unknown'] ?? 0) > 0)
-                      ExpansionTile(
-                        title: const Text('Unrecognised files'),
-                        subtitle: Text(
-                          'Showing ${(coverage['unknown_evidence'] as List? ?? []).length} of ${coverage['unknown']} paths.',
-                        ),
-                        children: [
-                          for (final path
-                              in coverage['unknown_evidence'] as List? ?? [])
-                            ListTile(title: SelectableText('$path')),
+                        const Text(repositoryRequirementExplanation),
+                        if (components.isEmpty)
+                          const Text(
+                            'No component was recognised. Review the coverage and unresolved findings below.',
+                          ),
+                        for (final component in components) ...[
+                          const Divider(),
+                          Text(
+                            '${projectScope(component['path'])}${component['basis'] == 'inferred' ? ' (inferred from source)' : ''}',
+                            style: Theme.of(context).textTheme.titleSmall,
+                          ),
+                          Text(
+                            'Languages: ${(component['languages'] as List? ?? []).map((e) => e['label']).join(', ')}',
+                          ),
+                          if (sourceNotices[component['path']]!.isNotEmpty)
+                            Text(sourceNotices[component['path']]!),
+                          for (final item
+                              in component['requirements'] as List? ?? [])
+                            requirement(
+                              item as Map,
+                              sourceOnly:
+                                  sourceNotices[component['path']]!.isNotEmpty,
+                            ),
+                          if ((component['frameworks'] as List? ?? [])
+                              .isNotEmpty)
+                            Text(
+                              'Frameworks: ${(component['frameworks'] as List).map((e) => e['label']).join(', ')}',
+                            ),
+                          for (final tool
+                              in component['configured_tooling'] as List? ?? [])
+                            Text(
+                              'Configured tooling: ${tool['id']} (${tool['evidence']})',
+                            ),
+                          for (final command
+                              in component['candidate_commands'] as List? ?? [])
+                            Text(
+                              'Candidate command: ${(command['command'] as List).join(' ')} (${command['source']})',
+                            ),
+                          for (final finding in additionalComponentFindings(
+                            component,
+                          ))
+                            Text('${finding['what']}: ${finding['reason']}'),
                         ],
-                      ),
-                    if (loaded?.override != null)
-                      Text(
-                        'Operator override: ${loaded!.override!['toolchain']} '
-                        '${loaded!.override!['constraint']} [${loaded!.override!['notation']}] · by ${loaded!.override!['actor']}',
-                      ),
+                        for (final finding
+                            in report['unresolved'] as List? ?? [])
+                          Text('${finding['what']}: ${finding['reason']}'),
+                        Text(
+                          'Scanned ${coverage['files'] ?? 0} files in ${coverage['directories'] ?? 0} directories · '
+                          '${coverage['unknown'] ?? 0} unrecognised${coverage['truncated'] == true ? ' · scan incomplete' : ''}',
+                        ),
+                        if ((coverage['unknown'] ?? 0) > 0)
+                          ExpansionTile(
+                            key: PageStorageKey(
+                              'project-environment-unknown-${widget.path}',
+                            ),
+                            title: const Text('Unrecognised files'),
+                            subtitle: Text(
+                              'Showing ${(coverage['unknown_evidence'] as List? ?? []).length} of ${coverage['unknown']} paths.',
+                            ),
+                            children: [
+                              for (final path
+                                  in coverage['unknown_evidence'] as List? ??
+                                      [])
+                                ListTile(
+                                  title: SelectableText(
+                                    '$path',
+                                    key: PageStorageKey(
+                                      'project-environment-file-${widget.path}-$path',
+                                    ),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        if (loaded?.override != null)
+                          Text(
+                            'Operator override: ${loaded!.override!['toolchain']} '
+                            '${loaded!.override!['constraint']} [${loaded!.override!['notation']}] · by ${loaded!.override!['actor']}',
+                          ),
+                      ],
+                      initiallyOpen: projectEvidenceNeedsAttention(report),
+                    ),
+                    if (requirements.isNotEmpty)
+                      section('host', 'Host SDK discovery', [
+                        const Text(hostSdkExplanation),
+                        for (final item in requirements) readiness(item),
+                        Text(projectInstallerSummary(report)),
+                      ]),
                   ],
                   Wrap(
                     spacing: 8,
@@ -580,77 +652,89 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                         ),
                     ],
                   ),
-                  if (environmentPlan != null) ...[
-                    const Text('Committed SDK preparation'),
-                    const Text(
-                      'Approve validation checks before preparing. These commands can execute project code.',
+                  if (environmentPlan != null)
+                    section(
+                      'settings',
+                      'Environment settings',
+                      [
+                        const Text(
+                          'Approve validation checks before preparing. These commands can execute project code.',
+                        ),
+                        if ((environmentPlan!['requirements'] as List? ?? [])
+                            .any(
+                              (item) =>
+                                  (item['restore_recipes'] as List? ?? []).any(
+                                    (recipe) =>
+                                        recipe['requires_restore'] == true,
+                                  ),
+                            ))
+                          CheckboxListTile(
+                            title: const Text('Approve dependency restoration'),
+                            subtitle: const Text(
+                              'Separate from SDK installation. May execute project build code.',
+                            ),
+                            value:
+                                environmentPlan!['restore_permission']?['allowed'] ==
+                                true,
+                            onChanged: environmentBusy || !admin
+                                ? null
+                                : (_) => environmentAction('authorize-restore'),
+                          ),
+                        for (final check
+                            in environmentPlan!['check_candidates'] as List? ??
+                                [])
+                          CheckboxListTile(
+                            title: Text(
+                              '${projectScope(check['cwd'])}: ${(check['arguments'] as List).join(' ')} (${recipeEvidenceLabel(check as Map)})',
+                            ),
+                            value:
+                                (environmentPlan!['selected_checks'] as List? ??
+                                        [])
+                                    .any((item) => item['id'] == check['id']),
+                            onChanged: environmentBusy || !admin
+                                ? null
+                                : (selected) {
+                                    final ids = [
+                                      for (final item
+                                          in environmentPlan!['selected_checks']
+                                                  as List? ??
+                                              [])
+                                        '${item['id']}',
+                                    ];
+                                    if (selected == true) {
+                                      ids.add('${check['id']}');
+                                    } else {
+                                      ids.remove('${check['id']}');
+                                    }
+                                    environmentAction('select', checks: ids);
+                                  },
+                          ),
+                        for (final item
+                            in environmentPlan!['requirements'] as List? ?? [])
+                          Text(
+                            preparationRequirementSummary(
+                              item as Map,
+                              environmentPlan!,
+                              environmentJob,
+                            ),
+                          ),
+                        if (environmentPlanCanPrepare(environmentPlan) &&
+                            ![
+                              'queued',
+                              'running',
+                              'ready',
+                            ].contains(environmentJob?['state']))
+                          TextButton(
+                            onPressed: environmentBusy || !admin
+                                ? null
+                                : () => environmentAction('prepare'),
+                            child: const Text('Prepare SDKs'),
+                          ),
+                      ],
+                      initiallyOpen:
+                          view?.current != true ||
+                          environmentStatus?['pending_plan'] == true,
                     ),
-                    if ((environmentPlan!['requirements'] as List? ?? []).any(
-                      (item) => (item['restore_recipes'] as List? ?? []).any(
-                        (recipe) => recipe['requires_restore'] == true,
-                      ),
-                    ))
-                      CheckboxListTile(
-                        title: const Text('Approve dependency restoration'),
-                        subtitle: const Text(
-                          'Separate from SDK installation. May execute project build code.',
-                        ),
-                        value:
-                            environmentPlan!['restore_permission']?['allowed'] ==
-                            true,
-                        onChanged: environmentBusy || !admin
-                            ? null
-                            : (_) => environmentAction('authorize-restore'),
-                      ),
-                    for (final check
-                        in environmentPlan!['check_candidates'] as List? ?? [])
-                      CheckboxListTile(
-                        title: Text(
-                          '${check['cwd']}: ${(check['arguments'] as List).join(' ')} (${recipeEvidenceLabel(check as Map)})',
-                        ),
-                        value:
-                            (environmentPlan!['selected_checks'] as List? ?? [])
-                                .any((item) => item['id'] == check['id']),
-                        onChanged: environmentBusy || !admin
-                            ? null
-                            : (selected) {
-                                final ids = [
-                                  for (final item
-                                      in environmentPlan!['selected_checks']
-                                              as List? ??
-                                          [])
-                                    '${item['id']}',
-                                ];
-                                if (selected == true) {
-                                  ids.add('${check['id']}');
-                                } else {
-                                  ids.remove('${check['id']}');
-                                }
-                                environmentAction('select', checks: ids);
-                              },
-                      ),
-                    for (final item
-                        in environmentPlan!['requirements'] as List? ?? [])
-                      Text(
-                        preparationRequirementSummary(
-                          item as Map,
-                          environmentPlan!,
-                          environmentJob,
-                        ),
-                      ),
-                    if (environmentPlanCanPrepare(environmentPlan) &&
-                        ![
-                          'queued',
-                          'running',
-                          'ready',
-                        ].contains(environmentJob?['state']))
-                      TextButton(
-                        onPressed: environmentBusy || !admin
-                            ? null
-                            : () => environmentAction('prepare'),
-                        child: const Text('Prepare SDKs'),
-                      ),
-                  ],
                 ],
               ),
             ),

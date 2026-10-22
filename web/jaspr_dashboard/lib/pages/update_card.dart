@@ -130,7 +130,7 @@ class _UpdateState extends OperationsState<UpdateCard> {
   ];
 
   /// Alpha channel: browse, a compact list of the builds, pick and install.
-  /// The <details> has no attributes, so refreshes never close it.
+  /// The shared disclosure helper preserves the user's choice during polling.
   Component _alphaBuilds() => el('details', [
     el('summary', [
       icon('flask-conical'),

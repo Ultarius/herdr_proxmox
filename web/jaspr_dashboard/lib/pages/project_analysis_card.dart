@@ -24,6 +24,7 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
   String? failure;
   bool refreshing = false;
   int requestId = 0;
+  final expanded = <String, bool>{};
   late final ProjectEnvironmentController environment;
   Map<String, dynamic>? get environmentPlan => environment.plan;
   Map<String, dynamic>? get environmentJob => environment.job;
@@ -36,6 +37,7 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
     super.didUpdateComponent(old);
     if (old.path != component.path) {
       environment.reset(component.path);
+      expanded.clear();
       requestId++;
       busy = refreshing = false;
       loaded = null;
@@ -68,6 +70,7 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
     String? jobId,
   }) async {
     if (!admin || environmentBusy) return;
+    if (operation == 'plan') setState(() => expanded['settings'] = true);
     await environment.action(operation, checks: checks, jobId: jobId);
   }
 
@@ -245,7 +248,7 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
       if (sourceNotice.isNotEmpty) meta(sourceNotice, classes: 'org-note'),
       el('h3', [
         text(
-          '${item['path']}'
+          '${projectScope(item['path'])}'
           '${item['basis'] == 'inferred' ? ' (inferred from source)' : ''}',
         ),
       ], classes: 'overline'),
@@ -260,6 +263,12 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
         meta(
           'Frameworks: '
           '${(item['frameworks'] as List).map((entry) => (entry as Map)['label']).join(', ')}',
+          classes: 'org-note',
+        ),
+      for (final tool
+          in (item['configured_tooling'] as List? ?? []).whereType<Map>())
+        meta(
+          'Configured tooling: ${tool['id']} (${tool['evidence']})',
           classes: 'org-note',
         ),
       for (final command
@@ -341,28 +350,68 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
     if (environmentStatus == null)
       return meta('Loading saved environment status…');
     final view = ProjectEnvironmentView(environmentStatus!);
-    return el('section', [
-      pill(
-        view.label,
-        tone: view.current
-            ? 'success'
-            : view.prepared != null
-            ? 'warning'
-            : 'neutral',
-      ),
-      meta(view.detail),
-      meta('Commit: ${view.revision}', classes: 'mono'),
-      if (view.prepared != null && !view.current)
-        meta('Prepared commit: ${view.preparedRevision}', classes: 'mono'),
-      if (view.pendingPlanDetail != null) meta(view.pendingPlanDetail),
-      for (final sdk in view.sdks) meta(sdk),
-      if (view.prepared != null) meta(view.checks),
-    ]);
+    return callout(
+      [
+        for (final sdk in view.sdks)
+          el('p', [
+            el('strong', [text(sdk)]),
+          ], classes: 'callout__text'),
+        if (view.prepared != null) calloutText(view.checks),
+        calloutText(view.detail),
+        calloutText('Commit: ${view.revision}'),
+        if (view.prepared != null && !view.current)
+          calloutText('Prepared commit: ${view.preparedRevision}'),
+        if (view.pendingPlanDetail != null) calloutText(view.pendingPlanDetail),
+      ],
+      title: view.label,
+      tone: view.current
+          ? 'success'
+          : view.prepared != null
+          ? 'warning'
+          : 'neutral',
+    );
+  }
+
+  bool get preparedCurrent =>
+      environmentStatus != null &&
+      ProjectEnvironmentView(environmentStatus!).current;
+
+  Component section(
+    String id,
+    String label,
+    List<Component> children, {
+    bool initiallyOpen = false,
+  }) {
+    final open = expanded[id] ?? initiallyOpen;
+    return disclosureElement(
+      [
+        el(
+          'summary',
+          [
+            el('span', [text(label)], classes: 'org-disclosure__title'),
+            icon('chevron-down', classes: 'icon--sm disclosure-chevron'),
+          ],
+          classes: 'disclosure-summary',
+          events: {
+            'click': (event) {
+              if (!mounted) return;
+              event.preventDefault();
+              setState(() => expanded[id] = !(expanded[id] ?? initiallyOpen));
+            },
+          },
+        ),
+        el('div', children, classes: 'org-disclosure__body'),
+      ],
+      key: ValueKey('environment-${component.path}-$id'),
+      classes: 'org-disclosure',
+      attributes: {'data-environment-section': id},
+      open: open,
+    );
   }
 
   @override
   Component build(BuildContext context) => card(
-    'Discovered requirements',
+    'Project environment',
     [
       if (failure != null)
         callout(
@@ -376,12 +425,6 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
           iconName: 'triangle-alert',
         )
       else ...[
-        meta(
-          'Source: ${(analysis['source'] as Map?)?['scope'] ?? 'unknown'}'
-          '${'${(analysis['source'] as Map?)?['revision'] ?? ''}'.isEmpty ? '' : ' · ${(analysis['source'] as Map)['revision']}'}'
-          ' · assessed ${(analysis['source'] as Map?)?['at'] ?? 'unknown'}',
-        ),
-        el('h3', [text('Project environment')], classes: 'overline'),
         if (environment.actionError != null)
           meta(environment.actionError, classes: 'error'),
         projectEnvironment(),
@@ -399,117 +442,151 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
               ),
           ]),
         if (environmentJob != null &&
+            environmentJob!['state'] != 'ready' &&
             !environment.activeJobs.any(
               (job) => job['id'] == environmentJob!['id'],
             ))
           meta(environmentJobLabel(environmentJob!)),
-        if (requirements.isNotEmpty) ...[
-          el('h3', [text('Host SDK discovery')], classes: 'overline'),
-          meta(hostSdkExplanation, classes: 'org-note'),
-          for (final requirement in requirements) readinessRow(requirement),
-          meta(projectInstallerSummary(analysis), classes: 'org-note'),
-        ],
-        el('h3', [text('Repository requirements')], classes: 'overline'),
-        meta(repositoryRequirementExplanation, classes: 'org-note'),
-        for (final item in components) componentBlock(item),
-        if (components.isEmpty)
-          emptyState(
-            'No component was recognised here. The coverage below says what was seen.',
-            iconName: 'search',
-          ),
-        for (final finding in unresolved)
+        if (projectEvidenceNeedsAttention(analysis))
           callout([
             calloutText(
-              '${finding['what']}: ${finding['reason']}'
-              '${'${finding['evidence'] ?? ''}'.isEmpty ? '' : ' (${finding['evidence']})'}',
+              'Repository evidence needs review. Open Repository requirements for the findings.',
             ),
-          ], tone: 'neutral'),
-        meta(
-          'Scanned ${coverage['files'] ?? 0} files in ${coverage['directories'] ?? 0} directories'
-          '${coverage['truncated'] == true ? ' (partial: a limit stopped the scan)' : ''}'
-          '${(coverage['unknown'] ?? 0) == 0 ? '' : ' · ${coverage['unknown']} unrecognised'}',
-        ),
-        if ((coverage['unknown'] ?? 0) > 0)
-          el('details', [
-            el('summary', [text('Unrecognised files')]),
+          ], tone: 'warning'),
+        section(
+          'repository',
+          'Repository requirements',
+          [
             meta(
-              'Showing ${(coverage['unknown_evidence'] as List? ?? []).length} of ${coverage['unknown']} paths.',
+              'Source: ${(analysis['source'] as Map?)?['scope'] ?? 'unknown'}'
+              '${'${(analysis['source'] as Map?)?['revision'] ?? ''}'.isEmpty ? '' : ' · ${(analysis['source'] as Map)['revision']}'}'
+              ' · assessed ${(analysis['source'] as Map?)?['at'] ?? 'unknown'}',
             ),
-            for (final path in coverage['unknown_evidence'] as List? ?? [])
-              meta(path, classes: 'mono'),
+            meta(
+              'Boundary: ${(analysis['source'] as Map?)?['boundary'] ?? 'repository root'} · cache ${(analysis['source'] as Map?)?['cache_seconds'] ?? 0}s',
+            ),
+            meta(repositoryRequirementExplanation, classes: 'org-note'),
+            for (final item in components) componentBlock(item),
+            if (components.isEmpty)
+              emptyState(
+                'No component was recognised here. The coverage below says what was seen.',
+                iconName: 'search',
+              ),
+            for (final finding in unresolved)
+              callout([
+                calloutText(
+                  '${finding['what']}: ${finding['reason']}'
+                  '${'${finding['evidence'] ?? ''}'.isEmpty ? '' : ' (${finding['evidence']})'}',
+                ),
+              ], tone: 'neutral'),
+            meta(
+              'Scanned ${coverage['files'] ?? 0} files in ${coverage['directories'] ?? 0} directories'
+              '${coverage['truncated'] == true ? ' (partial: a limit stopped the scan)' : ''}'
+              '${(coverage['unknown'] ?? 0) == 0 ? '' : ' · ${coverage['unknown']} unrecognised'}',
+            ),
+            if ((coverage['unknown'] ?? 0) > 0)
+              el('details', [
+                el('summary', [
+                  text('Unrecognised files'),
+                  el('span', [
+                    text(
+                      ' · Showing ${(coverage['unknown_evidence'] as List? ?? []).length} of ${coverage['unknown']} paths.',
+                    ),
+                  ], classes: 'org-disclosure__hint'),
+                ]),
+                for (final path in coverage['unknown_evidence'] as List? ?? [])
+                  meta(path, classes: 'mono'),
+              ]),
+            if (operatorOverride != null)
+              meta(
+                'Operator override: ${operatorOverride!['toolchain']} '
+                '${operatorOverride!['constraint'] ?? ''} '
+                '[${operatorOverride!['notation'] ?? 'semver'}]'
+                '${(overriddenEntry == null ? null : loaded!.assessmentOf(overriddenEntry!))?['provisionable'] == true ? ' · installation available' : ' · no satisfying installer'}'
+                ' · by ${operatorOverride!['actor']}.',
+              ),
+          ],
+          initiallyOpen: projectEvidenceNeedsAttention(analysis),
+        ),
+        if (requirements.isNotEmpty)
+          section('host', 'Host SDK discovery', [
+            meta(hostSdkExplanation, classes: 'org-note'),
+            for (final requirement in requirements) readinessRow(requirement),
+            meta(projectInstallerSummary(analysis), classes: 'org-note'),
           ]),
-        if (operatorOverride != null)
-          meta(
-            'Operator override: ${operatorOverride!['toolchain']} '
-            '${operatorOverride!['constraint'] ?? ''} '
-            '[${operatorOverride!['notation'] ?? 'semver'}]'
-            '${(overriddenEntry == null ? null : loaded!.assessmentOf(overriddenEntry!))?['provisionable'] == true ? ' · installation available' : ' · no satisfying installer'}'
-            ' · by ${operatorOverride!['actor']}.',
-          ),
       ],
       if (!admin)
         meta('Only an administrator can add an override.', iconName: 'lock'),
-      if (environmentPlan != null) ...[
-        el('h3', [text('Committed SDK preparation')], classes: 'overline'),
-        meta(
-          'Approve validation checks before preparing. These commands can execute project code.',
-        ),
-        if ((environmentPlan!['requirements'] as List? ?? []).any(
-          (item) => (item['restore_recipes'] as List? ?? []).any(
-            (recipe) => recipe['requires_restore'] == true,
-          ),
-        )) ...[
-          meta(
-            'Dependency restoration is separate from SDK installation and may execute project build code.',
-          ),
-          button(
-            environmentPlan!['restore_permission']?['allowed'] == true
-                ? 'Revoke dependency restoration'
-                : 'Approve dependency restoration',
-            () => environmentAction('authorize-restore'),
-            disabled: environmentBusy || !admin,
-          ),
-        ],
-        for (final check in environmentPlan!['check_candidates'] as List? ?? [])
-          button(
-            '${(environmentPlan!['selected_checks'] as List? ?? []).any((item) => item['id'] == check['id']) ? 'Deselect' : 'Approve'} ${check['cwd']}: ${(check['arguments'] as List).join(' ')} (${recipeEvidenceLabel(check as Map)})',
-            () {
-              final ids = [
-                for (final item
-                    in environmentPlan!['selected_checks'] as List? ?? [])
-                  '${item['id']}',
-              ];
-              if (ids.contains('${check['id']}')) {
-                ids.remove('${check['id']}');
-              } else {
-                ids.add('${check['id']}');
-              }
-              environmentAction('select', checks: ids);
-            },
-            disabled: environmentBusy || !admin,
-          ),
-        for (final item in environmentPlan!['requirements'] as List? ?? [])
-          meta(
-            preparationRequirementSummary(
-              item as Map,
-              environmentPlan!,
-              environmentJob,
+      if (environmentPlan != null)
+        section(
+          'settings',
+          'Environment settings',
+          [
+            meta(
+              'Approve validation checks before preparing. These commands can execute project code.',
             ),
-          ),
-        if (environmentPlanCanPrepare(environmentPlan) &&
-            !['queued', 'running', 'ready'].contains(environmentJob?['state']))
-          button(
-            'Prepare SDKs',
-            () => environmentAction('prepare'),
-            disabled: environmentBusy || !admin,
-          ),
-      ],
+            if ((environmentPlan!['requirements'] as List? ?? []).any(
+              (item) => (item['restore_recipes'] as List? ?? []).any(
+                (recipe) => recipe['requires_restore'] == true,
+              ),
+            )) ...[
+              meta(
+                'Dependency restoration is separate from SDK installation and may execute project build code.',
+              ),
+              button(
+                environmentPlan!['restore_permission']?['allowed'] == true
+                    ? 'Revoke dependency restoration'
+                    : 'Approve dependency restoration',
+                () => environmentAction('authorize-restore'),
+                disabled: environmentBusy || !admin,
+              ),
+            ],
+            for (final check
+                in environmentPlan!['check_candidates'] as List? ?? [])
+              button(
+                '${(environmentPlan!['selected_checks'] as List? ?? []).any((item) => item['id'] == check['id']) ? 'Deselect' : 'Approve'} ${projectScope(check['cwd'])}: ${(check['arguments'] as List).join(' ')} (${recipeEvidenceLabel(check as Map)})',
+                () {
+                  final ids = [
+                    for (final item
+                        in environmentPlan!['selected_checks'] as List? ?? [])
+                      '${item['id']}',
+                  ];
+                  if (ids.contains('${check['id']}')) {
+                    ids.remove('${check['id']}');
+                  } else {
+                    ids.add('${check['id']}');
+                  }
+                  environmentAction('select', checks: ids);
+                },
+                disabled: environmentBusy || !admin,
+              ),
+            for (final item in environmentPlan!['requirements'] as List? ?? [])
+              meta(
+                preparationRequirementSummary(
+                  item as Map,
+                  environmentPlan!,
+                  environmentJob,
+                ),
+              ),
+            if (environmentPlanCanPrepare(environmentPlan) &&
+                ![
+                  'queued',
+                  'running',
+                  'ready',
+                ].contains(environmentJob?['state']))
+              button(
+                'Prepare SDKs',
+                () => environmentAction('prepare'),
+                disabled: environmentBusy || !admin,
+              ),
+          ],
+          initiallyOpen:
+              !preparedCurrent || environmentStatus?['pending_plan'] == true,
+        ),
       feedback(),
     ],
     iconName: 'search',
-    subtitle:
-        'Derived from this repository\'s own files. Requirements show their evidence; anything '
-        'that could not be settled is listed rather than omitted.',
+    subtitle: 'Prepared SDKs and approved validation checks for this project.',
     actions: [
       if (admin)
         button(

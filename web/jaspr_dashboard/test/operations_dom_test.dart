@@ -292,6 +292,91 @@ void main() {
   }
 
   test(
+    'environment section identities and toggles survive preceding status changes',
+    () async {
+      var running = false;
+      await mount(const ProjectAnalysisCard(path: 'repo'), (request) {
+        if (request.url.path.endsWith('/analysis'))
+          return {
+            'source': {'boundary': 'repository root', 'cache_seconds': 30},
+            'requirements': [
+              {
+                'tool': 'rust',
+                'assessment': {'verdict': 'missing'},
+              },
+            ],
+            'components': [
+              {
+                'path': '.',
+                'requirements': [],
+                'configured_tooling': [
+                  {'id': 'rustfmt', 'evidence': 'rustfmt.toml'},
+                ],
+              },
+            ],
+          };
+        if (request.url.path.endsWith('/environment'))
+          return {
+            'project': 'repo',
+            'revision': 'head',
+            'plan_current': true,
+            'plan': {
+              'digest': 'plan',
+              'requirements': [],
+              'selected_checks': [],
+              'check_candidates': [],
+            },
+            'job': null,
+            'active_jobs': [
+              if (running)
+                {'id': 'preparing', 'digest': 'plan', 'state': 'running'},
+            ],
+            'prepared': {
+              'current': true,
+              'revision': 'head',
+              'requirements': [],
+              'selected_check_count': 0,
+            },
+          };
+        return {'workspaces': [], 'agents': []};
+      });
+      web.HTMLDetailsElement section(String id) =>
+          elements('details[data-environment-section="$id"]').single
+              as web.HTMLDetailsElement;
+      final host = section('host'), repository = section('repository');
+      final summary = host.querySelector('summary') as web.HTMLElement;
+      summary.click();
+      summary.click();
+      await settle();
+      expect(
+        host.open,
+        isFalse,
+        reason: 'Two clicks in one frame cancel each other',
+      );
+      summary.click();
+      await settle();
+      running = true;
+      await click('Re-analyse');
+      expect(section('host'), same(host));
+      expect(section('repository'), same(repository));
+      expect(host.open, isTrue);
+      expect(repository.open, isFalse);
+      expect(
+        web.document.getElementById('operations-test')!.textContent,
+        contains('Acquiring and verifying SDKs'),
+      );
+      expect(
+        repository.textContent,
+        contains('Boundary: repository root · cache 30s'),
+      );
+      expect(
+        repository.textContent,
+        contains('Configured tooling: rustfmt (rustfmt.toml)'),
+      );
+    },
+  );
+
+  test(
     'discovery displays source, inherited SDK evidence and host readiness',
     () async {
       await mount(const ProjectAnalysisCard(path: 'repo'), (request) {
@@ -599,6 +684,33 @@ void main() {
           expect(content(), contains('Prepared for this commit'));
           expect(content(), contains('1 approved validation check'));
           expect(content(), contains('SDK preparation recorded'));
+          for (final name in ['repository', 'host', 'settings']) {
+            final section =
+                elements('details[data-environment-section="$name"]').single
+                    as web.HTMLDetailsElement;
+            expect(
+              section.open,
+              isFalse,
+              reason: '$name is secondary to prepared SDKs',
+            );
+          }
+          expect(
+            elements('.callout__title').single.textContent,
+            'Prepared for this commit',
+          );
+          final host =
+              elements('details[data-environment-section="host"]').single
+                  as web.HTMLDetailsElement;
+          (host.querySelector('summary') as web.HTMLElement).click();
+          await settle();
+          expect(host.open, isTrue);
+          await click('Re-analyse');
+          expect(
+            host.open,
+            isTrue,
+            reason: 'refresh preserves expanded diagnostics',
+          );
+          expect(content(), isNot(contains('SDK preparation completed.')));
           binding.detachRootComponent();
           await settle();
           binding.attachRootComponent(
@@ -840,7 +952,15 @@ void main() {
       );
       expect(root.textContent!.split(reason), hasLength(2));
       expect(root.textContent, contains('A separate issue remains.'));
-      final details = root.querySelector('details') as web.HTMLDetailsElement;
+      expect(
+        (root.querySelector('details[data-environment-section="repository"]')
+                as web.HTMLDetailsElement)
+            .open,
+        isTrue,
+      );
+      final details =
+          root.querySelector('details:not([data-environment-section])')
+              as web.HTMLDetailsElement;
       expect(details.open, isFalse);
       (details.querySelector('summary') as web.HTMLElement).click();
       await settle();
@@ -900,6 +1020,80 @@ void main() {
       );
       await click('Install build service');
       expect(posts('build-service/install'), hasLength(2));
+    },
+  );
+
+  test(
+    'new builds do not close or transfer existing disclosure choices',
+    () async {
+      Map<String, dynamic> run(String id) => {
+        'id': id,
+        'repository': 'repo',
+        'state': 'complete',
+        'target': 'a' * 40,
+        'checks': [
+          {'id': 'test', 'status': 'passed'},
+        ],
+        'timings': {
+          'verify': {'duration_ms': 50, 'status': 'complete'},
+        },
+      };
+      var runs = [run('first'), run('second'), run('untouched')];
+      await mount(const BuildsPage(), (r) {
+        if (r.url.path == '/api/validation')
+          return {'runs': runs, 'executor': 'service'};
+        return buildResponse(r);
+      });
+      web.HTMLDetailsElement steps(String id) =>
+          elements(
+                'article[aria-labelledby="build-$id-title"] details.build-card__steps',
+              ).single
+              as web.HTMLDetailsElement;
+      final first = steps('first'), second = steps('second');
+      expect(first.open, isTrue);
+      expect(second.open, isFalse);
+      (first.querySelector('summary') as web.HTMLElement).click();
+      (second.querySelector('summary') as web.HTMLElement).click();
+      final timings =
+          elements('article[aria-labelledby="build-second-title"] details').last
+              as web.HTMLDetailsElement;
+      (timings.querySelector('summary') as web.HTMLElement).click();
+      await settle();
+      runs = [run('new'), ...runs];
+      await click('Refresh builds');
+      await until(() => elements('.build-entry').length == 4);
+      expect(steps('first'), same(first));
+      expect(steps('second'), same(second));
+      expect(first.open, isFalse);
+      expect(second.open, isTrue);
+      expect(timings.open, isTrue);
+      expect(steps('new').open, isTrue);
+      runs = [
+        for (final item in runs)
+          if (item['id'] == 'untouched')
+            {
+              ...item,
+              'state': 'failed',
+              'checks': [
+                {'id': 'test', 'status': 'failed'},
+              ],
+            }
+          else
+            item,
+      ];
+      await click('Refresh builds');
+      expect(
+        steps('untouched').open,
+        isFalse,
+        reason:
+            'Failure is an initial expansion default, not a polling command',
+      );
+      expect(
+        elements(
+          'article[aria-labelledby="build-untouched-title"]',
+        ).single.textContent,
+        contains('1 check failed'),
+      );
     },
   );
 

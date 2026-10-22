@@ -7,7 +7,104 @@ import 'package:herdr_dashboard/dashboard_bloc.dart';
 import 'package:herdr_dashboard/project_analysis_card.dart';
 import 'package:herdr_dashboard_state/project_analysis.dart';
 
+Future<void> expandSection(WidgetTester tester, String title) async {
+  await tester.ensureVisible(find.text(title));
+  if (!ExpansibleController.of(tester.element(find.text(title))).isExpanded)
+    await tester.tap(find.text(title));
+  await tester.pumpAndSettle();
+}
+
 void main() {
+  for (final manuallyClosed in [false, true]) {
+    testWidgets(
+      'later component findings open untouched repository details (closed=$manuallyClosed)',
+      (tester) async {
+        var attention = false;
+        final connection = DashboardBloc(
+          client: MockClient((request) async {
+            if (request.url.path.endsWith('/analysis'))
+              return http.Response(
+                jsonEncode({
+                  'requirements': [],
+                  'components': [
+                    {
+                      'path': '.',
+                      'requirements': [],
+                      'unresolved': [
+                        if (attention)
+                          {
+                            'what': 'Rust toolchain version',
+                            'reason': 'Version declaration missing',
+                          },
+                      ],
+                    },
+                  ],
+                }),
+                200,
+              );
+            if (request.url.path.endsWith('/environment'))
+              return http.Response(
+                jsonEncode({
+                  'project': 'repo',
+                  'revision': 'head',
+                  'plan_current': true,
+                  'plan': null,
+                  'job': null,
+                  'active_jobs': [],
+                  'prepared': {
+                    'current': true,
+                    'revision': 'head',
+                    'requirements': [],
+                    'selected_check_count': 0,
+                  },
+                }),
+                200,
+              );
+            return http.Response('{"workspaces":[],"agents":[]}', 200);
+          }),
+        );
+        BlocScope.register<DashboardBloc>(() => connection);
+        try {
+          connection.connect('token');
+          await tester.pumpAndSettle();
+          await tester.pumpWidget(
+            const MaterialApp(
+              home: Scaffold(body: ProjectAnalysisCard(path: 'repo')),
+            ),
+          );
+          await tester.pumpAndSettle();
+          await expandSection(tester, 'Project environment');
+          expect(
+            find.textContaining('Version declaration missing'),
+            findsNothing,
+          );
+          if (manuallyClosed) {
+            await expandSection(tester, 'Repository requirements');
+            await tester.tap(find.text('Repository requirements'));
+            await tester.pumpAndSettle();
+          }
+          attention = true;
+          await tester.ensureVisible(find.text('Re-analyse'));
+          await tester.tap(find.text('Re-analyse'));
+          await tester.pumpAndSettle();
+          expect(
+            find.textContaining('Repository evidence needs review'),
+            findsOneWidget,
+          );
+          expect(
+            find.textContaining('Version declaration missing'),
+            manuallyClosed ? findsNothing : findsOneWidget,
+          );
+          expect(tester.takeException(), isNull);
+        } finally {
+          await tester.pumpWidget(const SizedBox.shrink());
+          await connection.disconnect();
+          await BlocScope.reset();
+        }
+      },
+    );
+  }
+
   testWidgets(
     'a late status response cannot replace the newly selected project',
     (tester) async {
@@ -51,7 +148,7 @@ void main() {
       await tester.pumpAndSettle();
       delayed.complete(status('first-commit'));
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Discovered requirements'));
+      await tester.tap(find.text('Project environment'));
       await tester.pumpAndSettle();
       expect(find.text('Commit: second-commit'), findsOneWidget);
       expect(find.text('Commit: first-commit'), findsNothing);
@@ -164,7 +261,7 @@ void main() {
             ),
           );
           await tester.pumpAndSettle();
-          await tester.tap(find.text('Discovered requirements'));
+          await tester.tap(find.text('Project environment'));
           await tester.pumpAndSettle();
         }
 
@@ -193,6 +290,21 @@ void main() {
         } else {
           expect(find.text('Prepared for this commit'), findsOneWidget);
           expect(find.text('2 approved validation checks'), findsOneWidget);
+          expect(find.textContaining('Not found on host'), findsNothing);
+          if (state == 'ready')
+            expect(
+              find.textContaining('SDK preparation recorded'),
+              findsNothing,
+            );
+          expect(
+            find.text('Rust toolchain 1.97.1 · Repository root'),
+            findsOneWidget,
+          );
+          if (find
+              .textContaining('SDK preparation recorded')
+              .evaluate()
+              .isEmpty)
+            await expandSection(tester, 'Environment settings');
           expect(
             find.textContaining('SDK preparation recorded'),
             findsOneWidget,
@@ -202,6 +314,7 @@ void main() {
           expect(find.text('Prepared for this commit'), findsOneWidget);
           expect(statusReads, greaterThanOrEqualTo(2));
         }
+        await expandSection(tester, 'Host SDK discovery');
         expect(find.textContaining('Not found on host'), findsOneWidget);
         expect(writes, isEmpty);
         expect(tester.takeException(), isNull);
@@ -319,8 +432,9 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        await tester.tap(find.text('Discovered requirements'));
+        await tester.tap(find.text('Project environment'));
         await tester.pumpAndSettle();
+        await expandSection(tester, 'Repository requirements');
         expect(
           find.textContaining('Source-only component:'),
           overridden ? findsNothing : findsOneWidget,
@@ -329,8 +443,10 @@ void main() {
           find.text('Requested SDK components: rustfmt, clippy'),
           findsOneWidget,
         );
-        if (overridden)
+        if (overridden) {
+          await expandSection(tester, 'Host SDK discovery');
           expect(find.textContaining('· override'), findsOneWidget);
+        }
         await tester.ensureVisible(find.text('Plan environment'));
         await tester.tap(find.text('Plan environment'));
         await tester.pumpAndSettle();
@@ -581,7 +697,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Discovered requirements'));
+    await tester.tap(find.text('Project environment'));
     await tester.pumpAndSettle();
     expect(
       find.textContaining('Evidence: global.json#sdk.version'),
@@ -590,6 +706,7 @@ void main() {
     expect(find.textContaining('SDK lookup: Api'), findsOneWidget);
     expect(find.textContaining('partial scan'), findsOneWidget);
     expect(find.text('Host SDK discovery'), findsOneWidget);
+    await expandSection(tester, 'Host SDK discovery');
     expect(find.textContaining('· Not found on host'), findsOneWidget);
     expect(find.textContaining('Component: Api'), findsOneWidget);
     expect(
@@ -670,7 +787,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Discovered requirements'));
+    await tester.tap(find.text('Project environment'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Add override'));
     await tester.pumpAndSettle();

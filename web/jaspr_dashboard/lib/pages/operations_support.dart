@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:jaspr/client.dart';
 import 'package:jaspr/dom.dart' as dom;
 import '../services.dart';
+import '../ui.dart' show el;
 export 'dart:async';
 export 'package:jaspr/client.dart';
 export '../blocs.dart';
@@ -57,7 +58,7 @@ Component actions(List<Component> children) =>
     dom.div(classes: 'actions', children);
 Component stack(List<Component> children) =>
     dom.div(classes: 'stack', children);
-Component disclosure(String title, List<Component> children) => dom.details([
+Component disclosure(String title, List<Component> children) => el('details', [
   dom.summary([Component.text(title)]),
   ...children,
 ]);

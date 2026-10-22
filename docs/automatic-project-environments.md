@@ -39,7 +39,15 @@ Implemented now:
   retry. Discovery still starts without entering a tool name.
 - Both dashboards restore saved preparation on opening the project. **Project
   environment** shows the successful preparation for the checkout's exact HEAD,
-  its SDK versions, component scopes and approved check count. **Host SDK
+  its SDK versions, component scopes and approved check count. Once prepared,
+  the summary stays compact: expand **Repository requirements**, **Host SDK
+  discovery** or **Environment settings** for evidence and editable proposals.
+  **Plan environment** opens settings. Active preparation, lookup/action errors
+  and repository findings remain prominent; incomplete scans and unresolved or
+  conflicting evidence open untouched repository details, including findings
+  first discovered by a later analysis. An explicitly closed section stays
+  closed while its review notice remains visible. Expansion choices survive
+  refreshes for the selected project. **Host SDK
   discovery** separately reports executables found on the host PATH or configured
   installer paths: **Not found on host** does not mean a prepared project SDK is
   missing. **Repository requirements** describes declarations, and labels waived

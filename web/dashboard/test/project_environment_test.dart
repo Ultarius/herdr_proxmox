@@ -39,6 +39,72 @@ Map<String, dynamic> saved({
 };
 
 void main() {
+  test(
+    'component findings raise attention while waived source-only runtimes remain informational',
+    () {
+      for (final component in [
+        {
+          'path': '.',
+          'unresolved': [
+            {'reason': 'No toolchain declaration'},
+          ],
+        },
+        {
+          'path': '.',
+          'requirements': [
+            {'established': false},
+          ],
+        },
+        {
+          'path': '.',
+          'requirements': [
+            {
+              'established': true,
+              'conflicts': [
+                {'reason': 'Incompatible versions'},
+              ],
+            },
+          ],
+        },
+        {
+          'path': '.',
+          'requirements': [
+            {
+              'established': true,
+              'resolution': {'reason': 'Unknown version'},
+            },
+          ],
+        },
+      ]) {
+        expect(
+          projectEvidenceNeedsAttention({
+            'components': [component],
+          }),
+          isTrue,
+        );
+      }
+      expect(
+        projectEvidenceNeedsAttention({
+          'source_components': [
+            {'path': 'assets', 'capability': 'node', 'reason': 'Source only'},
+          ],
+          'components': [
+            {
+              'path': 'assets',
+              'requirements': [
+                {'tool': 'node', 'established': false},
+              ],
+              'unresolved': [
+                {'reason': 'Node version is undeclared'},
+              ],
+            },
+          ],
+        }),
+        isFalse,
+      );
+    },
+  );
+
   ProjectEnvironmentController controller(ProjectAnalysisRequest request) {
     final result = ProjectEnvironmentController(
       request: request,

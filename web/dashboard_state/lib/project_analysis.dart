@@ -14,6 +14,39 @@ const hostSdkExplanation =
 const repositoryRequirementExplanation =
     'Required and Selected describe repository declarations, not installation status.';
 
+String projectScope(Object? value) =>
+    value == '.' ? 'Repository root' : '$value';
+
+bool projectEvidenceNeedsAttention(Map report) =>
+    (report['coverage'] is Map && report['coverage']['truncated'] == true) ||
+    (report['unresolved'] is List &&
+        (report['unresolved'] as List).isNotEmpty) ||
+    (report['requirements'] is List &&
+        (report['requirements'] as List).whereType<Map>().any(
+          (item) =>
+              item['conflicts'] is List &&
+              (item['conflicts'] as List).isNotEmpty,
+        )) ||
+    (report['components'] is List &&
+        (report['components'] as List).whereType<Map>().any((component) {
+          // Intentionally waived source-only runtimes remain informational.
+          if (sourceComponentNotice(component, report).isNotEmpty) return false;
+          if (component['unresolved'] is List &&
+              (component['unresolved'] as List).isNotEmpty)
+            return true;
+          return (component['requirements'] as List? ?? [])
+              .whereType<Map>()
+              .any(
+                (requirement) =>
+                    requirement['established'] != true ||
+                    (requirement['conflicts'] is List &&
+                        (requirement['conflicts'] as List).isNotEmpty) ||
+                    (requirement['resolution'] is Map &&
+                        '${requirement['resolution']['reason'] ?? ''}'
+                            .isNotEmpty),
+              );
+        }));
+
 class ProjectEnvironmentView {
   const ProjectEnvironmentView(this.status);
   final Map status;
@@ -26,8 +59,7 @@ class ProjectEnvironmentView {
       ? 'Prepared for an earlier commit'
       : 'No prepared environment for this commit';
   String get detail => current
-      ? 'Validation uses the saved project SDK bindings and verifies them again when it runs. '
-            'Build and test results are recorded separately in Checks & builds.'
+      ? 'Validation uses this prepared environment. See Checks & builds for test results.'
       : prepared != null
       ? 'The saved preparation belongs to another commit. Use Plan environment to review '
             'and prepare the current commit before validation.'
@@ -42,7 +74,7 @@ class ProjectEnvironmentView {
     for (final item
         in (prepared?['requirements'] as List? ?? []).whereType<Map>())
       '${item['label'] ?? item['capability']} ${item['version'] ?? ''}'
-          ' · Components: ${(item['components'] as List? ?? []).join(', ')}',
+          ' · ${(item['components'] as List? ?? []).map(projectScope).join(', ')}',
   ];
   String get checks {
     final count =

@@ -228,8 +228,8 @@ Component? runFacts(Map run) {
         );
 }
 
-/// Validation steps disclosure. Its attributes are const (or null) so Jaspr
-/// never re-applies `open` over the user's own toggle on a refresh.
+/// The newest/failed flags set only the initial expansion. Later updates keep
+/// the user's choice, even if this run stops being newest or newly fails.
 Component checkSteps(List<Map> checks, {required bool open}) {
   final failed = checks.where((c) => statusLook(c['status']).$1 == 'danger');
   final passed = checks.every((c) => c['status'] == 'passed');
