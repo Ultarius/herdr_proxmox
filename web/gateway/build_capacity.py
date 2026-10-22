@@ -122,7 +122,6 @@ def output_size(directory, limit):
         for name in files:
             path = Path(parent, name)
             info = path.lstat()
-            import stat
             identity = (info.st_dev, info.st_ino)
             if stat.S_ISREG(info.st_mode) and identity not in seen:
                 seen.add(identity)

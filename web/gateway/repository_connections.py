@@ -1,4 +1,4 @@
-"""Repository-scoped GitHub read connections; private keys never enter responses.
+"""Repository-scoped GitHub read connections; private credentials never enter responses.
 
 Gateway and agents share a Unix user. Mode 0600 is not isolation from agents.
 No global SSH/Git configuration is edited; managed network operations get an
@@ -25,6 +25,16 @@ import uuid
 HOST_FINGERPRINT = 'SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU'
 IDENTIFIER = re.compile(r'[a-f0-9]{32}')
 REPOSITORY = re.compile(r'[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}')
+# This form stores personal access tokens, not OAuth/App access or refresh
+# credentials. Prefixes catch paste mistakes; only the access test verifies one.
+PERSONAL_TOKEN_PREFIXES = ('github_pat_', 'ghp_')
+
+
+def personal_token(value):
+    if (not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_]{20,255}', value)
+            or not value.startswith(PERSONAL_TOKEN_PREFIXES)):
+        raise ValueError('Enter a GitHub personal access token beginning with github_pat_ or ghp_.')
+    return value
 
 
 def repository_url(url):
@@ -84,7 +94,7 @@ class RepositoryConnections:
         write_private(self.path, json.dumps(data))
 
     def _remove_key_directory(self, identifier):
-        # Only a validated direct child and the three generated files can be
+        # Only a validated direct child and the generated credential files can be
         # removed. Never recursively follow a directory planted in this store.
         if not IDENTIFIER.fullmatch(identifier):
             raise ValueError('Invalid repository connection identity.')
@@ -96,7 +106,7 @@ class RepositoryConnections:
         if not folder.is_dir():
             raise ValueError('Repository key directory must be a regular managed directory.')
         files = list(folder.iterdir())
-        if any(path.name not in ('identity', 'identity.pub', 'known_hosts') or
+        if any(path.name not in ('identity', 'identity.pub', 'known_hosts', 'token.json') or
                (not path.is_symlink() and not path.is_file()) for path in files):
             raise ValueError('Repository key directory contains unexpected files; inspect it before removal.')
         for path in files:
@@ -126,8 +136,13 @@ class RepositoryConnections:
             raise ValueError('Enter a connection name of at most 80 characters.')
         if not isinstance(repository, str) or not REPOSITORY.fullmatch(repository) or any(p in ('.', '..') for p in repository.split('/')):
             raise ValueError('Enter owner/repository, for example Ultarius/bevy_game.')
-        if kind not in ('ssh', 'github'):
-            raise ValueError('Choose SSH or the configured GitHub account.')
+        if kind not in ('ssh', 'github', 'token'):
+            raise ValueError('Choose SSH, a GitHub token, or the configured GitHub account.')
+        token = body.get('token')
+        if kind == 'token':
+            personal_token(token)
+        elif token is not None:
+            raise ValueError('A token can only be supplied for a GitHub token connection.')
         identifier = uuid.uuid4().hex
         record = dict(id=identifier, label=label.strip(), repository=repository, kind=kind,
                       created_at=now(), host_verified=False, access_state='not_tested')
@@ -138,6 +153,14 @@ class RepositoryConnections:
             if kind == 'github':
                 if not self.github.configuration().get('token'):
                     raise ValueError('Configure the dashboard GitHub account first.')
+            elif kind == 'token':
+                folder = self.directory / identifier
+                folder.mkdir(mode=0o700)
+                try:
+                    write_private(folder / 'token.json', json.dumps(dict(token=token)))
+                except (OSError, ValueError):
+                    self._remove_key_directory(identifier)
+                    raise ValueError('Could not save the repository token on this gateway.') from None
             else:
                 folder = self.directory / identifier
                 folder.mkdir(mode=0o700)
@@ -156,10 +179,41 @@ class RepositoryConnections:
             try:
                 self.save(data)
             except (OSError, ValueError):
-                if kind == 'ssh':
+                if kind in ('ssh', 'token'):
                     self._remove_key_directory(identifier)
                 raise
         return record
+
+    def rotate(self, identifier, token):
+        token = personal_token(token)
+        with self.lock:
+            record = self.get(identifier)
+            if record['kind'] != 'token':
+                raise ValueError('Only a connection-specific GitHub token can be rotated here.')
+            if self.active_credentials.get(identifier):
+                raise ValueError('This connection is in use. Wait for its Git operation to finish before rotating it.')
+            credential = self._token_file(record)
+            data = self.load()
+            updated = data['connections'][identifier]
+            updated.update(access_state='not_tested', tested_at=None, error=None)
+            # Invalidate the old access verdict first. If atomic credential
+            # publication fails, the old token and bindings remain usable, but
+            # no stale verification is claimed for a possibly changed token.
+            self.save(data)
+            write_private(credential, json.dumps(dict(token=token)))
+            return dict(updated)
+
+    def _token_file(self, record):
+        credential = self._credential_path(record)
+        try:
+            parent, info = credential.parent.lstat(), credential.lstat()
+        except OSError:
+            raise ValueError('The repository token file is unavailable.') from None
+        if (not stat.S_ISDIR(parent.st_mode) or not stat.S_ISREG(info.st_mode)
+                or any(getattr(value, 'st_file_attributes', 0) & 0x400 for value in (parent, info))
+                or (os.name != 'nt' and info.st_mode & 0o077)):
+            raise ValueError('Repository token files must be regular files with mode 0600 in their managed directory.')
+        return credential
 
     def verify_host(self, identifier):
         record = self.get(identifier)
@@ -208,7 +262,8 @@ class RepositoryConnections:
     def _credentials(self, record, url):
         identifier = record['id']
         repository, kind = repository_url(url)
-        if repository.lower() != record['repository'].lower() or kind != record['kind']:
+        protocol = 'ssh' if record['kind'] == 'ssh' else 'github'
+        if repository.lower() != record['repository'].lower() or kind != protocol:
             raise ValueError('The selected connection does not match this repository and URL protocol.')
         environment = {k: v for k, v in os.environ.items() if not k.startswith('GIT_') and not k.startswith('HERDR_GITHUB_')}
         environment.update(GIT_TERMINAL_PROMPT='0', GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
@@ -231,13 +286,15 @@ class RepositoryConnections:
                         raise ValueError('Repository SSH files must be regular files with mode 0600.')
                 environment['GIT_SSH_COMMAND'] = self._binding_settings(record)[0][1]
             else:
-                if not self.github.configuration().get('token'):
+                from github_api import GitHub
+                credential = self._token_file(record) if record['kind'] == 'token' else self._credential_path(record)
+                if not GitHub(credential).configuration().get('token'):
                     raise ValueError('The configured GitHub credential is unavailable.')
                 helper = Path(temporary) / 'askpass'
                 helper.write_text('#!/bin/sh\nexec ' + shlex.join([sys.executable,
                     str(Path(__file__).with_name('repository_askpass.py'))]) + ' "$@"\n', encoding='utf-8')
                 helper.chmod(0o700)
-                environment.update(GIT_ASKPASS=str(helper), HERDR_GITHUB_CONFIG=str(self.github.path),
+                environment.update(GIT_ASKPASS=str(helper), HERDR_GITHUB_CONFIG=str(credential),
                                    HERDR_REPOSITORY=record['repository'])
             yield environment
 
@@ -249,7 +306,7 @@ class RepositoryConnections:
                                          'ls-remote', '--exit-code', '--', url, 'HEAD'],
                                         capture_output=True, timeout=20, env=environment)
             if result.returncode not in (0, 2):
-                raise ValueError('Repository access failed. Check the deploy key or GitHub account permissions and gateway connectivity.')
+                raise ValueError('Repository access failed. Check the deploy key or GitHub token permissions, expiry, organization approval and gateway connectivity.')
             state, error = 'verified', None
         except (ValueError, OSError, subprocess.TimeoutExpired) as failure:
             state = 'failed'
@@ -354,6 +411,11 @@ class RepositoryConnections:
             self.save(data)
         return dict(id=identifier, removed=True)
 
+    def _credential_path(self, record):
+        if record['kind'] == 'token':
+            return self.directory / record['id'] / 'token.json'
+        return self.github.path
+
     def _binding_settings(self, record):
         """Exact non-secret configuration generated by this release."""
         if record['kind'] == 'ssh':
@@ -363,7 +425,7 @@ class RepositoryConnections:
                 '-o', 'UserKnownHostsFile=' + str(folder / 'known_hosts'), '-o', 'GlobalKnownHostsFile=' + os.devnull,
                 '-o', 'ConnectTimeout=10'])
             return [('core.sshCommand', command)]
-        helper = shlex.join(['env', 'HERDR_GITHUB_CONFIG=' + str(self.github.path),
+        helper = shlex.join(['env', 'HERDR_GITHUB_CONFIG=' + str(self._credential_path(record)),
             'HERDR_REPOSITORY=' + record['repository'], sys.executable,
             str(Path(__file__).with_name('repository_askpass.py'))])
         return [('credential.helper', ''), ('credential.useHttpPath', 'true'),
@@ -391,7 +453,8 @@ class RepositoryConnections:
         if not isinstance(body, dict):
             raise ValueError('Expected a repository connection request.')
         action = body.get('action')
-        allowed = {'create': {'action', 'label', 'repository', 'kind'},
+        allowed = {'create': {'action', 'label', 'repository', 'kind', 'token'},
+                   'rotate': {'action', 'id', 'token'},
                    'verify_host': {'action', 'id'}, 'test': {'action', 'id', 'url'},
                    'bind': {'action', 'id', 'folder'}, 'unbind': {'action', 'id', 'folder'},
                    'remove': {'action', 'id'}}
@@ -401,6 +464,8 @@ class RepositoryConnections:
             raise ValueError('Enter an existing project folder name.')
         if action == 'create':
             return self.create(body)
+        if action == 'rotate':
+            return self.rotate(body.get('id'), body.get('token'))
         if action == 'verify_host':
             return self.verify_host(body.get('id'))
         if action == 'test':

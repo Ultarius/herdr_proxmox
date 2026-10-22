@@ -7,6 +7,9 @@ repository and execution lane. Agent and independent-validation downloads use
 separate pools.
 
 The shared orchestration handles ownership, budgets, activity and reclamation.
+The gateway passes its configured projects directory to storage operations;
+storage helpers have no separate default or environment-derived project root.
+Execution bindings retain that directory for finalization after a restart.
 SDK adapters declare build profiles, output variables, download strategies,
 command wrappers, legacy output locations and agent guidance. Adding an adapter
 does not require adding ecosystem branches to session or storage orchestration.
@@ -129,6 +132,16 @@ cleanup keeps its quarantine receipt so a later cleanup can finish safely.
 Linux registration, quarantine and recursive removal use pinned parent directory
 descriptors and no-follow opens. Windows clients can inspect and allocate, but
 destructive cleanup and legacy adoption are refused without these native APIs.
+Windows storage locks are nonblocking and exclusive, including leases requested
+as shared. Concurrent use can return a retryable busy error; it does not wait
+for another holder. Linux provides shared reader leases for managed builds.
+Database contention remains nonblocking. Background scans allow SQLite to recover
+an existing rollback journal after a writer crashes, under the same registry lock
+and sidecar validation as normal writes. Dashboard polling reads cached observations;
+read-only inventory never performs recovery or creates a missing store.
+If job or validation history lookup fails, the scan reports that authority as
+unavailable and still measures registered owners. Activity is unknown, cleanup
+is disabled, and healthy inventory remains visible while the lookup is retried.
 Enclosing Git repositories are checked even outside the Projects root. Repositories
 inside build outputs or legacy adoption candidates remain protected. Explicitly
 owned private caches and installed dependency trees can contain dependency Git

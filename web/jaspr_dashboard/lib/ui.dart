@@ -417,6 +417,10 @@ Component field(
   void Function(String) onInput, {
   String? id,
   String? placeholder,
+  String? autocomplete,
+  bool? spellcheck,
+  bool? autocorrect,
+  bool disabled = false,
   bool password = false,
   bool required = false,
 }) => _Control(
@@ -425,6 +429,10 @@ Component field(
   onInput,
   id: id,
   placeholder: placeholder,
+  autocomplete: autocomplete,
+  spellcheck: spellcheck,
+  autocorrect: autocorrect,
+  disabled: disabled,
   password: password,
   isRequired: required,
 );
@@ -469,6 +477,9 @@ class _Control extends StatefulComponent {
     this.change, {
     this.id,
     this.placeholder,
+    this.autocomplete,
+    this.spellcheck,
+    this.autocorrect,
     this.password = false,
     this.isRequired = false,
     this.disabled = false,
@@ -477,7 +488,8 @@ class _Control extends StatefulComponent {
     this.options = const {},
   });
   final String label, value, kind;
-  final String? id, placeholder;
+  final String? id, placeholder, autocomplete;
+  final bool? spellcheck, autocorrect;
   final bool password, isRequired, disabled;
   final int rows;
   final Map<String, String> options;
@@ -565,7 +577,14 @@ class _ControlState extends State<_Control> {
         onInput: component.change,
         attributes: {
           if (component.isRequired) 'required': '',
-          'autocomplete': component.password ? 'current-password' : 'off',
+          if (component.disabled) 'disabled': '',
+          if (component.spellcheck != null)
+            'spellcheck': '${component.spellcheck}',
+          if (component.autocorrect != null)
+            'autocorrect': component.autocorrect! ? 'on' : 'off',
+          'autocomplete':
+              component.autocomplete ??
+              (component.password ? 'current-password' : 'off'),
           if (component.placeholder != null)
             'placeholder': component.placeholder!,
         },

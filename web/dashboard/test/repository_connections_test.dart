@@ -1,12 +1,180 @@
-import 'dart:async';
 import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:herdr_dashboard_state/dashboard_bloc.dart';
 import 'package:herdr_dashboard_state/repository_connections.dart';
+import 'package:herdr_dashboard/repository_connections.dart';
+import 'package:juice/juice.dart';
 
 void main() {
+  for (final failFirst in [false, true]) {
+    testWidgets(
+      'token setup and rotation retain rejected pastes (failFirst=$failFirst)',
+      (tester) async {
+        final posts = <Map<String, dynamic>>[];
+        final records = <Map<String, dynamic>>[];
+        var rejectNext = failFirst;
+        final connection = DashboardBloc(
+          client: MockClient((request) async {
+            dynamic result = {'workspaces': [], 'agents': []};
+            if (request.url.path.endsWith('/connections')) {
+              result = {'connections': records, 'bindings': []};
+              if (request.method == 'POST') {
+                posts.add(Map<String, dynamic>.from(jsonDecode(request.body)));
+                if (rejectNext)
+                  return http.Response(
+                    '{"error":"Save failed; try again."}',
+                    422,
+                  );
+                if (posts.last['action'] == 'create') {
+                  records.add({
+                    'id': 'token-connection',
+                    'kind': 'token',
+                    'label': 'Private token',
+                    'repository': 'owner/private',
+                  });
+                }
+                result = records.single;
+              }
+            }
+            return http.Response(jsonEncode(result), 200);
+          }),
+        );
+        BlocScope.register<DashboardBloc>(() => connection);
+        try {
+          connection.connect('admin');
+          await tester.pumpAndSettle();
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: SingleChildScrollView(
+                  child: RepositoryConnectionsPanel(onChanged: (_) {}),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('Repository connections'));
+          await tester.pumpAndSettle();
+          await tester.enterText(
+            find.widgetWithText(TextField, 'Connection name'),
+            'Private token',
+          );
+          await tester.enterText(
+            find.widgetWithText(
+              TextField,
+              'GitHub repository (owner/repository)',
+            ),
+            'owner/private',
+          );
+          await tester.tap(find.text('SSH deploy key'));
+          await tester.pumpAndSettle();
+          await tester.tap(find.text(repositoryTokenLabel).last);
+          await tester.pumpAndSettle();
+          final input = find.widgetWithText(
+            TextField,
+            'GitHub personal access token',
+          );
+          expect(tester.widget<TextField>(input).obscureText, isTrue);
+          expect(tester.widget<TextField>(input).autofillHints, isNull);
+          await tester.enterText(input, 'github_pat_test_fixture');
+          await tester.ensureVisible(find.text('Save token connection'));
+          await tester.tap(find.text('Save token connection'));
+          await tester.pumpAndSettle();
+          if (failFirst) {
+            expect(posts.length, 1);
+            expect(
+              tester.widget<TextField>(input).controller!.text,
+              'github_pat_test_fixture',
+            );
+            expect(
+              find.textContaining('Save failed; try again.'),
+              findsOneWidget,
+            );
+            rejectNext = false;
+            await tester.tap(find.text('Save token connection'));
+            await tester.pumpAndSettle();
+          }
+          expect(posts.length, failFirst ? 2 : 1);
+          expect(posts.last, {
+            'action': 'create',
+            'label': 'Private token',
+            'repository': 'owner/private',
+            'kind': 'token',
+            'token': 'github_pat_test_fixture',
+          });
+          expect(tester.widget<TextField>(input).controller!.text, isEmpty);
+          expect(
+            find.textContaining('Token connection saved.'),
+            findsOneWidget,
+          );
+          expect(
+            find.byWidgetPredicate(
+              (widget) =>
+                  (widget is Text &&
+                      (widget.data ?? '').contains(
+                        'github_pat_test_fixture',
+                      )) ||
+                  (widget is SelectableText &&
+                      (widget.data ?? '').contains('github_pat_test_fixture')),
+            ),
+            findsNothing,
+          );
+          await tester.ensureVisible(find.text('Rotate token'));
+          await tester.tap(find.text('Rotate token'));
+          await tester.pumpAndSettle();
+          final replacement = find.widgetWithText(
+            TextField,
+            'Replacement GitHub personal access token',
+          );
+          await tester.enterText(replacement, 'github_pat_replacement_fixture');
+          rejectNext = failFirst;
+          await tester.ensureVisible(find.text('Save replacement token'));
+          await tester.tap(find.text('Save replacement token'));
+          await tester.pumpAndSettle();
+          if (failFirst) {
+            expect(
+              tester.widget<TextField>(replacement).controller!.text,
+              'github_pat_replacement_fixture',
+            );
+            rejectNext = false;
+            await tester.tap(find.text('Save replacement token'));
+            await tester.pumpAndSettle();
+          }
+          expect(
+            posts.where((post) => post['action'] == 'rotate').length,
+            failFirst ? 2 : 1,
+          );
+          expect(posts.last, {
+            'action': 'rotate',
+            'id': 'token-connection',
+            'token': 'github_pat_replacement_fixture',
+          });
+          expect(
+            find.byWidgetPredicate(
+              (widget) =>
+                  (widget is Text &&
+                      (widget.data ?? '').contains(
+                        'github_pat_replacement_fixture',
+                      )) ||
+                  (widget is SelectableText &&
+                      (widget.data ?? '').contains(
+                        'github_pat_replacement_fixture',
+                      )),
+            ),
+            findsNothing,
+          );
+          expect(find.textContaining('Token replaced.'), findsOneWidget);
+        } finally {
+          await tester.pumpWidget(const SizedBox.shrink());
+          await connection.disconnect();
+          BlocScope.endAll();
+        }
+      },
+    );
+  }
+
   test(
     'disconnected emissions do not repeatedly clear the controller and refresh disables immediately',
     () async {

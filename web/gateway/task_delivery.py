@@ -50,6 +50,20 @@ def inspected_validation(flow):
             if key in value} if isinstance(value, dict) else {}
 
 
+def migrate_inspected_validation(service, task, flow):
+    """Recover a legacy identity once; this never approves or executes checks."""
+    from validation import RUN_ID
+    if (isinstance(flow.get('validation'), dict) or not flow.get('sha')
+            or flow['sha'] != task.get('head_sha')):
+        return
+    identity = inspected_validation(flow)
+    if (not isinstance(identity.get('run_id'), str) or not RUN_ID.fullmatch(identity['run_id'])
+            or identity.get('state') not in ('queued', 'running', 'complete', 'failed', 'error', 'interrupted', 'cancelled')):
+        return
+    flow['validation'] = identity
+    service.save(task, 'delivery_validation_migrated', ACTOR)
+
+
 def inspection_request_id(task, flow):
     return 'delivery-' + task['id'] + '-' + flow['sha'][:12] + '-' + str(flow.get('attempt', 0))
 
@@ -202,6 +216,7 @@ def reconcile(service, task):
         flow = dict(sha=head, state='waiting_verification', attempt=0, started_at=stamp())
         task['delivery_workflow'] = flow
         service.save(task, 'delivery_superseded', ACTOR)
+    migrate_inspected_validation(service, task, flow)
     revalidation = refresh_failed_inspection(service, task, flow)
     if revalidation == 'waiting':
         return

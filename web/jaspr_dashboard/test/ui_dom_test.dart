@@ -206,6 +206,7 @@ void main() {
               as web.HTMLTextAreaElement;
       final choice = element('select') as web.HTMLSelectElement;
       final credential = input('controlled-secret');
+      expect(credential.getAttribute('autocomplete'), 'current-password');
       expect(text.value, 'Initial text');
       expect(multiline.value, 'Initial multiline text');
       expect(choice.value, 'a');

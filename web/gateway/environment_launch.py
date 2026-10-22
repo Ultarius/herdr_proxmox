@@ -84,8 +84,11 @@ def configure(store, job, frozen, pane, workspace):
     import execution_storage
     store.update_job(job['id'], storage_preparation=dict(state='allocating'))
     try:
+        projects = getattr(store, 'projects', None)
+        if not isinstance(projects, (str, os.PathLike)) or not Path(projects).is_absolute():
+            raise ValueError('Environment launch requires the configured absolute projects directory on its store.')
         storage = execution_storage.prepare(runtime['policy']['toolchains'], checkout,
-                                            lane='agent', execution_id=job['id'], projects=getattr(store, 'projects', None))
+                                            lane='agent', execution_id=job['id'], projects=projects)
     except BaseException:
         store.update_job(job['id'], storage_preparation=dict(state='failed', no_agent_started=True))
         raise

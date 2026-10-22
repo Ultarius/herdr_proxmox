@@ -63,7 +63,17 @@ class StorageService:
 
     def _closed_executions(self):
         errors = []
-        for job in self.organizations.job_records(launches_only=True):
+        def records(lane, load):
+            try:
+                values = load()
+                if not isinstance(values, list):
+                    raise ValueError('Activity lookup did not return a record list.')
+                return values
+            except Exception as error:
+                errors.append(dict(scope='activity', lane=lane, execution_id=lane + ' activity lookup', error=str(error)[:500]))
+                logging.warning('Storage %s activity lookup unavailable: %s', lane, error)
+                return []
+        for job in records('agent', lambda: self.organizations.job_records(launches_only=True)):
             try:
                 if job.get('storage_binding') and job.get('session_closed_at') and job.get('state') in ('finished', 'released'):
                     if (job.get('storage_finish') or {}).get('state') != 'complete':
@@ -78,8 +88,8 @@ class StorageService:
                     self.manager.close_execution(job['id'])
             except Exception as error:
                 self._pending(errors, 'agent', job['id'], error,
-                    lambda value: self.organizations.update_job(job['id'], storage_finish=value))
-        for run in self.validation.storage_records():
+                    lambda value, identity=job['id']: self.organizations.update_job(identity, storage_finish=value))
+        for run in records('validation', self.validation.storage_records):
             if run.get('state') in ('complete', 'failed', 'error', 'cancelled', 'interrupted'):
                 try:
                     self.manager.close_execution(run['id'])
@@ -87,7 +97,7 @@ class StorageService:
                         self.validation.update_storage_finish(run['id'], dict(state='complete'))
                 except Exception as error:
                     self._pending(errors, 'validation', run['id'], error,
-                        lambda value: self.validation.update_storage_finish(run['id'], value))
+                        lambda value, identity=run['id']: self.validation.update_storage_finish(identity, value))
         return errors
 
     @staticmethod
@@ -118,9 +128,11 @@ class StorageService:
         with self.lock:
             self.data['scanning'] = True
         try:
+            self.manager.recover()
             errors = self._closed_executions()
+            activity_unavailable = any(error.get('scope') == 'activity' for error in errors)
             policy = execution_storage.settings(self.manager.root)
-            if maintain:
+            if maintain and not activity_unavailable:
                 with build_capacity.try_idle() as idle:
                     pressure = any(build_capacity.storage_status(path).get('blocked') is True
                                    for path in (self.manager.projects, self.manager.root))
@@ -128,7 +140,7 @@ class StorageService:
                         kinds=None if idle else {'download-cache'},
                         **{key: policy[key] for key in ('output_budget_bytes', 'shared_budget_bytes',
                                                        'max_closed_run_bytes', 'idle_seconds')})
-            inventory = self.manager.inventory(self.active_ids)
+            inventory = self.manager.inventory(None if activity_unavailable else self.active_ids)
             with self.lock:
                 self.data = dict(available=True, sampled_at=time.time(), scanning=False, inventory=inventory,
                                  finalization_errors=errors)

@@ -9,6 +9,8 @@ from unittest.mock import Mock, patch
 from contributions import Contributions
 import task_delivery
 
+OLD_RUN = 'f' * 32
+
 
 class RevalidationTests(unittest.TestCase):
     def setUp(self):
@@ -36,7 +38,7 @@ class RevalidationTests(unittest.TestCase):
         self.service = Contributions(self.root / 'tasks.sqlite3', self.root, self.store, Mock())
         self.service.validation = Mock()
         self.service.policy_matches = Mock(return_value=True)
-        old = dict(run_id='old-failed-run', state='error')
+        old = dict(run_id=OLD_RUN, state='error')
         self.task = dict(id='1' * 32, title='Revalidated candidate', head_sha='a' * 40, run_id=self.run['id'], profile_id='worker',
             state='review_ready', organization_id='org', github_repository='owner/repo', repository='repo',
             await_verification=True, auto_publish=False, completion_receipt=dict(commit='a' * 40),
@@ -68,13 +70,13 @@ class RevalidationTests(unittest.TestCase):
         self.assertEqual(task['head_sha'], self.task['head_sha'])
         old = task['delivery_history'][-1]
         self.assertEqual(old['chat_id'], 'old-inspection')
-        self.assertEqual(old['validation']['run_id'], 'old-failed-run')
+        self.assertEqual(old['validation']['run_id'], OLD_RUN)
         self.assertEqual(old['superseded_by_validation'], 'new-passing-run')
         self.assertNotIn('feedback_prompt', old)
         arguments = self.store.action.call_args.args[1]
         self.assertTrue(arguments['request_id'].endswith('-1'))
         self.assertIn('new-passing-run', arguments['prompt'])
-        self.assertNotIn('old-failed-run', arguments['prompt'])
+        self.assertNotIn(OLD_RUN, arguments['prompt'])
         self.assertEqual(self.store.action.call_count, 1)
         # A restart/poll still waits for the new chat; an old answer cannot finish it.
         self.jobs.append(dict(id='new-inspection', state='queued', runs=[self.run]))
@@ -108,10 +110,43 @@ class RevalidationTests(unittest.TestCase):
 
     def test_recorded_failure_binding_does_not_need_legacy_prompt_parsing(self):
         flow = self.task['delivery_workflow']
-        flow['validation'] = dict(run_id='old-failed-run', state='error')
+        flow['validation'] = dict(run_id=OLD_RUN, state='error')
         flow.pop('feedback_prompt')
         self.save()
         self.assertEqual(self.advance()['delivery_workflow']['validation']['run_id'], 'new-passing-run')
+
+    def test_legacy_identity_is_migrated_once_without_replaying_the_inspection(self):
+        self.reply.update(state='running', delivery=dict(stage='submitting'))
+        task = self.advance()
+        self.assertEqual(task['delivery_workflow']['validation']['run_id'], OLD_RUN)
+        self.assertEqual(task['delivery_workflow']['state'], 'waiting_agent')
+        self.assertEqual(sum(entry['action'] == 'delivery_validation_migrated' for entry in task['audit']), 1)
+        task['delivery_workflow']['feedback_prompt'] = 'No longer parseable legacy text'
+        self.service.save(task, 'fixture', 'test')
+        task = self.advance()
+        self.assertEqual(task['delivery_workflow']['validation']['run_id'], OLD_RUN)
+        self.assertEqual(sum(entry['action'] == 'delivery_validation_migrated' for entry in task['audit']), 1)
+        self.store.action.assert_not_called()
+        self.service.validation.submit.assert_not_called()
+
+    def test_legacy_migration_rejects_mismatched_and_malformed_packets(self):
+        for prompt in ('broken', 'Evidence: []', 'Evidence: ' + json.dumps(dict(
+                sha='b' * 40, validation=dict(run_id='wrong', state='error')))):
+            with self.subTest(prompt=prompt):
+                task = copy.deepcopy(self.task)
+                task['delivery_workflow']['feedback_prompt'] = prompt
+                service = Mock()
+                task_delivery.migrate_inspected_validation(service, task, task['delivery_workflow'])
+                self.assertNotIn('validation', task['delivery_workflow'])
+                service.save.assert_not_called()
+        for run_id in ('arbitrary-run', 'f' * 31, 'f' * 33, 'G' * 32):
+            task = copy.deepcopy(self.task)
+            task['delivery_workflow']['feedback_prompt'] = 'Evidence: ' + json.dumps(dict(
+                sha=task['head_sha'], validation=dict(run_id=run_id, state='error')))
+            service = Mock()
+            task_delivery.migrate_inspected_validation(service, task, task['delivery_workflow'])
+            self.assertNotIn('validation', task['delivery_workflow'])
+            service.save.assert_not_called()
 
     def test_crash_before_enqueue_uses_passing_evidence_without_sending_frozen_failure(self):
         flow = self.task['delivery_workflow']
@@ -124,7 +159,7 @@ class RevalidationTests(unittest.TestCase):
         self.assertEqual(task['delivery_workflow']['attempt'], 1)
         self.assertEqual(task['delivery_workflow']['state'], 'waiting_agent')
         self.assertIn('new-passing-run', self.store.action.call_args.args[1]['prompt'])
-        self.assertNotIn('old-failed-run', self.store.action.call_args.args[1]['prompt'])
+        self.assertNotIn(OLD_RUN, self.store.action.call_args.args[1]['prompt'])
         self.assertEqual(self.store.action.call_count, 1)
 
     def test_crash_after_enqueue_recovers_the_chat_id_and_waits_before_refreshing(self):
@@ -187,12 +222,12 @@ class RevalidationTests(unittest.TestCase):
         task = self.advance()
         entry = task['delivery_history'][-1]
         self.assertEqual(entry['previous_inspection_error'], 'Old agent blocked')
-        self.assertEqual(entry['revalidation_wait']['previous_run_id'], 'old-failed-run')
+        self.assertEqual(entry['revalidation_wait']['previous_run_id'], OLD_RUN)
 
     def test_cancelled_and_legacy_unverified_complete_inspections_can_be_superseded(self):
         for state in ('cancelled', 'complete'):
             with self.subTest(state=state):
-                self.task['delivery_workflow']['validation'] = dict(run_id='old-failed-run', state=state,
+                self.task['delivery_workflow']['validation'] = dict(run_id=OLD_RUN, state=state,
                                                                     required_checks_verified=False)
                 self.save()
                 self.assertEqual(self.advance()['delivery_workflow']['validation']['run_id'], 'new-passing-run')
@@ -278,7 +313,7 @@ class RevalidationTests(unittest.TestCase):
     def test_only_new_verified_current_policy_results_can_refresh_a_validation_failure(self):
         build = self.task['builds']['a' * 40]
         original = copy.deepcopy(build)
-        for changes in (dict(run_id='old-failed-run'), dict(run_id=None), dict(state='error'),
+        for changes in (dict(run_id=OLD_RUN), dict(run_id=None), dict(state='error'),
                         dict(required_checks_verified=False), dict(target='b' * 40)):
             with self.subTest(changes=changes):
                 self.task['builds']['a' * 40] = dict(original, **changes)

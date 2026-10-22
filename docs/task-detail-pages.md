@@ -79,6 +79,19 @@ events and their independently identified validation runs remain available.
 
 ## Recover a saved delivery inspection
 
+Delivery jobs retain up to 20 diagnostic transitions (stage, code and time), so
+repeated failures and reply recovery do not erase every preceding stage. This
+bounded history excludes prompts, reply bodies and credentials. Existing jobs
+start their history from the last stage already recorded on disk.
+
+When reconciliation can recover a matching candidate's legacy validation identity
+from its old inspection prompt, it saves the structured identity once. Later
+reconciliation uses that record; migration does not approve validation, execute
+checks, or send another inspection prompt. Malformed and mismatched legacy
+packets remain unmigrated.
+Prompt-based migration recognizes the same 32 lowercase hexadecimal run IDs as
+the validation runner. Previously stored structured identities are retained.
+
 A passing build and a saved worker review do not by themselves release the
 worker reservation. The gateway must accept the inspection reply. If a status
 probe fails after the worker writes its reply, the chat remains interrupted and

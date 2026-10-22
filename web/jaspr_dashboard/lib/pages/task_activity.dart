@@ -209,6 +209,7 @@ const activityLabels = {
       'New validation superseded the failed delivery inspection',
   'delivery_revalidation_waiting':
       'Passing validation awaits the previous inspection',
+  'delivery_validation_migrated': 'Legacy validation identity recovered',
   'delivery_superseded':
       'Previous candidate delivery report retained as history',
   'review_policy': 'Automatic group review policy changed',
@@ -306,6 +307,7 @@ String activitySection(Object? action) {
     case 'build_evidence_mismatch':
     case 'delivery_revalidated':
     case 'delivery_revalidation_waiting':
+    case 'delivery_validation_migrated':
       return 'Checks & builds';
     default:
       return 'Overview';

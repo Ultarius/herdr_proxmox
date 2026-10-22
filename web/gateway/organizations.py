@@ -23,12 +23,39 @@ from request_identity import ORGANIZATION_REQUEST
 # fault. A meeting that hits one waits and is retried, so answering a permission
 # prompt or finishing a task resumes it without an operator retrying by hand.
 TRANSIENT_AGENT_CODES = ('agent_blocked', 'agent_working', 'agent_not_ready')
+SAVED_REPLY_NAME = re.compile(r'reply-[a-f0-9]{12}\.md|reply\.md')
+MAX_DELIVERY_TRANSITIONS = 20
 import toolchain_policy
 from herdr_errors import HerdrError, delivery_for, parse_completion, parse_resume, preview as preview_text
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def delivery_transition(previous, current, at):
+    """Bounded diagnostic stages only; never copy prompts, results or secrets."""
+    previous = previous if isinstance(previous, dict) else {}
+    def entry(value, timestamp):
+        if not isinstance(value, dict) or not isinstance(value.get('stage'), str):
+            return None
+        result = dict(stage=value['stage'][:80], at=timestamp)
+        if isinstance(value.get('code'), str):
+            result['code'] = value['code'][:120]
+        return result
+    history = []
+    saved = previous.get('transitions')
+    for value in saved[-MAX_DELIVERY_TRANSITIONS:] if isinstance(saved, list) else []:
+        if isinstance(value, dict) and (item := entry(value, str(value.get('at') or at)[:80])):
+            history.append(item)
+    # Seed older jobs from the stage already on disk before recording this one.
+    if not history and (old := entry(previous, str(previous.get('at') or at)[:80])):
+        history.append(old)
+    latest = entry(current, at)
+    if latest and (not history or (latest['stage'], latest.get('code')) !=
+                   (history[-1]['stage'], history[-1].get('code'))):
+        history.append(latest)
+    return dict(current, transitions=history[-MAX_DELIVERY_TRANSITIONS:]) if history else dict(current)
 
 
 def text(body, key, limit=120, optional=False):
@@ -977,7 +1004,10 @@ class OrganizationStore:
     def update_job(self, job_id, **changes):
         with self.lock, closing(self.connect()) as db, db:
             job = self.get(db, 'jobs', job_id)
-            job.update(**changes, updated_at=now())
+            updated_at = now()
+            if isinstance(changes.get('delivery'), dict):
+                changes['delivery'] = delivery_transition(job.get('delivery'), changes['delivery'], updated_at)
+            job.update(**changes, updated_at=updated_at)
             self.put(db, 'jobs', job)
         if changes.get('state') in ('answered', 'persona_sent', 'needs_attention', 'delivered', 'artifact_ready',
                                     'finished', 'released', 'cancelled', 'completed', 'reported_complete',
@@ -1251,7 +1281,7 @@ class OrganizationStore:
         if mode not in ('recover', 'fresh'):
             raise ValueError('Unsupported report repair mode.')
         if reply_name is not None and (mode != 'recover' or not isinstance(reply_name, str)
-                                      or not re.fullmatch(r'reply-[a-f0-9]{12}\.md|reply\.md', reply_name)):
+                                      or not SAVED_REPLY_NAME.fullmatch(reply_name)):
             raise ValueError('Select an exact saved reply file name, without a directory.')
         with self.lock:
             lock = self.agent_locks.setdefault(profile_id, threading.RLock())
@@ -1290,7 +1320,7 @@ class OrganizationStore:
                     # inspecting operator explicitly names a file. Never guess
                     # between files or override a recorded attempt binding.
                     name = recorded_name or reply_name or 'reply.md'
-                    if not re.fullmatch(r'reply-[a-f0-9]{12}\.md|reply\.md', str(name)):
+                    if not SAVED_REPLY_NAME.fullmatch(str(name)):
                         raise ValueError('unsupported reply file name in job delivery evidence')
                     reply = read_contribution(directory / name, label='chat reply')
                 except (ValueError, OSError) as error:

@@ -201,6 +201,20 @@ class StorageServiceTests(unittest.TestCase):
         self.assertIn('unknown', result['skipped'][0]['reason'])
         self.assertTrue(path.exists())
 
+    def test_failed_activity_list_queries_keep_healthy_inventory_visible_but_disable_retention(self):
+        self.allocate()
+        self.manager.close_execution(self.agent_id)
+        for owner, method in ((self.organizations, 'job_records'), (self.validation, 'storage_records')):
+            with self.subTest(method=method), patch.object(owner, method, side_effect=RuntimeError('history unavailable')), \
+                    patch.object(self.manager, 'maintain') as maintain:
+                observed = self.service.scan(maintain=True)
+                self.assertTrue(observed['available'], observed)
+                self.assertEqual(len(observed['inventory']['entries']), 1)
+                self.assertFalse(observed['inventory']['activity_known'])
+                self.assertFalse(observed['inventory']['entries'][0]['eligible'])
+                self.assertEqual(observed['finalization_errors'][0]['scope'], 'activity')
+                maintain.assert_not_called()
+
     def test_configuration_is_validated_and_snapshot_reports_new_policy(self):
         result = self.service.action(dict(action='configure', build_mode='full', output_budget_bytes=4096))
         self.assertEqual(result['snapshot']['policy']['build_mode'], 'full')

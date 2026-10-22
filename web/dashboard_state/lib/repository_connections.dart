@@ -1,6 +1,22 @@
 import 'dart:async';
 import 'dashboard_bloc.dart';
 
+const repositoryTokenLabel = 'Fine-grained GitHub token (HTTPS)';
+const repositoryTokenGuidance =
+    'Select the repository owner and Only select repositories on GitHub. '
+    'For cloning and pulling, grant Contents: Read-only; Metadata: Read-only is included. '
+    'Pushing requires Contents: Read and write. Organization approval may be required. '
+    'This token is saved for this connection in the container; it does not change GitHub publishing settings. '
+    'Keep tokens out of repository URLs.';
+const repositoryTokenUrl =
+    'https://github.com/settings/personal-access-tokens/new?contents=read';
+
+String repositoryCreateLabel(String kind) => switch (kind) {
+  'ssh' => 'Create SSH connection',
+  'token' => 'Save token connection',
+  _ => 'Create GitHub connection',
+};
+
 String repositoryConnectionUrl(Map item) => item['kind'] == 'ssh'
     ? "git@github.com:${item['repository']}.git"
     : "https://github.com/${item['repository']}.git";
@@ -23,6 +39,7 @@ class RepositoryConnectionsController {
     this.connection, {
     required this.onUpdate,
     required this.onChanged,
+    this.onReset,
   }) {
     generation = connection.generation;
     role = '${connection.operator.value['role']}';
@@ -34,6 +51,7 @@ class RepositoryConnectionsController {
   final DashboardBloc connection;
   final void Function() onUpdate;
   final void Function(List<Map<String, dynamic>>) onChanged;
+  final void Function()? onReset;
   late final StreamSubscription subscription;
   late int generation;
   late String role;
@@ -74,6 +92,7 @@ class RepositoryConnectionsController {
       bindings = [];
       message = null;
       pendingRemoval = null;
+      onReset?.call();
       onChanged([]);
       onUpdate();
     }
@@ -103,8 +122,8 @@ class RepositoryConnectionsController {
     }
   }
 
-  Future<void> action(String action, Map<String, dynamic> body) async {
-    if (!canManage || busy || refreshing || disposed) return;
+  Future<bool> action(String action, Map<String, dynamic> body) async {
+    if (!canManage || busy || refreshing || disposed) return false;
     final epoch = connection.generation, version = revision;
     busy = true;
     message = null;
@@ -114,25 +133,31 @@ class RepositoryConnectionsController {
         'action': action,
         ...body,
       });
-      if (!current(epoch, version)) return;
+      if (!current(epoch, version)) return false;
       if (action == 'remove') pendingRemoval = null;
       message = switch (action) {
         'create' =>
-          'Connection created. Configure its key if needed, then test access.',
+          body['kind'] == 'token'
+              ? 'Token connection saved. Test repository access, then select it below to clone.'
+              : 'Connection created. Configure its key if needed, then test access.',
         'test' =>
           result['access_state'] == 'verified'
               ? 'Repository access verified.'
               : result['error']?.toString(),
+        'rotate' =>
+          'Token replaced. Project assignments are unchanged. Test repository access again.',
         'bind' => 'Connection assigned to project.',
         'unbind' =>
           'Project connection unassigned. Operator Git settings were preserved.',
         'remove' =>
-          'Connection removed locally. Revoke its deploy key on GitHub separately.',
+          'Connection removed locally. Revoke its deploy key or token on GitHub separately.',
         _ => 'GitHub host fingerprint verified.',
       };
       await refresh();
+      return current(epoch, version);
     } catch (error) {
       if (current(epoch, version)) message = '$error';
+      return false;
     } finally {
       if (current(epoch, version)) {
         busy = false;

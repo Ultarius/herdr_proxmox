@@ -297,6 +297,18 @@ class Manager:
         self.root, self.projects = _absolute(root), _absolute(projects)
         self.database = self.root / 'registry.sqlite3'
 
+    def recover(self):
+        """Let SQLite recover a crashed writer outside read-only inventory calls."""
+        journal = Path(str(self.database) + '-journal')
+        if not self.database.exists() or (not journal.exists() and not journal.is_symlink()):
+            return False
+        # The normal guarded writer checks every database sidecar and takes
+        # nonblocking locks. SQLite decides whether the journal is actually hot;
+        # never remove or replay journal files ourselves.
+        with self._write():
+            pass
+        return True
+
     def _ensure(self):
         _safe_chain(self.root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)

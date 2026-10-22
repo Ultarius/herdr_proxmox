@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'web/gateway'))
 import environment_adapters
@@ -66,7 +66,7 @@ class ExecutionStorageTests(unittest.TestCase):
 
     def prepare(self, entries=None, *, checkout=None, lane='agent', identity=None, create=True):
         return execution_storage.prepare(entries or [self.entry()], checkout or self.project,
-            lane=lane, execution_id=identity or self.agent_id, create=create)
+            lane=lane, execution_id=identity or self.agent_id, create=create, projects=self.projects)
 
     def test_compact_is_default_full_is_explicit_and_each_plan_freezes_its_mode(self):
         compact = self.plan()
@@ -131,7 +131,7 @@ class ExecutionStorageTests(unittest.TestCase):
         self.assertEqual(int(variables['HERDR_BUILD_OUTPUT_LIMIT_BYTES']), execution_storage.DEFAULTS['active_output_limit_bytes'])
         shared = Path(configuration['manifest']['caches'][0]['shared'])
         self.assertFalse(cargo_home.is_relative_to(shared))
-        entries = execution_storage.manager().inventory(active_execution_ids={self.agent_id})['entries']
+        entries = execution_storage.manager(projects=self.projects).inventory(active_execution_ids={self.agent_id})['entries']
         self.assertEqual({entry['kind'] for entry in entries}, {'build-output', 'execution-cache', 'download-cache'})
         self.assertTrue(all(entry['project'] == str(self.project) for entry in entries))
         self.assertTrue((self.project / 'source.rs').is_file())
@@ -146,7 +146,7 @@ class ExecutionStorageTests(unittest.TestCase):
         self.assertNotEqual(agent['environment']['CARGO_HOME'], validation['environment']['CARGO_HOME'])
         self.assertNotEqual(agent['environment']['CARGO_TARGET_DIR'], validation['environment']['CARGO_TARGET_DIR'])
         self.assertNotEqual(agent['manifest']['caches'][0]['shared'], validation['manifest']['caches'][0]['shared'])
-        records = execution_storage.manager().inventory(active_execution_ids={self.agent_id, self.validation_id})['entries']
+        records = execution_storage.manager(projects=self.projects).inventory(active_execution_ids={self.agent_id, self.validation_id})['entries']
         self.assertTrue(records)
         self.assertTrue(all(record['project'] == str(self.project) for record in records))
 
@@ -178,7 +178,7 @@ class ExecutionStorageTests(unittest.TestCase):
         (output / 'rebuildable.o').write_bytes(b'object')
         result = execution_storage.finish(configuration, self.project, close=True)
         self.assertEqual(result['errors'], [])
-        entries = execution_storage.manager().inventory(active_execution_ids=())['entries']
+        entries = execution_storage.manager(projects=self.projects).inventory(active_execution_ids=())['entries']
         self.assertEqual({entry['state'] for entry in entries if entry['execution_id'] == self.agent_id}, {'closed'})
         self.assertTrue(all(entry['eligible'] for entry in entries))
         self.assertTrue((self.project / 'Cargo.lock').exists())
@@ -214,7 +214,7 @@ class ExecutionStorageTests(unittest.TestCase):
         self.assertEqual(configuration['outputs'], reopened['outputs'])
         self.assertTrue(output.is_dir())
         execution_storage.finish(reopened, self.project, close=True)
-        rows = execution_storage.manager().inventory(active_execution_ids=())['entries']
+        rows = execution_storage.manager(projects=self.projects).inventory(active_execution_ids=())['entries']
         self.assertTrue(all(row['eligible'] for row in rows), rows)
 
     def test_unknown_storage_contract_is_refused_before_allocation(self):
@@ -222,6 +222,59 @@ class ExecutionStorageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'storage contract changed'):
             self.prepare([entry])
         self.assertFalse(self.root.exists())
+
+    def test_projects_configuration_is_explicit_and_environment_cannot_redirect_it(self):
+        with patch.dict(os.environ, HERDR_PROJECTS=str(self.base / 'wrong-projects')):
+            with self.assertRaisesRegex(ValueError, 'configured absolute projects directory'):
+                execution_storage.manager()
+            with self.assertRaisesRegex(ValueError, 'configured absolute projects directory'):
+                execution_storage.prepare([self.entry()], self.project, lane='agent', execution_id=self.agent_id)
+            self.assertFalse(self.root.exists())
+            binding = self.prepare()
+            self.assertEqual(binding['projects'], str(self.projects))
+            self.assertTrue(execution_storage.grants(binding, projects=self.projects))
+            execution_storage.finish(binding, self.project, close=True)
+
+    def test_allocation_retries_back_off_but_respect_the_total_deadline(self):
+        from workspace_storage import StorageBusy
+        clock, sleeps = [0.0], []
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+        store = Mock()
+        store.allocate.side_effect = StorageBusy('busy')
+        with patch.object(execution_storage.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(execution_storage.time, 'sleep', side_effect=sleep):
+            with self.assertRaisesRegex(StorageBusy, 'retry this execution'):
+                execution_storage._allocate(store, 'owned')
+        self.assertEqual(sleeps[:5], [.1, .2, .4, .8, 1])
+        self.assertTrue(all(0 < seconds <= 1 for seconds in sleeps))
+        self.assertAlmostEqual(clock[0], 30)
+        sleeps.clear()
+        store.allocate.side_effect = [StorageBusy('busy'), StorageBusy('busy'), self.root]
+        with patch.object(execution_storage.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(execution_storage.time, 'sleep', side_effect=sleep):
+            self.assertEqual(execution_storage._allocate(store, 'owned'), self.root)
+        self.assertEqual(sleeps, [.1, .2])
+
+    def test_unavailable_optional_download_pool_does_not_block_preparation_or_close(self):
+        from workspace_storage import Manager
+        allocate = Manager.allocate
+        for error in (ValueError('invalid pool'), OSError('unavailable pool')):
+            with self.subTest(error=type(error).__name__):
+                def without_pool(manager, identity, **options):
+                    if options.get('kind') == 'download-cache':
+                        raise error
+                    return allocate(manager, identity, **options)
+                with patch.object(Manager, 'allocate', autospec=True, side_effect=without_pool), \
+                        patch('package_cache.seed') as seed:
+                    binding = self.prepare()
+                    self.assertTrue(all(Path(path).is_dir() for path in binding['outputs']))
+                    seed.assert_not_called()
+                    result = execution_storage.finish(binding, self.project, close=True)
+                self.assertIn('normal downloads remain enabled', result['errors'][0])
+                rows = execution_storage.manager(projects=self.projects).inventory(active_execution_ids=())['entries']
+                self.assertTrue(all(row['state'] == 'closed' for row in rows))
 
 
 if __name__ == '__main__':

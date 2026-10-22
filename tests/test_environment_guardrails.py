@@ -146,7 +146,7 @@ class LaunchBindingTests(unittest.TestCase):
     def test_binding_uses_daemon_tab_creation_and_only_closes_its_original_pane(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            store = Mock(path=root / 'organizations.sqlite3')
+            store = Mock(path=root / 'organizations.sqlite3', projects=root)
             store.command.return_value = dict(root_pane=dict(pane_id='w1:p2'), tab=dict(workspace_id='w1'))
             job = dict(id='a' * 32, worktree_path=str(root / 'checkout'))
             with patch.object(environment_launch, 'activate_shell') as activate:
@@ -162,17 +162,26 @@ class LaunchBindingTests(unittest.TestCase):
     def test_an_older_runtime_failure_never_falls_back_to_the_unbound_shell(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            store = Mock(path=root / 'organizations.sqlite3')
+            store = Mock(path=root / 'organizations.sqlite3', projects=root)
             store.command.side_effect = ValueError('unknown option --env')
             with self.assertRaisesRegex(ValueError, 'unknown option'):
                 environment_launch.configure(store, dict(id='a' * 32), self.frozen(root / 'sdk' / 'dotnet'), 'w1:p1', 'w1')
             self.assertEqual(store.command.call_count, 1)
             store.wait_for_shell.assert_not_called()
 
+    def test_missing_projects_contract_is_a_clear_launch_configuration_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            store = Mock(path=root / 'organizations.sqlite3', projects=None)
+            with self.assertRaisesRegex(ValueError, 'configured absolute projects directory'):
+                environment_launch.configure(store, dict(id='a' * 32), self.frozen(root / 'sdk' / 'dotnet'), 'w1:p1', 'w1')
+            self.assertTrue(any(call.kwargs.get('storage_preparation', {}).get('state') == 'failed'
+                                for call in store.update_job.call_args_list))
+
     def test_a_response_from_another_workspace_never_closes_the_original_pane(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            store = Mock(path=root / 'organizations.sqlite3')
+            store = Mock(path=root / 'organizations.sqlite3', projects=root)
             store.command.return_value = dict(root_pane=dict(pane_id='w2:p2'))
             with self.assertRaisesRegex(ValueError, 'assigned workspace'):
                 environment_launch.configure(store, dict(id='a' * 32), self.frozen(root / 'sdk' / 'dotnet'), 'w1:p1', 'w1')

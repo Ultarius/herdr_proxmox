@@ -10,17 +10,45 @@ avoids fetching connection configuration. Both populate the clone dropdown when
 their panel loads and refuse retries with an unavailable saved connection.
 
 1. Give the connection a name and enter `owner/repository`.
-2. Choose **SSH deploy key** or **Configured GitHub account (HTTPS)**.
+2. Choose **SSH deploy key**, **Fine-grained GitHub token (HTTPS)**, or
+   **Configured GitHub account (HTTPS)**.
+   For a fine-grained token, use the link in this form, choose the correct resource
+   owner and **Only select repositories**, then grant **Contents: Read-only**
+   (Metadata read access is included). Organization approval may be required.
+   Paste the token into the password field and click **Save token connection**.
+   New connections accept PATs beginning with `github_pat_` (fine-grained) or
+   `ghp_` (classic); a recognized prefix does not verify validity or permissions.
+   OAuth/App credentials and refresh tokens are not accepted by this PAT form.
+   The token field requests no browser autofill, spellcheck or autocorrection.
+   It is cleared after a successful save; a rejected or failed save retains the
+   masked paste for correction or retry while the dashboard session remains active.
+   It is also cleared on account changes, dashboard disconnection, or when leaving
+   the token authentication option. Browser extensions may
+   override autofill preferences.
+   This saves a separate credential for this connection without changing the
+   dashboard's GitHub publishing configuration.
+   Do not paste a token into the repository URL. Tokens expire or can be revoked;
+   use **Rotate token** on its saved connection to replace it in place. Project
+   assignments and the connection ID remain unchanged. Enter a replacement,
+   click **Save replacement token**, then **Test repository access** again.
+   Rotation refuses a connection currently used by a managed Git operation.
+   A failed credential-file replacement retains the old token; the access verdict
+   is reset before replacement so it cannot claim verification for a changed
+   credential. Revoke the old token on GitHub separately.
 3. For SSH, create the key, copy its public key (HTTP clipboard fallback downloads
    a public `.pub` file), and open the repository's GitHub deploy-key settings.
    Add it as read-only for clone/fetch/pull. Private key bytes never enter a response.
-4. Click **Verify GitHub host key**. The gateway scans only github.com Ed25519 and
+4. For SSH, click **Verify GitHub host key**. The gateway scans only github.com Ed25519 and
    compares the result to GitHub's published pinned fingerprint. An unexpected key
    is refused, never automatically trusted. No global known_hosts file is edited.
 5. Click **Test repository access**. This runs a bounded, non-interactive
    `ls-remote HEAD`; the result records an observation time, not a future guarantee.
-   HTTPS uses the current primary GitHub credential; it does not create or expand
-   token permissions or alter the publishing allowlist.
+   HTTPS uses the connection's saved token, or the current primary GitHub credential
+   when **Configured GitHub account** was selected. It does not create or expand
+   token permissions or alter the publishing allowlist. Tokens are stored in
+   separate mode-0600 files, never in connection listings, clone jobs, Git remotes,
+   or command arguments. A push requires Contents write access; the access test
+   verifies only repository reads.
    A successful query with no advertised `HEAD` (Git exit 2, for example an empty
    repository) also verifies access. It does not imply that any commits exist or
    that the credential can push.
@@ -52,21 +80,27 @@ not authorize PR creation, publication, merging, deployment, submodule access or
 Git LFS credentials. Those workflows keep their existing configuration.
 
 The API is `GET /api/projects/connections` and `POST /api/projects/connections`
-with actions `create`, `verify_host`, `test`, `bind`, `unbind`, and `remove`. Listing, configuration and
+with actions `create`, `rotate`, `verify_host`, `test`, `bind`, `unbind`, and `remove`. Listing, configuration and
 managed cloning are administrator operations. `projects/clone` accepts optional
 `connection_id`; durable job records retain that identifier, the credential-free
 URL and folder so retries can be reviewed. Requests have existing same-origin
 session checks. The shared client allows time for bounded host/access probes.
 
+`create` accepts `label`, `repository` (`owner/repository`), `kind` (`ssh`,
+`github`, or `token`), and a required `token` only for `kind: token`. Supplying a
+token for another kind is rejected. `rotate` accepts `id` and `token` and applies
+only to connection-specific token credentials. Neither action echoes token bytes.
+
 Keys and metadata live under the gateway configuration directory's
 `repository-connections/` (directory 0700, private files 0600). Metadata records
-public keys, repository identities, bindings and test outcomes. The configured
-GitHub token stays in the existing `github.json`; askpass releases it only for
+public keys, repository identities, bindings and test outcomes.
+The configured account token stays in the existing `github.json`; connection-specific
+tokens stay in `repository-connections/<connection-id>/token.json`. Askpass releases a token only for
 username/password prompts naming the exact selected GitHub repository. Redirects
 and credential helpers are disabled for managed gateway operations. Error output
 from Git/SSH is not copied into test results. The gateway and agents share the
 `herdr` Unix account: file modes protect against other users, not same-user agents.
-Repository connections/private keys are not part of configuration export/import;
+Repository connections, private keys and tokens are not part of configuration export/import;
 reconfigure them on a replacement container. Dashboard upgrades preserve the
 configuration directory. No live keys or remote grants are created by tests.
 
@@ -82,13 +116,15 @@ connection, and linked worktrees must be unassigned through their main checkout.
 
 Once unassigned, click **Remove connection**, then **Confirm removal**. Removal
 refuses bound connections and credentials in active use by a gateway Git command.
-It deletes the metadata record and that connection's generated key/trust files.
+It deletes the metadata record and that connection's generated key/trust files,
+including its saved `token.json` for token connections.
 It does not delete checkouts, global configuration or the primary GitHub token.
 Unexpected key-directory contents are refused for inspection rather than deleted
-recursively. Failed SSH key generation and failed creation saves clean up partial
-key files. A failed retirement can be retried after resolving its reported error.
+recursively. Failed key generation and failed connection creation clean up partial
+credential files, including `token.json`. A failed retirement can be retried after
+resolving its reported error.
 
-Revoke the deploy key in GitHub separately: deleting local configuration does not
+Revoke the deploy key or token in GitHub separately: deleting local configuration does not
 revoke remote authorization. The limits remain 64 connections and 128 checkout
 bindings; retired entries release their slots. API callers use `unbind` with
 `id` and direct-child `folder`, then `remove` with `id`; both require an admin.

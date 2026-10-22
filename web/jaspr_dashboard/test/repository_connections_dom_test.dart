@@ -41,8 +41,10 @@ void main() {
   late ClientAppBinding binding;
   late List<Map<String, dynamic>> connections, jobs, requests, bindings;
   Completer<http.Response>? pendingProbe;
+  String? saveError;
   setUp(() async {
     pendingProbe = null;
+    saveError = null;
     connections = [];
     bindings = [];
     jobs = [];
@@ -55,6 +57,10 @@ void main() {
           if (request.method == 'POST') {
             final body = Map<String, dynamic>.from(jsonDecode(request.body));
             requests.add(body);
+            if (['create', 'rotate'].contains(body['action']) &&
+                saveError != null) {
+              return http.Response(jsonEncode({'error': saveError}), 503);
+            }
             if (body['action'] == 'test' && pendingProbe != null)
               return pendingProbe!.future;
             if (body['action'] == 'create') {
@@ -63,7 +69,8 @@ void main() {
                 'label': body['label'],
                 'repository': body['repository'],
                 'kind': body['kind'],
-                'public_key': 'ssh-ed25519 PUBLIC test',
+                if (body['kind'] == 'ssh')
+                  'public_key': 'ssh-ed25519 PUBLIC test',
                 'host_verified': false,
                 'access_state': 'not_tested',
               });
@@ -71,6 +78,8 @@ void main() {
               connections.first['host_verified'] = true;
             } else if (body['action'] == 'test') {
               connections.first['access_state'] = 'verified';
+            } else if (body['action'] == 'rotate') {
+              connections.first['access_state'] = 'not_tested';
             }
             if (body['action'] == 'bind')
               bindings.add({
@@ -233,6 +242,70 @@ void main() {
       expect(nodes('pre'), isEmpty);
     },
   );
+  test(
+    'a fine-grained token can be saved, tested and selected for HTTPS cloning',
+    () async {
+      nodes('summary').single.click();
+      await settle();
+      final authentication = nodes('select').first as web.HTMLSelectElement;
+      authentication.value = 'token';
+      authentication.dispatchEvent(
+        web.Event('change', web.EventInit(bubbles: true)),
+      );
+      await settle();
+      await field('Connection name', 'Private token');
+      await field('GitHub repository (owner/repository)', 'owner/private');
+      final input =
+          nodes('input[type=password]').single as web.HTMLInputElement;
+      expect(input.getAttribute('autocomplete'), 'off');
+      expect(input.getAttribute('spellcheck'), 'false');
+      expect(input.getAttribute('autocorrect'), 'off');
+      await field('GitHub personal access token', 'github_pat_test_fixture');
+      expect(
+        nodes('p').any(
+          (item) => item.textContent?.contains('Contents: Read-only') == true,
+        ),
+        isTrue,
+      );
+      await click('Save token connection');
+      expect(
+        requests.where((request) => request['action'] == 'create').single,
+        {
+          'action': 'create',
+          'label': 'Private token',
+          'repository': 'owner/private',
+          'kind': 'token',
+          'token': 'github_pat_test_fixture',
+        },
+      );
+      expect(input.value, isEmpty);
+      expect(nodes('pre'), isEmpty);
+      expect(
+        nodes(
+          'button',
+        ).any((item) => item.textContent == 'Verify GitHub host key'),
+        isFalse,
+      );
+      await click('Test repository access');
+      expect(requests.last['url'], 'https://github.com/owner/private.git');
+      final selector = nodes('select').last as web.HTMLSelectElement;
+      selector.value = 'key-one';
+      selector.dispatchEvent(web.Event('change', web.EventInit(bubbles: true)));
+      await settle();
+      await click('Clone project');
+      expect(requests.last, {
+        'action': 'clone',
+        'url': 'https://github.com/owner/private.git',
+        'folder': 'private',
+        'connection_id': 'key-one',
+      });
+      expect(
+        nodes('.clone-project').single.textContent,
+        isNot(contains('github_pat_test_fixture')),
+      );
+    },
+  );
+
   test('a retained clone cannot silently reuse a missing connection', () async {
     jobs.add({
       'id': 'old-job',
@@ -259,6 +332,108 @@ void main() {
       contains('saved repository connection is unavailable'),
     );
   });
+
+  test(
+    'failed token saves retain the masked paste and rotation preserves the connection',
+    () async {
+      nodes('summary').single.click();
+      await settle();
+      final authentication = nodes('select').first as web.HTMLSelectElement;
+      authentication.value = 'token';
+      authentication.dispatchEvent(
+        web.Event('change', web.EventInit(bubbles: true)),
+      );
+      await settle();
+      await field('Connection name', 'Private token');
+      await field('GitHub repository (owner/repository)', 'owner/private');
+      await field('GitHub personal access token', 'github_pat_test_fixture');
+      saveError = 'Save failed; try again.';
+      await click('Save token connection');
+      expect(
+        (nodes('input[type=password]').single as web.HTMLInputElement).value,
+        'github_pat_test_fixture',
+      );
+      expect(
+        requests.where((request) => request['action'] == 'create').length,
+        1,
+      );
+      expect(
+        nodes('.repository-connections').single.textContent,
+        isNot(contains('github_pat_test_fixture')),
+      );
+      saveError = null;
+      await click('Save token connection');
+      expect(
+        (nodes('input[type=password]').single as web.HTMLInputElement).value,
+        isEmpty,
+      );
+      await click('Rotate token');
+      await field(
+        'Replacement GitHub personal access token',
+        'github_pat_replacement_fixture',
+      );
+      saveError = 'Rotation failed; try again.';
+      await click('Save replacement token');
+      expect(
+        (nodes('input[type=password]').last as web.HTMLInputElement).value,
+        'github_pat_replacement_fixture',
+      );
+      expect(
+        requests.where((request) => request['action'] == 'rotate').length,
+        1,
+      );
+      saveError = null;
+      await click('Save replacement token');
+      expect(requests.last, {
+        'action': 'rotate',
+        'id': 'key-one',
+        'token': 'github_pat_replacement_fixture',
+      });
+      expect(connections.single['id'], 'key-one');
+      expect(
+        requests.any(
+          (request) => ['bind', 'unbind', 'remove'].contains(request['action']),
+        ),
+        isFalse,
+      );
+      expect(
+        nodes('.repository-connections').single.textContent,
+        isNot(contains('github_pat_replacement_fixture')),
+      );
+      expect(nodes('input[type=password]').length, 1);
+      await field('GitHub personal access token', 'github_pat_unsaved_fixture');
+      connection.operator.value = {'role': 'operator'};
+      await settle();
+      expect(nodes('input[type=password]'), isEmpty);
+      connection.operator.value = {'role': 'admin'};
+      // The full page remounts administrative content after authentication;
+      // this isolated clone-card fixture has no outer role observer.
+      binding.detachRootComponent();
+      web.document.getElementById('repository-test')!.textContent = '';
+      binding.attachRootComponent(
+        CloneProjectCard(onCloned: (_) {}),
+        attachTo: '#repository-test',
+      );
+      await settle();
+      final restoredAuthentication =
+          nodes('select').first as web.HTMLSelectElement;
+      restoredAuthentication.value = 'token';
+      restoredAuthentication.dispatchEvent(
+        web.Event('change', web.EventInit(bubbles: true)),
+      );
+      await settle();
+      expect(
+        (nodes('input[type=password]').single as web.HTMLInputElement).value,
+        isEmpty,
+      );
+      expect(
+        requests.any(
+          (request) => request['token'] == 'github_pat_unsaved_fixture',
+        ),
+        isFalse,
+      );
+    },
+  );
   test(
     'account changes clear connection state and ignore a late access result',
     () async {

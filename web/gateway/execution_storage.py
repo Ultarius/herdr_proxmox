@@ -69,19 +69,24 @@ def configure_settings(value, directory=None):
 
 def manager(projects=None, directory=None):
     from workspace_storage import Manager
-    return Manager(directory or root(), projects or Path(os.environ.get('HERDR_PROJECTS', '/home/herdr/projects')))
+    if projects is None or not Path(projects).is_absolute():
+        raise ValueError('Managed storage requires the configured absolute projects directory.')
+    return Manager(directory or root(), projects)
 
 
 def _allocate(store, *args, **options):
     from workspace_storage import StorageBusy
     deadline = time.monotonic() + 30
+    delay = .1
     while True:
         try:
             return store.allocate(*args, **options)
         except StorageBusy:
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise StorageBusy('Managed storage maintenance is busy; retry this execution after cleanup completes.') from None
-            time.sleep(.1)
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 1)
 
 
 def grants(record, *, projects=None):
@@ -94,8 +99,10 @@ def grants(record, *, projects=None):
     lane, execution = record.get('lane'), record.get('execution_id')
     if lane not in ('agent', 'validation'):
         raise ValueError('Invalid storage binding lane.')
-    allowed = {'cache:' + lane + ':' + str(execution), 'output:' + lane + ':' + str(execution)}
+    cache_id = 'cache:' + lane + ':' + str(execution)
+    allowed = {cache_id, 'output:' + lane + ':' + str(execution)}
     result = []
+    expected_private = None
     for identity in record['objects']:
         if identity not in allowed:
             raise ValueError('A storage grant belongs to another execution.')
@@ -106,8 +113,9 @@ def grants(record, *, projects=None):
         from workspace_storage import _safe_chain
         _safe_chain(data)
         result.append(str(data))
-    expected_private = store._path('cache:' + lane + ':' + str(execution)) / 'data'
-    if (record.get('manifest') or {}).get('execution_root') != str(expected_private):
+        if identity == cache_id:
+            expected_private = data
+    if expected_private is None or (record.get('manifest') or {}).get('execution_root') != str(expected_private):
         raise ValueError('The private cache grant differs from its registered data directory.')
     if any(path not in result for path in record.get('outputs', [])):
         raise ValueError('The output grant differs from its registered data directory.')

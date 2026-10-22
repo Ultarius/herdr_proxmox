@@ -58,7 +58,7 @@ class StorageRegressions(unittest.TestCase):
         variables.start()
         self.addCleanup(variables.stop)
         self.repository(self.project)
-        self.manager = execution_storage.manager()
+        self.manager = execution_storage.manager(projects=self.projects)
 
     def git(self, directory, *arguments):
         return subprocess.check_output(['git', '-C', str(directory), *arguments], stderr=subprocess.DEVNULL)
@@ -74,10 +74,66 @@ class StorageRegressions(unittest.TestCase):
 
     def prepare(self):
         return execution_storage.prepare([dict(name='rust-toolchain', component='.', storage_contract=1)],
-            self.project, lane='agent', execution_id=self.identity)
+            self.project, lane='agent', execution_id=self.identity, projects=self.projects)
 
     def owned(self, manager=None, identity='owned'):
         return (manager or self.manager).allocate(identity, project=str(self.project), execution_id=self.identity)
+
+    def test_database_writer_crash_rolls_back_without_changing_registered_ownership(self):
+        self.owned()
+        owner = self.manager.binding('owned')
+        code = ("import os,sqlite3,sys\n"
+                "db=sqlite3.connect(sys.argv[1])\n"
+                "db.execute('PRAGMA cache_size=1')\n"
+                "db.execute('BEGIN IMMEDIATE')\n"
+                "db.execute('UPDATE storage SET data=? WHERE identity=?', ('x'*2000000, 'owned'))\n"
+                "os._exit(0)\n")
+        subprocess.run([sys.executable, '-c', code, str(self.manager.database)], check=True, timeout=10)
+        self.assertTrue(Path(str(self.manager.database) + '-journal').exists())
+        restarted = storage.Manager(self.root, self.projects)
+        # Ordinary polling remains read-only. The background scan must recover
+        # without waiting for a new execution/allocation to touch the database.
+        with self.assertRaises(storage.StorageBusy):
+            restarted.inventory(active_execution_ids=())
+        service = StorageService(Jobs(), Jobs(), manager=restarted)
+        observed = service.scan()
+        self.assertTrue(observed['available'], observed)
+        self.assertEqual(len(observed['inventory']['entries']), 1)
+        self.assertEqual(restarted.binding('owned'), owner)
+        restarted.allocate('new-owner', project=str(self.project), execution_id='e' * 32)
+        self.assertEqual(len(restarted.inventory(active_execution_ids={self.identity, 'e' * 32})['entries']), 2)
+
+    def test_recovery_preserves_missing_stores_and_refuses_a_live_writer(self):
+        self.assertFalse(self.manager.recover())
+        self.assertFalse(self.root.exists())
+        self.owned()
+        owner = self.manager.binding('owned')
+        with self.manager._write() as writer:
+            # A valid active rollback journal also belongs to its current writer.
+            writer.execute('UPDATE storage SET data=? WHERE identity=?', (json.dumps(dict(owner, last_used=0)), 'owned'))
+            self.assertTrue(Path(str(self.manager.database) + '-journal').exists())
+            with self.assertRaises(storage.StorageBusy):
+                self.manager.recover()
+        self.assertEqual(self.manager.binding('owned')['state'], 'active')
+
+    def test_sqlite_contention_is_retryable_and_recovery_preserves_existing_owners(self):
+        self.owned()
+        with closing(sqlite3.connect(self.manager.database)) as writer:
+            writer.execute('BEGIN IMMEDIATE')
+            with self.assertRaises(storage.StorageBusy):
+                self.manager.allocate('new-owner', project=str(self.project), execution_id='e' * 32)
+            writer.rollback()
+        self.manager.allocate('new-owner', project=str(self.project), execution_id='e' * 32)
+        self.assertEqual(self.manager.binding('owned')['execution_id'], self.identity)
+
+    def test_kernel_registry_lock_contention_does_not_change_ownership(self):
+        self.owned()
+        with storage._FileLock(self.root / 'registry.lock'):
+            with self.assertRaises(storage.StorageBusy):
+                self.manager.close_execution(self.identity)
+        self.assertEqual(self.manager.binding('owned')['state'], 'active')
+        self.manager.close_execution(self.identity)
+        self.assertEqual(self.manager.binding('owned')['state'], 'closed')
 
     def assert_tracked_protected(self, manager, enclosing):
         path = self.owned(manager)
@@ -214,7 +270,7 @@ class StorageRegressions(unittest.TestCase):
 
     def test_grants_are_registered_data_children_and_exclude_pool_and_owner_files(self):
         binding = self.prepare()
-        grants = execution_storage.grants(binding)
+        grants = execution_storage.grants(binding, projects=self.projects)
         self.assertTrue(grants)
         self.assertTrue(all(Path(path).name == 'data' for path in grants))
         self.assertNotIn(binding['manifest']['shared_root'], grants)
@@ -223,7 +279,11 @@ class StorageRegressions(unittest.TestCase):
         forged = copy.deepcopy(binding)
         forged['manifest']['execution_root'] = str(self.base)
         with self.assertRaisesRegex(ValueError, 'private cache grant'):
-            execution_storage.grants(forged)
+            execution_storage.grants(forged, projects=self.projects)
+        missing = copy.deepcopy(binding)
+        missing['objects'] = [identity for identity in missing['objects'] if not identity.startswith('cache:')]
+        with self.assertRaisesRegex(ValueError, 'private cache grant'):
+            execution_storage.grants(missing, projects=self.projects)
 
     def test_preparation_failure_after_allocation_closes_disposable_owners(self):
         with patch.object(environment_adapters, 'execution_caches', side_effect=ValueError('adapter setup failed')):
@@ -242,7 +302,7 @@ class StorageRegressions(unittest.TestCase):
     def test_private_only_adapter_guidance_needs_no_shared_pool(self):
         import session_workspace
         binding = execution_storage.prepare([dict(name='node', component='.', storage_contract=1)],
-            self.project, lane='agent', execution_id=self.identity)
+            self.project, lane='agent', execution_id=self.identity, projects=self.projects)
         guidance = session_workspace.guidance(dict(scratch_directory=str(self.base / 'scratch'), storage_binding=binding))
         self.assertIn(binding['environment']['npm_config_cache'], guidance)
         self.assertIsNone(binding['pool'])
