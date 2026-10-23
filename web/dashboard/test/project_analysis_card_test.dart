@@ -7,9 +7,522 @@ import 'package:herdr_dashboard/dashboard_bloc.dart';
 import 'package:herdr_dashboard/project_analysis_card.dart';
 import 'package:herdr_dashboard_state/project_analysis.dart';
 
+Future<void> expandSection(WidgetTester tester, String title) async {
+  await tester.ensureVisible(find.text(title));
+  if (!ExpansibleController.of(tester.element(find.text(title))).isExpanded)
+    await tester.tap(find.text(title));
+  await tester.pumpAndSettle();
+}
+
 void main() {
+  for (final manuallyClosed in [false, true]) {
+    testWidgets(
+      'later component findings open untouched repository details (closed=$manuallyClosed)',
+      (tester) async {
+        var attention = false;
+        final connection = DashboardBloc(
+          client: MockClient((request) async {
+            if (request.url.path.endsWith('/analysis'))
+              return http.Response(
+                jsonEncode({
+                  'requirements': [],
+                  'components': [
+                    {
+                      'path': '.',
+                      'requirements': [],
+                      'unresolved': [
+                        if (attention)
+                          {
+                            'what': 'Rust toolchain version',
+                            'reason': 'Version declaration missing',
+                          },
+                      ],
+                    },
+                  ],
+                }),
+                200,
+              );
+            if (request.url.path.endsWith('/environment'))
+              return http.Response(
+                jsonEncode({
+                  'project': 'repo',
+                  'revision': 'head',
+                  'plan_current': true,
+                  'plan': null,
+                  'job': null,
+                  'active_jobs': [],
+                  'prepared': {
+                    'current': true,
+                    'revision': 'head',
+                    'requirements': [],
+                    'selected_check_count': 0,
+                  },
+                }),
+                200,
+              );
+            return http.Response('{"workspaces":[],"agents":[]}', 200);
+          }),
+        );
+        BlocScope.register<DashboardBloc>(() => connection);
+        try {
+          connection.connect('token');
+          await tester.pumpAndSettle();
+          await tester.pumpWidget(
+            const MaterialApp(
+              home: Scaffold(body: ProjectAnalysisCard(path: 'repo')),
+            ),
+          );
+          await tester.pumpAndSettle();
+          await expandSection(tester, 'Project environment');
+          expect(
+            find.textContaining('Version declaration missing'),
+            findsNothing,
+          );
+          if (manuallyClosed) {
+            await expandSection(tester, 'Repository requirements');
+            await tester.tap(find.text('Repository requirements'));
+            await tester.pumpAndSettle();
+          }
+          attention = true;
+          await tester.ensureVisible(find.text('Re-analyse'));
+          await tester.tap(find.text('Re-analyse'));
+          await tester.pumpAndSettle();
+          expect(
+            find.textContaining('Repository evidence needs review'),
+            findsOneWidget,
+          );
+          expect(
+            find.textContaining('Version declaration missing'),
+            manuallyClosed ? findsNothing : findsOneWidget,
+          );
+          expect(tester.takeException(), isNull);
+        } finally {
+          await tester.pumpWidget(const SizedBox.shrink());
+          await connection.disconnect();
+          await BlocScope.reset();
+        }
+      },
+    );
+  }
+
+  testWidgets(
+    'a late status response cannot replace the newly selected project',
+    (tester) async {
+      final delayed = Completer<http.Response>();
+      http.Response status(String revision) => http.Response(
+        jsonEncode({
+          'project': revision,
+          'revision': revision,
+          'plan_current': false,
+          'prepared': {
+            'current': true,
+            'revision': revision,
+            'requirements': [],
+            'selected_checks': [],
+          },
+        }),
+        200,
+      );
+      final connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.url.path.endsWith('/environment')) {
+            return request.url.queryParameters['path'] == 'first'
+                ? delayed.future
+                : status('second-commit');
+          }
+          return http.Response(
+            '{"components":[],"requirements":[],"workspaces":[],"agents":[]}',
+            200,
+          );
+        }),
+      );
+      BlocScope.register<DashboardBloc>(() => connection);
+      connection.connect('token');
+      await tester.pumpAndSettle();
+      Widget page(String path) => MaterialApp(
+        home: Scaffold(body: ProjectAnalysisCard(path: path)),
+      );
+      await tester.pumpWidget(page('first'));
+      await tester.pumpAndSettle();
+      await tester.pumpWidget(page('second'));
+      await tester.pumpAndSettle();
+      delayed.complete(status('first-commit'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Project environment'));
+      await tester.pumpAndSettle();
+      expect(find.text('Commit: second-commit'), findsOneWidget);
+      expect(find.text('Commit: first-commit'), findsNothing);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await connection.disconnect();
+      await BlocScope.reset();
+    },
+  );
+
+  for (final state in ['ready', 'older', 'unavailable', 'queued']) {
+    testWidgets(
+      'restores saved environment ($state) without preparing or running checks',
+      (tester) async {
+        var statusReads = 0;
+        var polled = false;
+        final writes = <String>[];
+        final plan = {
+          'digest': 'saved-plan',
+          'preparation_version': 1,
+          'requirements': [
+            {
+              'capability': 'rust-toolchain',
+              'label': 'Rust toolchain',
+              'version': '1.97.1',
+              'components': ['.'],
+              'state': 'acquire',
+              'artifact': {},
+              'activation': 'available',
+            },
+          ],
+          'selected_checks': [],
+          'check_candidates': [],
+        };
+        final connection = DashboardBloc(
+          client: MockClient((request) async {
+            if (request.method == 'POST' &&
+                request.url.path.contains('/environment'))
+              writes.add(request.url.path);
+            if (request.url.path.endsWith('/environment')) {
+              if (request.url.queryParameters.containsKey('job')) {
+                polled = true;
+                return http.Response(
+                  '{"id":"saved-job","digest":"saved-plan","state":"ready"}',
+                  200,
+                );
+              }
+              statusReads++;
+              if (state == 'unavailable')
+                return http.Response('{"error":"store unavailable"}', 503);
+              return http.Response(
+                jsonEncode({
+                  'project': 'repo',
+                  'revision': 'current-commit',
+                  'plan_current': state != 'older',
+                  'plan': plan,
+                  'job': {
+                    'id': 'saved-job',
+                    'digest': 'saved-plan',
+                    'state': state == 'queued' && !polled ? 'queued' : 'ready',
+                  },
+                  'prepared': state == 'queued' && !polled
+                      ? null
+                      : {
+                          'current': state != 'older',
+                          'revision': state == 'older'
+                              ? 'old-commit'
+                              : 'current-commit',
+                          'requirements': plan['requirements'],
+                          'selected_checks': [
+                            {'id': 'test'},
+                            {'id': 'build'},
+                          ],
+                        },
+                }),
+                200,
+              );
+            }
+            if (request.url.path.endsWith('/analysis'))
+              return http.Response(
+                jsonEncode({
+                  'components': [
+                    {'path': '.', 'requirements': []},
+                  ],
+                  'requirements': [
+                    {
+                      'tool': 'rust',
+                      'label': 'Rust',
+                      'constraint': '>=1.97.1',
+                      'assessment': {
+                        'verdict': 'missing',
+                        'detail': 'No host executable.',
+                      },
+                    },
+                  ],
+                }),
+                200,
+              );
+            return http.Response('{"workspaces":[],"agents":[]}', 200);
+          }),
+        );
+        BlocScope.register<DashboardBloc>(() => connection);
+        connection.connect('token');
+        await tester.pumpAndSettle();
+        connection.operator.value = {'role': 'operator'};
+        Future<void> open() async {
+          await tester.pumpWidget(
+            const MaterialApp(
+              home: Scaffold(body: ProjectAnalysisCard(path: 'repo')),
+            ),
+          );
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('Project environment'));
+          await tester.pumpAndSettle();
+        }
+
+        await open();
+        if (state == 'queued') {
+          expect(find.text('SDK preparation queued'), findsOneWidget);
+          await tester.pump(const Duration(seconds: 2));
+          await tester.pumpAndSettle();
+        }
+        if (state == 'unavailable') {
+          expect(
+            find.textContaining('Saved environment status unavailable'),
+            findsOneWidget,
+          );
+          expect(
+            find.text('No prepared environment for this commit'),
+            findsNothing,
+          );
+        } else if (state == 'older') {
+          expect(find.text('Prepared for an earlier commit'), findsOneWidget);
+          expect(find.text('Commit: current-commit'), findsOneWidget);
+          expect(find.text('Prepared commit: old-commit'), findsOneWidget);
+          expect(find.byIcon(Icons.warning_amber_rounded), findsOneWidget);
+          expect(find.text('Prepare SDKs'), findsNothing);
+          expect(find.text('Prepared for this commit'), findsNothing);
+        } else {
+          expect(find.text('Prepared for this commit'), findsOneWidget);
+          expect(find.text('2 approved validation checks'), findsOneWidget);
+          expect(find.textContaining('Not found on host'), findsNothing);
+          if (state == 'ready')
+            expect(
+              find.textContaining('SDK preparation recorded'),
+              findsNothing,
+            );
+          expect(
+            find.text('Rust toolchain 1.97.1 · Repository root'),
+            findsOneWidget,
+          );
+          if (find
+              .textContaining('SDK preparation recorded')
+              .evaluate()
+              .isEmpty)
+            await expandSection(tester, 'Environment settings');
+          expect(
+            find.textContaining('SDK preparation recorded'),
+            findsOneWidget,
+          );
+          await tester.pumpWidget(const SizedBox.shrink());
+          await open();
+          expect(find.text('Prepared for this commit'), findsOneWidget);
+          expect(statusReads, greaterThanOrEqualTo(2));
+        }
+        await expandSection(tester, 'Host SDK discovery');
+        expect(find.textContaining('Not found on host'), findsOneWidget);
+        expect(writes, isEmpty);
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await connection.disconnect();
+        await BlocScope.reset();
+      },
+    );
+  }
+
+  for (final overridden in [false, true]) {
+    testWidgets(
+      'renders asset decision, SDK add-ons and recipe evidence (override=$overridden)',
+      (tester) async {
+        final sources = overridden
+            ? []
+            : [
+                {
+                  'path': 'assets/dev',
+                  'reason':
+                      'This heuristic can include Node servers or tools: add a Node.js override if needed.',
+                },
+              ];
+        Map<String, dynamic>? savedPlan;
+        final connection = DashboardBloc(
+          client: MockClient((request) async {
+            if (request.url.path.endsWith('/environment'))
+              return http.Response(
+                jsonEncode({
+                  'project': 'repo',
+                  'revision': 'head',
+                  'plan_current': true,
+                  'plan': savedPlan,
+                  'job': null,
+                  'active_jobs': [],
+                  'prepared': null,
+                }),
+                200,
+              );
+            if (request.url.path.endsWith('/environment/plan')) {
+              return http.Response(
+                jsonEncode(
+                  savedPlan = {
+                    'digest': 'plan',
+                    'source_components': sources,
+                    'requirements': [],
+                    'selected_checks': [],
+                    'check_candidates': [
+                      {
+                        'id': '.:build',
+                        'cwd': '.',
+                        'arguments': [
+                          'cargo',
+                          'build',
+                          '--no-default-features',
+                        ],
+                        'source': 'README#headless-cargo',
+                        'derived': true,
+                        'evidence': 'README.md',
+                      },
+                    ],
+                  },
+                ),
+                200,
+              );
+            }
+            if (request.url.path.endsWith('/analysis')) {
+              return http.Response(
+                jsonEncode({
+                  'source_components': sources,
+                  'requirements': overridden
+                      ? [
+                          {
+                            'tool': 'node',
+                            'label': 'Node.js',
+                            'components': ['assets/dev'],
+                            'override': {'constraint': '20.19.2'},
+                            'assessment': {'verdict': 'missing'},
+                          },
+                        ]
+                      : [],
+                  'components': [
+                    {
+                      'path': '.',
+                      'basis': 'manifest',
+                      'requirements': [
+                        {
+                          'tool': 'rust-toolchain',
+                          'established': true,
+                          'selection_lookup': {
+                            'components': ['rustfmt', 'clippy'],
+                          },
+                        },
+                      ],
+                    },
+                    {
+                      'path': 'assets/dev',
+                      'basis': 'inferred',
+                      'requirements': [],
+                    },
+                  ],
+                }),
+                200,
+              );
+            }
+            return http.Response('{"workspaces":[],"agents":[]}', 200);
+          }),
+        );
+        BlocScope.register<DashboardBloc>(() => connection);
+        connection.connect('token');
+        await tester.pumpAndSettle();
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: ProjectAnalysisCard(path: 'repo')),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Project environment'));
+        await tester.pumpAndSettle();
+        await expandSection(tester, 'Repository requirements');
+        expect(
+          find.textContaining('Source-only component:'),
+          overridden ? findsNothing : findsOneWidget,
+        );
+        expect(
+          find.text('Requested SDK components: rustfmt, clippy'),
+          findsOneWidget,
+        );
+        if (overridden) {
+          await expandSection(tester, 'Host SDK discovery');
+          expect(find.textContaining('· override'), findsOneWidget);
+        }
+        await tester.ensureVisible(find.text('Plan environment'));
+        await tester.tap(find.text('Plan environment'));
+        await tester.pumpAndSettle();
+        expect(find.textContaining('Evidence: README.md'), findsOneWidget);
+        expect(find.textContaining('Derived companion'), findsOneWidget);
+        if (!overridden)
+          expect(find.textContaining('Node servers or tools'), findsOneWidget);
+        expect(
+          find.textContaining('Source-only component:'),
+          overridden ? findsNothing : findsOneWidget,
+        );
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await connection.disconnect();
+        await BlocScope.reset();
+      },
+    );
+  }
+
+  test(
+    'source helpers and bundled installer notes do not overstate SDK support',
+    () {
+      expect(
+        projectInstallerSummary({'provisionable': []}),
+        contains('Plan environment'),
+      );
+      expect(
+        projectInstallerSummary({'provisionable': []}),
+        isNot(contains('must be provided on the host')),
+      );
+      final component = {'path': 'assets/dev', 'basis': 'inferred'};
+      final report = {
+        'source_components': [
+          null,
+          'invalid',
+          {
+            'path': 'assets/dev',
+            'capability': 'node',
+            'reason': 'JS/TS asset.',
+          },
+        ],
+      };
+      expect(
+        sourceComponentNotice(component, report),
+        contains('does not block'),
+      );
+      expect(sourceComponentNotice({'path': '.'}, report), isEmpty);
+      expect(
+        sourceComponentNotice(
+          component,
+          report,
+          plan: {'source_components': []},
+        ),
+        isEmpty,
+      );
+      expect(sourceComponentNotice(component, {}), isEmpty);
+      expect(
+        sourceComponentNotice(component, {
+          ...report,
+          'requirements': [
+            {
+              'tool': 'node',
+              'override': {'constraint': '20.19.2'},
+            },
+          ],
+        }, plan: report),
+        isEmpty,
+      );
+    },
+  );
+
   test('SDK readiness never claims dependency or test verification', () {
-    expect(environmentJobLabel({'state': 'ready'}), contains('have not run'));
+    expect(
+      environmentJobLabel({'state': 'ready'}),
+      contains('recorded separately'),
+    );
     expect(
       environmentPlanCanPrepare({
         'preparation_version': 1,
@@ -184,7 +697,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Discovered requirements'));
+    await tester.tap(find.text('Project environment'));
     await tester.pumpAndSettle();
     expect(
       find.textContaining('Evidence: global.json#sdk.version'),
@@ -192,8 +705,9 @@ void main() {
     );
     expect(find.textContaining('SDK lookup: Api'), findsOneWidget);
     expect(find.textContaining('partial scan'), findsOneWidget);
-    expect(find.text('Host readiness'), findsOneWidget);
-    expect(find.textContaining('· missing'), findsOneWidget);
+    expect(find.text('Host SDK discovery'), findsOneWidget);
+    await expandSection(tester, 'Host SDK discovery');
+    expect(find.textContaining('· Not found on host'), findsOneWidget);
     expect(find.textContaining('Component: Api'), findsOneWidget);
     expect(
       find.textContaining('Installed — required version unknown'),
@@ -210,7 +724,7 @@ void main() {
     );
     expect(
       find.textContaining(
-        'No requirement of this project is installable by this release',
+        'No matching SDK is in the bundled installer catalog',
       ),
       findsOneWidget,
     );
@@ -273,7 +787,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Discovered requirements'));
+    await tester.tap(find.text('Project environment'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Add override'));
     await tester.pumpAndSettle();

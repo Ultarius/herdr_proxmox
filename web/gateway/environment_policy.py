@@ -51,6 +51,21 @@ def tree(root, revision):
     return entries
 
 
+def declarations(entries, names):
+    """Fingerprint protected committed inputs, refusing absent/unsafe evidence."""
+    result = {}
+    for name in sorted(set(names)):
+        entry = entries.get(name)
+        if entry is None:
+            raise ValueError('A protected project declaration is missing from the committed tree: ' + name)
+        if entry['kind'] != 'blob' or entry['mode'] not in ('100644', '100755'):
+            raise ValueError('A protected project declaration is not a committed regular file: ' + name)
+        if entry['size'] > project_requirements.MAX_MANIFEST_BYTES:
+            raise ValueError('A protected project declaration or recipe evidence exceeds the 256 KiB limit: ' + name)
+        result[name] = entry['blob']
+    return result
+
+
 class EnvironmentPolicies:
     def __init__(self, projects, store):
         self.projects = Path(projects).resolve()
@@ -82,7 +97,7 @@ class EnvironmentPolicies:
         if (report.get('coverage', {}).get('truncated')
                 or any(item.get('what') == 'component list' for item in report.get('unresolved', []))):
             raise ValueError('Project discovery was truncated; approval requires complete evidence.')
-        legacy = toolchain_policy.resolve_legacy_committed(root)
+        legacy = toolchain_policy.resolve_legacy_committed(root, revision=revision)
         unknown = [item['reason'] for item in report.get('unresolved', [])
                    if item.get('what') in ('unregistered manifests', 'components')]
         submodules = [name for name, entry in entries.items() if entry['kind'] == 'commit']
@@ -127,17 +142,10 @@ class EnvironmentPolicies:
                      or Path(name).name.lower() == 'nuget.config'
                      or name.endswith(('.cargo/config', '.cargo/config.toml', '.config/dotnet-tools.json'))]
         protected = sorted(set(protected) | {name for entry in policy['toolchains']
-            for name in entry.get('protected_inputs', [])})
-        policy['declarations'] = {}
-        for name in protected:
-            entry = entries.get(name)
-            if entry is None:
-                raise ValueError('A protected project declaration is missing from the committed tree: ' + name)
-            if entry['kind'] != 'blob' or entry['mode'] not in ('100644', '100755'):
-                raise ValueError('A protected project declaration is not a committed regular file: ' + name)
-            if entry['size'] > project_requirements.MAX_MANIFEST_BYTES:
-                raise ValueError('A protected project declaration exceeds the manifest size limit: ' + name)
-            policy['declarations'][name] = entry['blob']
+            for name in entry.get('protected_inputs', [])}
+            | {recipe['evidence'].split('#')[0] for recipe in policy.get('recipes', [])
+               if recipe.get('evidence')})
+        policy['declarations'] = declarations(entries, protected)
         policy['lockfiles'] = legacy['lockfiles']
         policy['checks'] = legacy['checks']
         executable_recipes = []

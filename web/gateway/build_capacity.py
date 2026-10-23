@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -17,6 +18,67 @@ import uuid
 
 GIB = 1024 ** 3
 CARGO_HEAVY = {'build', 'test', 'check', 'clippy', 'bench', 'run', 'doc', 'rustc', 'rustdoc', 'install', 'fix'}
+
+
+@contextmanager
+def storage_leases(environment):
+    """Process-held leases outlive job-state changes and inherited pane exits."""
+    encoded = (environment or {}).get('HERDR_STORAGE_LEASES') or '[]'
+    if len(encoded) > 16384:
+        raise ValueError('Storage lease metadata exceeds its limit.')
+    paths = json.loads(encoded)
+    if not isinstance(paths, list) or len(paths) > 16 or any(not isinstance(path, str) for path in paths):
+        raise ValueError('Invalid storage lease metadata.')
+    descriptors = []
+    try:
+        for value in dict.fromkeys(paths):
+            path = Path(value)
+            if not path.is_absolute() or '..' in path.parts:
+                raise ValueError('A storage lease requires an exact absolute path.')
+            for parent in (path, *path.parents):
+                info = parent.lstat()
+                if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                    raise ValueError('Storage lease paths must not be linked.')
+            fd = os.open(path, os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0))
+            descriptors.append(fd)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError('Storage leases require regular control files.')
+            if os.name == 'nt':
+                if not _lock(fd):
+                    raise ValueError('Managed storage is busy.')
+            else:
+                import fcntl
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise ValueError('Managed storage is busy.') from None
+        yield tuple(descriptors)
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+def start_process(arguments, *, env, **options):
+    """Attach storage leases to the real child and all cooperating descendants."""
+    context = storage_leases(env)
+    descriptors = context.__enter__()
+    try:
+        if os.name != 'nt':
+            options['pass_fds'] = tuple(dict.fromkeys([*options.get('pass_fds', ()), *descriptors]))
+        process = subprocess.Popen(arguments, env=env, **options)
+    except BaseException:
+        context.__exit__(*sys.exc_info())
+        raise
+    process.herdr_storage_context = context
+    return process
+
+
+def release_process_storage(process):
+    context = getattr(process, 'herdr_storage_context', None)
+    if context is not None:
+        process.herdr_storage_context = None
+        context.__exit__(None, None, None)
 
 
 def root():
@@ -46,6 +108,69 @@ def storage_status(path=None, minimum_free=2 * GIB):
                     blocked=blocked, reason=reason)
     except OSError:
         return dict(available=False, blocked=False, reason='Storage measurements unavailable.')
+
+
+class StorageLimitExceeded(ValueError):
+    """A running check stopped without certifying success."""
+
+
+def output_size(directory, limit):
+    """Bounded, non-following scan of a registered generated-output root."""
+    total, count, seen = 0, 0, set()
+    for parent, directories, files in os.walk(directory, followlinks=False):
+        directories[:] = [name for name in directories if not Path(parent, name).is_symlink()]
+        for name in files:
+            path = Path(parent, name)
+            info = path.lstat()
+            identity = (info.st_dev, info.st_ino)
+            if stat.S_ISREG(info.st_mode) and identity not in seen:
+                seen.add(identity)
+                total += info.st_blocks * 512 if hasattr(info, 'st_blocks') else info.st_size
+            count += 1
+            if total > limit or count > 500000:
+                return max(total, limit + 1)
+    return total
+
+
+def wait_for_process(process, *, timeout=None, storage=None, environment=None, interval=1):
+    """Watch cheap free-space signals; bound managed output every ten seconds.
+
+    The caller owns termination of its process group. An unavailable measurement
+    stops this build rather than repeatedly writing into an unknown filesystem.
+    This is a cooperative limit, not a filesystem quota.
+    """
+    environment = os.environ if environment is None else environment
+    directory = environment.get('HERDR_BUILD_OUTPUT_ROOT')
+    limit = int(environment.get('HERDR_BUILD_OUTPUT_LIMIT_BYTES') or 0)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    next_size = 0
+    while process.poll() is None:
+        managed = environment.get('HERDR_BUILD_STORAGE_ROOT')
+        # Tools may clean/recreate their data directory. Its owned parent is
+        # stable and measures the same filesystem without treating clean as a
+        # lost store. The data directory itself still supplies output bytes.
+        for path in dict.fromkeys([storage, *([Path(directory).parent] if directory else []), *([managed] if managed else [])]):
+            status = storage_status(path)
+            if status.get('blocked') or not status.get('available'):
+                raise StorageLimitExceeded(status['reason'] + ' Build stopped; source and receipts were preserved.')
+        now = time.monotonic()
+        if directory and limit and now >= next_size:
+            try:
+                size = output_size(directory, limit)
+            except FileNotFoundError:
+                size = 0
+            if size > limit:
+                raise StorageLimitExceeded('Managed build output exceeded its ' + str(limit // (1024 ** 2)) +
+                    ' MiB budget. Build stopped; inspect storage before retrying.')
+            next_size = now + 10
+        remaining = None if deadline is None else deadline - now
+        if remaining is not None and remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        try:
+            return process.wait(timeout=min(interval, remaining) if remaining is not None else interval)
+        except subprocess.TimeoutExpired:
+            pass
+    return process.returncode
 
 
 def budget(proc='/proc', cgroup='/sys/fs/cgroup', *, storage=None):
@@ -184,6 +309,20 @@ def _lock(descriptor, blocking=False):
         return True
     except BlockingIOError:
         return False
+
+
+@contextmanager
+def try_idle(directory=None):
+    """Maintenance never waits behind or runs alongside a cooperating build."""
+    directory = Path(directory) if directory is not None else root()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if directory.is_symlink():
+        raise ValueError('Build capacity directory must not be a symlink.')
+    descriptor = _open(directory / 'lane.lock')
+    try:
+        yield _lock(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _tickets(directory, *, prune=True):
@@ -370,6 +509,12 @@ def main(arguments):
         raise ValueError('No Cargo executable is available behind the managed wrapper; prepare the project SDK.')
     options = arguments[:arguments.index('--') if '--' in arguments else len(arguments)]
     if any(item in ('--help', '-h', '--version', '-V') for item in options) or not any(item in CARGO_HEAVY for item in options):
+        if os.environ.get('HERDR_STORAGE_LEASES'):
+            process = start_process([executable, *arguments], env=dict(os.environ))
+            try:
+                return process.wait()
+            finally:
+                release_process_storage(process)
         os.execv(executable, [executable, *arguments])
     def status(data):
         if data['state'] == 'waiting':
@@ -378,14 +523,25 @@ def main(arguments):
             print(f"Herdr build running: {data['compiler_jobs']} compiler job(s), 1 test thread.", file=sys.stderr, flush=True)
     with claim('cargo', directory=directory, changed=status) as lease:
         forwarded = cargo_arguments(arguments, lease['budget']['compiler_jobs'])
-        process = subprocess.Popen([executable, *forwarded], env=dict(os.environ, **cargo_variables(lease)),
+        environment = dict(os.environ, **cargo_variables(lease))
+        process = start_process([executable, *forwarded], env=environment,
+                                   start_new_session=os.name != 'nt',
                                    **({'pass_fds': (lease['fd'],)} if os.name != 'nt' else {}))
         try:
-            return process.wait()
+            return wait_for_process(process, storage=Path.cwd(), environment=environment)
         except BaseException:
-            process.terminate()
+            if os.name != 'nt':
+                import signal
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
             process.wait()
             raise
+        finally:
+            release_process_storage(process)
 
 
 if __name__ == '__main__':

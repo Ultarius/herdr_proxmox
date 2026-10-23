@@ -4,12 +4,14 @@ import time
 
 ACTOR = 'automatic_task_delivery'
 MAX_VALIDATION_REPAIRS = 2
+ACTIVE_INSPECTIONS = ('queued', 'running', 'waiting_for_input')
 
 
 def history_entry(flow, **transition):
     """Review facts and a chat audit pointer, never a replayable execution payload."""
     fields = ('sha', 'state', 'error', 'agent_report', 'failure_stage', 'chat_id',
-              'superseded_by', 'superseded_at')
+              'superseded_by', 'superseded_at', 'validation', 'superseded_by_validation',
+              'previous_inspection_error', 'revalidation_wait')
     record = {key: flow[key] for key in fields if key in flow}
     if 'error' in record:
         record['error'] = str(record['error'])[:2000]
@@ -31,6 +33,122 @@ def pending(task):
     return (flow.get('state') != 'complete' or flow.get('sha') != task.get('head_sha')
             or evidence.get('target') != task.get('head_sha') or evidence.get('state') != 'complete'
             or evidence.get('required_checks_verified') is not True)
+
+
+def inspected_validation(flow):
+    """Read the frozen inspection identity, including pre-binding gateway jobs."""
+    value = flow.get('validation')
+    if not isinstance(value, dict):
+        # Legacy packets include checks, unlike the new compact binding. Normalize
+        # only identity fields; never treat either shape as executable evidence.
+        try:
+            packet = json.loads((flow.get('feedback_prompt') or '').rsplit('Evidence: ', 1)[1])
+            value = packet.get('validation') if packet.get('sha') == flow.get('sha') else None
+        except (IndexError, ValueError, AttributeError, TypeError):
+            value = None
+    return {key: value[key] for key in ('run_id', 'state', 'plan_digest', 'policy_digest', 'required_checks_verified')
+            if key in value} if isinstance(value, dict) else {}
+
+
+def migrate_inspected_validation(service, task, flow):
+    """Recover a legacy identity once; this never approves or executes checks."""
+    from validation import RUN_ID
+    if (isinstance(flow.get('validation'), dict) or not flow.get('sha')
+            or flow['sha'] != task.get('head_sha')):
+        return
+    identity = inspected_validation(flow)
+    if (not isinstance(identity.get('run_id'), str) or not RUN_ID.fullmatch(identity['run_id'])
+            or identity.get('state') not in ('queued', 'running', 'complete', 'failed', 'error', 'interrupted', 'cancelled')):
+        return
+    flow['validation'] = identity
+    service.save(task, 'delivery_validation_migrated', ACTOR)
+
+
+def inspection_request_id(task, flow):
+    return 'delivery-' + task['id'] + '-' + flow['sha'][:12] + '-' + str(flow.get('attempt', 0))
+
+
+def inspection_job(service, task, flow):
+    if flow.get('chat_id'):
+        try:
+            return service.store.job_record(flow['chat_id'])
+        except ValueError:
+            return dict(id=flow['chat_id'], state='unavailable')
+    if flow.get('feedback_prompt') and flow.get('sha'):
+        return service.store.job_for_request(inspection_request_id(task, flow))
+    return None
+
+
+def check_inspection_retry(service, task):
+    """Mutation-time guard: a cached attention banner cannot authorize parallel chats."""
+    flow = task.get('delivery_workflow') or {}
+    if flow.get('state') != 'attention':
+        raise ValueError('Only a delivery needing attention can be retried.')
+    reply = inspection_job(service, task, flow) or {}
+    if reply.get('state') in ACTIVE_INSPECTIONS:
+        raise ValueError('The previous delivery inspection is still active. Wait for it to finish before retrying.')
+
+
+def refresh_failed_inspection(service, task, flow):
+    """New passing evidence supersedes a settled failure, never uncertain input."""
+    from contributions import stamp
+    head = task.get('head_sha')
+    evidence = task.get('builds', {}).get(head, {})
+    if (flow.get('sha') != head or flow.get('result_kind') != 'validation_failed'
+            or flow.get('state') not in ('attention', 'waiting_agent', 'notifying_agent')):
+        return None
+    previous = inspected_validation(flow)
+    if (previous.get('state') not in ('failed', 'error', 'interrupted', 'cancelled', 'complete')
+            or (previous.get('state') == 'complete' and previous.get('required_checks_verified') is True)
+            or not previous.get('run_id') or not evidence.get('run_id')
+            or previous['run_id'] == evidence['run_id'] or evidence.get('target') != head
+            or evidence.get('state') != 'complete' or evidence.get('required_checks_verified') is not True
+            or not service.policy_matches(task, evidence)):
+        return None
+    reply = inspection_job(service, task, flow) or {}
+    if not flow.get('chat_id') and reply.get('id'):
+        flow['chat_id'] = reply['id']  # Recover the committed enqueue after a crash.
+        if (reply.get('kind') == 'chat' and reply.get('organization_id') == task.get('organization_id')
+                and reply.get('profile_id') == task.get('profile_id') and reply.get('runs')
+                and reply['runs'][0].get('id') == task.get('run_id')):
+            service.store.update_job(reply['id'], task_id=task['id'], delivery_inspection=True)
+    never_submitted = not reply and not flow.get('chat_id') and bool(flow.get('feedback_prompt'))
+    settled = (reply.get('state') == 'answered' and (reply.get('delivery') or {}).get('stage') == 'reply_verified'
+               and reply.get('runs') and reply['runs'][0].get('id') == task.get('run_id'))
+    try:
+        report = json.loads(reply.get('result') or '{}')
+        if settled and isinstance(report, dict) and report.get('outcome') == 'repaired':
+            return None  # Existing repair acceptance owns any newly committed work.
+        settled = (settled and isinstance(report, dict) and report.get('sha') == head
+                   and report.get('outcome') in ('reviewed', 'needs_attention')
+                   and isinstance(report.get('summary'), str) and 1 <= len(report['summary'].strip()) <= 2000)
+    except (ValueError, TypeError):
+        settled = False
+    if not settled and not never_submitted:
+        active = reply.get('state') in ACTIVE_INSPECTIONS
+        waiting = dict(previous_run_id=previous['run_id'], run_id=evidence['run_id'],
+                       chat_id=flow.get('chat_id'), inspection_pending=active)
+        if active:
+            remedy = 'Wait for the existing inspection to finish; resolve its console prompt if needed.'
+        elif reply.get('state') == 'unavailable' or not reply:
+            remedy = 'The previous inspection job is unavailable. Inspect the original session, then choose Retry verification and delivery inspection to request a fresh inspection.'
+        else:
+            remedy = 'Inspect or recover its saved chat reply, then choose Retry verification and delivery inspection.'
+        message = ('Validation run ' + evidence['run_id'] + ' passed. The previous delivery inspection used failed run '
+                   + previous['run_id'] + '. ' + remedy)
+        state = 'waiting_agent' if active else 'attention'
+        if flow.get('revalidation_wait') != waiting or flow.get('error') != message or flow.get('state') != state:
+            flow.setdefault('previous_inspection_error', str(flow.get('error') or '')[:2000])
+            flow.update(revalidation_wait=waiting, error=message, state=state)
+            service.save(task, 'delivery_revalidation_waiting', ACTOR)
+        return 'waiting'
+    history = [history_entry(entry) for entry in (task.get('delivery_history') or [])[-4:]]
+    history.append(history_entry(dict(flow, validation=previous), superseded_by_validation=evidence['run_id'], superseded_at=stamp()))
+    task['delivery_history'] = history
+    task['delivery_workflow'] = dict(sha=head, state='waiting_verification', started_at=stamp(),
+                                    attempt=flow.get('attempt', 0) + 1)
+    service.save(task, 'delivery_revalidated', ACTOR)
+    return 'refreshed'
 
 
 def advance(service, task_ids=None):
@@ -98,6 +216,24 @@ def reconcile(service, task):
         flow = dict(sha=head, state='waiting_verification', attempt=0, started_at=stamp())
         task['delivery_workflow'] = flow
         service.save(task, 'delivery_superseded', ACTOR)
+    migrate_inspected_validation(service, task, flow)
+    revalidation = refresh_failed_inspection(service, task, flow)
+    if revalidation == 'waiting':
+        return
+    if revalidation == 'refreshed':
+        flow = task['delivery_workflow']
+    if (flow.get('state') == 'attention' and flow.get('result_kind') == 'success'
+            and not flow.get('inspection_verified') and flow.get('sha') == head and flow.get('chat_id')):
+        reply = inspection_job(service, task, flow) or {}
+        recovered_at = reply.get('recovered_at')
+        if (reply.get('state') == 'answered' and (reply.get('delivery') or {}).get('stage') == 'reply_verified'
+                and (reply.get('delivery') or {}).get('recovered') is True and recovered_at
+                and flow.get('recovered_inspection_at') != recovered_at
+                and reply.get('runs') and reply['runs'][0].get('id') == task.get('run_id')):
+            # Explicit reply recovery is permission to re-read this inspection,
+            # not to declare delivery complete. All checks below still apply.
+            flow.update(state='waiting_agent', recovered_inspection_at=recovered_at)
+            service.save(task, 'delivery_inspection_recovered', ACTOR)
     if flow.get('state') == 'attention':
         if flow.get('notification_pending') and flow.get('notification_retry_after', 0) <= time.time():
             notify_agent(service, task, flow)
@@ -239,6 +375,7 @@ def notify_agent(service, task, flow):
     evidence = task.get('builds', {}).get(head, {})
     verified = evidence.get('target') == head and evidence.get('required_checks_verified') is True and evidence.get('state') == 'complete'
     if 'feedback_prompt' not in flow:
+        flow['validation'] = {key: evidence.get(key) for key in ('run_id', 'state', 'plan_digest', 'policy_digest', 'required_checks_verified')}
         can_repair = repair_allowed(task, flow)
         flow['repair_allowed'] = can_repair
         packet = dict(sha=head, validation=dict(state=evidence.get('state'),
@@ -275,7 +412,7 @@ def notify_agent(service, task, flow):
     job = service.store.action('chat', dict(organization_id=task['organization_id'], profile_id=task['profile_id'],
                                expected_run_id=run['id'],
                                prompt=flow['feedback_prompt'], wait_seconds=600,
-                               request_id='delivery-' + task['id'] + '-' + head[:12] + '-' + str(flow.get('attempt', 0))))
+                               request_id=inspection_request_id(task, flow)))
     service.store.update_job(job['id'], task_id=task['id'], delivery_inspection=True)
     flow.pop('notification_pending', None)
     flow.pop('notification_error', None)

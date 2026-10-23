@@ -40,6 +40,33 @@ inspect their destination and resave the task's Automation settings to establish
 the validation reservation and publication authorization. If delivery already
 needs attention, use the explicit delivery retry after fixing its cause.
 
+Delivery inspections bind to a validation run as well as the candidate SHA.
+When a new run passes for the same candidate under the current approved policy,
+a verified, settled inspection of the old failed run is retained in history and
+replaced with an inspection of the passing evidence. The agent must acknowledge
+the new evidence before handoff; the build alone never releases its session.
+This does not retry a build, reset publication errors or grant publication.
+
+If the previous chat is still running or its delivery is uncertain, Herdr keeps
+the handoff blocked and states which failed and passing runs are involved.
+An old permission error is historical evidence, not a current status probe.
+Queued/running chats and chats waiting for input remain `waiting_agent`; resolve
+their console prompt if necessary and wait. Retry is disabled while that chat is
+active, and the gateway checks the durable job again before accepting a retry.
+An uncertain or invalid reply becomes `attention`: inspect or recover the saved
+reply in Org chart → Chat, then choose **Retry verification and delivery
+inspection** in the task Overview. If the job is unavailable, inspect the original
+session and request a fresh inspection with that action. An already passing build
+is reused. A legacy inspection without a recorded validation-run identity also
+needs explicit recovery.
+
+A crash after prompt preparation is recovered from the atomic organization
+request receipt: an existing chat is read by its recorded ID; a request that never
+committed can be replaced with the passing evidence before any prompt is sent.
+The old error and wait identities remain in bounded history. Cancelled and legacy
+unverified-complete failure inspections can also be superseded by a new verified
+pass; a verified successful inspection is not treated as a failed one.
+
 The timeline is a bounded view of actual Git history, not a pipeline diagram. Green requires a completed build with required checks verified. Red indicates build failure. Other nodes have no verified pass. Missing edges outside the captured history are not invented. Legacy candidates need recapture to load parent data. Tree equality with the last fetched configured base is informational: it does not prove publication, deployment or independent validation.
 
 ## Completion receipt

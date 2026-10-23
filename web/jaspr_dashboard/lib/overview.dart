@@ -6,6 +6,7 @@ import 'ui.dart';
 import 'services.dart';
 import 'navigation.dart';
 import 'repository_connections.dart';
+import 'storage_panel.dart';
 import 'package:herdr_dashboard_state/repository_connections.dart';
 
 String agentName(Map<String, dynamic> agent) =>
@@ -102,20 +103,35 @@ String _consoleHref(Map<String, dynamic> agent) =>
     '#/agents/${Uri.encodeComponent('${agent['profile_id']}')}';
 
 /// Native disclosure in the template card look: tile, title, meta, chevron.
-Component _disclosureSummary(String iconName, String title, String meta) =>
-    el('summary', [
-      el(
-        'span',
-        [icon(iconName)],
-        classes: 'icon-tile icon-tile--sm',
-        attributes: {'aria-hidden': 'true'},
-      ),
-      el('span', [
-        _text('overview-disclosure__title', title),
-        _text('overview-disclosure__meta', meta),
-      ], classes: 'overview-disclosure__text'),
-      icon('chevron-down', classes: 'disclosure-chevron'),
-    ], classes: 'overview-disclosure__summary disclosure-summary');
+Component _disclosureSummary(
+  String iconName,
+  String title,
+  String meta, {
+  void Function()? onToggle,
+}) => el(
+  'summary',
+  [
+    el(
+      'span',
+      [icon(iconName)],
+      classes: 'icon-tile icon-tile--sm',
+      attributes: {'aria-hidden': 'true'},
+    ),
+    el('span', [
+      _text('overview-disclosure__title', title),
+      _text('overview-disclosure__meta', meta),
+    ], classes: 'overview-disclosure__text'),
+    icon('chevron-down', classes: 'disclosure-chevron'),
+  ],
+  classes: 'overview-disclosure__summary disclosure-summary',
+  events: {
+    if (onToggle != null)
+      'click': (event) {
+        event.preventDefault();
+        onToggle();
+      },
+  },
+);
 
 class OverviewPage extends StatefulComponent {
   const OverviewPage({this.agentsOnly = false, super.key});
@@ -729,13 +745,15 @@ class _OverviewPageState extends State<OverviewPage> {
     ],
   );
 
-  Component _projectForm(DashboardState state) => el(
-    'details',
+  Component _projectForm(DashboardState state) => disclosureElement(
     [
       _disclosureSummary(
         'folder-plus',
         'Add a project or workspace',
         'Create a workspace for a project directory, or clone a repository first',
+        onToggle: () {
+          if (mounted) setState(() => creating = !creating);
+        },
       ),
       el(
         'div',
@@ -788,7 +806,15 @@ class _OverviewPageState extends State<OverviewPage> {
       ),
     ],
     classes: 'card overview-disclosure',
-    attributes: {'id': 'overview-project-form', if (creating) 'open': ''},
+    attributes: {'id': 'overview-project-form'},
+    open: creating,
+    events: {
+      'toggle': (event) {
+        if (!mounted || event.target != event.currentTarget) return;
+        final value = (event.currentTarget as web.HTMLDetailsElement).open;
+        if (value != creating) setState(() => creating = value);
+      },
+    },
   );
 
   /// "Tuesday, 13 October" without pulling in a date-formatting package.
@@ -1222,6 +1248,7 @@ class _SystemHealthState extends State<SystemHealth> {
           ], classes: 'health'),
           processes(d['processes'] as List? ?? []),
         ],
+        const StoragePanel(key: ValueKey('managed-storage')),
       ],
       iconName: 'cpu',
       classes: 'overview-grid__wide overview-health',

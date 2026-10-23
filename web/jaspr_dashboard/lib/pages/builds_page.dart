@@ -547,6 +547,7 @@ class _BuildsState extends OperationsState<BuildsPage> {
                     rail(run['state']),
                     _card(run, newest: index == newest),
                   ],
+                  key: ValueKey('build-${run['id']}'),
                   classes: 'build-entry',
                   attributes: {
                     'data-status': '${run['state']}',

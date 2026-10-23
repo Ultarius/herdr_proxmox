@@ -16,8 +16,11 @@ class _RepositoryConnectionsPanelState
     extends State<RepositoryConnectionsPanel> {
   final label = TextEditingController(),
       repository = TextEditingController(),
+      token = TextEditingController(),
+      replacementToken = TextEditingController(),
       folder = TextEditingController();
   String kind = 'ssh';
+  String? rotatingId;
   late final RepositoryConnectionsController controller;
   List<Map<String, dynamic>> get connections => controller.connections;
   List<Map<String, dynamic>> get bindings => controller.bindings;
@@ -29,6 +32,11 @@ class _RepositoryConnectionsPanelState
     super.initState();
     controller = RepositoryConnectionsController(
       BlocScope.get<DashboardBloc>(),
+      onReset: () {
+        token.clear();
+        replacementToken.clear();
+        rotatingId = null;
+      },
       onUpdate: () {
         if (mounted) setState(() {});
       },
@@ -43,6 +51,8 @@ class _RepositoryConnectionsPanelState
     controller.dispose();
     label.dispose();
     repository.dispose();
+    token.dispose();
+    replacementToken.dispose();
     folder.dispose();
     super.dispose();
   }
@@ -51,6 +61,34 @@ class _RepositoryConnectionsPanelState
   Future<void> action(String action, Map<String, dynamic> body) =>
       controller.action(action, body);
   String url(Map item) => repositoryConnectionUrl(item);
+  Future<void> createConnection() async {
+    final secret = token.text;
+    final saved = await controller.action('create', {
+      'label': label.text.trim(),
+      'repository': repository.text.trim(),
+      'kind': kind,
+      if (kind == 'token') 'token': secret.trim(),
+    });
+    if (mounted && saved && token.text == secret) token.clear();
+  }
+
+  Future<void> rotateToken(String id) async {
+    final secret = replacementToken.text;
+    final saved = await controller.action('rotate', {
+      'id': id,
+      'token': secret.trim(),
+    });
+    if (mounted &&
+        saved &&
+        rotatingId == id &&
+        replacementToken.text == secret) {
+      setState(() {
+        replacementToken.clear();
+        rotatingId = null;
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) => !controller.canManage
       ? const SizedBox.shrink()
@@ -64,7 +102,7 @@ class _RepositoryConnectionsPanelState
               child: const Text('Refresh connections'),
             ),
             const Text(
-              'Repository-specific GitHub access. Private keys remain in the container. These are separate from keys used to log into the container.',
+              'Use a repository-specific SSH key, a fine-grained GitHub token, or the configured GitHub account. Credentials remain in the container. These are separate from keys used to log into the container.',
             ),
             TextField(
               key: const PageStorageKey('repository-connection-name'),
@@ -85,25 +123,44 @@ class _RepositoryConnectionsPanelState
               items: const [
                 DropdownMenuItem(value: 'ssh', child: Text('SSH deploy key')),
                 DropdownMenuItem(
+                  value: 'token',
+                  child: Text(repositoryTokenLabel),
+                ),
+                DropdownMenuItem(
                   value: 'github',
                   child: Text('Configured GitHub account (HTTPS)'),
                 ),
               ],
-              onChanged: busy ? null : (value) => setState(() => kind = value!),
-            ),
-            FilledButton(
-              onPressed: busy
+              onChanged: busy
                   ? null
-                  : () => action('create', {
-                      'label': label.text.trim(),
-                      'repository': repository.text.trim(),
-                      'kind': kind,
+                  : (value) => setState(() {
+                      kind = value!;
+                      token.clear();
                     }),
-              child: Text(
-                kind == 'ssh'
-                    ? 'Create SSH connection'
-                    : 'Create GitHub connection',
+            ),
+            if (kind == 'token') ...[
+              const Text(repositoryTokenGuidance),
+              TextButton(
+                onPressed: () =>
+                    openExternalLink(Uri.parse(repositoryTokenUrl)),
+                child: const Text('Create a fine-grained token on GitHub'),
               ),
+              TextField(
+                key: const PageStorageKey('repository-connection-token'),
+                controller: token,
+                enabled: !busy,
+                obscureText: true,
+                autofillHints: null,
+                enableSuggestions: false,
+                autocorrect: false,
+                decoration: const InputDecoration(
+                  labelText: 'GitHub personal access token',
+                ),
+              ),
+            ],
+            FilledButton(
+              onPressed: busy ? null : createConnection,
+              child: Text(repositoryCreateLabel(kind)),
             ),
             TextField(
               key: const PageStorageKey('repository-connection-folder'),
@@ -194,6 +251,52 @@ class _RepositoryConnectionsPanelState
                         ),
                     ],
                     if (item['error'] != null) Text('${item['error']}'),
+                    if (item['kind'] == 'token') ...[
+                      TextButton(
+                        onPressed: busy
+                            ? null
+                            : () => setState(() {
+                                rotatingId = '${item['id']}';
+                                replacementToken.clear();
+                              }),
+                        child: const Text('Rotate token'),
+                      ),
+                      if (rotatingId == item['id']) ...[
+                        const Text(
+                          'Replace the saved token without changing project assignments. Test access afterward; revoke the old token on GitHub separately.',
+                        ),
+                        TextField(
+                          key: PageStorageKey(
+                            'repository-token-rotation-${item['id']}',
+                          ),
+                          controller: replacementToken,
+                          enabled: !busy,
+                          obscureText: true,
+                          autofillHints: null,
+                          enableSuggestions: false,
+                          autocorrect: false,
+                          decoration: const InputDecoration(
+                            labelText:
+                                'Replacement GitHub personal access token',
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: busy
+                              ? null
+                              : () => rotateToken('${item['id']}'),
+                          child: const Text('Save replacement token'),
+                        ),
+                        TextButton(
+                          onPressed: busy
+                              ? null
+                              : () => setState(() {
+                                  rotatingId = null;
+                                  replacementToken.clear();
+                                }),
+                          child: const Text('Cancel token rotation'),
+                        ),
+                      ],
+                    ],
                     Wrap(
                       spacing: 8,
                       children: [
@@ -231,7 +334,7 @@ class _RepositoryConnectionsPanelState
                     ),
                     if (controller.pendingRemoval == item['id']) ...[
                       const Text(
-                        'Delete this connection and its local key files? Revoke its deploy key on GitHub separately.',
+                        'Delete this connection and its local credentials? Revoke its deploy key or token on GitHub separately.',
                       ),
                       Wrap(
                         children: [

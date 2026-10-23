@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:herdr_dashboard_state/task_execution.dart';
+import 'package:herdr_dashboard_state/task_validation_environment.dart';
 import 'native_task_ui.dart';
 import '../navigation.dart';
 import '../services.dart';
@@ -268,6 +269,54 @@ class _TasksPageState extends State<TasksPage> {
     } catch (e) {
       if (mounted && epoch == connection.generation)
         setState(() => readError = '$e');
+    }
+  }
+
+  Future<void> reviewTaskEnvironment(Map<String, dynamic> task) async {
+    if (busy || !admin) return;
+    final epoch = connection.generation;
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      final review = await reviewValidationEnvironment(
+        connection.request,
+        '${task['id']}',
+        'task-${requestId()}',
+      );
+      if (!mounted || epoch != connection.generation) return;
+      setState(() => busy = false);
+      final approved = await showDialog<bool>(
+        context: context,
+        builder: (dialog) => AlertDialog(
+          title: const Text('Review validation environment'),
+          content: SingleChildScrollView(
+            child: SelectableText(validationEnvironmentReviewText(review)),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialog, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialog, true),
+              child: const Text('Approve for this candidate'),
+            ),
+          ],
+        ),
+      );
+      if (approved == true && mounted && epoch == connection.generation) {
+        await act(
+          'validation_environment',
+          validationEnvironmentApproval(review),
+        );
+      }
+    } catch (e) {
+      if (mounted && epoch == connection.generation)
+        setState(() => error = '$e');
+    } finally {
+      if (mounted) setState(() => busy = false);
     }
   }
 
@@ -2842,7 +2891,11 @@ class _TasksPageState extends State<TasksPage> {
                     if (task['delivery_workflow']['state'] == 'attention')
                       TextButton(
                         onPressed:
-                            admin && !busy && task['auto_validate'] == true
+                            admin &&
+                                !busy &&
+                                task['auto_validate'] == true &&
+                                task['delivery_workflow']['revalidation_wait']?['inspection_pending'] !=
+                                    true
                             ? () => act('policy', {
                                 'task_id': task['id'],
                                 'auto_capture': taskAutoCapture(task),
@@ -3071,6 +3124,23 @@ class _TasksPageState extends State<TasksPage> {
               _actions(task),
             ],
             if (section == 'Checks & builds') ...[
+              if (task['validation_environment_status'] case {
+                'state': 'unavailable',
+                'reason': final String reason,
+              })
+                Text(reason),
+              if (hasApprovedValidationEnvironment(task))
+                const Text(
+                  'Validation environment approved for this candidate.',
+                ),
+              if (needsValidationEnvironmentReview(task))
+                OutlinedButton.icon(
+                  onPressed: admin && !busy
+                      ? () => reviewTaskEnvironment(task)
+                      : null,
+                  icon: const Icon('fact_check'),
+                  label: const Text('Review validation environment'),
+                ),
               ui.card(
                 'Validation evidence',
                 iconName: 'circle-check',

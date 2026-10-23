@@ -10,6 +10,7 @@ import unittest
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 import uuid
+from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -19,6 +20,47 @@ spec.loader.exec_module(gateway)
 
 
 class OrganizationTests(unittest.TestCase):
+    def test_delivery_transitions_survive_repeated_failures_recovery_and_reload(self):
+        from organizations import MAX_DELIVERY_TRANSITIONS
+        organization = self.organization()
+        identifier = uuid.uuid4().hex
+        job = dict(id=identifier, organization_id=organization, kind='chat', state='uncertain',
+                   delivery=dict(stage='submitted', at='original-time', reply_name='reply.md'))
+        with self.store.lock, closing(self.store.connect()) as db, db:
+            self.store.put(db, 'jobs', job)
+        for stage, code in (('blocked', 'agent_blocked'), ('unknown', 'transport_failed'), ('reply_verified', '')):
+            self.store.update_job(identifier, delivery=dict(stage=stage, code=code, prompt='private prompt', result='private reply'))
+        with closing(self.store.connect()) as db:
+            saved = self.store.get(db, 'jobs', identifier)['delivery']
+        history = saved['transitions']
+        self.assertEqual([value['stage'] for value in history], ['submitted', 'blocked', 'unknown', 'reply_verified'])
+        self.assertEqual(history[0]['at'], 'original-time')
+        self.assertEqual(history[1]['code'], 'agent_blocked')
+        self.assertNotIn('private', json.dumps(history))
+        for unused in range(3):
+            self.store.update_job(identifier, delivery=dict(stage='reply_verified', code=''))
+        self.assertEqual(len(self.store.job_record(identifier)['delivery']['transitions']), 4)
+        for index in range(MAX_DELIVERY_TRANSITIONS + 5):
+            self.store.update_job(identifier, delivery=dict(stage='retry', code=str(index)))
+        history = self.store.job_record(identifier)['delivery']['transitions']
+        self.assertEqual(len(history), MAX_DELIVERY_TRANSITIONS)
+        self.assertEqual(history[-1]['code'], str(MAX_DELIVERY_TRANSITIONS + 4))
+
+    def test_job_request_lookup_distinguishes_unsubmitted_pending_and_removed_jobs(self):
+        organization = self.organization()
+        identifier, request = uuid.uuid4().hex, uuid.uuid4().hex
+        job = dict(id=identifier, organization_id=organization, kind='chat', state='queued')
+        self.assertIsNone(self.store.job_for_request(request))
+        with self.store.lock, closing(self.store.connect()) as db, db:
+            self.store.put(db, 'jobs', job)
+            db.execute('INSERT INTO requests VALUES (?,?,?)', (request, 'fixture', json.dumps(dict(id=identifier))))
+        before = len(self.calls)
+        self.assertEqual(self.store.job_for_request(request), job)
+        with self.store.lock, closing(self.store.connect()) as db, db:
+            db.execute('DELETE FROM jobs WHERE id=?', (identifier,))
+        self.assertEqual(self.store.job_for_request(request), dict(id=identifier, state='unavailable'))
+        self.assertEqual(len(self.calls), before)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

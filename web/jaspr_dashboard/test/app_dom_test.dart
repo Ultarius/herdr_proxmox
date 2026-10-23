@@ -188,6 +188,56 @@ void main() {
     await settle(100);
   }
 
+  test('background snapshot refresh keeps overview disclosures open', () async {
+    await mount();
+    final terminal =
+        nodes('details').firstWhere(
+              (node) =>
+                  node
+                      .querySelector('summary')
+                      ?.textContent
+                      ?.contains('Terminal access') ==
+                  true,
+            )
+            as web.HTMLDetailsElement;
+    (terminal.querySelector('summary') as web.HTMLElement).click();
+    await settle();
+    expect(terminal.open, isTrue);
+    for (var update = 0; update < 2; update++) {
+      liveAgents = [
+        {'name': 'Active agent $update'},
+      ];
+      await connection.send(DashboardCommand('refresh', null, true));
+      await settle();
+      expect(nodes('details').contains(terminal), isTrue);
+      expect(terminal.open, isTrue);
+      expect(
+        nodes('main').single.textContent,
+        contains('Active agent $update'),
+      );
+    }
+  });
+
+  test(
+    'controlled workspace summary keeps clicks when a parent refresh lands before toggle',
+    () async {
+      await mount();
+      final details =
+          web.document.getElementById('overview-project-form')
+              as web.HTMLDetailsElement;
+      for (final open in [true, false, true]) {
+        (details.querySelector('summary') as web.HTMLElement).click();
+        ui.messages.value = 'Background update $open';
+        await settle();
+        expect(details.open, open);
+      }
+      (details.querySelector('summary') as web.HTMLElement).click();
+      (details.querySelector('summary') as web.HTMLElement).click();
+      await settle();
+      expect(details.open, isTrue);
+    },
+  );
+
   test(
     'persisted session restores original collaboration route and sidebar directory',
     () async {

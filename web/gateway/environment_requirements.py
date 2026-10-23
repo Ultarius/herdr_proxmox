@@ -1,6 +1,7 @@
 """Archive SDK planning shared by registered acquisition adapters."""
 import re
 
+import environment_adapters
 import environment_plan
 import project_requirements
 
@@ -24,14 +25,27 @@ def plan_archive(item, *, paths, read, revision, resolve, specifications):
         item.update(state='unresolved', reason='The SDK selection could not be read.')
         return
     try:
-        key = (item['capability'], version)
+        components = set()
+        for entry in item['evidence']:
+            lookup = entry.get('selection_lookup') or {}
+            requested = lookup.get('components', [])
+            if not isinstance(requested, list):
+                raise ValueError('Optional SDK components must be a list.')
+            if requested and item['capability'] != 'rust-toolchain':
+                raise ValueError('Optional components are supported only for the Rust toolchain adapter.')
+            if item['capability'] == 'rust-toolchain':
+                if any(not isinstance(name, str) or name not in environment_adapters.RUST_COMPONENTS for name in requested):
+                    raise ValueError('Only rustfmt and clippy are supported optional Rust components.')
+                components.update(requested)
+        key = (item['capability'], version, tuple(sorted(components)))
         if key not in specifications:
-            specifications[key] = resolve(*key)
+            specifications[key] = (resolve(item['capability'], version, components=sorted(components))
+                                   if components else resolve(item['capability'], version))
         specification = specifications[key]
         for entry in item['evidence']:
             lookup = entry.get('selection_lookup') or {}
-            if lookup.get('components') or lookup.get('targets') or lookup.get('path') or lookup.get('profile') not in (None, 'minimal'):
-                raise ValueError('This Rust component needs targets, profiles or optional components not yet supported by the acquisition adapter.')
+            if lookup.get('targets') or lookup.get('path') or lookup.get('profile') not in (None, 'minimal'):
+                raise ValueError('This Rust component needs extra targets, a custom path or a non-minimal profile not yet supported by the acquisition adapter.')
             declarations = project_requirements.declarations(override or entry, item['notation'])
             if any(environment_plan._satisfies(version, constraint, notation or item['notation']) != 'satisfied'
                    for constraint, notation in declarations):

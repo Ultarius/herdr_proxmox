@@ -153,16 +153,18 @@ def resolve(root, path=None, read=None):
     return policy
 
 
-def resolve_committed(root, path=None):
+def resolve_committed(root, path=None, *, revision=None):
     if PROJECT_RESOLVER is not None and path is None:
-        return PROJECT_RESOLVER(root)
-    return resolve_legacy_committed(root, path)
+        return PROJECT_RESOLVER(root, revision=revision) if revision is not None else PROJECT_RESOLVER(root)
+    if revision is None:
+        return resolve_legacy_committed(root, path)
+    return resolve_legacy_committed(root, path, revision=revision)
 
 
-def resolve_legacy_committed(root, path=None):
-    """Read HEAD's blobs, so uncommitted files cannot change approval rules."""
+def resolve_legacy_committed(root, path=None, *, revision=None):
+    """Read one committed tree, so working-tree edits cannot change approval rules."""
     import project_git
-    revision = project_git.git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip()
+    revision = project_git.git(root, 'rev-parse', '--verify', (revision or 'HEAD') + '^{commit}').strip()
     def read(name):
         records = project_git.git(root, 'ls-tree', revision, '--', ':(literal)' + name).strip()
         if not records:
@@ -191,6 +193,26 @@ def changes(approved, candidate):
     changed.extend('toolchain:' + (name[1] if name[0] == '.' else '/'.join(name)) for name in before.keys() | after.keys()
                    if before.get(name) != after.get(name))
     return sorted(set(changed))
+
+
+def candidate_policy(root, approved, revision='HEAD'):
+    """Compare candidate inputs without requiring its own preparation receipt.
+
+    Selected recipe evidence is protected by the approved plan. A candidate
+    without that plan must still supply its own committed bytes for those paths.
+    No commands or SDK selections are copied from the candidate into approval.
+    """
+    candidate = resolve_committed(root) if revision == 'HEAD' else resolve_committed(root, revision=revision)
+    evidence = {item['evidence'].split('#')[0] for item in approved.get('recipes', [])
+                if item.get('evidence')}
+    if evidence:
+        import environment_policy
+        try:
+            values = environment_policy.declarations(environment_policy.tree(root, revision), evidence)
+        except ValueError as error:
+            raise ValueError('Selected validation recipe evidence is unavailable or unsafe: ' + str(error)) from error
+        candidate = dict(candidate, declarations=dict(candidate['declarations'], **values))
+    return candidate
 
 
 def parse_flutter(text):
@@ -310,6 +332,7 @@ def environment(policy, base=None):
             import environment_adapters
             value.update(environment_adapters.get(entry['name']).environment(
                 entry['executables'][0], entry.get('execution_environment')))
+            value.update(environment_adapters.get(entry['name']).build_environment(entry))
     if directories:
         value['PATH'] = os.pathsep.join([*directories, value.get('PATH', '')]).strip(os.pathsep)
     return value

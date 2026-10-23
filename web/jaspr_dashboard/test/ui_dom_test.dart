@@ -104,6 +104,22 @@ class _ControlsState extends ui.State<_Controls> {
       password: true,
     ),
     ui.button('Open parent', openParent, classes: 'open-parent'),
+    ui.el(
+      'details',
+      [
+        ui.el('summary', [ui.text('Polling disclosure')]),
+        ui.text(value),
+      ],
+      attributes: {'id': 'polling-disclosure'},
+    ),
+    ui.el(
+      'details',
+      [
+        ui.el('summary', [ui.text('Initially open disclosure')]),
+        ui.text(body),
+      ],
+      attributes: {'id': 'initially-open-disclosure', 'open': ''},
+    ),
     ui.buildDialogs(),
   ]);
 }
@@ -149,6 +165,38 @@ void main() {
     web.document.getElementById('ui-dom-test')!.textContent = '';
   });
 
+  test('background updates preserve opened and closed disclosures', () async {
+    final opened = element('#polling-disclosure') as web.HTMLDetailsElement;
+    final closed =
+        element('#initially-open-disclosure') as web.HTMLDetailsElement;
+    (opened.querySelector('summary') as web.HTMLElement).click();
+    (closed.querySelector('summary') as web.HTMLElement).click();
+    await settle();
+    expect(opened.open, isTrue);
+    expect(closed.open, isFalse);
+    for (var update = 0; update < 3; update++) {
+      state.replaceControls('Server update $update', 'Details $update', 'a');
+      await settle();
+      expect(element('#polling-disclosure'), same(opened));
+      expect(opened.open, isTrue);
+      expect(closed.open, isFalse);
+      expect(opened.textContent, contains('Server update $update'));
+    }
+  });
+
+  test(
+    'an update during a click does not race the native toggle event',
+    () async {
+      final details = element('#polling-disclosure') as web.HTMLDetailsElement;
+      for (final open in [true, false, true]) {
+        (details.querySelector('summary') as web.HTMLElement).click();
+        state.replaceControls('Refreshed during click', 'New details', 'a');
+        await settle();
+        expect(details.open, open);
+      }
+    },
+  );
+
   test(
     'dirty input, textarea and select reflect programmatic changes and clears',
     () async {
@@ -158,6 +206,7 @@ void main() {
               as web.HTMLTextAreaElement;
       final choice = element('select') as web.HTMLSelectElement;
       final credential = input('controlled-secret');
+      expect(credential.getAttribute('autocomplete'), 'current-password');
       expect(text.value, 'Initial text');
       expect(multiline.value, 'Initial multiline text');
       expect(choice.value, 'a');

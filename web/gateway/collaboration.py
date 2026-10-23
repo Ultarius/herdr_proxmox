@@ -1067,7 +1067,7 @@ def execute(store, job):
         "Optionally add a top-level knowledge array to discussion.json, up to 10 items with kind=finding/decision/question/guidance, title and body. Cite the knowledge IDs considered; new claims stay reported, not verified. "
         "Write and update the artifact as your synthesis develops. Save both files before finishing. "
         f"Then write {receipt} as UTF-8 JSON, last of all: "
-        f'{{"discussion_id": "{job['id']}", "attempt_id": "{attempt}", '
+        f'{{"discussion_id": "{job["id"]}", "attempt_id": "{attempt}", '
         '"artifact_sha256": "<sha256 of the exact action-plan.md bytes you wrote>", '
         '"transcript_sha256": "<sha256 of the exact discussion.json bytes you wrote>"}}. '
         "Hash the bytes on disk, not a re-encoded copy. This receipt is what marks the discussion "

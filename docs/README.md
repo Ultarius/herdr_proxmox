@@ -9,6 +9,7 @@
 - [Alpha builds](alpha-builds.md) — install feature-branch builds for testing.
 - [Dashboard updates](dashboard-updates.md) — installation storage checks and recovery after a full disk.
 - [Build capacity](build-capacity.md) — compiler budgets, resource waits and storage recovery.
+- [Rust project validation](rust-project-validation.md) — headless checks, managed components and source-only helpers.
 - [Repository connections](repository-connections.md) — private GitHub access, deploy keys and project bindings.
 - [Run logs](run-logs.md) — inspect execution and terminal output.
 - [Configuration migration](configuration-migration.md) — backup and move configuration.

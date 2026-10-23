@@ -2,6 +2,7 @@ import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'overview_panels.dart';
 import 'recent_activity.dart';
+import 'storage_panel.dart';
 
 class ResourcePanel extends StatefulWidget {
   const ResourcePanel({super.key});
@@ -212,6 +213,7 @@ class _ResourcePanelState extends State<ResourcePanel> {
                 ],
               ),
             ],
+            const StoragePanel(key: ValueKey('managed-storage')),
           ],
         ),
       ),

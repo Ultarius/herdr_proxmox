@@ -5,7 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -15,6 +15,45 @@ spec.loader.exec_module(gateway)
 
 
 class GatewayTests(unittest.TestCase):
+    def test_managed_storage_endpoints_require_administrator(self):
+        server = gateway.ThreadingHTTPServer(('127.0.0.1', 0), gateway.Handler)
+        server.token = 'a' * 48
+        server.operators = Mock()
+        server.operators.identify.side_effect = lambda token: dict(name='reader', role='operator') if token == 'reader' else None
+        server.storage = Mock()
+        server.storage.snapshot.return_value = dict(available=True, inventory={})
+        server.storage.action.return_value = dict(snapshot=dict(scanning=True))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f'http://127.0.0.1:{server.server_port}/api/storage'
+        try:
+            for token, status in (('', 401), ('reader', 403)):
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(Request(base, headers={'Authorization': 'Bearer ' + token}))
+                self.assertEqual(error.exception.code, status)
+            server.storage.snapshot.assert_not_called()
+            with self.assertRaises(HTTPError) as error:
+                urlopen(Request(base, data=b'{"action":"scan"}', headers={'Authorization': 'Bearer reader'}))
+            self.assertEqual(error.exception.code, 403)
+            server.storage.action.assert_not_called()
+            admin = {'Authorization': 'Bearer ' + server.token}
+            self.assertEqual(json.load(urlopen(Request(base, headers=admin))), dict(available=True, inventory={}))
+            self.assertEqual(json.load(urlopen(Request(base, data=b'{"action":"scan"}', headers=admin))),
+                             dict(snapshot=dict(scanning=True)))
+            server.storage.action.assert_called_once_with(dict(action='scan'))
+            server.storage.action.side_effect = gateway.StorageBusy('Storage maintenance is busy.')
+            with self.assertRaises(HTTPError) as busy:
+                urlopen(Request(base, data=b'{"action":"preview","ids":["owned"]}', headers=admin))
+            self.assertEqual(busy.exception.code, 409)
+            self.assertEqual(busy.exception.headers['Retry-After'], '2')
+            response = json.load(busy.exception)
+            self.assertEqual(response['code'], 'storage_busy')
+            self.assertTrue(response['retryable'])
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+
     def test_clone_project_validates_destination_and_git_transport(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(gateway, 'PROJECTS', Path(directory)), patch.object(gateway.subprocess, 'run') as run:
             run.return_value.returncode = 0

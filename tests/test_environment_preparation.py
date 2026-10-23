@@ -322,7 +322,9 @@ class HttpTests(unittest.TestCase):
         gateway.token = 'a' * 48
         gateway.environments = Mock()
         gateway.environments.plan.return_value = {'digest': 'b' * 64}
-        gateway.environments.store.job.return_value = {'state': 'queued'}
+        gateway.environments.store.job.return_value = {'id': 'id', 'state': 'queued', 'receipts': ['private SDK path']}
+        gateway.environments.job_view.side_effect = EnvironmentPreparation.job_view
+        gateway.environments.status.return_value = {'project': 'app', 'revision': 'a' * 40, 'prepared': None}
         gateway.operators = Mock()
         gateway.operators.identify.side_effect = lambda token: {'name': 'operator', 'role': 'operator'} if token == 'operator' else None
         thread = threading.Thread(target=gateway.serve_forever, daemon=True)
@@ -334,16 +336,134 @@ class HttpTests(unittest.TestCase):
                     urlopen(Request(base + '/plan', data=b'{"path":"app"}', headers={'Authorization': 'Bearer ' + token}))
                 refused.exception.close()
             gateway.environments.plan.assert_not_called()
+            with urlopen(Request(base + '?path=app', headers={'Authorization': 'Bearer operator'})) as response:
+                self.assertIsNone(json.load(response)['prepared'])
+            gateway.environments.status.assert_called_once_with('app', details=False)
+            gateway.environments.plan.assert_not_called()
             with urlopen(Request(base + '/plan', data=b'{"path":"app"}', headers={'Authorization': 'Bearer ' + gateway.token})) as response:
                 self.assertEqual(json.load(response)['digest'], 'b' * 64)
             gateway.environments.plan.assert_called_once_with('app', None)
             with urlopen(Request(base + '?job=id', headers={'Authorization': 'Bearer ' + gateway.token})) as response:
                 self.assertEqual(json.load(response)['state'], 'queued')
+            with urlopen(Request(base + '?job=id', headers={'Authorization': 'Bearer operator'})) as response:
+                public = json.load(response)
+                self.assertEqual(public['state'], 'queued')
+                self.assertNotIn('receipts', public)
             gateway.environments.prepare.assert_not_called()
         finally:
             gateway.shutdown()
             gateway.server_close()
             thread.join()
+
+
+class SavedStatusTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.analysis = Mock(root=root / 'projects')
+        self.analysis.project.return_value = self.analysis.root / 'app'
+        self.service = EnvironmentPreparation(self.analysis, root / 'plans.sqlite3', root / 'sdks')
+        git = patch('environment_preparation.project_git.git', return_value='a' * 40)
+        self.git = git.start()
+        self.addCleanup(git.stop)
+
+    def test_empty_status_is_read_only_and_never_plans_or_acquires(self):
+        with patch.object(self.service, 'plan') as planning, patch.object(self.service, 'acquire') as acquire:
+            status = self.service.status('app')
+        self.assertEqual(status['revision'], 'a' * 40)
+        self.assertIsNone(status['plan'])
+        self.assertIsNone(status['prepared'])
+        self.assertEqual(self.service.store.history('app'), [])
+        planning.assert_not_called()
+        acquire.assert_not_called()
+
+    def test_ready_record_and_newer_unprepared_proposal_are_distinct(self):
+        approved = plan()
+        self.service.store.save(approved)
+        job = self.service.store.enqueue(approved['digest'])
+        self.service.store.claim('worker')
+        self.service.store.finish(job['id'], 'worker', 'ready')
+        proposal = dict(approved, selected_checks=[dict(id='another-check')])
+        proposal['digest'] = environment_plan.digest(proposal)
+        self.service.store.save(proposal)
+        status = self.service.status('app', details=True)
+        self.assertEqual(status['prepared']['job_id'], job['id'])
+        self.assertTrue(status['prepared']['current'])
+        self.assertEqual(status['plan']['digest'], proposal['digest'])
+        self.assertTrue(status['plan_current'])
+        self.assertIsNone(status['job'])
+
+    def test_older_preparation_is_historical_and_project_scoped(self):
+        saved = plan()
+        self.service.store.save(saved)
+        job = self.service.store.enqueue(saved['digest'])
+        self.service.store.claim('worker')
+        self.service.store.finish(job['id'], 'worker', 'ready')
+        self.git.return_value = 'b' * 40
+        status = self.service.status('app')
+        self.assertFalse(status['prepared']['current'])
+        self.assertFalse(status['plan_current'])
+        self.assertEqual(status['prepared']['revision'], 'a' * 40)
+        self.analysis.project.return_value = self.analysis.root / 'other'
+        self.assertIsNone(self.service.status('other')['prepared'])
+
+    def test_queued_failed_and_cancelled_jobs_do_not_claim_ready(self):
+        saved = plan()
+        self.service.store.save(saved)
+        job = self.service.store.enqueue(saved['digest'])
+        self.assertEqual(self.service.status('app')['job']['state'], 'queued')
+        self.assertIsNone(self.service.status('app')['prepared'])
+        self.service.store.claim('worker')
+        self.assertEqual(self.service.status('app')['job']['state'], 'running')
+        self.service.store.finish(job['id'], 'worker', 'failed', error='network unavailable')
+        self.assertEqual(self.service.status('app')['job']['state'], 'failed')
+        retried = self.service.store.enqueue(saved['digest'], retry=True)
+        self.service.store.cancel(retried['id'])
+        self.assertEqual(self.service.status('app')['job']['state'], 'cancelled')
+        self.assertIsNone(self.service.status('app')['prepared'])
+
+    def test_active_jobs_survive_newer_plans_and_remain_separate_from_the_proposal(self):
+        first = plan(selected_checks=[dict(id='first')])
+        self.service.store.save(first)
+        first_job = self.service.store.enqueue(first['digest'])
+        self.service.store.claim('worker')
+        second = plan(selected_checks=[dict(id='second')])
+        self.service.store.save(second)
+        status = self.service.status('app', details=True)
+        self.assertEqual(status['plan']['digest'], second['digest'])
+        self.assertIsNone(status['job'])
+        self.assertEqual([(item['id'], item['state']) for item in status['active_jobs']], [(first_job['id'], 'running')])
+        second_job = self.service.store.enqueue(second['digest'])
+        self.assertEqual(len(self.service.status('app')['active_jobs']), 2)
+        self.service.store.finish(first_job['id'], 'worker', 'ready')
+        status = self.service.status('app', details=True)
+        self.assertEqual([item['id'] for item in status['active_jobs']], [second_job['id']])
+        self.assertTrue(status['pending_plan'])
+        self.assertTrue(status['prepared']['current'])
+
+    def test_operator_summary_omits_editable_documents_and_private_job_details(self):
+        saved = plan(selected_checks=[dict(id='test', arguments=['private-command'])],
+                     restore_permission=dict(actor='private-actor'),
+                     requirements=[dict(capability='dotnet-sdk', state='acquire', version='8.0.100',
+                                        artifact=dict(url='https://private-publisher.test/sdk', hash='private-hash'))])
+        self.service.store.save(saved)
+        job = self.service.store.enqueue(saved['digest'])
+        self.service.store.claim('worker')
+        self.service.store.finish(job['id'], 'worker', 'ready', receipts=[dict(path='/private/sdk')])
+        status = self.service.status('app')
+        self.assertIsNone(status['plan'])
+        self.assertNotIn('digest', status['job'])
+        self.assertEqual(status['prepared']['selected_check_count'], 1)
+        for private in ('private-command', 'private-actor', 'private-publisher', 'private-hash', '/private/sdk'):
+            self.assertNotIn(private, json.dumps(status))
+        self.assertIn('private-command', json.dumps(self.service.status('app', details=True)))
+
+    def test_saved_status_uses_one_database_read_snapshot(self):
+        import sqlite3
+        with patch('environment_store.sqlite3.connect', wraps=sqlite3.connect) as connect:
+            self.service.status('app')
+        self.assertEqual(connect.call_count, 1)
 
 
 if __name__ == '__main__':

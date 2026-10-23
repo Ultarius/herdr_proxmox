@@ -32,6 +32,7 @@ from session_ownership import reserves as session_reserves
 import toolchain_policy
 import pr_repairs
 import task_delivery
+import task_validation_environment
 MAX_INSTANCES_PER_TEMPLATE = 2
 
 SHA = re.compile(r'[a-f0-9]{40}|[a-f0-9]{64}')
@@ -1084,7 +1085,11 @@ class Contributions:
                 return False
         if approved.get('plan_digest') and task.get('run_id'):
             try:
-                frozen = pr_repairs.validation_binding(task) or self.frozen_environment(task)
+                target = evidence.get('target')
+                transition = task_validation_environment.binding(task, target, approved)
+                if target == task.get('head_sha') and task['state'] != 'merged':
+                    transition = transition or pr_repairs.validation_binding(task)
+                frozen = transition or self.frozen_environment(task)
             except (OSError, ValueError, sqlite3.Error):
                 return False
             if (not frozen or frozen.get('plan_digest') != evidence.get('plan_digest')
@@ -1236,6 +1241,13 @@ class Contributions:
         except ValueError as error:
             return False, str(error)
         return True, ''
+
+    @staticmethod
+    def handoff_candidate(task, run):
+        """Display eligibility only; launch still verifies the checkout and live session."""
+        return bool(task and run.get('state') == 'persona_sent' and not task_delivery.pending(task)
+                    and (task.get('state') == 'completed' or (task.get('state') in HANDOFF_TASK_STATES
+                         and (task.get('completion_receipt') or {}).get('commit') == task.get('head_sha'))))
 
     def finish_execution(self, task, run, request_id, actor):
         """Archive, close and mark a verified-finished execution. Idempotent by request ID."""
@@ -1833,11 +1845,20 @@ class Contributions:
         task['updated_at'] = stamp()
         entry = dict(action=action, actor=actor, at=task['updated_at'],
                      state=task['state'], head_sha=task.get('head_sha'))
-        if action == 'delivery_superseded' and task.get('delivery_history'):
+        if action == 'validation_environment_approved':
+            approval = task['validation_environment']
+            entry.update(approval_id=approval['id'], candidate=approval['candidate'],
+                         plan_digest=approval['plan_digest'], policy_digest=approval['digest'],
+                         detail='Approved the prepared environment for validation of this exact candidate; session policy retained.')
+        if action in ('delivery_superseded', 'delivery_revalidated') and task.get('delivery_history'):
             previous = task['delivery_history'][-1]
             entry.update(previous_sha=previous.get('sha'), delivery_chat_id=previous.get('chat_id'),
+                previous_validation_run=(previous.get('validation') or {}).get('run_id'),
+                validation_run=previous.get('superseded_by_validation'),
                 detail='Previous delivery report superseded for ' + str(previous.get('sha')) +
                        ('. Inspection chat retained for audit: ' + str(previous['chat_id']) if previous.get('chat_id') else ''))
+            if action == 'delivery_revalidated':
+                entry['detail'] += '. Validation ' + str(entry['previous_validation_run']) + ' superseded by ' + str(entry['validation_run']) + '.'
         if (action.startswith('pr_repair_') or action.startswith('validation_update_')) and task.get('pr_repair'):
             repair = task['pr_repair']
             entry.update(repair_id=repair['id'], repair_state=repair['state'],
@@ -2063,10 +2084,7 @@ class Contributions:
                 pane_id=blocking.get('pane_id'),
                 task_id=blocking.get('task_id'), task_title=(blocking_task or {}).get('title', ''),
                 task_state=(blocking_task or {}).get('state', ''),
-                handoff_ready=bool(blocking.get('state') == 'persona_sent' and blocking_task and (
-                    blocking_task.get('state') == 'completed' or (
-                        blocking_task.get('state') in HANDOFF_TASK_STATES
-                        and (blocking_task.get('completion_receipt') or {}).get('commit') == blocking_task.get('head_sha')))))
+                handoff_ready=self.handoff_candidate(blocking_task, blocking))
         else:
             task['blocking_execution'] = None
         task['launch_retryable'] = self.retryable_preflight(next((j for j in jobs if j.get('id') == task.get('run_id')), None))
@@ -2099,6 +2117,7 @@ class Contributions:
             # Discovery is revision-cached by the resolver; approval and prepared
             # environment receipts can change without a repository HEAD change.
             task['validation_policy'] = self.validation_policy(task)
+            task['validation_environment_status'] = task_validation_environment.status(self, task)
         return task
 
     @staticmethod
@@ -2289,9 +2308,13 @@ class Contributions:
                 task = None
             if task is None:
                 return dict(state='attention', action='inspect', run_id=active['id'], detail='The execution references a missing task; inspect its run.')
-            receipt = (task or {}).get('completion_receipt') or {}
-            if task and (task.get('state') == 'completed' or (task.get('state') in HANDOFF_TASK_STATES
-                        and receipt.get('commit') == task.get('head_sha'))):
+            if task_delivery.pending(task):
+                flow = task.get('delivery_workflow') or {}
+                detail = (flow.get('error') if flow.get('state') == 'attention' or flow.get('revalidation_wait') else None)
+                return dict(state='attention' if flow.get('state') == 'attention' else 'occupied',
+                            action='inspect', run_id=active['id'], task_id=task['id'], task_title=task.get('title', ''),
+                            detail=detail or 'The previous task is waiting for verification and agent delivery inspection. Open it to inspect delivery before handoff.')
+            if self.handoff_candidate(task, active):
                 return dict(state='handoff', action='handoff', run_id=active['id'], task_id=task['id'],
                             task_title=task.get('title', ''),
                             detail='The previous task has recorded completion evidence; verify the checkout and session before handoff.')
@@ -2938,6 +2961,8 @@ class Contributions:
                 raise ValueError('Repository remote changed; inspect the task before continuing.')
         if action == 'repair':
             return pr_repairs.request(self, task, body, actor)
+        elif action == 'validation_environment':
+            return task_validation_environment.action(self, task, body, actor)
         elif action == 'launch':
             return self.launch_task(task, actor, body.get('inspected_general_session'), body.get('as_instance') is True)
         elif action == 'complete':
@@ -3147,6 +3172,8 @@ class Contributions:
                 created = self.enqueue_assignment(created, actor)
                 self.save(created, 'assignment_queued', actor)
         elif action == 'policy':
+            if body.get('retry_delivery') is True:
+                task_delivery.check_inspection_retry(self, task)
             if task['state'] in ('merged', 'closed', 'completed') and not stopping_delivery:
                 raise ValueError('A terminal task can stop delivery automation, but cannot enable it.')
             capture = body.get('auto_capture', body.get('auto_validate', task.get('auto_capture', task.get('auto_validate', False))))
@@ -3401,13 +3428,16 @@ class Contributions:
                 event['task_revision_id'] = task['candidate_revision']
             approved = toolchain_policy.resolve_committed(repository)
             if approved.get('plan_digest') and task.get('run_id'):
-                transition = pr_repairs.validation_binding(task)
+                transition = task_validation_environment.binding(task, target, approved)
+                if target == task.get('head_sha') and task['state'] != 'merged':
+                    transition = transition or pr_repairs.validation_binding(task)
                 frozen = transition or self.frozen_environment(task) or {}
                 if transition:
                     event['policy_transition'] = dict(transition)
-                event.update(frozen_plan_digest=frozen.get('plan_digest') or 'unavailable',
-                             frozen_policy_digest=frozen.get('digest') or 'unavailable')
-                event_id = hashlib.sha256((event_id + ':' + task['run_id'] + ':' + event['frozen_plan_digest']).encode()).hexdigest()
+                event.update(environment_binding_required=True,
+                             frozen_plan_digest=frozen.get('plan_digest'), frozen_policy_digest=frozen.get('digest'))
+                event_id = hashlib.sha256((event_id + ':' + task['run_id'] + ':' + (event['frozen_plan_digest'] or 'missing')
+                                           + ':' + (event['frozen_policy_digest'] or 'missing')).encode()).hexdigest()
                 event['id'] = event_id
             with closing(self.connect()) as db, db:
                 db.execute('INSERT OR IGNORE INTO build_events VALUES (?,?)', (event_id, json.dumps(event)))

@@ -2,10 +2,142 @@
 ///
 /// The gateway resolves one view — discovery, any operator override, the
 /// disagreement between them and the host assessment — so the cards read a
-/// single answer rather than joining two endpoints and risking a different
-/// picture from the one provisioning acts on.
+/// single requirement answer. Saved SDK preparation is loaded separately from
+/// its execution authority, with its exact commit and lookup errors preserved.
 typedef ProjectAnalysisRequest =
     Future<dynamic> Function(String path, [Map<String, dynamic>? body]);
+
+const hostSdkExplanation =
+    'Executables found on the gateway host PATH or in its configured installer. '
+    'Project SDKs are isolated and shown separately above; a missing host SDK '
+    'does not block validation using a prepared project environment.';
+const repositoryRequirementExplanation =
+    'Required and Selected describe repository declarations, not installation status.';
+
+String projectScope(Object? value) =>
+    value == '.' ? 'Repository root' : '$value';
+
+bool projectEvidenceNeedsAttention(Map report) =>
+    (report['coverage'] is Map && report['coverage']['truncated'] == true) ||
+    (report['unresolved'] is List &&
+        (report['unresolved'] as List).isNotEmpty) ||
+    (report['requirements'] is List &&
+        (report['requirements'] as List).whereType<Map>().any(
+          (item) =>
+              item['conflicts'] is List &&
+              (item['conflicts'] as List).isNotEmpty,
+        )) ||
+    (report['components'] is List &&
+        (report['components'] as List).whereType<Map>().any((component) {
+          // Intentionally waived source-only runtimes remain informational.
+          if (sourceComponentNotice(component, report).isNotEmpty) return false;
+          if (component['unresolved'] is List &&
+              (component['unresolved'] as List).isNotEmpty)
+            return true;
+          return (component['requirements'] as List? ?? [])
+              .whereType<Map>()
+              .any(
+                (requirement) =>
+                    requirement['established'] != true ||
+                    (requirement['conflicts'] is List &&
+                        (requirement['conflicts'] as List).isNotEmpty) ||
+                    (requirement['resolution'] is Map &&
+                        '${requirement['resolution']['reason'] ?? ''}'
+                            .isNotEmpty),
+              );
+        }));
+
+class ProjectEnvironmentView {
+  const ProjectEnvironmentView(this.status);
+  final Map status;
+  Map? get prepared =>
+      status['prepared'] is Map ? status['prepared'] as Map : null;
+  bool get current => prepared?['current'] == true;
+  String get label => current
+      ? 'Prepared for this commit'
+      : prepared != null
+      ? 'Prepared for an earlier commit'
+      : 'No prepared environment for this commit';
+  String get detail => current
+      ? 'Validation uses this prepared environment. See Checks & builds for test results.'
+      : prepared != null
+      ? 'The saved preparation belongs to another commit. Use Plan environment to review '
+            'and prepare the current commit before validation.'
+      : 'Use Plan environment to review SDKs and validation checks. Opening this page '
+            'does not prepare SDKs or run project commands.';
+  String get revision => '${status['revision'] ?? ''}';
+  String get preparedRevision => '${prepared?['revision'] ?? ''}';
+  String? get pendingPlanDetail => status['pending_plan'] == true
+      ? 'A newer plan is pending preparation. Validation continues to use the saved prepared environment.'
+      : null;
+  List<String> get sdks => [
+    for (final item
+        in (prepared?['requirements'] as List? ?? []).whereType<Map>())
+      '${item['label'] ?? item['capability']} ${item['version'] ?? ''}'
+          ' · ${(item['components'] as List? ?? []).map(projectScope).join(', ')}',
+  ];
+  String get checks {
+    final count =
+        prepared?['selected_check_count'] ??
+        (prepared?['selected_checks'] as List? ?? []).length;
+    return '$count approved validation ${count == 1 ? 'check' : 'checks'}';
+  }
+}
+
+String preparationRequirementSummary(Map item, Map plan, Map? job) {
+  final ready = job?['state'] == 'ready' && job?['digest'] == plan['digest'];
+  return '${item['components']}: ${item['label'] ?? item['capability']} ${item['version']} · '
+      '${ready
+          ? 'SDK preparation recorded'
+          : item['state'] == 'ready'
+          ? 'SDK available'
+          : 'Planned action: ${item['state']}'}'
+      '${item['reason'] == null || item['reason'] == '' ? '' : ' · ${item['reason']}'}'
+      ' · Activation: ${item['activation'] ?? 'unavailable'}'
+      '${item['activation_reason'] == null || item['activation_reason'] == '' ? '' : ' · ${item['activation_reason']}'}';
+}
+
+String projectInstallerSummary(Map analysis) {
+  final bundled = analysis['provisionable'] as List? ?? [];
+  return bundled.isEmpty
+      ? 'No matching SDK is in the bundled installer catalog. Use Plan environment '
+            'to check project-specific SDK preparation.'
+      : 'The bundled installer can provide: ${bundled.join(', ')}. '
+            'Use Plan environment for project-specific SDK preparation.';
+}
+
+String sourceComponentNotice(Map component, Map report, {Map? plan}) {
+  final sources = (plan ?? report)['source_components'];
+  if (sources is! List) return '';
+  for (final item in sources.whereType<Map>()) {
+    if (item['path'] == component['path']) {
+      final requirements = report['requirements'];
+      if (requirements is List &&
+          requirements.whereType<Map>().any(
+            (requirement) =>
+                requirement['override'] is Map &&
+                (requirement['capability'] ?? requirement['tool']) ==
+                    item['capability'],
+          ))
+        return '';
+      return 'Source-only component: ${item['reason']} '
+          'It does not block SDK preparation in this environment.';
+    }
+  }
+  return '';
+}
+
+String requestedComponentNotice(Map requirement) {
+  final lookup = requirement['selection_lookup'];
+  final components = lookup is Map ? lookup['components'] : null;
+  return components is List && components.isNotEmpty
+      ? 'Requested SDK components: ${components.join(', ')}'
+      : '';
+}
+
+String recipeEvidenceLabel(Map check) =>
+    '${check['source']}${check['derived'] == true ? ' · Derived companion' : ''}'
+    '${check['evidence'] == null || check['evidence'] == '' ? '' : ' · Evidence: ${check['evidence']}'}';
 
 bool environmentPlanCanPrepare(Map? plan) =>
     plan?['preparation_version'] == 1 &&
@@ -19,7 +151,7 @@ bool environmentPlanCanPrepare(Map? plan) =>
 
 String environmentJobLabel(Map job) => switch (job['state']) {
   'ready' =>
-    'SDKs prepared. Dependency restore and project checks have not run.',
+    'SDK preparation completed. Build and test results are recorded separately in Checks & builds.',
   'queued' => 'SDK preparation queued',
   'running' => 'Acquiring and verifying SDKs',
   'cancelled' => 'SDK preparation cancelled',
@@ -56,6 +188,7 @@ class ProjectAnalysisLoad {
   /// An executable without a version rule proves availability, not compatibility.
   String readinessLabel(Map<String, dynamic> requirement) {
     final verdict = '${assessmentOf(requirement)['verdict'] ?? 'unknown'}';
+    if (verdict == 'missing') return 'Not found on host';
     if (verdict != 'satisfied') return verdict;
     final override = requirement['override'] as Map?;
     final declarations = override == null

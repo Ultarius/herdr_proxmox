@@ -42,6 +42,136 @@ class RepositoryConnectionTests(unittest.TestCase):
         with patch('repository_connections.subprocess.run', side_effect=generate):
             return self.service.create(dict(label='Private project', repository='owner/private', kind='ssh'))
 
+    def test_token_rotation_keeps_bindings_invalidates_access_and_preserves_old_bytes_on_failure(self):
+        from repository_connections import write_private
+        original, replacement = 'github_pat_' + 'r' * 50, 'github_pat_' + 's' * 50
+        record = self.service.create(dict(label='PAT', repository='owner/private', kind='token', token=original))
+        credential = self.service.directory / record['id'] / 'token.json'
+        data = self.service.load()
+        data['bindings'][str(self.projects / 'private' / '.git')] = record['id']
+        data['connections'][record['id']].update(access_state='verified', tested_at='before')
+        self.service.save(data)
+        with self.service.credentials(record['id'], 'https://github.com/owner/private.git'):
+            with self.assertRaisesRegex(ValueError, 'in use'):
+                self.service.rotate(record['id'], replacement)
+        bindings = self.service.snapshot()['bindings']
+        def fail_credential(path, content):
+            if path == credential:
+                raise OSError('disk full')
+            return write_private(path, content)
+        with patch('repository_connections.write_private', side_effect=fail_credential):
+            with self.assertRaises(OSError):
+                self.service.rotate(record['id'], replacement)
+        self.assertEqual(GitHub(credential).configuration()['token'], original)
+        self.assertEqual(self.service.get(record['id'])['access_state'], 'not_tested')
+        result = self.service.action(dict(action='rotate', id=record['id'], token=replacement), 'admin')
+        self.assertEqual(result['id'], record['id'])
+        self.assertEqual(GitHub(credential).configuration()['token'], replacement)
+        self.assertEqual(self.service.snapshot()['bindings'], bindings)
+        self.assertNotIn(replacement, json.dumps(self.service.snapshot()))
+        self.assertFalse(self.github.path.exists())
+        with self.assertRaises(ValueError):
+            self.service.action(dict(action='rotate', id=record['id'], token=original), 'operator')
+        with self.assertRaisesRegex(ValueError, 'connection-specific'):
+            self.service.rotate(self.github_connection()['id'], replacement)
+
+    def test_repository_token_file_cannot_be_linked_or_world_readable(self):
+        secret = 'github_pat_' + 'z' * 50
+        record = self.service.create(dict(label='PAT', repository='owner/private', kind='token', token=secret))
+        credential = self.service.directory / record['id'] / 'token.json'
+        if os.name != 'nt':
+            credential.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, 'mode 0600'), self.service.credentials(record['id'], 'https://github.com/owner/private.git'):
+                pass
+            credential.chmod(0o600)
+        target = self.root / 'other-credential.json'
+        credential.replace(target)
+        try:
+            credential.symlink_to(target)
+        except OSError:
+            self.skipTest('Symlink creation requires privileges on this host.')
+        with self.assertRaisesRegex(ValueError, 'regular files'), self.service.credentials(record['id'], 'https://github.com/owner/private.git'):
+            pass
+        with self.assertRaisesRegex(ValueError, 'regular files'):
+            self.service.rotate(record['id'], secret)
+
+    def test_repository_token_is_private_scoped_and_independent_of_publishing(self):
+        secret = 'github_pat_' + 'a' * 50
+        record = self.service.action(dict(action='create', label='Read private', repository='owner/private',
+                                         kind='token', token=secret), 'admin')
+        self.assertFalse(self.github.path.exists())
+        self.assertNotIn(secret, json.dumps(record))
+        self.assertNotIn(secret, self.service.path.read_text())
+        self.assertNotIn(secret, json.dumps(self.service.snapshot()))
+        credential = self.service.directory / record['id'] / 'token.json'
+        self.assertEqual(GitHub(credential).configuration()['token'], secret)
+        if os.name != 'nt':
+            self.assertEqual(credential.stat().st_mode & 0o777, 0o600)
+        script = Path(__file__).parents[1] / 'web/gateway/repository_askpass.py'
+        with self.service.credentials(record['id'], 'https://github.com/owner/private.git') as environment:
+            self.assertNotIn(secret, json.dumps(environment))
+            self.assertEqual(environment['HERDR_GITHUB_CONFIG'], str(credential))
+            result = subprocess.run([sys.executable, str(script), "Password for 'https://x-access-token@github.com/owner/private.git': "],
+                                    env=environment, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout.strip(), secret)
+            rejected = subprocess.run([sys.executable, str(script), "Password for 'https://github.com/owner/other.git': "],
+                                      env=environment, capture_output=True, text=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertNotIn(secret, rejected.stdout + rejected.stderr)
+            with self.assertRaisesRegex(ValueError, 'in use'):
+                self.service.remove(record['id'])
+        settings = json.dumps(self.service._binding_settings(record))
+        self.assertIn(str(credential).replace('\\', '\\\\'), settings)
+        self.assertNotIn(secret, settings)
+        with self.assertRaises(ValueError), self.service.credentials(record['id'], 'https://github.com/owner/other.git'):
+            pass
+        with self.assertRaises(ValueError), self.service.credentials(record['id'], 'git@github.com:owner/private.git'):
+            pass
+        self.service.remove(record['id'])
+        self.assertFalse(credential.parent.exists())
+
+    def test_token_connection_clone_uses_private_askpass_and_a_clean_url(self):
+        secret = 'github_pat_' + 'b' * 50
+        record = self.service.create(dict(label='Read private', repository='owner/private', kind='token', token=secret))
+        def clone(arguments, **options):
+            self.assertNotIn(secret, json.dumps(arguments))
+            self.assertNotIn(secret, json.dumps(options['env']))
+            self.assertEqual(arguments[-2], 'https://github.com/owner/private.git')
+            credential = Path(options['env']['HERDR_GITHUB_CONFIG'])
+            self.assertEqual(GitHub(credential).configuration()['token'], secret)
+            return subprocess.CompletedProcess(arguments, 0, stderr='')
+        with patch('project_files.subprocess.run', side_effect=clone), patch.object(self.service, 'bind') as bind:
+            clone_repository(self.projects, dict(folder='private', url='https://github.com/owner/private.git',
+                             connection_id=record['id']), connections=self.service)
+            bind.assert_called_once_with(record['id'], self.projects / 'private')
+
+    def test_invalid_token_and_failed_save_leave_no_credential(self):
+        body = dict(label='Read private', repository='owner/private', kind='token')
+        for value in (None, '', 'short', 'secret with spaces' * 3, 'unrelated_secret_' + 'a' * 30,
+                      'gho_' + 'a' * 36, 'ghu_' + 'a' * 36, 'ghs_' + 'a' * 36, 'ghr_' + 'a' * 36,
+                      'github_pat_', 'ghp_', 'github_pat_' + 'a' * 256):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'personal access token'):
+                self.service.create(dict(body, token=value))
+        with patch.object(self.service, 'save', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                self.service.create(dict(body, token='github_pat_' + 'c' * 50))
+        self.assertEqual(list(self.service.directory.iterdir()), [])
+
+    def test_both_personal_token_formats_can_be_saved_but_access_still_needs_verification(self):
+        for prefix in ('github_pat_', 'ghp_'):
+            with self.subTest(prefix=prefix):
+                secret = prefix + 'a' * 50
+                record = self.service.create(dict(label='PAT', repository='owner/private', kind='token', token=secret))
+                self.assertEqual(record['access_state'], 'not_tested')
+                with patch('repository_connections.subprocess.run', return_value=subprocess.CompletedProcess(
+                        [], 128, stdout=b'', stderr=b'Authentication failed: ' + secret.encode())):
+                    result = self.service.test(record['id'], 'https://github.com/owner/private.git')
+                self.assertEqual(result['access_state'], 'failed')
+                self.assertIn('expiry', result['error'])
+                self.assertNotIn(secret, json.dumps(self.service.snapshot()))
+                self.service.remove(record['id'])
+
     def verify(self, identifier):
         with patch('repository_connections.subprocess.run', return_value=subprocess.CompletedProcess([], 0,
                    stdout=('github.com ssh-ed25519 ' + HOST_KEY + '\n').encode())):
@@ -417,6 +547,19 @@ class RepositoryConnectionHttpTests(unittest.TestCase):
         self.assertEqual(json.load(request('/api/projects/connections', 'administrator', dict(action='remove', id=record['id']))),
                          dict(id=record['id'], removed=True))
         self.assertEqual(service.snapshot()['connections'], [])
+        secret = 'github_pat_' + 'd' * 50
+        token_record = json.load(request('/api/projects/connections', 'administrator',
+                                dict(action='create', label='Scoped token', repository='owner/private',
+                                     kind='token', token=secret)))
+        self.assertNotIn(secret, json.dumps(token_record))
+        self.assertNotIn(secret, json.dumps(json.load(request('/api/projects/connections', 'administrator'))))
+        self.assertEqual(github.configuration()['token'], 'secret_' + 'a' * 30)
+        rotated = json.load(request('/api/projects/connections', 'administrator',
+                            dict(action='rotate', id=token_record['id'], token='github_pat_' + 'e' * 50)))
+        self.assertEqual(rotated['id'], token_record['id'])
+        self.assertEqual(rotated['access_state'], 'not_tested')
+        self.assertNotIn('github_pat_', json.dumps(rotated))
+        request('/api/projects/connections', 'administrator', dict(action='remove', id=token_record['id'])).close()
 
 
 if __name__ == '__main__':

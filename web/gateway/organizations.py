@@ -23,12 +23,39 @@ from request_identity import ORGANIZATION_REQUEST
 # fault. A meeting that hits one waits and is retried, so answering a permission
 # prompt or finishing a task resumes it without an operator retrying by hand.
 TRANSIENT_AGENT_CODES = ('agent_blocked', 'agent_working', 'agent_not_ready')
+SAVED_REPLY_NAME = re.compile(r'reply-[a-f0-9]{12}\.md|reply\.md')
+MAX_DELIVERY_TRANSITIONS = 20
 import toolchain_policy
 from herdr_errors import HerdrError, delivery_for, parse_completion, parse_resume, preview as preview_text
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def delivery_transition(previous, current, at):
+    """Bounded diagnostic stages only; never copy prompts, results or secrets."""
+    previous = previous if isinstance(previous, dict) else {}
+    def entry(value, timestamp):
+        if not isinstance(value, dict) or not isinstance(value.get('stage'), str):
+            return None
+        result = dict(stage=value['stage'][:80], at=timestamp)
+        if isinstance(value.get('code'), str):
+            result['code'] = value['code'][:120]
+        return result
+    history = []
+    saved = previous.get('transitions')
+    for value in saved[-MAX_DELIVERY_TRANSITIONS:] if isinstance(saved, list) else []:
+        if isinstance(value, dict) and (item := entry(value, str(value.get('at') or at)[:80])):
+            history.append(item)
+    # Seed older jobs from the stage already on disk before recording this one.
+    if not history and (old := entry(previous, str(previous.get('at') or at)[:80])):
+        history.append(old)
+    latest = entry(current, at)
+    if latest and (not history or (latest['stage'], latest.get('code')) !=
+                   (history[-1]['stage'], history[-1].get('code'))):
+        history.append(latest)
+    return dict(current, transitions=history[-MAX_DELIVERY_TRANSITIONS:]) if history else dict(current)
 
 
 def text(body, key, limit=120, optional=False):
@@ -343,6 +370,18 @@ class OrganizationStore:
     def job_record(self, job_id):
         with self.lock, closing(self.connect()) as db:
             return self.get(db, 'jobs', job_id)
+
+    def job_for_request(self, request_id):
+        """Recover a committed enqueue without repeating the request or reading all jobs."""
+        with self.lock, closing(self.connect()) as db:
+            row = db.execute('SELECT response FROM requests WHERE key=?', (request_id,)).fetchone()
+            if row is None:
+                return None  # Job and request receipt commit in the same transaction.
+            identifier = json.loads(row['response'])['id']
+            try:
+                return self.get(db, 'jobs', identifier)
+            except ValueError:
+                return dict(id=identifier, state='unavailable')  # Receipt survives a removed job.
 
     def profile_records(self):
         """Narrow durable profile read with no runtime queries or integration callbacks."""
@@ -965,7 +1004,10 @@ class OrganizationStore:
     def update_job(self, job_id, **changes):
         with self.lock, closing(self.connect()) as db, db:
             job = self.get(db, 'jobs', job_id)
-            job.update(**changes, updated_at=now())
+            updated_at = now()
+            if isinstance(changes.get('delivery'), dict):
+                changes['delivery'] = delivery_transition(job.get('delivery'), changes['delivery'], updated_at)
+            job.update(**changes, updated_at=updated_at)
             self.put(db, 'jobs', job)
         if changes.get('state') in ('answered', 'persona_sent', 'needs_attention', 'delivered', 'artifact_ready',
                                     'finished', 'released', 'cancelled', 'completed', 'reported_complete',
@@ -1106,7 +1148,20 @@ class OrganizationStore:
                     self.close_identity(run, ready=not allow_busy)  # Recheck ownership before closure.
                     self.command('pane', 'close', run['pane_id'], timeout=10)
                 terminal = 'finished' if mode == 'finish' else 'released'
+                storage_finish = None
+                if run.get('storage_binding'):
+                    # Keep the launch active until harvest and owner closure
+                    # finish. Retention must not infer idleness from a pane
+                    # closure while the broker is still using its private cache.
+                    import execution_storage
+                    try:
+                        result = execution_storage.finish(run['storage_binding'], run.get('worktree_path') or
+                            run.get('source_project'), close=True)
+                        storage_finish = dict(state='complete', warnings=result.get('errors', []))
+                    except (OSError, ValueError) as error:
+                        storage_finish = dict(state='pending', error=str(error)[:500])
                 run = self.update_job(run['id'], state=terminal, session_closed_at=now(),
+                    **({'storage_finish': storage_finish} if storage_finish else {}),
                     session_closed_by=actor, session_archive_id=saved['id'], session_close_status=status,
                     session_request_id=request_id, session_request_mode=mode,
                     session_close_identity='agent_session' if run.get('agent_session') else 'pane_checkout',
@@ -1149,7 +1204,8 @@ class OrganizationStore:
             job = self.get(db, 'jobs', text(body, 'job_id', 40), text(body, 'organization_id', 40))
         if job['kind'] != 'chat':
             raise ValueError('Select an interrupted chat reply.')
-        resolution = self.resolve_coordinator_report(job['id'], job['profile_id'], 'recover')
+        resolution = self.resolve_coordinator_report(job['id'], job['profile_id'], 'recover',
+                                                     reply_name=body.get('reply_name'))
         if not job.get('recovered_by'):
             self.update_job(job['id'], recovered_by=actor)
         return {'resolution': resolution}
@@ -1216,7 +1272,7 @@ class OrganizationStore:
         finally:
             lock.release()
 
-    def resolve_coordinator_report(self, job_id, profile_id, mode):
+    def resolve_coordinator_report(self, job_id, profile_id, mode, *, reply_name=None):
         """Recover output or retire uncertain delivery under the agent's lock.
 
         Never send terminal input here. The coordinator queues a new, auditable
@@ -1224,6 +1280,9 @@ class OrganizationStore:
         """
         if mode not in ('recover', 'fresh'):
             raise ValueError('Unsupported report repair mode.')
+        if reply_name is not None and (mode != 'recover' or not isinstance(reply_name, str)
+                                      or not SAVED_REPLY_NAME.fullmatch(reply_name)):
+            raise ValueError('Select an exact saved reply file name, without a directory.')
         with self.lock:
             lock = self.agent_locks.setdefault(profile_id, threading.RLock())
         if not lock.acquire(blocking=False):
@@ -1233,6 +1292,9 @@ class OrganizationStore:
                 job = self.get(db, 'jobs', job_id)
                 if job['kind'] != 'chat' or job.get('profile_id') != profile_id:
                     raise ValueError('Select an interrupted chat reply for the matching agent.')
+                recorded_name = (job.get('delivery') or {}).get('reply_name') or job.get('reply_name')
+                if reply_name is not None and recorded_name and reply_name != recorded_name:
+                    raise ValueError('Recovery cannot replace the reply file recorded for this attempt.')
                 if job['state'] == 'answered' and mode == 'recover':
                     return 'recovered'
                 if job['state'] == 'superseded' and mode == 'fresh':
@@ -1254,17 +1316,19 @@ class OrganizationStore:
                     raise ValueError('Reply directories must not be symlinks.')
                 try:
                     # Read the attempt's own reply file. Legacy jobs without
-                    # per-attempt evidence keep their original reply.md. Recovery
-                    # only reads: it never quarantines or rewrites the reply.
-                    name = (job.get('delivery') or {}).get('reply_name') or 'reply.md'
-                    if not re.fullmatch(r'reply-[a-f0-9]{12}\.md|reply\.md', str(name)):
+                    # per-attempt evidence keep their original reply.md unless an
+                    # inspecting operator explicitly names a file. Never guess
+                    # between files or override a recorded attempt binding.
+                    name = recorded_name or reply_name or 'reply.md'
+                    if not SAVED_REPLY_NAME.fullmatch(str(name)):
                         raise ValueError('unsupported reply file name in job delivery evidence')
                     reply = read_contribution(directory / name, label='chat reply')
                 except (ValueError, OSError) as error:
                     raise ValueError(f'Reply recovery failed for job {job_id}: {error}') from error
-                self.update_job(job_id, state='answered', result=reply, result_format='markdown',
+                self.update_job(job_id, state='answered', result=reply, result_format='markdown', reply_name=name,
                                 previous_error=job.get('error', ''), error='', recovered_at=now(),
-                                delivery=dict(job.get('delivery') or {}, stage='reply_verified',
+                                delivery=dict(job.get('delivery') or {}, stage='reply_verified', reply_name=name,
+                                              reply_name_restored=bool(reply_name and not recorded_name),
                                               recovered=True, bytes=len(reply.encode('utf-8'))))
                 return 'recovered'
             if runs:
@@ -1698,18 +1762,6 @@ class OrganizationStore:
                 output_directories = ['chat-replies']
                 if profile.get('group_id') or job.get('session_purpose') == 'discussion':
                     output_directories.append('discussion-artifacts')
-                # Worktrees share committed Git objects. Evidence is read from
-                # the assigned checkout; no implicit main-checkout access grant.
-                arguments = launch_arguments(profile) + prepare_permissions(
-                    profile, self.path.parent, output_directories=tuple(output_directories))
-                # Native resume uses adapter arguments validated before they were
-                # recorded; free-form command text is never executed here.
-                resume_args = job.get('resume_args')
-                if isinstance(resume_args, list) and resume_args and all(isinstance(a, str) and 0 < len(a) <= 200 for a in resume_args):
-                    arguments = arguments + [str(a) for a in resume_args][:20]
-                # Record the exact executable arguments sent to Herdr, separately
-                # from the editable profile and any later in-TUI model changes.
-                job = self.update_job(job_id, launch_arguments=arguments)
                 # Frozen before the agent starts, so the session's policy is the
                 # one that applied when the work began.
                 admitted = (job.get('environment_admission') or {}).get('state') == 'ready'
@@ -1741,6 +1793,21 @@ class OrganizationStore:
                         self.require_environment_continuation(continuation)
                 from session_workspace import prepare as prepare_scratch, environment as scratch_environment, install_wrappers
                 from environment_launch import activate_shell
+                # Allocate the environment first, then grant only its exact owned
+                # output/cache roots. Never grant the whole storage registry or
+                # another checkout merely because Git objects are shared.
+                import execution_storage
+                permission_options = dict(output_directories=tuple(output_directories))
+                managed = tuple(execution_storage.grants(job.get('storage_binding'), projects=self.projects))
+                if managed:
+                    permission_options['managed_directories'] = managed
+                    permission_options['managed_root'] = execution_storage.root()
+                arguments = launch_arguments(profile) + prepare_permissions(
+                    profile, self.path.parent, **permission_options)
+                resume_args = job.get('resume_args')
+                if isinstance(resume_args, list) and resume_args and all(isinstance(a, str) and 0 < len(a) <= 200 for a in resume_args):
+                    arguments = arguments + [str(a) for a in resume_args][:20]
+                job = self.update_job(job_id, launch_arguments=arguments)
                 job = self.update_job(job_id, launch_stage='scratch_binding')
                 scratch = prepare_scratch(job.get('worktree_path') or project, job['id'], repository=repository)
                 job = self.update_job(job_id, scratch_directory=str(scratch))
@@ -1858,8 +1925,18 @@ class OrganizationStore:
                 except Exception:
                     pass  # Unavailable evidence must not claim delivery certainty.
             if job['kind'] in ('launch', 'chat', 'delegate') and delivery in ('blocked', 'unknown') and code:
-                self.update_job(job_id, delivery=dict(stage='blocked' if delivery == 'blocked' else 'unknown',
-                                                      code=code, at=now()))
+                # A post-prompt status check can fail after the reply was saved.
+                # Retain its exact attempt filename and submission evidence so
+                # inspected recovery can read that file without another prompt.
+                try:
+                    with self.lock, closing(self.connect()) as db:
+                        saved = self.get(db, 'jobs', job_id).get('delivery') or {}
+                except (ValueError, OSError, sqlite3.Error):
+                    saved = {}
+                if not isinstance(saved, dict):
+                    saved = {}
+                self.update_job(job_id, delivery=dict(saved, previous_stage=saved.get('stage'),
+                    stage='blocked' if delivery == 'blocked' else 'unknown', code=code, at=now()))
             if job['kind'] == 'chat':
                 # Diagnostics must never replace the original failure with their own.
                 try:

@@ -34,6 +34,46 @@ class BuildCapacityTests(unittest.TestCase):
         with patch.object(capacity, 'storage_status', return_value=dict(available=True, blocked=False, reason='')):
             return capacity.budget(self.proc, self.cg, storage=self.directory)
 
+    def test_running_build_is_stopped_when_free_space_disappears(self):
+        process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'])
+        self.addCleanup(lambda: process.poll() is None and (process.kill(), process.wait()))
+        with patch.object(capacity, 'storage_status', side_effect=[
+                dict(available=True, blocked=False, reason=''),
+                dict(available=True, blocked=True, reason='Low disk space.')]):
+            with self.assertRaisesRegex(capacity.StorageLimitExceeded, 'Low disk space'):
+                capacity.wait_for_process(process, storage=self.directory, environment={}, interval=.01)
+        self.assertIsNone(process.poll())  # Caller retains process-group ownership.
+
+    def test_running_build_output_limit_counts_internal_hardlinks_once(self):
+        output = self.directory / 'output'
+        output.mkdir()
+        data = output / 'object'
+        data.write_bytes(b'x' * 8192)
+        os.link(data, output / 'alias')
+        size = capacity.output_size(output, 100000)
+        self.assertLess(size, 16384)
+        process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'])
+        self.addCleanup(lambda: process.poll() is None and (process.kill(), process.wait()))
+        with patch.object(capacity, 'storage_status', return_value=dict(available=True, blocked=False, reason='')):
+            with self.assertRaisesRegex(capacity.StorageLimitExceeded, 'output exceeded'):
+                capacity.wait_for_process(process, storage=self.directory,
+                    environment=dict(HERDR_BUILD_OUTPUT_ROOT=str(output), HERDR_BUILD_OUTPUT_LIMIT_BYTES='1024'))
+
+    def test_storage_stop_records_failure_and_does_not_run_remaining_checks(self):
+        import check_runner
+        folder = self.directory / 'stopped'
+        folder.mkdir()
+        marker = folder / 'must-not-run'
+        commands = [dict(id='first', arguments=[sys.executable, '-c', 'import time; time.sleep(20)']),
+                    dict(id='second', arguments=[sys.executable, '-c', 'from pathlib import Path; Path(' + repr(str(marker)) + ').touch()'])]
+        with patch.object(capacity, 'wait_for_process', side_effect=capacity.StorageLimitExceeded('Storage budget reached.')):
+            checks, status, timed_out = check_runner.run_scripts(self.directory, commands, folder, 30, 'bash', 20000)
+        self.assertNotEqual(status, 0)
+        self.assertFalse(timed_out)
+        self.assertEqual([item['status'] for item in checks], ['failed', 'not_run'])
+        self.assertEqual(checks[0]['blocker'], 'storage_pressure')
+        self.assertFalse(marker.exists())
+
     def test_cgroup_budget_reserves_capacity_and_full_swap_alone_does_not_block(self):
         with patch.object(capacity.os, 'sched_getaffinity', return_value=set(range(16)), create=True):
             budget = self.sample()

@@ -21,7 +21,8 @@ def candidates(report, paths):
                 if arguments is None:
                     continue
             result.append(dict(id=f'{directory}:{index}:{proposal["purpose"]}', cwd=directory,
-                arguments=arguments, source=proposal['source'], purpose=proposal['purpose']))
+                arguments=arguments, source=proposal['source'], purpose=proposal['purpose'],
+                evidence=proposal.get('evidence', ''), derived=proposal.get('derived') is True))
     return result[:100]
 
 

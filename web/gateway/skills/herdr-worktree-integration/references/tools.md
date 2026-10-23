@@ -49,3 +49,24 @@ are not OS isolation. Do not overwrite shared executables, use `pip install
 `/usr/local`, use sudo/system package managers, or enter another task's caches.
 Permission denials mean `missing_permissions`: report the exact path/operation,
 stop bounded attempts and do not request broader access as a workaround.
+
+## Managed build storage
+
+Use the SDK adapter's supplied build mode, output variables and download caches.
+New environment plans default to compact builds; full debugger information is an
+operator choice in Managed build storage followed by a newly approved plan.
+Do not override those variables or build into additional output trees. Heavy
+commands queue for the shared compiler budget and stop on storage pressure;
+waiting is not a reason to launch a duplicate command.
+
+Managed output and execution caches are rebuildable and can be reclaimed after
+the session closes. Keep screenshots, save data, test fixtures and deliverables
+in the project's documented evidence paths outside managed storage. Installed
+dependencies stay private to the execution. Only adapter-declared download data
+may be reused, scoped to the same repository and execution lane. Do not link
+mutable dependency trees across tasks or delete another execution's data.
+
+If a storage limit stops a check, report the actual blocker and preserve source
+edits and evidence. Do not repeatedly retry, change the budget, clean unrelated
+directories or claim success. The operator can inspect managed storage, preview
+cleanup of inactive outputs or increase the filesystem capacity.

@@ -201,6 +201,181 @@ void main() {
     return {'workspaces': [], 'agents': []};
   }
 
+  for (final overridden in [false, true]) {
+    test(
+      'asset notice follows gateway classification and override=$overridden',
+      () async {
+        final sources = overridden
+            ? []
+            : [
+                {
+                  'path': 'assets/dev',
+                  'reason':
+                      'This heuristic can include Node servers or tools: add a Node.js override if needed.',
+                },
+              ];
+        Map<String, dynamic>? savedPlan;
+        await mount(const ProjectAnalysisCard(path: 'repo'), (request) {
+          if (request.url.path.endsWith('/environment'))
+            return {
+              'project': 'repo',
+              'revision': 'head',
+              'plan_current': true,
+              'plan': savedPlan,
+              'job': null,
+              'active_jobs': [],
+              'prepared': null,
+            };
+          if (request.url.path.endsWith('/environment/plan'))
+            return savedPlan = {
+              'digest': 'plan',
+              'source_components': sources,
+              'requirements': [],
+              'selected_checks': [],
+              'check_candidates': [
+                {
+                  'id': '.:build',
+                  'cwd': '.',
+                  'arguments': ['cargo', 'build', '--no-default-features'],
+                  'source': 'README#headless-cargo',
+                  'derived': true,
+                  'evidence': 'README.md',
+                },
+              ],
+            };
+          if (request.url.path.endsWith('/analysis'))
+            return {
+              'source_components': sources,
+              'requirements': overridden
+                  ? [
+                      {
+                        'tool': 'node',
+                        'label': 'Node.js',
+                        'components': ['assets/dev'],
+                        'override': {'constraint': '20.19.2'},
+                        'assessment': {'verdict': 'missing'},
+                      },
+                    ]
+                  : [],
+              'components': [
+                {
+                  'path': '.',
+                  'basis': 'manifest',
+                  'requirements': [
+                    {
+                      'tool': 'rust-toolchain',
+                      'established': true,
+                      'selection_lookup': {
+                        'components': ['rustfmt', 'clippy'],
+                      },
+                    },
+                  ],
+                },
+                {'path': 'assets/dev', 'basis': 'inferred', 'requirements': []},
+              ],
+            };
+          return {'workspaces': [], 'agents': []};
+        });
+        var content = web.document
+            .getElementById('operations-test')!
+            .textContent!;
+        expect(content.contains('Source-only component:'), !overridden);
+        expect(content, contains('Requested SDK components: rustfmt, clippy'));
+        await click('Plan environment');
+        content = web.document.getElementById('operations-test')!.textContent!;
+        expect(content.contains('Source-only component:'), !overridden);
+        expect(content, contains('Evidence: README.md'));
+        expect(content, contains('Derived companion'));
+        if (!overridden) expect(content, contains('Node servers or tools'));
+      },
+    );
+  }
+
+  test(
+    'environment section identities and toggles survive preceding status changes',
+    () async {
+      var running = false;
+      await mount(const ProjectAnalysisCard(path: 'repo'), (request) {
+        if (request.url.path.endsWith('/analysis'))
+          return {
+            'source': {'boundary': 'repository root', 'cache_seconds': 30},
+            'requirements': [
+              {
+                'tool': 'rust',
+                'assessment': {'verdict': 'missing'},
+              },
+            ],
+            'components': [
+              {
+                'path': '.',
+                'requirements': [],
+                'configured_tooling': [
+                  {'id': 'rustfmt', 'evidence': 'rustfmt.toml'},
+                ],
+              },
+            ],
+          };
+        if (request.url.path.endsWith('/environment'))
+          return {
+            'project': 'repo',
+            'revision': 'head',
+            'plan_current': true,
+            'plan': {
+              'digest': 'plan',
+              'requirements': [],
+              'selected_checks': [],
+              'check_candidates': [],
+            },
+            'job': null,
+            'active_jobs': [
+              if (running)
+                {'id': 'preparing', 'digest': 'plan', 'state': 'running'},
+            ],
+            'prepared': {
+              'current': true,
+              'revision': 'head',
+              'requirements': [],
+              'selected_check_count': 0,
+            },
+          };
+        return {'workspaces': [], 'agents': []};
+      });
+      web.HTMLDetailsElement section(String id) =>
+          elements('details[data-environment-section="$id"]').single
+              as web.HTMLDetailsElement;
+      final host = section('host'), repository = section('repository');
+      final summary = host.querySelector('summary') as web.HTMLElement;
+      summary.click();
+      summary.click();
+      await settle();
+      expect(
+        host.open,
+        isFalse,
+        reason: 'Two clicks in one frame cancel each other',
+      );
+      summary.click();
+      await settle();
+      running = true;
+      await click('Re-analyse');
+      expect(section('host'), same(host));
+      expect(section('repository'), same(repository));
+      expect(host.open, isTrue);
+      expect(repository.open, isFalse);
+      expect(
+        web.document.getElementById('operations-test')!.textContent,
+        contains('Acquiring and verifying SDKs'),
+      );
+      expect(
+        repository.textContent,
+        contains('Boundary: repository root · cache 30s'),
+      );
+      expect(
+        repository.textContent,
+        contains('Configured tooling: rustfmt (rustfmt.toml)'),
+      );
+    },
+  );
+
   test(
     'discovery displays source, inherited SDK evidence and host readiness',
     () async {
@@ -292,7 +467,7 @@ void main() {
       expect(content, contains('SDK lookup: Api'));
       expect(content, contains('Host configuration above the repository root'));
       expect(content, contains('partial: a limit stopped the scan'));
-      expect(content, contains('Host readiness'));
+      expect(content, contains('Host SDK discovery'));
       expect(content, contains('Measured 8.0.400'));
       expect(content, contains('/usr/bin/dotnet'));
       expect(content, contains('Component: Api'));
@@ -303,7 +478,7 @@ void main() {
       expect(content, isNot(contains("Instance of 'Text'")));
       expect(
         content,
-        contains('No requirement of this project is installable'),
+        contains('No matching SDK is in the bundled installer catalog'),
       );
       await click('Re-analyse');
       expect(
@@ -340,15 +515,28 @@ void main() {
           },
         ],
       };
+      Map<String, dynamic>? savedPlan;
+      Map<String, dynamic>? savedJob;
       await mount(const ProjectAnalysisCard(path: 'repo'), (request) {
+        if (request.url.path.endsWith('/environment')) {
+          return {
+            'project': 'repo',
+            'revision': 'current-commit',
+            'plan_current': true,
+            'plan': savedPlan,
+            'job': savedJob,
+            'prepared': null,
+            'active_jobs': savedJob?['state'] == 'queued' ? [savedJob] : [],
+          };
+        }
         if (request.url.path.endsWith('/environment/plan'))
-          return fixture(false);
+          return savedPlan = fixture(false);
         if (request.url.path.endsWith('/environment/select'))
-          return fixture(true);
+          return savedPlan = fixture(true);
         if (request.url.path.endsWith('/environment/prepare'))
-          return {'id': 'job', 'state': 'queued'};
+          return savedJob = {'id': 'job', 'state': 'queued'};
         if (request.url.path.endsWith('/environment/cancel'))
-          return {'id': 'job', 'state': 'cancelled'};
+          return savedJob = {'id': 'job', 'state': 'cancelled'};
         return {
           'components': [],
           'requirements': [],
@@ -387,6 +575,166 @@ void main() {
     },
   );
 
+  for (final state in ['ready', 'older', 'unavailable', 'queued']) {
+    test(
+      'saved project environment survives reload ($state), independently of host discovery',
+      () async {
+        var polled = false;
+        final plan = {
+          'digest': 'saved-plan',
+          'preparation_version': 1,
+          'requirements': [
+            {
+              'capability': 'dotnet-sdk',
+              'label': '.NET SDK',
+              'version': '8.0.100',
+              'components': ['Api'],
+              'state': 'acquire',
+              'artifact': {},
+              'activation': 'available',
+            },
+          ],
+          'check_candidates': [],
+          'selected_checks': [],
+        };
+        await mount(const ProjectAnalysisCard(path: 'repo'), (request) {
+          if (request.url.path.endsWith('/environment')) {
+            if (request.url.queryParameters.containsKey('job')) {
+              polled = true;
+              return {
+                'id': 'saved-job',
+                'digest': 'saved-plan',
+                'state': 'ready',
+              };
+            }
+            if (state == 'unavailable')
+              return http.Response('{"error":"store unavailable"}', 503);
+            return {
+              'project': 'repo',
+              'revision': 'current-commit',
+              'plan_current': state != 'older',
+              'plan': plan,
+              'job': {
+                'id': 'saved-job',
+                'digest': 'saved-plan',
+                'state': state == 'queued' && !polled ? 'queued' : 'ready',
+              },
+              'prepared': state == 'queued' && !polled
+                  ? null
+                  : {
+                      'current': state != 'older',
+                      'revision': state == 'older'
+                          ? 'old-commit'
+                          : 'current-commit',
+                      'requirements': plan['requirements'],
+                      'selected_checks': [
+                        {'id': 'build'},
+                      ],
+                    },
+            };
+          }
+          if (request.url.path.endsWith('/analysis'))
+            return {
+              'source_components': [
+                {
+                  'path': 'assets',
+                  'capability': 'node',
+                  'reason': 'JS/TS asset.',
+                },
+              ],
+              'requirements': [
+                {
+                  'tool': 'dotnet-sdk',
+                  'label': '.NET SDK',
+                  'constraint': '8.0.100',
+                  'components': ['Api'],
+                  'assessment': {'verdict': 'missing'},
+                },
+              ],
+              'components': [
+                {
+                  'path': 'assets',
+                  'basis': 'inferred',
+                  'requirements': [
+                    {'tool': 'node', 'label': 'Node.js', 'established': false},
+                  ],
+                },
+              ],
+            };
+          return {'workspaces': [], 'agents': []};
+        }, role: 'operator');
+        String content() =>
+            web.document.getElementById('operations-test')!.textContent!;
+        if (state == 'queued') {
+          expect(content(), contains('SDK preparation queued'));
+          await Future<void>.delayed(const Duration(milliseconds: 2300));
+          await settle();
+        }
+        if (state == 'unavailable') {
+          expect(content(), contains('Saved environment status unavailable'));
+          expect(
+            content(),
+            isNot(contains('No prepared environment for this commit')),
+          );
+        } else if (state == 'older') {
+          expect(content(), contains('Prepared for an earlier commit'));
+          expect(content(), isNot(contains('Prepared for this commit')));
+          expect(content(), isNot(contains('Prepare SDKs')));
+        } else {
+          expect(content(), contains('Prepared for this commit'));
+          expect(content(), contains('1 approved validation check'));
+          expect(content(), contains('SDK preparation recorded'));
+          for (final name in ['repository', 'host', 'settings']) {
+            final section =
+                elements('details[data-environment-section="$name"]').single
+                    as web.HTMLDetailsElement;
+            expect(
+              section.open,
+              isFalse,
+              reason: '$name is secondary to prepared SDKs',
+            );
+          }
+          expect(
+            elements('.callout__title').single.textContent,
+            'Prepared for this commit',
+          );
+          final host =
+              elements('details[data-environment-section="host"]').single
+                  as web.HTMLDetailsElement;
+          (host.querySelector('summary') as web.HTMLElement).click();
+          await settle();
+          expect(host.open, isTrue);
+          await click('Re-analyse');
+          expect(
+            host.open,
+            isTrue,
+            reason: 'refresh preserves expanded diagnostics',
+          );
+          expect(content(), isNot(contains('SDK preparation completed.')));
+          binding.detachRootComponent();
+          await settle();
+          binding.attachRootComponent(
+            _Host(const ProjectAnalysisCard(path: 'repo')),
+            attachTo: '#operations-test',
+          );
+          await settle();
+          expect(content(), contains('Prepared for this commit'));
+        }
+        expect(content(), contains('Host SDK discovery'));
+        expect(content(), contains('Not found on host'));
+        expect(content(), contains('Repository requirements'));
+        expect(
+          elements(
+            '.ops-pill',
+          ).where((element) => element.textContent == 'Source only'),
+          hasLength(1),
+        );
+        expect(posts('projects/environment/plan'), isEmpty);
+        expect(posts('projects/environment/prepare'), isEmpty);
+      },
+    );
+  }
+
   test('Dependency approval is separate from check selection', () async {
     Map<String, dynamic> fixture(bool allowed) => {
       'digest': allowed ? 'restore-approved' : 'plan',
@@ -402,10 +750,22 @@ void main() {
       'check_candidates': [],
       'selected_checks': [],
     };
+    Map<String, dynamic>? savedPlan;
     await mount(const ProjectAnalysisCard(path: 'repo'), (request) {
-      if (request.url.path.endsWith('/environment/plan')) return fixture(false);
+      if (request.url.path.endsWith('/environment'))
+        return {
+          'project': 'repo',
+          'revision': 'head',
+          'plan_current': true,
+          'plan': savedPlan,
+          'job': null,
+          'active_jobs': [],
+          'prepared': null,
+        };
+      if (request.url.path.endsWith('/environment/plan'))
+        return savedPlan = fixture(false);
       if (request.url.path.endsWith('/environment/authorize-restore')) {
-        return fixture(true);
+        return savedPlan = fixture(true);
       }
       return {
         'components': [],
@@ -426,6 +786,121 @@ void main() {
       contains('Revoke dependency restoration'),
     );
   });
+
+  test(
+    'new proposals preserve an older active run, action errors and lookup failures stay distinct',
+    () async {
+      var proposed = false, failLookup = false, polls = 0;
+      final oldJob = {'id': 'original-job', 'digest': 'A', 'state': 'running'};
+      Map<String, dynamic> plan() => {
+        'digest': proposed ? 'B' : 'A',
+        'preparation_version': 1,
+        'requirements': [
+          {
+            'capability': 'node',
+            'version': '22.0.0',
+            'components': ['tools'],
+            'state': 'acquire',
+            'activation': 'available',
+            'artifact': {},
+          },
+        ],
+        'selected_checks': [],
+        'check_candidates': [],
+      };
+      await mount(const ProjectAnalysisCard(path: 'repo'), (request) {
+        if (request.url.path.endsWith('/environment/plan')) {
+          proposed = true;
+          return plan();
+        }
+        if (request.url.path.endsWith('/environment/prepare'))
+          return http.Response('{"error":"preparation refused"}', 400);
+        if (request.url.path.endsWith('/environment')) {
+          if (request.url.queryParameters.containsKey('job')) {
+            polls++;
+            return oldJob;
+          }
+          if (failLookup)
+            return http.Response('{"error":"storage unavailable"}', 503);
+          return {
+            'project': 'repo',
+            'revision': 'head',
+            'plan_current': true,
+            'plan': plan(),
+            'job': proposed ? null : oldJob,
+            'active_jobs': [oldJob],
+            'prepared': null,
+          };
+        }
+        return {
+          'components': [
+            {'path': 'tools', 'requirements': []},
+          ],
+          'requirements': [],
+          'workspaces': [],
+          'agents': [],
+        };
+      });
+      await click('Plan environment');
+      String content() =>
+          web.document.getElementById('operations-test')!.textContent!;
+      expect(content(), contains('Preparation job: original-job'));
+      await Future<void>.delayed(const Duration(milliseconds: 2200));
+      await settle();
+      expect(polls, greaterThan(0));
+      await click('Prepare SDKs');
+      expect(content(), contains('Environment action (prepare) failed:'));
+      expect(
+        content(),
+        isNot(contains('Saved environment status unavailable')),
+      );
+      expect(content(), contains('Preparation job: original-job'));
+      failLookup = true;
+      await click('Re-analyse');
+      expect(content(), contains('Saved environment status unavailable'));
+      expect(content(), contains('Repository requirements'));
+      expect(content(), isNot(contains('Prepare SDKs')));
+      expect(content(), isNot(contains('Preparation job: original-job')));
+      final stoppedAt = polls;
+      await Future<void>.delayed(const Duration(milliseconds: 2200));
+      expect(polls, stoppedAt);
+    },
+  );
+
+  test(
+    'repository discovery renders while saved preparation is still loading',
+    () async {
+      final pending = Completer<Map<String, dynamic>>();
+      await mount(const ProjectAnalysisCard(path: 'repo'), (request) {
+        if (request.url.path.endsWith('/environment')) return pending.future;
+        return {
+          'components': [
+            {'path': 'immediate-discovery', 'requirements': []},
+          ],
+          'requirements': [],
+          'workspaces': [],
+          'agents': [],
+        };
+      });
+      final root = web.document.getElementById('operations-test')!;
+      expect(root.textContent, contains('immediate-discovery'));
+      expect(root.textContent, contains('Loading saved environment status…'));
+      pending.complete({
+        'project': 'repo',
+        'revision': 'head',
+        'plan_current': true,
+        'plan': null,
+        'job': null,
+        'active_jobs': [],
+        'prepared': null,
+      });
+      await settle();
+      expect(
+        root.textContent,
+        contains('No prepared environment for this commit'),
+      );
+    },
+  );
 
   test(
     'discovery distinguishes installed runtimes, deduplicates reasons and exposes unknown paths',
@@ -477,7 +952,15 @@ void main() {
       );
       expect(root.textContent!.split(reason), hasLength(2));
       expect(root.textContent, contains('A separate issue remains.'));
-      final details = root.querySelector('details') as web.HTMLDetailsElement;
+      expect(
+        (root.querySelector('details[data-environment-section="repository"]')
+                as web.HTMLDetailsElement)
+            .open,
+        isTrue,
+      );
+      final details =
+          root.querySelector('details:not([data-environment-section])')
+              as web.HTMLDetailsElement;
       expect(details.open, isFalse);
       (details.querySelector('summary') as web.HTMLElement).click();
       await settle();
@@ -537,6 +1020,80 @@ void main() {
       );
       await click('Install build service');
       expect(posts('build-service/install'), hasLength(2));
+    },
+  );
+
+  test(
+    'new builds do not close or transfer existing disclosure choices',
+    () async {
+      Map<String, dynamic> run(String id) => {
+        'id': id,
+        'repository': 'repo',
+        'state': 'complete',
+        'target': 'a' * 40,
+        'checks': [
+          {'id': 'test', 'status': 'passed'},
+        ],
+        'timings': {
+          'verify': {'duration_ms': 50, 'status': 'complete'},
+        },
+      };
+      var runs = [run('first'), run('second'), run('untouched')];
+      await mount(const BuildsPage(), (r) {
+        if (r.url.path == '/api/validation')
+          return {'runs': runs, 'executor': 'service'};
+        return buildResponse(r);
+      });
+      web.HTMLDetailsElement steps(String id) =>
+          elements(
+                'article[aria-labelledby="build-$id-title"] details.build-card__steps',
+              ).single
+              as web.HTMLDetailsElement;
+      final first = steps('first'), second = steps('second');
+      expect(first.open, isTrue);
+      expect(second.open, isFalse);
+      (first.querySelector('summary') as web.HTMLElement).click();
+      (second.querySelector('summary') as web.HTMLElement).click();
+      final timings =
+          elements('article[aria-labelledby="build-second-title"] details').last
+              as web.HTMLDetailsElement;
+      (timings.querySelector('summary') as web.HTMLElement).click();
+      await settle();
+      runs = [run('new'), ...runs];
+      await click('Refresh builds');
+      await until(() => elements('.build-entry').length == 4);
+      expect(steps('first'), same(first));
+      expect(steps('second'), same(second));
+      expect(first.open, isFalse);
+      expect(second.open, isTrue);
+      expect(timings.open, isTrue);
+      expect(steps('new').open, isTrue);
+      runs = [
+        for (final item in runs)
+          if (item['id'] == 'untouched')
+            {
+              ...item,
+              'state': 'failed',
+              'checks': [
+                {'id': 'test', 'status': 'failed'},
+              ],
+            }
+          else
+            item,
+      ];
+      await click('Refresh builds');
+      expect(
+        steps('untouched').open,
+        isFalse,
+        reason:
+            'Failure is an initial expansion default, not a polling command',
+      );
+      expect(
+        elements(
+          'article[aria-labelledby="build-untouched-title"]',
+        ).single.textContent,
+        contains('1 check failed'),
+      );
     },
   );
 

@@ -314,6 +314,28 @@ class EnvironmentPlanStore:
             row = db.execute('SELECT data FROM environment_jobs WHERE id=?', (identifier,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def status_records(self, project, revision):
+        """One read snapshot for the proposal, active runs and prepared binding."""
+        with closing(sqlite3.connect(self.path)) as db:
+            db.execute('BEGIN')
+            row = db.execute('SELECT data FROM environment_plans WHERE project=? AND revision=? '
+                             'ORDER BY rowid DESC LIMIT 1', (project, revision)).fetchone()
+            if row is None:
+                row = db.execute('SELECT data FROM environment_plans WHERE project=? ORDER BY rowid DESC LIMIT 1',
+                                 (project,)).fetchone()
+            plan = json.loads(row[0]) if row else None
+            row = db.execute('SELECT data FROM environment_jobs WHERE digest=? ORDER BY generation DESC LIMIT 1',
+                             (plan['digest'],)).fetchone() if plan else None
+            job = json.loads(row[0]) if row else None
+            active = db.execute("SELECT j.data FROM environment_jobs j JOIN environment_plans p ON p.digest=j.digest "
+                                "WHERE p.project=? AND p.revision=? AND j.state IN ('queued','running') "
+                                'ORDER BY j.rowid', (project, revision)).fetchall()
+            row = db.execute("SELECT p.data,j.data FROM environment_jobs j JOIN environment_plans p ON p.digest=j.digest "
+                             "WHERE p.project=? AND j.state='ready' ORDER BY (p.revision=?) DESC,j.rowid DESC LIMIT 1",
+                             (project, revision)).fetchone()
+            prepared_plan, prepared_job = (json.loads(row[0]), json.loads(row[1])) if row else (None, None)
+        return plan, job, [json.loads(row[0]) for row in active], prepared_plan, prepared_job
+
     def prepared(self, project, revision):
         """Latest successful binding for this exact approved source, not a candidate."""
         with closing(sqlite3.connect(self.path)) as db:

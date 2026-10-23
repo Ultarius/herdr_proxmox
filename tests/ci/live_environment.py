@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -134,6 +135,7 @@ def runtime(root):
 
 def qualify(root, command, name, files, assisted=False):
     from types import SimpleNamespace
+    os.environ['HERDR_WORKSPACE_STORAGE_ROOT'] = str(root / 'build-storage')
     projects = root / 'projects'
     projects.mkdir(exist_ok=True)
     repository = projects / name
@@ -194,7 +196,10 @@ def qualify(root, command, name, files, assisted=False):
             raise RuntimeError(json.dumps(job))
         runner = ValidationRuns(projects, lambda _: None, root=root / ('validation-' + name))
         frozen = job['toolchain_policy']
-        run = dict(id='a' * 32, event_id='b' * 64, repository=name, path=str(repository),
+        # All SDK qualifications share the storage registry. Each validation
+        # needs its own execution identity, just like a submitted gateway run.
+        run_id = uuid.uuid4().hex
+        run = dict(id=run_id, event_id=hashlib.sha256(run_id.encode()).hexdigest(), repository=name, path=str(repository),
             target=job['start_sha'], actor='qualification', started_at='qualification',
             frozen_plan_digest=frozen['plan_digest'], frozen_policy_digest=frozen['digest'])
         output = runner.root / run['id']

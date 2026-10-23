@@ -59,10 +59,8 @@ def environment(directory, run=None):
 
 
 def install_wrappers(directory, run):
-    import build_capacity
     import environment_adapters
-    wrappers = {entry['capacity_wrapper'] for entry in environment_adapters.session_tools(toolchains(run))}
-    return build_capacity.install_cargo(directory) if 'cargo' in wrappers else None
+    return environment_adapters.install_wrappers(toolchains(run), directory)
 
 
 def toolchain_guidance(run):
@@ -74,8 +72,11 @@ def toolchain_guidance(run):
         scope = ' in component ' + str(entry['component']) if entry['component'] is not None else ''
         commands = ', '.join(entry['commands'])
         lines.append(f"Bound {entry['name']}{scope}: use the prepared commands {commands} by name from the selected environment.")
-        if entry['capacity_wrapper'] == 'cargo':
-            lines.append('Cargo commands use the session PATH wrapper, which queues heavy work and caps compiler/test parallelism.')
+        if entry.get('capacity_guidance'):
+            lines.append(entry['capacity_guidance'])
+        if entry.get('build_mode'):
+            lines.append('Build mode: ' + entry['build_mode'] + '. ' + entry.get('build_guidance', '') +
+                         ' Changing this mode requires an operator to approve a new plan; do not override the profile variables yourself.')
     return '\n'.join(lines) + ('\n' if lines else '')
 
 
@@ -83,6 +84,17 @@ def guidance(run):
     directory = run.get('scratch_directory')
     if not directory:
         return ''
+    storage = run.get('storage_binding') or {}
+    output_note = ('\nManaged build outputs: ' + ', '.join(storage['outputs']) +
+                   '. These are disposable and may be reclaimed after the session closes. ') if storage.get('outputs') else '\nManaged execution storage: '
+    cache_paths = [entry['private'] for entry in (storage.get('manifest') or {}).get('caches', []) if entry.get('private')]
+    cache_note = ('\nProvided private package caches: ' + ', '.join(cache_paths) + '.\n') if cache_paths else ''
+    storage_guidance = (output_note + 'Use the provided output variables '
+        'and adapter instructions; do not override managed output locations or create duplicate build trees. '
+        'Save screenshots, fixtures, save games and deliverables in the checkout\'s documented evidence paths, outside managed output. '
+        'Keep installed dependencies private to this execution; never symlink/hardlink mutable dependency trees across tasks. '
+        'Reuse only the download cache paths provided by the platform. Do not delete shared caches or another execution\'s files.\n'
+        + cache_note + '\n'.join(storage.get('guidance') or []) + '\n') if storage.get('outputs') or storage.get('guidance') else ''
     return (
         '\nSession scratch directory: ' + str(directory) + '. '
         'TMPDIR, TMP, TEMP and HERDR_SCRATCH point here. Use mktemp under "$TMPDIR" '
@@ -102,7 +114,7 @@ def guidance(run):
         'Preserve source edits and receipts; ask the operator to inspect disposable build caches or expand storage. '
         'Once space is restored, finish the original task checks and submit the required completion receipt; '
         'an idle session by itself does not finish a task.\n'
-    ) + toolchain_guidance(run)
+    ) + toolchain_guidance(run) + storage_guidance
 
 
 def tool_guidance():

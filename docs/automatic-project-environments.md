@@ -1,5 +1,9 @@
 # Automatic project environments: implementation plan
 
+New plans also freeze the adapter's build mode. Compact builds, managed output
+retention and scoped dependency-download reuse are described in
+[Managed build storage](managed-build-storage.md).
+
 Status: partially implemented in the current changeset, 2026-10-17. The full
 automatic launch/validation path below remains the target, not a shipped claim.
 
@@ -11,6 +15,15 @@ Implemented now:
 
 - Immutable, evidence-bearing plans per component, with persisted identities.
   Different components can select different versions of one SDK.
+- JS/TS source-only components beside non-Node manifest-backed projects are
+  treated as assets rather than mandatory Node runtimes. The report and plan
+  expose this decision as `source_components`; both dashboards use that decision.
+  A Node manifest anywhere in the repository or an explicit Node override retains
+  the Node gates. Inferred Python, Go, Rust and other languages keep their SDK
+  requirements, as do manifest-free JavaScript repositories.
+  This is a heuristic that can also exempt a source-only Node server or tool;
+  the dashboard notice explicitly tells operators to declare or override that
+  runtime when needed.
 - Committed discovery applies the same dependency tree, build output and vendor
   exclusions as the working-tree walk, so a vendored third-party tree cannot
   become this project's runtime requirement or move a repository off Herdr's own
@@ -28,10 +41,53 @@ Implemented now:
 - Explicit administrator actions in both project explorer dashboards:
   **Plan environment**, then **Prepare SDKs**, with progress, cancellation and
   retry. Discovery still starts without entering a tool name.
+- Both dashboards restore saved preparation on opening the project. **Project
+  environment** shows the successful preparation for the checkout's exact HEAD,
+  its SDK versions, component scopes and approved check count. Once prepared,
+  the summary stays compact: expand **Repository requirements**, **Host SDK
+  discovery** or **Environment settings** for evidence and editable proposals.
+  **Plan environment** opens settings. Active preparation, lookup/action errors
+  and repository findings remain prominent; incomplete scans and unresolved or
+  conflicting evidence open untouched repository details, including findings
+  first discovered by a later analysis. An explicitly closed section stays
+  closed while its review notice remains visible. Expansion choices survive
+  refreshes for the selected project. **Host SDK
+  discovery** separately reports executables found on the host PATH or configured
+  installer paths: **Not found on host** does not mean a prepared project SDK is
+  missing. **Repository requirements** describes declarations, and labels waived
+  asset runtimes **Source only**. A historical receipt is explicitly **Prepared
+  for an earlier commit**, never a binding for the current one. Plans and running
+  jobs for the current commit survive reopening; a newer, unprepared proposal
+  does not hide the previously prepared environment. Lookup errors are shown as
+  unavailable, not as absence of preparation.
+  The read-only `GET /api/projects/environment?path=<project>` returns these
+  saved records without planning, downloading, executing SDK probes or approving
+  checks. Opening the page sends no preparation POST. Active jobs resume polling;
+  project and connection guards discard responses from an old selection.
+  Active preparations are listed across all plans for the current project and
+  commit. Creating or editing a proposal preserves those runs; each can be
+  cancelled explicitly. A newer pending plan is labelled separately from the
+  prepared binding. Administrator actions reload saved status, including when a
+  request returns an already-finished job. Discovery renders independently of
+  the status lookup. A failed lookup clears preparation controls and polling;
+  an action failure keeps the last known status and identifies the failed action.
+  The two dashboards share this controller. Read-only operators receive compact
+  status and progress summaries; editable plans and full job details are returned
+  to administrators. Status metadata is read in one SQLite snapshot, and both the
+  current and historical preparation commit are shown when they differ.
 - Trusted publisher metadata and checksummed acquisition for exact, three-part
   .NET SDK and Rust toolchain versions on Linux glibc x64/arm64. Installations
   coexist by artifact identity; acquisition runs without root and changes no
   global SDK selection. Rust prepares the compiler, Cargo and host standard library.
+  Minimal Rust profiles can also request `rustfmt` and `clippy`: their exact-version
+  publisher archives are independently checksummed and their commands are probed.
+- Cargo projects can propose headless build/test pairs from an exact
+  `cargo test --no-default-features` or `cargo build --no-default-features` in a
+  fenced README example. Both proposals carry that README as evidence, including
+  the companion operation derived from it. Shell expressions,
+  extra arguments and graphical smoke commands are not imported. These are still
+  proposals requiring administrator approval (or the separate automatic-check
+  permission). The README is frozen as a protected policy input when selected.
 - Durable jobs, leases, restart recovery, cancellation fencing, atomic staging
   and reuse probes. Manual preparation requires the clean checkout's exact HEAD.
   Automatic preparation exports only the recorded commit's SDK-selection blobs
@@ -76,7 +132,7 @@ mixed-project preparation job. Existing host measurements are reused, including
 alternative measured executable versions; absence of an adapter never erases them.
 
 Current refusals are explicit: unresolved/moving SDK versions, Rust extra targets,
-optional components and non-minimal profiles, custom .NET SDK search paths,
+optional components other than rustfmt/clippy and non-minimal profiles, custom .NET SDK search paths,
 unsupported executor platforms, and capabilities without a managed adapter. A
 mixed .NET/Node project remains blocked until both capabilities can be prepared.
 
@@ -91,7 +147,8 @@ Run `python3 tests/ci/project_environments.py` as an unprivileged Linux glibc
 user, or dispatch CI with **run_project_environments** enabled. The same job now
 runs on release-producing pushes on x64 and arm64 and is a prerequisite of publication. It
 downloads pinned fixture SDKs and performs a real .NET restore/build and offline
-Cargo test in disposable repositories. Its results qualify adapters; they do not
+Cargo test plus real rustfmt/Clippy acquisition, probes and commands in disposable
+repositories. Its results qualify adapters; they do not
 turn SDK receipts into project validation evidence. Qualification also runs the
 actual product validation engine and publication evidence gate. Missing SDK receipts
 cause the existing unverified directory to be quarantined for inspection and

@@ -3,6 +3,39 @@ import 'package:juice/juice.dart';
 import 'package:herdr_dashboard/task_activity.dart';
 
 void main() {
+  test('revalidation history identifies the retained chat and passing run', () {
+    final entry = {
+      'action': 'delivery_revalidated',
+      'actor': 'gateway',
+      'at': 'now',
+      'previous_sha': 'a' * 40,
+      'delivery_chat_id': 'old-chat',
+      'validation_run': 'passing-run',
+      'previous_validation_run': 'failed-run',
+    };
+    expect(activityLabel(entry['action']), contains('New validation'));
+    expect(activitySection(entry['action']), 'Checks & builds');
+    expect(
+      activitySubtitle(entry),
+      contains('chat old-chat · validation failed-run → passing-run'),
+    );
+  });
+  test('waiting for the previous inspection explains passing revalidation', () {
+    expect(
+      taskNextStep({
+        'state': 'review_ready',
+        'head_sha': 'sha',
+        'await_verification': true,
+        'delivery_workflow': {
+          'sha': 'sha',
+          'state': 'waiting_agent',
+          'revalidation_wait': {'inspection_pending': true},
+          'error': 'Validation passed; waiting for the previous inspection.',
+        },
+      }),
+      'Validation passed; waiting for the previous inspection.',
+    );
+  });
   test('working capture waits are distinct from automation errors', () {
     final task = <String, dynamic>{
       'state': 'implementing',

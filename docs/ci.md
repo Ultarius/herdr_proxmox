@@ -15,8 +15,71 @@ VM tests; CI runs the browser suite separately. Before merging gateway changes,
 also run `python3 scripts/test-project-discovery.py --all` on native Linux; the
 runner refuses unsupported filesystem capabilities and fails on any skipped test.
 
+## Keeping CI bounded
+
+Jobs represent execution environments and trust boundaries, rather than individual
+features. New regression tests belong in the existing discovered suites:
+
+| Lane | Runs | Coverage |
+| --- | --- | --- |
+| Installer and gateway checks | Every push and PR | Shell syntax/fixtures, complete Python discovery on the pinned primary Python, workflow lint |
+| Minimum supported Python checks | Every push and PR | The same complete Linux Python suite on the floor declared in `pyproject.toml` |
+| Web build and browser checks | Every push and PR | Existing Flutter/Jaspr analysis, VM/browser tests and one reusable release build |
+| Real project SDK preparation | Release pushes or explicit manual selection, after Python checks pass | Publisher downloads, actual builds and live daemon qualification on x64/ARM |
+| Debian provisioning | Trusted default-branch pushes/manual runs, after Python/web checks pass | Fresh installation and service smoke checks |
+| Proxmox LXC | Explicit manual selection on the trusted default branch | The actual lab host and container lifecycle |
+| Release publication | Release pushes, after Python/web/SDK qualification | Packaging and publication of the already-built assets |
+
+`tests/test_*.py` files are discovered by `scripts/test-project-discovery.py --all`
+on both Python lanes; no workflow test-file allowlist needs extending. The minimum
+version comes from `requires-python = ">=major.minor"`. The primary minor version
+is pinned once in the workflow's `CI_PRIMARY_PYTHON` setting (currently 3.12);
+`setup-python` installs its current patch release. Runner-image Python changes
+therefore do not silently change gateway test coverage. If the floor matches the
+primary version, compatibility reports that the primary job covers it and does
+not rerun the suite. If the primary interpreter is too old, CI fails with a
+runtime-selection error. Both jobs bootstrap the pinned primary before running
+the TOML-based helper. Compatibility uses `--select-only` to install a newer
+floor even when it exceeds the primary; the primary job still refuses to certify
+an unsupported version. Direct helper invocation below Python 3.11 gives a
+bootstrap diagnostic instead of failing at its `tomllib` import. A more complex
+version declaration requires reviewing selection rather than guessing a floor.
+
+The previous feature-specific storage matrix is folded into these lanes: storage
+regressions are discovered alongside every other gateway test. Running the full
+suite on the minimum Python version is deliberate compatibility coverage. It
+costs more than a narrow storage-only run, but catches unsupported APIs and syntax
+across the gateway without creating a separate compatibility job per feature.
+
+Superseded PR workflows are cancelled using a
+[GitHub concurrency group](https://docs.github.com/en/actions/concepts/workflows-and-actions/concurrency).
+Push/manual runs have unique groups, so release publication and provisioning
+sequences are not superseded by this setting. Their existing cleanup steps remain
+in place. Required check names for the installer/gateway and web jobs stay stable;
+the general minimum-runtime job replaces the storage-specific checks.
+
+Core, compatibility and web jobs reuse `scripts/check-evidence.py` to record
+measured phase durations. `scripts/ci.py summarize` puts a slowest-first table in
+the job summary, including failed phases. The summary omits command lines; raw
+JSON timing artifacts retain command lines and are retained for seven days.
+Missing timing data is labelled as missing, never a pass.
+Timings are diagnostic evidence, not a coverage gate or an absolute wall-clock
+budget. Use these measurements to decide when a suite needs deterministic
+sharding; do not split it into new jobs after every fix or raise timeouts blindly.
+
+Add a job only for a distinct interpreter/platform, privilege boundary, hardware
+requirement or genuinely measured parallelism need. Preserve full automatic
+discovery, the no-skips Linux gate, required check names and release dependencies
+when reorganizing. Expensive external qualification belongs in the established
+release/manual lanes. Do not skip required jobs using path filters that can leave
+their checks pending. This keeps the regular job count bounded as tests grow;
+it does not promise constant test duration.
+
+## Release and installation coverage
+
 Pushing a `v*` tag additionally publishes a GitHub release after the installer
-checks and web build pass. It contains `herdr-proxmox.tar.gz` (matching installer,
+checks, minimum-Python checks, web build and real SDK qualification pass. It
+contains `herdr-proxmox.tar.gz` (matching installer,
 complete gateway and compiled UI) and its SHA-256 checksum. The remote `--web`
 installer consumes these assets. The release job has repository-content write
 permission; ordinary checks retain read-only permissions. This packaging job

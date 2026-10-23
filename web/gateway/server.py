@@ -37,6 +37,7 @@ from operators import Operators
 from sdk_install import SdkInstall
 from build_service_install import BuildServiceInstall
 from request_validation import FieldValidationError
+from workspace_storage import StorageBusy
 import project_analysis
 from repository_queries import RepositoryQueries
 from operation_metrics import METRICS, query_measurement
@@ -447,8 +448,17 @@ class Handler(BaseHTTPRequestHandler):
                     self.reply(503, {'error': 'Environment preparation is unavailable.'})
                     return
                 identifier = (query.get('job') or [''])[0]
+                if 'path' in query:
+                    try:
+                        self.reply(200, preparation.status(query['path'][0],
+                            details=self.operator.get('role') == 'admin'))
+                    except (ValueError, OSError, sqlite3.Error) as error:
+                        self.reply(400, {'error': str(error)[:500]})
+                    return
                 result = preparation.store.job(identifier) if identifier else preparation.store.get(
                     (query.get('plan') or [''])[0])
+                if identifier and self.operator.get('role') != 'admin':
+                    result = preparation.job_view(result)
                 self.reply(200 if result else 404, result or {'error': 'No environment record has that identity.'})
                 return
             if self.path == '/api/build':
@@ -457,6 +467,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == '/api/resources':
                 self.reply(200, resources.snapshot())
+                return
+            if self.path == '/api/storage':
+                if self.operator['role'] != 'admin':
+                    self.reply(403, {'error': 'Only an administrator can inspect managed build storage.'})
+                    return
+                self.reply(200, self.server.storage.snapshot())
                 return
             if self.path == '/api/organizations/export':
                 self.reply(200, export_configuration(self.server.organizations))
@@ -660,6 +676,7 @@ class Handler(BaseHTTPRequestHandler):
         actions = {f'/api/workspaces/{name}': name for name in ('create', 'focus', 'rename')}
         actions['/api/organizations/templates'] = 'templates'
         actions['/api/organizations/templates/library'] = 'template_library'
+        actions['/api/storage'] = 'storage'
         environment_actions = {f'/api/projects/environment/{name}': name for name in ('plan', 'select', 'prepare', 'cancel', 'authorize-restore')}
         actions.update(environment_actions)
         release_actions = {f'/api/releases/{name}': name for name in ('create', 'single', 'membership', 'freeze', 'revise', 'retry', 'resume', 'repair', 'exclude', 'publish', 'assembly', 'review', 'review_policy', 'pull', 'refresh')}
@@ -667,7 +684,7 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'resolve_delegation', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'retry_discussion', 'cancel_discussion', 'remove_agent', 'remove_group', 'session', 'realign_discussion_session')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close', 'verify', 'install_integration')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/knowledge', '/api/updates/install', '/api/updates/check', '/api/updates/alphas', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/build-service/install', '/api/validation/run', '/api/projects/clone', '/api/projects/connections', '/api/projects/browse', '/api/projects/git', '/api/projects/toolchain', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/guidance', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/start_proposal', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/publication', '/api/tasks/repair', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build', '/api/tasks/policy', '/api/tasks/complete', '/api/tasks/discuss', '/api/tasks/review_policy', '/api/tasks/proposal', '/api/tasks/assignment', '/api/tasks/automation', '/api/tasks/discovery', '/api/tasks/handover', '/api/tasks/consult', '/api/tasks/acceptance'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/knowledge', '/api/updates/install', '/api/updates/check', '/api/updates/alphas', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/build-service/install', '/api/validation/run', '/api/projects/clone', '/api/projects/connections', '/api/projects/browse', '/api/projects/git', '/api/projects/toolchain', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/guidance', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/start_proposal', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/publication', '/api/tasks/repair', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build', '/api/tasks/policy', '/api/tasks/complete', '/api/tasks/discuss', '/api/tasks/review_policy', '/api/tasks/proposal', '/api/tasks/assignment', '/api/tasks/automation', '/api/tasks/discovery', '/api/tasks/handover', '/api/tasks/consult', '/api/tasks/acceptance', '/api/tasks/validation_environment'):
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -676,7 +693,12 @@ class Handler(BaseHTTPRequestHandler):
                                 team_templates.MAX_REQUEST_BYTES if self.path in ('/api/organizations/save', '/api/organizations/templates', '/api/organizations/templates/library') else 65536):
                 raise ValueError('Invalid request size.')
             body = json.loads(self.rfile.read(size))
-            if self.path == '/api/organizations/templates/library':
+            if self.path == '/api/storage':
+                if role != 'admin':
+                    self.reply(403, {'error': 'Only an administrator can manage build storage.'})
+                    return
+                self.reply(200, self.server.storage.action(body))
+            elif self.path == '/api/organizations/templates/library':
                 if not isinstance(body, dict):
                     raise ValueError('Expected a JSON object.')
                 if body.get('action') == 'save' and role != 'admin':
@@ -867,6 +889,9 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(502, {'error': str(exc)[:500], 'source': 'github', 'github_status': exc.status})
         except FieldValidationError as exc:
             self.reply(400, {'error': str(exc)[:500], 'field_errors': exc.field_errors})
+        except StorageBusy as exc:
+            self.reply(409, {'error': str(exc)[:500], 'code': 'storage_busy', 'retryable': True, 'retry_after': 2},
+                       retry_after=2)
         except (ValueError, UnicodeError) as exc:
             self.reply(400, {'error': str(exc)[:500]})
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -981,10 +1006,14 @@ def main():
     RUNTIME_EVENTS = RuntimeEvents(organizations.events, command)
     RUNTIME_EVENTS.start()
     contributions.start()
+    from storage_service import StorageService
+    storage = StorageService(organizations, validation)
+    storage.start()
     try:
-        serve_gateway(bind, 8787, policy, token, {'github': github, 'repository_connections': repository_connections, 'contributions': contributions, 'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator, 'operators': operators, 'sdk_install': sdk_install, 'build_service_install': build_service_install, 'validation': validation, 'analysis': analysis, 'environments': environments, 'repository_queries': queries}, cookie_secure=secure_setting == '1')
+        serve_gateway(bind, 8787, policy, token, {'github': github, 'repository_connections': repository_connections, 'contributions': contributions, 'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator, 'operators': operators, 'sdk_install': sdk_install, 'build_service_install': build_service_install, 'validation': validation, 'analysis': analysis, 'environments': environments, 'repository_queries': queries, 'storage': storage}, cookie_secure=secure_setting == '1')
     finally:
         try:
+            storage.close()
             environments.close()
             RUNTIME_EVENTS.close()
             outbox.close()

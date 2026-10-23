@@ -13,6 +13,9 @@ class RepositoryConnectionsPanel extends StatefulComponent {
 class _RepositoryConnectionsPanelState
     extends State<RepositoryConnectionsPanel> {
   String label = '', repository = '', kind = 'ssh', existingFolder = '';
+  String token = '';
+  String? rotatingId;
+  String replacementToken = '';
   late final RepositoryConnectionsController controller;
   List<Map<String, dynamic>> get connections => controller.connections;
   List<Map<String, dynamic>> get bindings => controller.bindings;
@@ -24,6 +27,11 @@ class _RepositoryConnectionsPanelState
     super.initState();
     controller = RepositoryConnectionsController(
       dashboardConnection,
+      onReset: () {
+        token = '';
+        replacementToken = '';
+        rotatingId = null;
+      },
       onUpdate: () {
         if (mounted) setState(() {});
       },
@@ -43,6 +51,31 @@ class _RepositoryConnectionsPanelState
   Future<void> action(String action, Map<String, dynamic> body) =>
       controller.action(action, body);
   String url(Map item) => repositoryConnectionUrl(item);
+  Future<void> createConnection() async {
+    final secret = token;
+    final saved = await controller.action('create', {
+      'label': label.trim(),
+      'repository': repository.trim(),
+      'kind': kind,
+      if (kind == 'token') 'token': secret.trim(),
+    });
+    if (mounted && saved && token == secret) setState(() => token = '');
+  }
+
+  Future<void> rotateToken(String id) async {
+    final secret = replacementToken;
+    final saved = await controller.action('rotate', {
+      'id': id,
+      'token': secret.trim(),
+    });
+    if (mounted && saved && rotatingId == id && replacementToken == secret) {
+      setState(() {
+        replacementToken = '';
+        rotatingId = null;
+      });
+    }
+  }
+
   @override
   Component build(BuildContext context) => !controller.canManage
       ? const Component.empty()
@@ -55,7 +88,7 @@ class _RepositoryConnectionsPanelState
           ),
           el('p', [
             text(
-              'Create a repository-specific SSH key or reuse the configured GitHub account. Private keys remain in the container. These are separate from keys used to log into the container.',
+              'Use a repository-specific SSH key, a fine-grained GitHub token, or the configured GitHub account. Credentials remain in the container. These are separate from keys used to log into the container.',
             ),
           ]),
           field('Connection name', label, (value) => label = value),
@@ -64,21 +97,43 @@ class _RepositoryConnectionsPanelState
             repository,
             (value) => repository = value,
           ),
-          select('Authentication', kind, {
-            'ssh': 'SSH deploy key',
-            'github': 'Configured GitHub account (HTTPS)',
-          }, (value) => setState(() => kind = value)),
-          button(
-            kind == 'ssh'
-                ? 'Create SSH connection'
-                : 'Create GitHub connection',
-            () => action('create', {
-              'label': label.trim(),
-              'repository': repository.trim(),
-              'kind': kind,
+          select(
+            'Authentication',
+            kind,
+            {
+              'ssh': 'SSH deploy key',
+              'token': repositoryTokenLabel,
+              'github': 'Configured GitHub account (HTTPS)',
+            },
+            (value) => setState(() {
+              kind = value;
+              token = '';
             }),
             disabled: busy,
           ),
+          if (kind == 'token') ...[
+            el('p', [text(repositoryTokenGuidance)]),
+            el(
+              'a',
+              [text('Create a fine-grained token on GitHub')],
+              attributes: {
+                'href': repositoryTokenUrl,
+                'target': '_blank',
+                'rel': 'noopener noreferrer',
+              },
+            ),
+            field(
+              'GitHub personal access token',
+              token,
+              (value) => token = value,
+              password: true,
+              autocomplete: 'off',
+              spellcheck: false,
+              autocorrect: false,
+              disabled: busy,
+            ),
+          ],
+          button(repositoryCreateLabel(kind), createConnection, disabled: busy),
           field(
             'Existing project folder (direct child, optional)',
             existingFolder,
@@ -149,6 +204,48 @@ class _RepositoryConnectionsPanelState
                   el('p', [text(item['host_fingerprint'])], classes: 'mono'),
               ],
               if (item['error'] != null) notice(item['error'], error: true),
+              if (item['kind'] == 'token') ...[
+                button(
+                  'Rotate token',
+                  () => setState(() {
+                    rotatingId = '${item['id']}';
+                    replacementToken = '';
+                  }),
+                  disabled: busy,
+                  small: true,
+                ),
+                if (rotatingId == item['id']) ...[
+                  el('p', [
+                    text(
+                      'Replace the saved token without changing project assignments. Test access afterward; revoke the old token on GitHub separately.',
+                    ),
+                  ]),
+                  field(
+                    'Replacement GitHub personal access token',
+                    replacementToken,
+                    (value) => replacementToken = value,
+                    id: 'repository-token-rotation-${item['id']}',
+                    password: true,
+                    autocomplete: 'off',
+                    spellcheck: false,
+                    autocorrect: false,
+                    disabled: busy,
+                  ),
+                  button(
+                    'Save replacement token',
+                    () => rotateToken('${item['id']}'),
+                    disabled: busy,
+                  ),
+                  button(
+                    'Cancel token rotation',
+                    () => setState(() {
+                      rotatingId = null;
+                      replacementToken = '';
+                    }),
+                    disabled: busy,
+                  ),
+                ],
+              ],
               button(
                 'Test repository access',
                 () => action('test', {'id': item['id'], 'url': url(item)}),
@@ -177,7 +274,7 @@ class _RepositoryConnectionsPanelState
               if (controller.pendingRemoval == item['id']) ...[
                 el('p', [
                   text(
-                    'Delete this connection and its local key files? Revoke its deploy key on GitHub separately.',
+                    'Delete this connection and its local credentials? Revoke its deploy key or token on GitHub separately.',
                   ),
                 ]),
                 button(

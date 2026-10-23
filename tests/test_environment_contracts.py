@@ -23,6 +23,28 @@ def adapter(**changes):
 
 
 class ContractTests(unittest.TestCase):
+    def test_build_storage_and_prompt_contracts_are_adapter_owned(self):
+        install = Mock(return_value=Path('/execution/commands'))
+        contract = adapter(build_profiles=(('compact', (('FIXTURE_DEBUG', 'lines'),)),),
+            build_guidance=(('compact', 'Fixture compact explanation.'),),
+            output_variables=(('FIXTURE_OUTPUT', '{outputs}/compiled'),),
+            capacity_installer=install, capacity_guidance='Fixture broker explanation.')
+        entry = dict(name='fixture-sdk', component='.', executables=['/sdk/compiler'], build_mode='compact')
+        with patch.dict(adapters.ADAPTERS, {'fixture-sdk': contract}):
+            self.assertEqual(toolchain_policy.environment(dict(toolchains=[entry]), base={})['FIXTURE_DEBUG'], 'lines')
+            self.assertEqual(contract.output_environment('/generated'), {'FIXTURE_OUTPUT': '/generated/compiled'})
+            self.assertEqual(adapters.install_wrappers([entry], '/scratch'), Path('/execution/commands'))
+            metadata = adapters.session_tools([entry])[0]
+            self.assertEqual(metadata['build_guidance'], 'Fixture compact explanation.')
+            self.assertEqual(metadata['capacity_guidance'], 'Fixture broker explanation.')
+            import session_workspace
+            guidance = session_workspace.toolchain_guidance(dict(toolchain_policy=dict(policy=dict(toolchains=[entry]))))
+            self.assertIn('Fixture compact explanation.', guidance)
+            self.assertIn('Fixture broker explanation.', guidance)
+            self.assertNotIn('Cargo', guidance)
+        install.assert_called_once_with('/scratch')
+        self.assertEqual(contract.build_environment(dict(entry, build_mode=None)), {})
+
     def test_installer_provider_dispatch_does_not_use_an_archive_or_capability_branch(self):
         acquire = Mock(return_value={'verified': True})
         provider = providers.Provider(acquire=acquire)

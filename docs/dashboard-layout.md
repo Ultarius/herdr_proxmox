@@ -17,6 +17,15 @@ choice is stored in this browser's local storage; unavailable storage does not
 prevent using the application. Organization and group surfaces follow the
 active theme as well.
 
+Background polling updates page contents without resetting native expandable
+sections. A section you opened stays open, and one you closed stays closed;
+build timeline choices remain attached to the same build when new runs arrive.
+Newest or failed builds start expanded when first rendered; later changes in
+those flags do not override expansion while the build remains on the page.
+These choices last while the page is mounted. Navigating away or reloading the
+browser may restore the page's default expansion state. Sections explicitly
+controlled by an action, such as Plan environment, can still open when requested.
+
 System health retains the existing resource sampler, error backoff, pressure
 warnings, and process details. Recent activity reports agent changes observed
 while this overview is open. It is not a persistent audit log and starts empty;
