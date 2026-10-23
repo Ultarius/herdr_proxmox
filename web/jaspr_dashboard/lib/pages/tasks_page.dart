@@ -2660,14 +2660,18 @@ class _TasksPageState extends State<TasksPage> {
                 attributes: {
                   'type': 'button',
                   'role': 'tab',
+                  'id':
+                      'task-detail-tab-${label.replaceAll(' ', '-').replaceAll('&', 'and')}',
                   'aria-selected': '${section == label}',
                   'aria-controls': 'task-detail-panel',
+                  'tabindex': section == label ? '0' : '-1',
                 },
                 events: {'click': (_) => setState(() => section = label)},
               ),
           ],
           classes: 'tabs task-detail__tabs',
           attributes: {'role': 'tablist', 'aria-label': 'Task sections'},
+          events: {'keydown': ui.tabListKeyDown},
         ),
         ui.el(
           'div',
@@ -3200,7 +3204,9 @@ class _TasksPageState extends State<TasksPage> {
           attributes: {
             'id': 'task-detail-panel',
             'role': 'tabpanel',
-            'aria-label': section,
+            'aria-labelledby':
+                'task-detail-tab-${section.replaceAll(' ', '-').replaceAll('&', 'and')}',
+            'tabindex': '0',
           },
         ),
       ],

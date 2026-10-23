@@ -52,8 +52,11 @@ abstract class OperationsState<T extends StatefulComponent> extends State<T> {
 }
 
 Component paragraph(Object? value) => dom.p([Component.text('${value ?? ''}')]);
-Component codeText(Object? value) =>
-    dom.pre(classes: 'code-output', [Component.text('${value ?? ''}')]);
+Component codeText(Object? value, {String label = 'Text output'}) => dom.pre(
+  classes: 'code-output',
+  attributes: {'tabindex': '0', 'aria-label': label},
+  [Component.text('${value ?? ''}')],
+);
 Component actions(List<Component> children) =>
     dom.div(classes: 'actions', children);
 Component stack(List<Component> children) =>

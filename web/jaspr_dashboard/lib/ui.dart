@@ -618,12 +618,13 @@ Component table(List<String> headings, List<List<Component>> rows) =>
 
 final dialogChanges = ValueNotifier<int>(0);
 final _dialogs = <_Dialog>[];
+int _nextDialogId = 0;
 final messages = ValueNotifier<String?>(null);
 void toast(String message) => messages.value = message;
 void refreshDialogs() => dialogChanges.value++;
 void closeDialogs() {
   for (final dialog in _dialogs.reversed.toList()) {
-    dialog.close();
+    dialog.forceClose();
   }
 }
 
@@ -642,6 +643,7 @@ class _Dialog {
     this.title,
     this.content,
     this.close,
+    this.forceClose,
     this.dismissible,
     this.label,
     this.canDismiss,
@@ -649,9 +651,12 @@ class _Dialog {
   final String title;
   final Component Function() content;
   final void Function() close;
+  final void Function() forceClose;
   final bool dismissible;
   final DialogLabel? label;
   final bool Function()? canDismiss;
+  final String id = 'herdr-dialog-${_nextDialogId++}';
+  web.HTMLDialogElement? element;
 }
 
 Future<T?> showDialog<T>(
@@ -667,16 +672,25 @@ Future<T?> showDialog<T>(
   void headingChanged() => scheduleMicrotask(refreshDialogs);
   label?.headings.addListener(headingChanged);
   late _Dialog dialog;
-  void close(T? value) {
+  void close(T? value, {bool force = false}) {
     if (result.isCompleted) return;
-    if (value == null && canDismiss?.call() == false) return;
+    if (!force && value == null && canDismiss?.call() == false) return;
     _dialogs.remove(dialog);
     label?.headings.removeListener(headingChanged);
     result.complete(value);
+    // Close before removing the component so the browser leaves the top layer
+    // and can restore focus to its opener, including another modal dialog.
+    dialog.element?.close();
     refreshDialogs();
     scheduleMicrotask(() {
-      if (previouslyFocused?.isConnected ?? false)
-        (previouslyFocused as web.HTMLElement).focus();
+      if (previouslyFocused?.isConnected ?? false) {
+        if (previouslyFocused!.namespaceURI == 'http://www.w3.org/2000/svg') {
+          (previouslyFocused as web.SVGElement).focus();
+        } else if (previouslyFocused.namespaceURI ==
+            'http://www.w3.org/1999/xhtml') {
+          (previouslyFocused as web.HTMLElement).focus();
+        }
+      }
     });
   }
 
@@ -684,17 +698,13 @@ Future<T?> showDialog<T>(
     title,
     () => content(close),
     () => close(null),
+    () => close(null, force: true),
     dismissible,
     label,
     canDismiss,
   );
   _dialogs.add(dialog);
   refreshDialogs();
-  scheduleMicrotask(() {
-    (web.document.querySelector('.dialog-layer:last-child .dialog')
-            as web.HTMLElement?)
-        ?.focus();
-  });
   return result.future;
 }
 
@@ -715,90 +725,190 @@ Future<bool> confirm(
     ) ==
     true;
 
-Component buildDialogs() => el('div', [
-  for (final dialog in _dialogs)
-    el(
-      'div',
-      [
-        el(
-          'section',
-          [
-            el('div', [
-              // Only when there is one: an empty heading still takes space and
-              // leaves a gap under the close button. Dialogs built through the
-              // Flutter-shaped AlertDialog carry their own title instead.
-              if (dialog.title.isNotEmpty) el('h2', [text(dialog.title)]),
-              if (dialog.label case final label?)
-                el(
-                  'h2',
-                  [text(label.fallback)],
-                  classes: 'visually-hidden',
-                  attributes: {'id': label.fallbackId},
-                ),
-              if (dialog.dismissible)
-                button(
-                  'Close',
-                  dialog.close,
-                  disabled: dialog.canDismiss?.call() == false,
-                ),
-            ], classes: 'dialog__header'),
-            dialog.content(),
-          ],
-          classes: 'dialog',
-          attributes: {
-            'role': 'dialog',
-            'aria-modal': '${_dialogs.last == dialog}',
-            if (dialog.label != null)
-              'aria-labelledby': dialog.label!.id
-            else
-              'aria-label': dialog.title,
-            'tabindex': '-1',
-            if (_dialogs.last != dialog) 'inert': '',
-          },
-        ),
-      ],
-      classes: 'dialog-layer',
-      events: {
-        'keydown': (event) {
-          final key = event as web.KeyboardEvent;
-          if (_dialogs.isEmpty || _dialogs.last != dialog) return;
-          key.stopPropagation();
-          if (key.key == 'Escape' && dialog.dismissible) {
-            key.preventDefault();
-            dialog.close();
-          }
-          if (key.key == 'Tab') {
-            final elements = web.document.querySelectorAll(
-              '.dialog-layer:last-child :is(button,input,select,textarea):not(:disabled), .dialog-layer:last-child a[href]',
-            );
-            if (elements.length == 0) {
-              key.preventDefault();
-              (web.document.querySelector('.dialog-layer:last-child .dialog')
-                      as web.HTMLElement?)
-                  ?.focus();
-              return;
-            }
-            final first = elements.item(0) as web.HTMLElement;
-            final last = elements.item(elements.length - 1) as web.HTMLElement;
-            final panel = web.document.querySelector(
-              '.dialog-layer:last-child .dialog',
-            );
-            if (web.document.activeElement == panel ||
-                !(panel?.contains(web.document.activeElement) ?? false)) {
-              key.preventDefault();
-              if (key.shiftKey)
-                last.focus();
-              else
-                first.focus();
-            } else if (key.shiftKey && web.document.activeElement == first) {
-              key.preventDefault();
-              last.focus();
-            } else if (!key.shiftKey && web.document.activeElement == last) {
-              key.preventDefault();
-              first.focus();
-            }
-          }
+/// Standard automatic-activation tab navigation. Attach to the tablist's
+/// `keydown` event; callers keep ownership of selected state and tabindex.
+void tabListKeyDown(web.Event event) {
+  final key = event as web.KeyboardEvent;
+  if (key.defaultPrevented ||
+      key.isComposing ||
+      key.altKey ||
+      key.ctrlKey ||
+      key.metaKey ||
+      key.shiftKey) {
+    return;
+  }
+  final list = event.currentTarget as web.HTMLElement;
+  final target = event.target as web.Element?;
+  if (target?.closest('[role="tablist"]') != list) return;
+  final active = target?.closest('[role="tab"]');
+  final vertical = list.getAttribute('aria-orientation') == 'vertical';
+  final rtl = web.window.getComputedStyle(list).direction == 'rtl';
+  final forward = vertical
+      ? 'ArrowDown'
+      : rtl
+      ? 'ArrowLeft'
+      : 'ArrowRight';
+  final backward = vertical
+      ? 'ArrowUp'
+      : rtl
+      ? 'ArrowRight'
+      : 'ArrowLeft';
+  if (!['Home', 'End', forward, backward].contains(key.key)) return;
+  final nodes = list.querySelectorAll('[role="tab"]');
+  final tabs = <web.HTMLElement>[];
+  for (var index = 0; index < nodes.length; index++) {
+    final tab = nodes.item(index) as web.HTMLElement;
+    if (tab.closest('[role="tablist"]') == list &&
+        !tab.matches(':disabled, [aria-disabled="true"]') &&
+        tab.closest('[inert], [hidden]') == null &&
+        tab.getClientRects().length > 0 &&
+        web.window.getComputedStyle(tab).visibility != 'hidden') {
+      tabs.add(tab);
+    }
+  }
+  final current = tabs.indexWhere((tab) => tab == active);
+  if (current < 0) return;
+  final next = switch (key.key) {
+    'Home' => 0,
+    'End' => tabs.length - 1,
+    _ => (current + (key.key == forward ? 1 : -1)) % tabs.length,
+  };
+  key.preventDefault();
+  tabs[next].focus();
+  tabs[next].click();
+}
+
+class _DialogView extends StatefulComponent {
+  const _DialogView(this.dialog, {required super.key});
+  final _Dialog dialog;
+  @override
+  State<_DialogView> createState() => _DialogViewState();
+}
+
+class _DialogViewState extends State<_DialogView> {
+  Timer? presentation;
+  int presentationAttempts = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    // showModal needs a connected element. Start after the DOM commit, and
+    // retry transient mounting/presentation failures without stranding a Future.
+    presentation = Timer(Duration.zero, present);
+  }
+
+  void present() {
+    presentation?.cancel();
+    presentation = null;
+    final dialog = component.dialog;
+    if (!mounted || !_dialogs.contains(dialog)) return;
+    presentationAttempts++;
+    final element = web.document.getElementById(dialog.id);
+    if (element?.tagName == 'DIALOG' && element!.isConnected) {
+      final native = element as web.HTMLDialogElement;
+      dialog.element = native;
+      try {
+        if (!native.matches(':modal')) {
+          // A nonmodal show/open from an external caller must not prevent the
+          // guarded dialog from returning to the browser's modal top layer.
+          if (native.open) native.close();
+          native.showModal();
+        }
+        presentationAttempts = 0;
+        return;
+      } catch (_) {
+        // A detached node or a transient native presentation failure can be
+        // retried after the next commit. Persistent failures cancel below.
+      }
+    }
+    if (presentationAttempts < 5) {
+      presentation = Timer(const Duration(milliseconds: 20), present);
+    } else {
+      toast('Unable to open the dialog. Please try again.');
+      dialog.forceClose();
+    }
+  }
+
+  @override
+  void dispose() {
+    presentation?.cancel();
+    final dialog = component.dialog;
+    if (dialog.element?.open == true) dialog.element!.close();
+    dialog.element = null;
+    super.dispose();
+  }
+
+  @override
+  Component build(BuildContext context) {
+    final dialog = component.dialog;
+    final top = _dialogs.isNotEmpty && _dialogs.last == dialog;
+    return el('div', [
+      el(
+        'dialog',
+        [
+          el('div', [
+            // Only when there is one: an empty heading still takes space and
+            // leaves a gap under the close button. Dialogs built through the
+            // Flutter-shaped AlertDialog carry their own title instead.
+            if (dialog.title.isNotEmpty) el('h2', [text(dialog.title)]),
+            if (dialog.label case final label?)
+              el(
+                'h2',
+                [text(label.fallback)],
+                classes: 'visually-hidden',
+                attributes: {'id': label.fallbackId},
+              ),
+            if (dialog.dismissible)
+              button(
+                'Close',
+                dialog.close,
+                disabled: dialog.canDismiss?.call() == false,
+              ),
+          ], classes: 'dialog__header'),
+          dialog.content(),
+        ],
+        classes: 'dialog',
+        attributes: {
+          'id': dialog.id,
+          // Jaspr reconciles actual DOM attributes on every build. Preserve a
+          // currently open native dialog, never a previous presentation state.
+          if (dialog.element?.open == true) 'open': '',
+          'role': 'dialog',
+          'aria-modal': '$top',
+          if (dialog.label != null)
+            'aria-labelledby': dialog.label!.id
+          else
+            'aria-label': dialog.title,
         },
-      },
-    ),
+        events: {
+          'cancel': (event) {
+            // Keep result completion and canDismiss authoritative. Native
+            // modality handles Tab and background inertness for all controls.
+            event.preventDefault();
+            if (_dialogs.isNotEmpty &&
+                _dialogs.last == dialog &&
+                dialog.dismissible) {
+              dialog.close();
+            }
+          },
+          'close': (_) {
+            if (!_dialogs.contains(dialog)) return;
+            // close events are queued. A later presentation may already have
+            // returned the same node to the top layer before this event runs.
+            if (dialog.element?.matches(':modal') == true) return;
+            dialog.close();
+            // An external native close must not bypass a busy form's guard.
+            if (_dialogs.contains(dialog)) {
+              presentationAttempts = 0;
+              present();
+            }
+          },
+        },
+      ),
+    ], classes: 'dialog-layer');
+  }
+}
+
+Component buildDialogs() => el('div', [
+  for (final dialog in _dialogs) _DialogView(dialog, key: Key(dialog.id)),
 ], classes: 'dialog-host');

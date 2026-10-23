@@ -166,6 +166,9 @@ jobs:
         working-directory: web/jaspr_dashboard
         # Focus and requestAnimationFrame checks share one browser viewport.
         run: python3 ../../scripts/check-evidence.py browser-tests dart test --platform chrome --concurrency=1
+      - name: Verify trusted keyboard navigation and responsive native dialogs
+        working-directory: web/jaspr_dashboard
+        run: python3 ../../scripts/check-evidence.py native-navigation dart run tool/check_native_navigation.dart
       - name: Verify request IDs in compiled JavaScript
         working-directory: web/dashboard
         run: |

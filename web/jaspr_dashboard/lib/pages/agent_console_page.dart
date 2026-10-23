@@ -1,12 +1,12 @@
 import 'snapshot_terminal.dart';
 import 'folder_access_panel.dart';
 import 'dart:async';
+import 'package:jaspr/dom.dart' as dom;
+import 'package:web/web.dart' as web;
 
 import '../services.dart';
 
 import '../ui.dart';
-
-import 'org_forms.dart';
 
 import 'ops_ui.dart';
 
@@ -70,9 +70,90 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
 
   bool showDraft = false;
 
-  bool followOutput = true;
+  static int nextId = 0;
 
-  bool scrollingToBottom = false;
+  late final String consoleId = 'agent-console-${nextId++}';
+
+  bool expanded = false;
+
+  // Keep the empty host component identical across page renders. Jaspr's DOM
+  // attribute reconciler would otherwise remove showModal()'s native open
+  // attribute. The page content stays reactive through its original ownership.
+  late final Component modalHost = el(
+    'dialog',
+    [],
+    classes: 'console-modal',
+    attributes: {'id': '$consoleId-modal', 'aria-label': 'Agent console'},
+    events: {
+      'cancel': closeExpanded,
+      'close': (_) {
+        if (mounted && expanded && modal?.open == false) {
+          restoreInlinePage();
+          setState(() => expanded = false);
+          restoreExpansionFocus();
+        }
+      },
+    },
+  );
+
+  web.HTMLDialogElement? get modal =>
+      web.document.getElementById('$consoleId-modal') as web.HTMLDialogElement?;
+
+  void restoreInlinePage() {
+    final shell = web.document.getElementById(consoleId);
+    final page = modal?.querySelector('.console-page');
+    if (shell != null && page != null) shell.insertBefore(page, modal);
+  }
+
+  void releaseModal() {
+    expanded = false;
+    modal?.close();
+    restoreInlinePage();
+  }
+
+  void toggleExpanded() {
+    final dialog = modal;
+    if (dialog == null) return;
+    if (expanded) {
+      releaseModal();
+    } else {
+      final page = web.document
+          .getElementById(consoleId)
+          ?.querySelector('.console-page');
+      if (page == null) return;
+      // Move the same DOM subtree into a native top-layer host. Jaspr keeps
+      // ownership of the page and its descendants, so polling keeps updating
+      // the existing emulator. Restore it before deactivation removes children.
+      dialog.appendChild(page);
+      dialog.setAttribute(
+        'aria-label',
+        'Agent console for ${profile?['name'] ?? 'Agent'}',
+      );
+      try {
+        dialog.showModal();
+        expanded = true;
+      } catch (_) {
+        restoreInlinePage();
+        rethrow;
+      }
+    }
+    setState(() {});
+    restoreExpansionFocus();
+  }
+
+  void restoreExpansionFocus() {
+    Timer.run(() {
+      if (!mounted) return;
+      (web.document.getElementById('$consoleId-expand') as web.HTMLElement?)
+          ?.focus(web.FocusOptions(preventScroll: expanded));
+    });
+  }
+
+  void closeExpanded(web.Event event) {
+    if (!expanded) return;
+    event.preventDefault();
+    toggleExpanded();
+  }
 
   @override
   void initState() {
@@ -111,10 +192,16 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
     refresh();
   }
 
-  void followLatestOutput() {}
+  @override
+  void deactivate() {
+    // Reconcile the temporary DOM portal before Jaspr removes its owned nodes.
+    releaseModal();
+    super.deactivate();
+  }
 
   @override
   void dispose() {
+    releaseModal();
     timer?.cancel();
 
     subscription?.cancel();
@@ -209,8 +296,6 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
 
         error = null;
       });
-
-      followLatestOutput();
     } catch (e) {
       if (mounted && epoch == connection.generation) {
         setState(() {
@@ -373,142 +458,187 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
       'thinking',
     ].contains(status);
 
-    return opsPage([
-      el('div', [
-        if (profile != null) roleTile(name, role: profile!['role'], live: live),
-        pageHeader(
-          name,
-          overline: 'Agent console',
-          subtitle: profile == null
-              ? null
-              : '${profile!['role']} · ${profile!['runtime']}',
-          actions: [
-            pill(state.$1, tone: state.$2, shape: state.$3),
-            button(
-              'Refresh console',
-              refresh,
-              disabled: sending,
-              iconName: 'refresh-cw',
-            ),
-          ],
-        ),
-      ], classes: 'console-head'),
-
-      if (profile != null)
-        facts([
-          (
-            'Refresh',
-            text('Every $cadence ${cadence == 1 ? 'second' : 'seconds'}'),
-          ),
-          ('Model', model.isEmpty ? none() : text(model)),
-          ('Workspace', project.isEmpty ? none() : mono(project)),
-          if ('${inspection?['scratch_directory'] ?? ''}'.isNotEmpty)
-            ('Session scratch', mono(inspection!['scratch_directory'])),
-          if (delivery != null)
-            (
-              'Terminal response',
-              el('span', [
-                pill(
-                  '${delivery['state']}',
-                  tone: stateTone(delivery['state']),
-                  shape: shapeFor(stateTone(delivery['state'])),
+    return el(
+      'div',
+      [
+        opsPage([
+          el('div', [
+            if (profile != null)
+              roleTile(name, role: profile!['role'], live: live),
+            pageHeader(
+              name,
+              overline: 'Agent console',
+              subtitle: profile == null
+                  ? null
+                  : '${profile!['role']} · ${profile!['runtime']}',
+              actions: [
+                pill(state.$1, tone: state.$2, shape: state.$3),
+                button(
+                  'Refresh console',
+                  refresh,
+                  disabled: sending,
+                  iconName: 'refresh-cw',
                 ),
-                if ('${delivery['error'] ?? ''}'.isNotEmpty)
-                  text(' ${delivery['error']}'),
-              ], classes: 'console-response'),
+              ],
             ),
-        ], classes: 'console-facts'),
+          ], classes: 'console-head'),
 
-      if (error != null) callout([calloutText(error)], tone: 'danger'),
-
-      if (responseError != null)
-        callout([calloutText(responseError)], tone: 'danger', role: 'alert'),
-
-      if (pendingInput != null)
-        callout(
-          [
-            calloutText(
-              'Delivery of ${pendingInput!.body?['key']} is unknown. Recheck before sending another key.',
-            ),
-          ],
-          tone: 'warning',
-          iconName: 'hourglass',
-          actions: [
-            button(
-              'Recheck pending response',
-              submitPendingInput,
-              disabled: sending || !connection.state.connected,
-              small: true,
-            ),
-          ],
-        ),
-
-      if (error == null) folderAccessPanel(inspection),
-
-      if (blocked)
-        callout(
-          [
-            calloutText(
-              'Select Allow or Reject in the console prompt, then confirm. Escape cancels where supported.',
-            ),
-          ],
-          tone: 'danger',
-          title: 'Requires attention',
-          actions: [
-            for (final key in [
-              'up',
-              'down',
-              'tab',
-              'shift+tab',
-              'enter',
-              'esc',
-            ])
-              button(
-                key == 'enter' ? 'Confirm selected Allow / Reject' : key,
-                () => sendKey(key),
-                disabled: !canRespond,
-                small: true,
-                variant: key == 'enter' ? 'primary' : 'secondary',
-                iconName: switch (key) {
-                  'up' => 'chevron-up',
-                  'down' => 'chevron-down',
-                  'enter' => 'check',
-                  _ => null,
-                },
-                classes: key == 'enter' ? null : 'console-key',
+          if (profile != null)
+            facts([
+              (
+                'Refresh',
+                text('Every $cadence ${cadence == 1 ? 'second' : 'seconds'}'),
               ),
-          ],
-        ),
-
-      terminalPanel(
-        title: showDraft && draft.isNotEmpty
-            ? 'Current reply draft'
-            : 'Live console',
-        iconName: showDraft && draft.isNotEmpty ? 'file-text' : 'terminal',
-        actions: [
-          if (draft.isNotEmpty)
-            button(
-              showDraft ? 'Live console' : 'Current reply draft',
-              () => setState(() => showDraft = !showDraft),
-              variant: 'ghost',
-              small: true,
-              iconName: showDraft ? 'terminal' : 'file-text',
-            ),
-        ],
-        body: [
-          showDraft && draft.isNotEmpty
-              ? pre(draft)
-              : SnapshotTerminal(
-                  '${inspection?['output'] ?? 'No live session output available.'}',
+              ('Model', model.isEmpty ? none() : text(model)),
+              ('Workspace', project.isEmpty ? none() : mono(project)),
+              if ('${inspection?['scratch_directory'] ?? ''}'.isNotEmpty)
+                ('Session scratch', mono(inspection!['scratch_directory'])),
+              if (delivery != null)
+                (
+                  'Terminal response',
+                  el('span', [
+                    pill(
+                      '${delivery['state']}',
+                      tone: stateTone(delivery['state']),
+                      shape: shapeFor(stateTone(delivery['state'])),
+                    ),
+                    if ('${delivery['error'] ?? ''}'.isNotEmpty)
+                      text(' ${delivery['error']}'),
+                  ], classes: 'console-response'),
                 ),
-        ],
-        footer: [
-          meta(
-            'Refreshes every second while working, every 5 seconds while idle, and every 2 seconds while awaiting attention. Retained output may omit earlier work.',
-            iconName: 'history',
-          ),
-        ],
-      ),
-    ], classes: 'console-page');
+            ], classes: 'console-facts'),
+
+          if (error != null)
+            callout([calloutText(error)], tone: 'danger', role: 'alert'),
+
+          if (responseError != null)
+            callout(
+              [calloutText(responseError)],
+              tone: 'danger',
+              role: 'alert',
+            ),
+
+          if (pendingInput != null)
+            callout(
+              [
+                calloutText(
+                  'Delivery of ${pendingInput!.body?['key']} is unknown. Recheck before sending another key.',
+                ),
+              ],
+              tone: 'warning',
+              iconName: 'hourglass',
+              actions: [
+                button(
+                  'Recheck pending response',
+                  submitPendingInput,
+                  disabled: sending || !connection.state.connected,
+                  small: true,
+                ),
+              ],
+            ),
+
+          if (error == null) folderAccessPanel(inspection),
+
+          if (blocked)
+            callout(
+              [
+                calloutText(
+                  'Select Allow or Reject in the console prompt, then confirm. Escape cancels where supported.',
+                ),
+              ],
+              tone: 'danger',
+              title: 'Requires attention',
+              actions: [
+                for (final key in [
+                  'up',
+                  'down',
+                  'tab',
+                  'shift+tab',
+                  'enter',
+                  'esc',
+                ])
+                  button(
+                    key == 'enter' ? 'Confirm selected Allow / Reject' : key,
+                    () => sendKey(key),
+                    disabled: !canRespond,
+                    small: true,
+                    variant: key == 'enter' ? 'primary' : 'secondary',
+                    iconName: switch (key) {
+                      'up' => 'chevron-up',
+                      'down' => 'chevron-down',
+                      'enter' => 'check',
+                      _ => null,
+                    },
+                    classes: key == 'enter' ? null : 'console-key',
+                  ),
+              ],
+            ),
+
+          el('div', [
+            terminalPanel(
+              title: showDraft && draft.isNotEmpty
+                  ? 'Current reply draft'
+                  : 'Live console',
+              iconName: showDraft && draft.isNotEmpty
+                  ? 'file-text'
+                  : 'terminal',
+              actions: [
+                if (draft.isNotEmpty)
+                  button(
+                    showDraft ? 'Live console' : 'Current reply draft',
+                    () => setState(() => showDraft = !showDraft),
+                    variant: 'ghost',
+                    small: true,
+                    iconName: showDraft ? 'terminal' : 'file-text',
+                  ),
+                dom.button(
+                  [
+                    icon(expanded ? 'x' : 'scan'),
+                    text(expanded ? 'Exit full screen' : 'Full screen'),
+                  ],
+                  type: dom.ButtonType.button,
+                  classes: 'btn btn--ghost btn--sm',
+                  onClick: toggleExpanded,
+                  attributes: {
+                    'id': '$consoleId-expand',
+                    'aria-pressed': '$expanded',
+                    'aria-controls': '$consoleId-modal',
+                  },
+                ),
+              ],
+              body: [
+                showDraft && draft.isNotEmpty
+                    ? el(
+                        'pre',
+                        [text(draft)],
+                        attributes: {
+                          'tabindex': '0',
+                          'aria-label': 'Current reply draft',
+                        },
+                      )
+                    : SnapshotTerminal(
+                        '${inspection?['output'] ?? 'No live session output available.'}',
+                        fill: true,
+                      ),
+              ],
+              footer: [
+                meta(
+                  'Refreshes every second while working, every 5 seconds while idle, and every 2 seconds while awaiting attention. Retained output may omit earlier work.',
+                  iconName: 'history',
+                ),
+              ],
+            ),
+          ], classes: 'console-output'),
+        ], classes: 'console-page'),
+        modalHost,
+      ],
+      classes: 'console-shell',
+      attributes: {
+        'id': consoleId,
+        'data-expanded': '$expanded',
+        'aria-label': 'Agent console for $name',
+        if (!expanded) 'role': 'region',
+      },
+    );
   }
 }

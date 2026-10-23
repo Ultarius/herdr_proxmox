@@ -16,6 +16,7 @@ class _LogsState extends OperationsState<LogsPage> {
   List<Map<String, dynamic>> logs = [];
   String? preview;
   int total = 0;
+  bool refreshing = false, loaded = false;
   @override
   void initState() {
     super.initState();
@@ -24,16 +25,23 @@ class _LogsState extends OperationsState<LogsPage> {
 
   Future<void> refresh() async {
     final epoch = connection.generation;
-    if (!connection.state.connected) return;
+    if (!connection.state.connected || refreshing) return;
+    setState(() {
+      refreshing = true;
+      error = null;
+    });
     try {
       final result = await connection.request('logs');
       if (valid(epoch))
         setState(() {
           logs = List<Map<String, dynamic>>.from(result['logs']);
           total = result['total_bytes'] as int;
+          loaded = true;
         });
     } catch (e) {
       if (valid(epoch)) setState(() => error = '$e');
+    } finally {
+      if (valid(epoch)) setState(() => refreshing = false);
     }
   }
 
@@ -132,7 +140,12 @@ class _LogsState extends OperationsState<LogsPage> {
       subtitle:
           'Save retained terminal text before closing a pane. These are snapshots, not guaranteed full run transcripts. Setup/login terminals are never archived here.',
       actions: [
-        button('Refresh logs', refresh, disabled: busy, iconName: 'refresh-cw'),
+        button(
+          'Refresh logs',
+          refresh,
+          disabled: busy || refreshing,
+          iconName: 'refresh-cw',
+        ),
       ],
     ),
     el('div', [
@@ -186,7 +199,7 @@ class _LogsState extends OperationsState<LogsPage> {
                 'source': source,
               }),
               primary: true,
-              disabled: busy,
+              disabled: busy || pane.trim().isEmpty,
               iconName: 'download',
             ),
           ], classes: 'logs-save__footer'),
@@ -205,13 +218,17 @@ class _LogsState extends OperationsState<LogsPage> {
       card(
         'Saved snapshots',
         [
-          storage(),
-          if (logs.isEmpty)
+          if (loaded) storage(),
+          if (refreshing && !loaded)
+            meta('Loading saved snapshots…', iconName: 'hourglass'),
+          if (!refreshing && !loaded && error != null)
+            meta('Saved snapshots are unavailable. Refresh logs to try again.'),
+          if (loaded && logs.isEmpty)
             emptyState(
               'No saved snapshots. Save a pane’s text to keep it after the pane closes.',
               iconName: 'archive',
             )
-          else
+          else if (logs.isNotEmpty)
             table(
               ['Snapshot', 'Pane', 'Source', 'Created', 'Size', 'Actions'],
               [
@@ -269,13 +286,13 @@ class _LogsState extends OperationsState<LogsPage> {
             ),
         ],
         iconName: 'archive',
-        count: logs.length,
+        count: loaded ? logs.length : null,
         classes: 'logs-saved',
       ),
       if (preview != null)
         card(
           'Snapshot preview',
-          [codeText(preview)],
+          [codeText(preview, label: 'Saved snapshot preview')],
           iconName: 'scan',
           actions: [
             button(

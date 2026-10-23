@@ -520,6 +520,7 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
                     'id': '$instance-tab-$value',
                     'aria-selected': '${view == value}',
                     'aria-controls': '$instance-panel-$value',
+                    'tabindex': view == value ? '0' : '-1',
                   },
                   events: {
                     'click': (_) => setState(() {
@@ -531,6 +532,7 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
             ],
             classes: 'tabs task-wf-tabs',
             attributes: {'role': 'tablist', 'aria-label': 'Task view'},
+            events: {'keydown': tabListKeyDown},
           ),
           if (view == 'workflow')
             el('div', [
@@ -644,6 +646,7 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
               'role': 'tabpanel',
               'id': '$instance-panel-workflow',
               'aria-labelledby': '$instance-tab-workflow',
+              'tabindex': '0',
             },
           )
         else
@@ -672,6 +675,7 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
               'role': 'tabpanel',
               'id': '$instance-panel-list',
               'aria-labelledby': '$instance-tab-list',
+              'tabindex': '0',
             },
           ),
         el(

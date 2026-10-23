@@ -78,7 +78,9 @@ code { padding: 1px var(--space-1-5); border-radius: var(--radius-xs); backgroun
 .rail__add:hover, .rail__btn:hover { background: var(--color-rail-hover); color: var(--color-rail-active); }
 .rail__footer { margin-top: auto; display: flex; flex-direction: column; gap: var(--space-1); padding-top: var(--space-4); }
 
-.sidebar { display: flex; flex-direction: column; height: 100dvh; min-width: 0; background: var(--color-surface); border-right: 1px solid var(--color-border); }
+.sidebar { display: flex; flex-direction: column; position: static; margin: 0; padding: 0; width: auto; max-width: none; max-height: none; height: 100dvh; min-width: 0; color: inherit; background: var(--color-surface); border: 0; border-right: 1px solid var(--color-border); }
+.sidebar::backdrop { background: var(--color-scrim); }
+body:has(.sidebar:modal), .app:has(.sidebar:modal) .main-content { overflow: hidden; }
 .sidebar__brand {
   display: flex; align-items: center; gap: var(--space-2); flex: none; height: var(--topbar-height);
   padding: 0 var(--space-3) 0 var(--space-5); border-bottom: 1px solid var(--color-border);
@@ -123,6 +125,9 @@ code { padding: 1px var(--space-1-5); border-radius: var(--radius-xs); backgroun
 .topbar > :is(.topbar__menu, .topbar__collapse) { margin-left: calc(-1 * var(--space-2)); }
 .topbar > .topbar__menu { display: none; }
 .topbar .breadcrumb { flex: 1; }
+.topbar .breadcrumb__item { min-width: 0; }
+.topbar .breadcrumb__item:not(:last-child) { flex: 0 1 auto; }
+.topbar .breadcrumb__link { display: block; max-width: 32ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .breadcrumb__link { color: var(--color-text-secondary); }
 .breadcrumb__link:hover { color: var(--color-text); text-decoration: none; }
 @media (max-width: 1279.98px) { .topbar .topbar__updated { display: none; } }
@@ -299,13 +304,14 @@ details.card > summary ~ :last-child { margin-bottom: var(--space-5); }
 
 /* ---- Dialog layer (ui.dart showDialog) with the Phase 2 dialog look ---------- */
 .dialog-host { display: contents; }
-.dialog-layer { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; padding: var(--space-6); background: var(--color-scrim); overflow: auto; }
-.dialog-layer:not(:last-child) { pointer-events: none; }
+.dialog-layer { display: contents; }
+.dialog:not([open]) { display: none; }
 .dialog {
-  width: min(100%, 920px); max-width: 920px; max-height: calc(100dvh - var(--space-12)); overflow: auto; padding: var(--space-6);
+  position: fixed; inset: 0; margin: auto; width: min(calc(100% - var(--space-12)), 920px); max-width: 920px; max-height: calc(100dvh - var(--space-12)); overflow: auto; padding: var(--space-6);
   background: var(--color-surface); color: var(--color-text); border: 1px solid var(--color-border); border-radius: var(--radius-xl); box-shadow: var(--shadow-lg);
 }
-.dialog:focus { outline: none; }
+.dialog::backdrop { background: var(--color-scrim); }
+body:has(.dialog:modal), .app:has(.dialog:modal) .main-content { overflow: hidden !important; }
 .dialog__header { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4); margin: calc(-1 * var(--space-1)) 0 var(--space-5); }
 .dialog__header h2 { margin: 0; font-size: var(--text-lg-size); line-height: var(--text-lg-leading); }
 /* An agent that is working breathes. The halo is mixed from the dot's own tone
@@ -362,8 +368,7 @@ details.card > summary ~ :last-child { margin-bottom: var(--space-5); }
   .card__body { padding: 0 var(--space-4) var(--space-4); }
   .card__body > .table-scroll { margin-inline: calc(-1 * var(--space-4)); }
   .native-card { padding: var(--space-4); }
-  .dialog-layer { padding: var(--space-2); align-items: flex-end; }
-  .dialog { padding: var(--space-5); max-height: calc(100dvh - var(--space-4)); border-radius: var(--radius-xl) var(--radius-xl) 0 0; }
+  .dialog { inset: auto var(--space-2) var(--space-2); width: calc(100% - var(--space-4)); padding: var(--space-5); max-height: calc(100dvh - var(--space-4)); border-radius: var(--radius-xl) var(--radius-xl) 0 0; }
   .native-row { flex-direction: column; align-items: stretch; }
   .actions .native-row { flex-direction: row; }
   h1 { font-size: var(--text-xl-size); line-height: var(--text-xl-leading); }

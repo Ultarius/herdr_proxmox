@@ -45,7 +45,10 @@ class _GitState extends OperationsState<ProjectGitPanel> {
         'action': fetch ? 'fetch' : 'status',
       });
       if (valid(epoch))
-        setState(() => data = Map<String, dynamic>.from(result));
+        setState(() {
+          data = Map<String, dynamic>.from(result);
+          error = null;
+        });
     } catch (e) {
       if (valid(epoch)) setState(() => error = '$e');
     } finally {
@@ -128,6 +131,7 @@ class _GitState extends OperationsState<ProjectGitPanel> {
         (close) => stack([
           codeText(
             '${result['truncated'] == true ? 'Showing the first 64 KB.\n\n' : ''}${(result['diff'] as String).isEmpty ? 'No tracked diff. New files can be opened in Files.' : result['diff']}',
+            label: 'Git diff for ${file['path']}',
           ),
           actions([
             if (file['kind'] != 'deleted')

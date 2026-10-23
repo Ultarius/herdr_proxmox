@@ -339,13 +339,13 @@ void main() {
         (_) => ui.text('Awaiting review'),
       );
       await settle();
-      expect(nodes('[role=dialog]').length, 1);
+      expect(nodes('.dialog-host .dialog').length, 1);
       final epoch = connection.generation;
       await click('Sign out');
       expect(connection.generation, greaterThan(epoch));
       expect(connection.state.connected, false);
       expect(await pending, isNull);
-      expect(nodes('[role=dialog]'), isEmpty);
+      expect(nodes('.dialog-host .dialog'), isEmpty);
       expect(
         (nodes('main input[type=password]').single as web.HTMLInputElement)
             .value,
@@ -387,7 +387,7 @@ void main() {
       await switched;
       await settle();
       expect(connection.operator.value['name'], 'new-account');
-      expect(nodes('[role=dialog]'), isEmpty);
+      expect(nodes('.dialog-host .dialog'), isEmpty);
       expect(
         nodes('.workspace-tile').single.textContent,
         contains('Original workspace'),

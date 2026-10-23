@@ -80,7 +80,9 @@ class _ToolchainState extends OperationsState<ToolchainCard> {
   Component build(BuildContext context) => card(
     'Herdr build tools',
     [
-      if (sdk['state'] == 'unavailable')
+      if (sdk.isEmpty)
+        meta('Loading build tool status…', iconName: 'hourglass')
+      else if (sdk['state'] == 'unavailable')
         callout([
           calloutText(
             'Toolchain status unavailable: ${sdk['error']}. Verify the updated gateway was restarted.',

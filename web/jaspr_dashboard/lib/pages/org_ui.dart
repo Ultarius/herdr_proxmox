@@ -1,5 +1,3 @@
-import 'dart:async';
-import 'package:web/web.dart' as web;
 import '../ui.dart';
 
 /// Phase 2 building blocks shared by the organization, team, runs, group and
@@ -280,16 +278,6 @@ Component viewTabs(
   String selected,
   void Function(String) onSelect,
 ) {
-  final keys = items.keys.toList();
-  void move(int index) {
-    final value = keys[(index + keys.length) % keys.length];
-    onSelect(value);
-    Timer(Duration.zero, () {
-      (web.document.getElementById('$id-tab-$value') as web.HTMLElement?)
-          ?.focus();
-    });
-  }
-
   return el(
     'div',
     [
@@ -311,18 +299,7 @@ Component viewTabs(
     ],
     classes: 'tabs',
     attributes: {'role': 'tablist', 'aria-label': label},
-    events: {
-      'keydown': (event) {
-        final key = (event as web.KeyboardEvent).key;
-        final index = keys.indexOf(selected);
-        if (key == 'ArrowRight') move(index + 1);
-        if (key == 'ArrowLeft') move(index - 1);
-        if (key == 'Home') move(0);
-        if (key == 'End') move(keys.length - 1);
-        if (['ArrowRight', 'ArrowLeft', 'Home', 'End'].contains(key))
-          event.preventDefault();
-      },
-    },
+    events: {'keydown': tabListKeyDown},
   );
 }
 
@@ -335,6 +312,7 @@ Component tabPanel(String id, String selected, List<Component> children) => el(
     'role': 'tabpanel',
     'id': '$id-panel',
     'aria-labelledby': '$id-tab-$selected',
+    'tabindex': '0',
   },
 );
 

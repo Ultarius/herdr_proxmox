@@ -23,6 +23,7 @@ class _AccessState extends OperationsState<DashboardAccessControls> {
       final data = await connection.request('dashboard-access');
       if (valid(epoch))
         setState(() {
+          error = null;
           mode = data['mode'] as String?;
           pending = data['pending_mode'] as String?;
         });
@@ -48,6 +49,7 @@ class _AccessState extends OperationsState<DashboardAccessControls> {
           ),
           codeText(
             'ssh -N -L 8787:127.0.0.1:8787 herdr@${['localhost', '127.0.0.1'].contains(web.window.location.hostname) ? '<lxc-ip>' : web.window.location.hostname}',
+            label: 'SSH dashboard tunnel command',
           ),
           toggle(
             'I tested the tunnel and can open the dashboard through it.',
@@ -104,13 +106,19 @@ class _AccessState extends OperationsState<DashboardAccessControls> {
         button(
           'Allow LAN access',
           () => change('lan'),
-          disabled: busy || pending != null || mode == null || mode == 'lan',
+          disabled:
+              !admin ||
+              busy ||
+              pending != null ||
+              mode == null ||
+              mode == 'lan',
           iconName: 'wifi',
         ),
         button(
           'Require SSH tunnel',
           () => change('ssh'),
           disabled:
+              !admin ||
               busy ||
               pending != null ||
               mode == null ||
@@ -130,6 +138,11 @@ class _AccessState extends OperationsState<DashboardAccessControls> {
         meta(
           'Add an SSH public key before requiring an SSH tunnel.',
           iconName: 'info',
+        ),
+      if (!admin)
+        meta(
+          'Only an administrator can change dashboard access.',
+          iconName: 'lock',
         ),
       feedback(),
     ],

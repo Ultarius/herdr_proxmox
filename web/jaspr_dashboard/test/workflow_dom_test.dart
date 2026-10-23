@@ -158,6 +158,67 @@ void main() {
     web.document.getElementById('workflow-test')!.textContent = '';
   });
 
+  test('workflow and list tabs switch by keyboard with one tab stop', () async {
+    final tabs = nodes('.task-wf-tabs [role=tab]').toList();
+    Future<void> selected(web.HTMLElement tab) async {
+      final deadline = DateTime.now().add(const Duration(seconds: 5));
+      while ((web.document.activeElement != tab ||
+              tab.getAttribute('aria-selected') != 'true') &&
+          DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 15));
+      }
+      expect(web.document.activeElement, tab);
+      expect(tab.getAttribute('aria-selected'), 'true');
+    }
+
+    expect(tabs.where((tab) => tab.tabIndex == 0), [tabs.first]);
+    tabs.first.focus();
+    key(tabs.first, 'ArrowRight');
+    await selected(tabs.last);
+    expect(tabs.last.getAttribute('aria-selected'), 'true');
+    expect(web.document.activeElement, tabs.last);
+    expect(nodes('.task-wf-list-panel').single.tabIndex, 0);
+    expect(
+      nodes('.task-wf-list-panel').single.getAttribute('aria-labelledby'),
+      tabs.last.id,
+    );
+    key(tabs.last, 'ArrowRight');
+    await selected(tabs.first);
+    expect(tabs.first.getAttribute('aria-selected'), 'true');
+    expect(web.document.activeElement, tabs.first);
+    expect(nodes('.task-wf-board').single.tabIndex, 0);
+  });
+
+  test('workflow actions wrap inside a tablet-width content area', () async {
+    final root =
+        web.document.getElementById('workflow-test')! as web.HTMLElement;
+    root.style.width =
+        '641px'; // Available content at the 768px shell breakpoint.
+    addTearDown(() => root.style.width = '760px');
+    state.replace([row('review', state: 'review_ready')]);
+    await settle();
+    final actions = nodes('.wf-view').single;
+    final bounds = root.getBoundingClientRect();
+    expect(root.scrollWidth, lessThanOrEqualTo(root.clientWidth + 1));
+    expect(
+      actions.getBoundingClientRect().right,
+      lessThanOrEqualTo(bounds.right + 1),
+    );
+    for (final control in nodes('.wf-view button')) {
+      expect(
+        control.getBoundingClientRect().right,
+        lessThanOrEqualTo(bounds.right + 1),
+        reason: control.textContent,
+      );
+    }
+    expect(
+      nodes(
+        '.wf-view button',
+      ).any((button) => button.textContent == 'Full screen'),
+      true,
+    );
+  });
+
   Map<String, dynamic> release({String state = 'collecting'}) => {
     'id': 'release-one',
     'version': 'alpha.15',

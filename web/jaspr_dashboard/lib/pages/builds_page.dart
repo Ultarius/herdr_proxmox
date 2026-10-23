@@ -17,6 +17,7 @@ class _BuildsState extends OperationsState<BuildsPage> {
   String executor = 'gateway';
   int queued = 0;
   bool refreshing = false;
+  bool loaded = false;
   Map<String, dynamic>? performance;
   int performanceEpoch = -1;
   bool loadingPerformance = false;
@@ -38,7 +39,7 @@ class _BuildsState extends OperationsState<BuildsPage> {
 
   Future<void> refresh() async {
     if (refreshing || !connection.state.connected) return;
-    refreshing = true;
+    setState(() => refreshing = true);
     final epoch = connection.generation;
     try {
       final validation = await connection.request('validation');
@@ -61,6 +62,8 @@ class _BuildsState extends OperationsState<BuildsPage> {
           identity = Map<String, dynamic>.from(deployed);
           deployment = status;
           buildService = installer;
+          loaded = true;
+          error = null;
         });
     } catch (e) {
       if (valid(epoch)) setState(() => error = '$e');
@@ -105,7 +108,12 @@ class _BuildsState extends OperationsState<BuildsPage> {
         disabled: loadingPerformance,
       ),
       if (performanceError != null)
-        el('p', [text(performanceError)], classes: 'error'),
+        el(
+          'p',
+          [text(performanceError)],
+          classes: 'error',
+          attributes: {'role': 'alert'},
+        ),
       if (data != null) ...[
         paragraph(
           'Process ${data['pid']} · since ${data['started_at']} · percentiles use the latest ${data['sample_window']} samples per operation.',
@@ -573,7 +581,9 @@ class _BuildsState extends OperationsState<BuildsPage> {
   Component build(BuildContext context) => el('div', [
     pageHeader(
       'Builds & deployments',
-      subtitle: 'Build executor: $executor · $queued queued',
+      subtitle: loaded
+          ? 'Build executor: $executor · $queued queued'
+          : 'Validation history and deployment status',
       actions: [
         button(
           'Refresh builds',
@@ -584,7 +594,9 @@ class _BuildsState extends OperationsState<BuildsPage> {
       ],
     ),
     el('div', [feedback()], classes: 'builds-feedback'),
-    if (executor != 'service')
+    if (!loaded && error == null)
+      el('p', [text('Loading builds…')], attributes: {'role': 'status'}),
+    if (loaded && executor != 'service')
       callout('warning', 'triangle-alert', [
         paragraph(
           'Manual capture and builds are available. Automatic capture works without this service, and automatic validation uses the gateway executor. Gateway builds stop on restart; install this service for restart resilience. Installation restarts the gateway and keeps automation opt-in.',
@@ -608,7 +620,8 @@ class _BuildsState extends OperationsState<BuildsPage> {
       paragraph(
         'Build-service installation: ${installationStatusLabel(buildService!['state'])}',
       ),
-      if (buildService!['error'] != null) paragraph(buildService!['error']),
+      if (buildService!['error'] != null)
+        el('p', [text(buildService!['error'])], attributes: {'role': 'alert'}),
       if (buildService!['output'] != null)
         disclosure('Build-service installation output', [
           codeText(buildService!['output']),
@@ -616,7 +629,7 @@ class _BuildsState extends OperationsState<BuildsPage> {
     ],
     if (identity != null) _runningCard(),
     ?cadenceStrip(runs, DateTime.now()),
-    _history(),
+    if (loaded) _history(),
     if (admin) performanceCard(),
     const UpdateCard(),
   ], classes: 'stack builds-page');

@@ -1018,7 +1018,11 @@ class _OrganizationPageState extends State<OrganizationPage> {
               ], classes: 'table org-team'),
             ],
             classes: 'table-scroll org-team-wrap',
-            attributes: {'role': 'region', 'aria-label': 'Team'},
+            attributes: {
+              'role': 'region',
+              'aria-label': 'Team',
+              'tabindex': '0',
+            },
           ),
       ],
       iconName: 'users',
@@ -1123,6 +1127,12 @@ class _OrganizationPageState extends State<OrganizationPage> {
         ],
       ),
       if (state.error != null) notice(state.error, error: true),
+      if (!state.loaded && state.error == null)
+        el(
+          'p',
+          [text('Loading organization…')],
+          attributes: {'role': 'status'},
+        ),
       if (error != null) notice(error, error: true),
       if (readinessError != null) notice(readinessError, error: true),
       if (bloc.pending != null)

@@ -78,6 +78,7 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
           'role': 'tab',
           'id': id,
           'aria-selected': '$selected',
+          'tabindex': selected ? '0' : '-1',
           'aria-controls': 'explorer-panel',
         },
         events: {
@@ -127,6 +128,7 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
         ],
         classes: 'tabs explorer-tabs',
         attributes: {'role': 'tablist', 'aria-label': 'Explorer view'},
+        events: {'keydown': tabListKeyDown},
       ),
       el('div', [
         el(
@@ -207,7 +209,13 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
                           'Listing limited to 1,000 items. Open a subfolder to explore further.',
                         ),
                       ]),
-                    if (entries.isEmpty)
+                    if (directory == null && busy)
+                      meta('Loading folder…', iconName: 'hourglass')
+                    else if (directory == null && error != null)
+                      meta(
+                        'Folder contents are unavailable. Refresh to try again.',
+                      )
+                    else if (entries.isEmpty)
                       emptyState(
                         filter.isNotEmpty
                             ? 'No entries match your filter.'
@@ -223,22 +231,29 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
                           [
                             for (final entry in entries)
                               [
-                                button(
-                                  '${entry['name']}',
-                                  () => open(entry['path'] as String),
-                                  disabled:
-                                      busy ||
-                                      ![
-                                        'folder',
-                                        'file',
-                                      ].contains(entry['kind']),
-                                  variant: 'ghost',
-                                  small: true,
-                                  iconName: entry['kind'] == 'folder'
-                                      ? 'folder'
-                                      : 'file-text',
-                                  classes: 'file-link',
-                                ),
+                                el('div', [
+                                  button(
+                                    '${entry['name']}',
+                                    () => open(entry['path'] as String),
+                                    disabled:
+                                        busy ||
+                                        ![
+                                          'folder',
+                                          'file',
+                                        ].contains(entry['kind']),
+                                    variant: 'ghost',
+                                    small: true,
+                                    iconName: entry['kind'] == 'folder'
+                                        ? 'folder'
+                                        : 'file-text',
+                                    classes: 'file-link',
+                                  ),
+                                  el('span', [
+                                    text(
+                                      '${entry['kind']} · ${displayTime(entry['modified'])}',
+                                    ),
+                                  ], classes: 'file-details'),
+                                ], classes: 'file-identity'),
                                 text(entry['kind']),
                                 mono(displayTime(entry['modified'])),
                                 mono(size(entry['size'])),
@@ -248,7 +263,7 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
                       ], classes: 'file-table'),
                   ],
                   iconName: 'folder-open',
-                  count: entries.length,
+                  count: directory == null ? null : entries.length,
                   classes: 'explorer-files',
                 ),
                 if (preview != null)
@@ -263,7 +278,10 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
                       else ...[
                         if (preview!['truncated'] == true)
                           callout([calloutText('Showing the first 64 KB.')]),
-                        codeText(preview!['content']),
+                        codeText(
+                          preview!['content'],
+                          label: 'File preview for ${preview!['path']}',
+                        ),
                       ],
                     ],
                     iconName: 'file-text',
@@ -295,6 +313,8 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
         attributes: {
           'id': 'explorer-panel',
           'role': 'tabpanel',
+          'tabindex': '0',
+          'aria-busy': '$busy',
           'aria-labelledby': gitView
               ? 'explorer-tab-git'
               : 'explorer-tab-files',

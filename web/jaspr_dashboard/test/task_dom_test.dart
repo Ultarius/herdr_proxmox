@@ -188,6 +188,66 @@ void main() {
       : {'workspaces': [], 'agents': []};
 
   test(
+    'task detail tabs support roving keyboard focus and named panels',
+    () async {
+      final task = publishedTask();
+      await mount(
+        const TasksPage(taskId: 'task'),
+        (r) => taskResponse(r, task),
+      );
+      final tabs = elements('.task-detail__tabs [role=tab]').toList();
+      expect(tabs, hasLength(4));
+      Future<void> selected(web.HTMLElement tab) async {
+        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        while ((web.document.activeElement != tab ||
+                tab.getAttribute('aria-selected') != 'true') &&
+            DateTime.now().isBefore(deadline)) {
+          await Future<void>.delayed(const Duration(milliseconds: 15));
+        }
+        expect(web.document.activeElement, tab);
+        expect(tab.getAttribute('aria-selected'), 'true');
+      }
+
+      expect(tabs.where((tab) => tab.tabIndex == 0), [tabs.first]);
+      tabs.first.focus();
+      tabs.first.dispatchEvent(
+        web.KeyboardEvent(
+          'keydown',
+          web.KeyboardEventInit(
+            key: 'ArrowRight',
+            bubbles: true,
+            cancelable: true,
+          ),
+        ),
+      );
+      await selected(tabs[1]);
+      expect(web.document.activeElement, tabs[1]);
+      expect(tabs[1].getAttribute('aria-selected'), 'true');
+      expect(tabs.where((tab) => tab.tabIndex == 0), [tabs[1]]);
+      final panel = elements('#task-detail-panel').single;
+      expect(panel.getAttribute('aria-labelledby'), tabs[1].id);
+      expect(panel.tabIndex, 0);
+      tabs[1].dispatchEvent(
+        web.KeyboardEvent(
+          'keydown',
+          web.KeyboardEventInit(key: 'End', bubbles: true, cancelable: true),
+        ),
+      );
+      await selected(tabs.last);
+      expect(web.document.activeElement, tabs.last);
+      expect(panel.getAttribute('aria-labelledby'), tabs.last.id);
+      tabs.last.dispatchEvent(
+        web.KeyboardEvent(
+          'keydown',
+          web.KeyboardEventInit(key: 'Home', bubbles: true, cancelable: true),
+        ),
+      );
+      await selected(tabs.first);
+      expect(web.document.activeElement, tabs.first);
+    },
+  );
+
+  test(
     'environment recovery reviews exact candidate and requires explicit approval',
     () async {
       final task = publishedTask()
@@ -1211,6 +1271,66 @@ void main() {
       await click('Record decision');
       expect(posts.first['mode'], 'review');
       expect(posts.first['id'], 'knowledge-1');
+    },
+  );
+
+  test(
+    'knowledge filter disclosure preserves user choices during refresh',
+    () async {
+      var revision = 1;
+      await mount(
+        const KnowledgePage(organizationId: 'org'),
+        (request) => request.url.path.endsWith('/organizations/directory')
+            ? {
+                'organizations': [
+                  {'id': 'org', 'name': 'Engineering'},
+                ],
+              }
+            : request.url.path.endsWith('/knowledge')
+            ? {
+                'records': [
+                  {
+                    'id': 'finding',
+                    'title': 'Finding revision $revision',
+                    'body': 'Retained review evidence',
+                    'kind': 'finding',
+                    'state': 'reported',
+                    'repository': 'repo',
+                    'source': {},
+                    'audit': [],
+                  },
+                ],
+                'repositories': ['repo'],
+                'next_before': null,
+              }
+            : {'workspaces': [], 'agents': []},
+      );
+      final filters =
+          elements('.knowledge-filters').single as web.HTMLDetailsElement;
+      Future<void> refresh() async {
+        revision++;
+        await click('Refresh knowledge');
+        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        while (!elements(
+              '.knowledge-record',
+            ).single.textContent!.contains('Finding revision $revision') &&
+            DateTime.now().isBefore(deadline)) {
+          await Future<void>.delayed(const Duration(milliseconds: 15));
+        }
+        expect(
+          elements('.knowledge-record').single.textContent,
+          contains('Finding revision $revision'),
+        );
+        expect(elements('.knowledge-filters').single, same(filters));
+      }
+
+      if (filters.open)
+        (filters.querySelector('summary')! as web.HTMLElement).click();
+      await refresh();
+      expect(filters.open, isFalse);
+      (filters.querySelector('summary')! as web.HTMLElement).click();
+      await refresh();
+      expect(filters.open, isTrue);
     },
   );
 

@@ -75,6 +75,40 @@
 .terminal-panel .ops-meta { color: var(--color-text-tertiary); }
 
 /* ---- Agent console ------------------------------------------------------------ */
+/* The page fills the main content's remaining height; metadata stays at its
+   natural height, and the console receives the rest. Short screens can scroll. */
+.main-content:has(.console-page) > .page-frame { height: 100%; display: flex; flex-direction: column; }
+/* The inline region owns the page. Expansion moves its existing DOM into a
+   separate native dialog, preserving the terminal without exposing a closed
+   dialog as ordinary page content. */
+.console-shell {
+  display: flex; flex-direction: column; flex: 1; position: static; margin: 0;
+  padding: 0; border: 0; width: 100%; max-width: none; max-height: none;
+  min-width: 0; min-height: 0; background: transparent; color: inherit;
+}
+.console-modal { margin: 0; border: 0; width: 100%; max-width: none; max-height: none; min-width: 0; color: inherit; }
+.console-page { flex: 1; min-height: 0; }
+.console-page > :not(.console-output) { flex-shrink: 0; }
+.console-output { display: flex; flex: 1; min-width: 0; min-height: 360px; }
+.console-output > .terminal-panel { flex: 1; }
+.console-output .terminal-panel__body { flex: 1; min-height: 0; }
+.console-output :is(.terminal-panel__header, .terminal-panel__footer) { flex-shrink: 0; }
+.snapshot-terminal { position: relative; min-width: 0; }
+.snapshot-terminal--fill { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.terminal-host--fill { flex: 1; min-height: 0; }
+.snapshot-terminal__follow { position: absolute; right: var(--space-4); bottom: var(--space-4); z-index: 1; box-shadow: var(--shadow-md); }
+.console-output .terminal-panel__body > pre { flex: 1; min-height: 0; max-height: none; }
+/* Keep prompt actions, errors and folder requests alongside the expanded output.
+   Short viewports scroll the whole console while the terminal keeps its own scrollback. */
+.console-modal:modal {
+  display: flex; flex-direction: column;
+  position: fixed; inset: 0; width: 100%; height: 100dvh; min-height: 0;
+  padding: var(--space-4); background: var(--color-canvas); overflow: auto;
+  overscroll-behavior: contain;
+}
+.console-modal::backdrop { background: var(--color-canvas); }
+body:has(.console-modal:modal),
+.main-content:has(.console-modal:modal) { overflow: hidden !important; }
 .console-head { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: var(--space-4); align-items: start; }
 .console-head > .page-header { grid-column: -2 / -1; margin-bottom: 0; }
 .console-head > .role-tile { width: 48px; height: 48px; margin-top: var(--space-1); --tile-radius: var(--radius-lg); font-size: var(--text-sm-size); }
@@ -85,6 +119,7 @@
 .console-facts > div { display: flex; flex-direction: column; gap: var(--space-0-5); min-width: 0; }
 .console-facts > div:has(.mono) { flex: 1 1 280px; }
 .console-facts dt { font-size: var(--text-xs-size); line-height: var(--text-xs-leading); }
+.console-facts dd { overflow-wrap: anywhere; }
 .console-response { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--space-1-5); }
 .console-key { font-family: var(--font-mono); font-size: var(--text-xs-size); }
 .folder-access { min-width: 0; margin-block: var(--space-3); }
@@ -110,8 +145,19 @@
 .ops-page .code-output { margin: 0; max-height: 560px; overflow: auto; }
 
 /* ---- Project knowledge ---------------------------------------------------------- */
+.knowledge-card { container-type: inline-size; }
+@container (max-width: 600px) {
+  .knowledge-record__head { flex-wrap: wrap; }
+  .knowledge-record__tags { justify-content: flex-start; padding-left: calc(var(--space-2) + var(--icon-md) + var(--space-2)); }
+}
 .knowledge-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--space-3); }
 .knowledge-toolbar > .field { flex: 1 1 170px; margin: 0; gap: var(--space-1); }
+.knowledge-filters { flex: 3 1 480px; min-width: 0; }
+.knowledge-filters > summary { min-height: 36px; gap: var(--space-2); font-size: var(--text-sm-size); }
+.knowledge-filters[open] > summary { margin-bottom: var(--space-3); }
+.knowledge-filter-fields { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--space-3); }
+.knowledge-filter-fields > .field { flex: 1 1 150px; margin: 0; }
+.knowledge-filter-fields > .knowledge-states { flex-basis: 100%; }
 .knowledge-toolbar > .field > span, .knowledge-states .toolbar__label { font-size: var(--text-xs-size); line-height: var(--text-xs-leading); color: var(--color-text-secondary); }
 .knowledge-search { flex: 2 1 280px; }
 :is(.knowledge-search, .explorer-filter) .field { flex: 1; margin: 0; }
@@ -143,6 +189,7 @@
   padding: var(--space-1) var(--space-5) var(--space-5) calc(var(--space-3) + var(--space-2) + var(--icon-md) + var(--space-2));
 }
 .knowledge-record__body > * { margin: 0; }
+.knowledge-record__body[hidden] { display: none; }
 .knowledge-record__text { max-width: 80ch; white-space: pre-wrap; overflow-wrap: anywhere; }
 .knowledge-record__body > .overline { margin-bottom: calc(-1 * var(--space-2)); }
 .knowledge-audit { display: flex; flex-direction: column; gap: var(--space-1-5); font-size: var(--text-sm-size); line-height: var(--text-sm-leading); color: var(--color-text-secondary); }
@@ -153,13 +200,14 @@
 /* ---- Project explorer ------------------------------------------------------------ */
 .explorer-location { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2) var(--space-4); }
 .explorer-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-0-5); min-width: 0; }
-.explorer-crumbs > li { display: flex; align-items: center; gap: var(--space-0-5); min-width: 0; }
+.explorer-crumbs > li { max-width: 100%; display: flex; align-items: center; gap: var(--space-0-5); min-width: 0; }
 .explorer-crumbs > li + li::before { content: "/"; padding-inline: var(--space-0-5); color: var(--color-text-disabled); }
+.explorer-crumbs .btn { max-width: 100%; flex-shrink: 1; }
 .explorer-crumbs > li:last-child > .btn { color: var(--color-text); font-weight: var(--weight-semibold); }
 .explorer-root { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
-.explorer-panel { min-width: 0; }
+.explorer-panel { min-width: 0; container-type: inline-size; }
 .explorer-panes { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-5); align-items: start; }
-@media (min-width: 1100px) { .explorer-panes--split { grid-template-columns: minmax(300px, 2fr) minmax(0, 3fr); } }
+@container (min-width: 800px) { .explorer-panes--split { grid-template-columns: minmax(300px, 2fr) minmax(0, 3fr); } }
 .explorer-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3) var(--space-4); }
 .explorer-filter { flex: 1 1 240px; max-width: 420px; }
 .card__body > .file-table { margin: 0 calc(-1 * var(--space-5)) calc(-1 * var(--space-5)); }
@@ -168,8 +216,13 @@
 .file-table td .mono { color: var(--color-text-secondary); white-space: nowrap; }
 .file-link { max-width: 100%; margin-left: calc(-1 * var(--space-2)); padding-inline: var(--space-2); justify-content: flex-start; color: var(--color-text); text-align: left; }
 .file-link .icon { color: var(--color-text-tertiary); }
+.file-identity { min-width: 0; }
+.file-details { display: none; color: var(--color-text-secondary); font-size: var(--text-xs-size); overflow-wrap: anywhere; }
+.explorer-panes--split .file-details { display: block; }
+.explorer-crumbs .btn, .file-link, .git-file { white-space: normal; height: auto; min-height: var(--control-sm); overflow-wrap: anywhere; }
+.git-file .icon, .file-link .icon { flex-shrink: 0; }
 .explorer-panes--split .file-table :is(th, td):is(:nth-child(2), :nth-child(3)) { display: none; }
-@media (max-width: 639.98px) { .file-table :is(th, td):is(:nth-child(2), :nth-child(3)) { display: none; } }
+@media (max-width: 639.98px) { .file-details { display: block; } .file-table :is(th, td):is(:nth-child(2), :nth-child(3)) { display: none; } }
 .explorer-preview .card__title { font-family: var(--font-mono); font-size: var(--text-sm-size); overflow-wrap: anywhere; }
 
 /* ---- Git panel ---------------------------------------------------------------------- */
@@ -229,7 +282,7 @@
 .logs-saved td .actions { justify-content: flex-start; }
 
 /* ---- CLI accounts -------------------------------------------------------------------- */
-.provider-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: var(--space-4); }
+.provider-grid { display: grid; align-items: start; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: var(--space-4); align-items: start; }
 .provider-card { display: flex; flex-direction: column; gap: var(--space-4); padding: var(--space-5); }
 .provider-card > * { margin: 0; }
 .provider-card__head { display: flex; align-items: flex-start; gap: var(--space-3); }
@@ -252,7 +305,11 @@
 .setup-link__url { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; color: var(--color-text-secondary); }
 .setup-controls { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: var(--space-3) var(--space-5); padding: var(--space-1) var(--space-2) 0; }
 .setup-send { display: flex; align-items: flex-end; gap: var(--space-2); flex: 1 1 360px; max-width: 560px; }
-.setup-send > .field { flex: 1; margin: 0; }
+.setup-send > .field { flex: 1; min-width: 0; margin: 0; }
+.setup-send { min-width: 0; }
+.provider-card__head > .pill { flex-shrink: 0; }
+.ops-page :is(.ops-dl dd, .ops-meta, .callout__text, .knowledge-audit li) { overflow-wrap: anywhere; }
+.project-analysis-card .org-disclosure__body > .btn { white-space: normal; height: auto; min-height: var(--control-md); text-align: left; overflow-wrap: anywhere; }
 
 /* ---- Narrow screens ------------------------------------------------------------------ */
 @media (max-width: 1023.98px) {

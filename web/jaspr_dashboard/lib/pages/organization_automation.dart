@@ -207,7 +207,12 @@ class _OrganizationAutomationState extends State<OrganizationAutomation> {
       [
         if (error != null) errorLine(error),
         if (policy == null && error == null)
-          note(busy ? 'Loading limits…' : 'Limits are not loaded.'),
+          el(
+            'p',
+            [text(busy ? 'Loading limits…' : 'Limits are not loaded.')],
+            classes: 'org-note',
+            attributes: {'role': 'status'},
+          ),
         if (policy != null)
           el('div', [
             if (switches.isNotEmpty)

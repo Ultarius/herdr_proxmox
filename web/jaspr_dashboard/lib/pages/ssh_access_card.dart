@@ -11,6 +11,7 @@ class SshAccessCard extends StatefulComponent {
 class _SshState extends OperationsState<SshAccessCard> {
   String publicKey = '';
   int? count;
+  bool loading = false;
   @override
   void initState() {
     super.initState();
@@ -18,12 +19,23 @@ class _SshState extends OperationsState<SshAccessCard> {
   }
 
   Future<void> load() async {
+    if (loading || !connection.state.connected) return;
     final epoch = connection.generation;
+    setState(() {
+      loading = true;
+      error = null;
+    });
     try {
       final data = await connection.request('ssh-access');
-      if (valid(epoch)) setState(() => count = data['key_count'] as int?);
+      if (valid(epoch))
+        setState(() {
+          count = data['key_count'] as int?;
+          error = null;
+        });
     } catch (e) {
       if (valid(epoch)) setState(() => error = '$e');
+    } finally {
+      if (valid(epoch)) setState(() => loading = false);
     }
   }
 
@@ -53,12 +65,21 @@ class _SshState extends OperationsState<SshAccessCard> {
           (
             'Public keys',
             count == null
-                ? none()
+                ? text(
+                    loading ? 'Loading key status…' : 'Key status unavailable.',
+                  )
                 : text(
                     '$count SSH public key${count == 1 ? '' : 's'} configured',
                   ),
           ),
         ]),
+        if (error != null)
+          button(
+            'Retry key status',
+            load,
+            disabled: loading,
+            iconName: 'refresh-cw',
+          ),
         textarea(
           'SSH public key (.pub)',
           publicKey,
@@ -68,9 +89,14 @@ class _SshState extends OperationsState<SshAccessCard> {
           busy ? 'Adding key…' : 'Add SSH public key',
           add,
           primary: true,
-          disabled: busy,
+          disabled: busy || !admin,
           iconName: 'plus',
         ),
+        if (!admin)
+          meta(
+            'Only an administrator can add an SSH public key.',
+            iconName: 'lock',
+          ),
         feedback(),
       ],
       iconName: 'key-round',

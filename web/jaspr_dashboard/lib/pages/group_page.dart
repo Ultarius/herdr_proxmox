@@ -1037,7 +1037,11 @@ class _GroupPageState extends State<GroupPage> {
           ], classes: 'table org-members'),
         ],
         classes: 'table-scroll',
-        attributes: {'role': 'region', 'aria-label': 'Group members'},
+        attributes: {
+          'role': 'region',
+          'aria-label': 'Group members',
+          'tabindex': '0',
+        },
       ),
     ],
     iconName: 'users',
@@ -1169,6 +1173,7 @@ class _GroupPageState extends State<GroupPage> {
   Component build(BuildContext context) {
     if (!connection.state.connected)
       return el('div', [
+        pageHeader('Discussion group'),
         card('Group', [
           emptyState(
             'The dashboard is not connected.',
@@ -1180,13 +1185,19 @@ class _GroupPageState extends State<GroupPage> {
 
     if (group == null)
       return el('div', [
+        pageHeader('Discussion group'),
         card('Group', [
           emptyState(
-            error ?? (loaded ? 'Group not found.' : 'Loading group…'),
+            loaded
+                ? 'Group not found.'
+                : 'Group details are not available yet.',
             iconName: 'message-square',
             actions: [button('Refresh', refresh, iconName: 'refresh-cw')],
           ),
         ], iconName: 'message-square'),
+        if (error != null) errorLine(error),
+        if (!loaded && error == null)
+          el('p', [text('Loading group…')], attributes: {'role': 'status'}),
       ], classes: 'group-page');
 
     final archived = group!['removed_at'] != null;

@@ -140,6 +140,7 @@ void main() {
   DashboardBloc? connection;
   final posts = <Map<String, dynamic>>[];
   setUpAll(() {
+    Logger.level = Level.off;
     JuiceLoggerConfig.minLevel = Level.off;
     web.document.body!.appendChild(web.HTMLDivElement()..id = 'org-dom-test');
     binding = ClientAppBinding();
@@ -263,6 +264,59 @@ void main() {
 
   List<Map<String, dynamic>> actions(String action) =>
       posts.where((p) => p['path'] == '/api/organizations/$action').toList();
+
+  test(
+    'group loading and failed history use status and alert announcements',
+    () async {
+      final history = Completer<http.Response>();
+      await mount(
+        const GroupPage(id: 'group'),
+        response: (request) {
+          if (request.url.path.endsWith('/organizations/history'))
+            return history.future;
+          return null;
+        },
+      );
+      expect(nodes('[role=status]').single.textContent, 'Loading group…');
+      expect(nodes('h1').single.textContent, 'Discussion group');
+      expect(nodes('[role=alert]'), isEmpty);
+      history.complete(
+        http.Response('{"error":"Group history unavailable"}', 503),
+      );
+      await settle();
+      expect(
+        nodes('[role=alert]').single.textContent,
+        contains('Group history unavailable'),
+      );
+      expect(nodes('[role=status]'), isEmpty);
+    },
+  );
+
+  test(
+    'organization and group tabs retain keyboard access to scrollable tables',
+    () async {
+      await mount(const OrganizationPage(initialView: 'chart'));
+      final chart = nodes('#org-view-tab-chart').single;
+      chart.focus();
+      chart.dispatchEvent(
+        web.KeyboardEvent(
+          'keydown',
+          web.KeyboardEventInit(
+            key: 'ArrowRight',
+            bubbles: true,
+            cancelable: true,
+          ),
+        ),
+      );
+      await settle();
+      expect(web.document.activeElement, nodes('#org-view-tab-team').single);
+      expect(
+        nodes('#org-view-panel').single.getAttribute('aria-labelledby'),
+        'org-view-tab-team',
+      );
+      expect(nodes('[role=region][aria-label=Team]').single.tabIndex, 0);
+    },
+  );
 
   Map<String, dynamic> proposalJob() => {
     'id': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',

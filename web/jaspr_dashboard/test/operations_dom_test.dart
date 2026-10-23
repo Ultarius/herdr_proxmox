@@ -17,6 +17,7 @@ import 'package:herdr_jaspr_dashboard/pages/project_analysis_card.dart';
 import 'package:herdr_jaspr_dashboard/pages/update_card.dart';
 import 'package:herdr_jaspr_dashboard/pages/toolchain_card.dart';
 import 'package:herdr_jaspr_dashboard/pages/dashboard_access_controls.dart';
+import 'package:herdr_jaspr_dashboard/pages/ssh_access_card.dart';
 import 'package:herdr_jaspr_dashboard/pages/project_git_panel.dart';
 import 'package:herdr_jaspr_dashboard/pages/integration_board.dart';
 import 'package:herdr_jaspr_dashboard/pages/cli_setup_page.dart';
@@ -107,6 +108,7 @@ void main() {
   DashboardBloc? connection;
   final requests = <Map<String, dynamic>>[];
   setUpAll(() async {
+    Logger.level = Level.off;
     JuiceLoggerConfig.minLevel = Level.off;
     web.document.body!.appendChild(
       web.HTMLDivElement()..id = 'operations-test',
@@ -200,6 +202,82 @@ void main() {
       return http.Response.bytes([1, 2], 200);
     return {'workspaces': [], 'agents': []};
   }
+
+  test('SSH key status stops loading on failure and can be retried', () async {
+    final first = Completer<Object>();
+    var reads = 0;
+    await mount(const SshAccessCard(), (request) {
+      if (request.url.path == '/api/ssh-access') {
+        if (reads++ == 0) return first.future;
+        return {'key_count': 2};
+      }
+      return {'mode': 'lan', 'pending_mode': null};
+    });
+    expect(
+      elements('.ssh-card').single.textContent,
+      contains('Loading key status…'),
+    );
+    first.complete(http.Response('{"error":"Key registry unavailable"}', 503));
+    await until(() => elements('.ssh-card [role=alert]').isNotEmpty);
+    expect(
+      elements('.ssh-card').single.textContent,
+      contains('Key status unavailable.'),
+    );
+    expect(
+      elements('.ssh-card').single.textContent,
+      isNot(contains('Loading key status…')),
+    );
+    await click('Retry key status');
+    await until(
+      () => elements(
+        '.ssh-card',
+      ).single.textContent!.contains('2 SSH public keys configured'),
+    );
+    expect(elements('.ssh-card [role=alert]'), isEmpty);
+  });
+
+  test(
+    'build loading and retry feedback distinguish unknown, empty and failed',
+    () async {
+      final initial = Completer<Object>();
+      var requests = 0;
+      var failed = false;
+      await mount(const BuildsPage(), (request) {
+        if (request.url.path == '/api/validation') {
+          if (requests++ == 0) return initial.future;
+          if (failed)
+            return http.Response('{"error":"Build history unavailable"}', 503);
+          return {'runs': [], 'executor': 'service'};
+        }
+        return buildResponse(request);
+      });
+      expect(
+        elements(
+          '[role=status]',
+        ).any((e) => e.textContent == 'Loading builds…'),
+        true,
+      );
+      expect(elements('.history__empty'), isEmpty);
+      expect(button('Refresh builds').disabled, true);
+      initial.complete({'runs': [], 'executor': 'service'});
+      await until(() => !button('Refresh builds').disabled);
+      expect(
+        elements('.history__empty').single.textContent,
+        contains('No validation builds recorded.'),
+      );
+      failed = true;
+      await click('Refresh builds');
+      await until(() => elements('.builds-feedback [role=alert]').isNotEmpty);
+      expect(
+        elements('.builds-feedback [role=alert]').single.textContent,
+        contains('Build history unavailable'),
+      );
+      failed = false;
+      await click('Refresh builds');
+      await until(() => !button('Refresh builds').disabled);
+      expect(elements('.builds-feedback [role=alert]'), isEmpty);
+    },
+  );
 
   for (final overridden in [false, true]) {
     test(

@@ -43,7 +43,12 @@ class _UpdateState extends OperationsState<UpdateCard> {
   });
   Future<void> install({bool alpha = false}) async {
     final version = alpha ? alphaVersion : info?['latest'];
-    if (version == null || busy || queued || info?['supported'] != true) return;
+    if (!admin ||
+        version == null ||
+        busy ||
+        queued ||
+        info?['supported'] != true)
+      return;
     final epoch = connection.generation;
     if (!await confirm(
           'Install $version?',
@@ -199,6 +204,7 @@ class _UpdateState extends OperationsState<UpdateCard> {
             variant: 'primary',
             iconName: 'download',
             disabled:
+                !admin ||
                 busy ||
                 alphaVersion == null ||
                 info?['supported'] != true ||
@@ -252,12 +258,15 @@ class _UpdateState extends OperationsState<UpdateCard> {
           variant: 'primary',
           iconName: 'download',
           disabled:
+              !admin ||
               busy ||
               info?['available'] != true ||
               info?['supported'] != true ||
               queued,
         ),
       ]),
+      if (!admin)
+        paragraph('Only an administrator can install dashboard updates.'),
       _alphaBuilds(),
       feedback(),
     ],

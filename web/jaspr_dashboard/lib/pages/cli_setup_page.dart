@@ -17,7 +17,7 @@ class _CliState extends OperationsState<CliSetupPage> {
   Map<String, dynamic>? integrations;
   String? session, selected;
   String paste = '';
-  bool running = false, polling = false;
+  bool running = false, polling = false, refreshing = false, loaded = false;
   int cursor = 0, generation = 0;
   Timer? timer;
   Future<void> writes = Future.value();
@@ -58,19 +58,26 @@ class _CliState extends OperationsState<CliSetupPage> {
   }
 
   Future<void> refresh() async {
-    if (!connection.state.connected) return;
+    if (!connection.state.connected || refreshing) return;
     final epoch = connection.generation;
+    setState(() {
+      refreshing = true;
+      error = null;
+    });
     try {
       final data = await connection.request('cli-setup');
       if (valid(epoch))
         setState(() {
           clis = List<Map<String, dynamic>>.from(data['clis']);
+          loaded = true;
           integrations = data['integrations'] is Map
               ? Map<String, dynamic>.from(data['integrations'])
               : null;
         });
     } catch (e) {
       if (valid(epoch)) setState(() => error = '$e');
+    } finally {
+      if (valid(epoch)) setState(() => refreshing = false);
     }
   }
 
@@ -346,7 +353,7 @@ class _CliState extends OperationsState<CliSetupPage> {
           () => showDialog<void>(
             'Terminal text',
             (close) => stack([
-              codeText(terminal.getText()),
+              codeText(terminal.getText(), label: 'CLI setup terminal text'),
               button('Close', () => close(null)),
             ]),
           ),
@@ -458,7 +465,7 @@ class _CliState extends OperationsState<CliSetupPage> {
           button(
             'Refresh status',
             refresh,
-            disabled: busy,
+            disabled: busy || refreshing,
             iconName: 'refresh-cw',
           ),
         ],
@@ -470,6 +477,13 @@ class _CliState extends OperationsState<CliSetupPage> {
           iconName: 'link',
         ),
       feedback(),
+      if (!loaded && refreshing)
+        meta('Loading CLI accounts…', iconName: 'hourglass'),
+      if (loaded && clis.isEmpty)
+        emptyState(
+          'No CLI accounts are configured for this installation.',
+          iconName: 'terminal',
+        ),
       if (clis.isNotEmpty)
         el('div', [
           for (final cli in clis) account(cli),

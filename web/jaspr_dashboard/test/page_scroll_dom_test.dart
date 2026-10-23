@@ -188,7 +188,7 @@ void main() {
       expectSinglePageScroller();
       nodes('.knowledge-record__toggle').first.click();
       await settle();
-      expect(nodes('.knowledge-record__body').length, 1);
+      expect(nodes('.knowledge-record__body:not([hidden])').length, 1);
       expectSinglePageScroller();
       final main = nodes('.main-content').single;
       main.scrollTop = 300;
