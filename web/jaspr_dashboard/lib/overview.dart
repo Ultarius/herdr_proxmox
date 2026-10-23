@@ -699,37 +699,37 @@ class _OverviewPageState extends State<OverviewPage> {
           ],
         )
       else
-        el(
-          'ul',
-          [
-            for (final workspace in state.workspaces)
-              el('li', [_workspaceTile(state, workspace, admin)]),
-            if (admin)
-              el('li', [
+        el('div', [
+          el(
+            'ul',
+            [
+              for (final workspace in state.workspaces)
+                el('li', [_workspaceTile(state, workspace, admin)]),
+            ],
+            classes: 'ws-grid',
+            attributes: {'role': 'list'},
+          ),
+          if (admin)
+            el(
+              'button',
+              [
                 el(
-                  'button',
-                  [
-                    el(
-                      'span',
-                      [icon('plus')],
-                      classes: 'icon-tile',
-                      attributes: {'aria-hidden': 'true'},
-                    ),
-                    _text('ws-create__title', 'Create workspace'),
-                    _text(
-                      'ws-create__meta',
-                      'Use a project directory or clone a repository',
-                    ),
-                  ],
-                  classes: 'ws-create',
-                  attributes: {'type': 'button'},
-                  events: {'click': (_) => openProject()},
+                  'span',
+                  [icon('plus')],
+                  classes: 'icon-tile',
+                  attributes: {'aria-hidden': 'true'},
                 ),
-              ], classes: 'ws-grid__create'),
-          ],
-          classes: 'ws-grid',
-          attributes: {'role': 'list'},
-        ),
+                _text('ws-create__title', 'Create workspace'),
+                _text(
+                  'ws-create__meta',
+                  'Use a project directory or clone a repository',
+                ),
+              ],
+              classes: 'ws-create',
+              attributes: {'type': 'button'},
+              events: {'click': (_) => openProject()},
+            ),
+        ], classes: 'ws-section'),
     ],
     iconName: 'folder',
     count: state.workspaces.length,
@@ -882,25 +882,30 @@ class _OverviewPageState extends State<OverviewPage> {
         _attention(blocked),
       ],
       el('div', [
-        _agents(),
-        if (overview) ...[_workspaces(state, admin), const RecentActivity()],
-        const SystemHealth(),
+        el('div', [
+          _agents(),
+          if (overview) _workspaces(state, admin),
+        ], classes: 'overview-lane overview-lane--primary'),
+        el('div', [
+          const SystemHealth(),
+          if (overview) const RecentActivity(),
+          el('details', [
+            _disclosureSummary(
+              'terminal',
+              'Terminal access',
+              'Connect to the container over SSH to run Herdr directly',
+            ),
+            el('div', [
+              _text(
+                'code-output',
+                'ssh herdr@<container-ip>\nThen: cd ~/projects && herdr',
+                'pre',
+              ),
+            ], classes: 'overview-disclosure__body'),
+          ], classes: 'card overview-disclosure'),
+        ], classes: 'overview-lane overview-lane--secondary'),
       ], classes: 'overview-grid'),
       if (overview && admin) _projectForm(state),
-      el('details', [
-        _disclosureSummary(
-          'terminal',
-          'Terminal access',
-          'Connect to the container over SSH to run Herdr directly',
-        ),
-        el('div', [
-          _text(
-            'code-output',
-            'ssh herdr@<container-ip>\nThen: cd ~/projects && herdr',
-            'pre',
-          ),
-        ], classes: 'overview-disclosure__body'),
-      ], classes: 'card overview-disclosure'),
     ], classes: 'overview-page');
   }
 }

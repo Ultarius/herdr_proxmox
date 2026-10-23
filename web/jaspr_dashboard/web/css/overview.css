@@ -10,12 +10,16 @@
    ========================================================================== */
 
 /* ---- Page rhythm: 24px steps; banner + stat strip belong together -------- */
-.overview-page { display: flex; flex-direction: column; min-width: 0; }
+.overview-page { display: flex; flex-direction: column; min-width: 0; container: overview / inline-size; }
 .overview-page > * { margin: 0; }
 .overview-page > * + * { margin-top: var(--space-6); }
 .overview-page > .runtime + .overview-stats { margin-top: var(--space-4); }
 /* styles.css gives every p/h a 12px bottom margin; the template has none */
 .overview-page :where(p, h2, h3) { margin-bottom: 0; }
+/* Three summary items use the entire last row in the two-column tablet layout. */
+@container stat-strip (min-width: 560px) and (max-width: 799.98px) {
+  .overview-stats .stat-strip > li:last-child { grid-column: 1 / -1; }
+}
 
 /* ---- Runtime banner (slim, one row) -----------------------------------------
    Tile · "Herdr is running" + meta on one line · toggle. Wraps on phones.    */
@@ -55,15 +59,17 @@
   .overview-attention .attention__action { grid-column: 3; }
 }
 
-/* ---- Overview grid -------------------------------------------------------------
-     < xl   one column: agents, workspaces, activity, health
-     >= xl  main column + activity rail; agents and system health span both. */
-.overview-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-6); }
-.overview-grid > .card { display: flex; flex-direction: column; }
-.overview-grid > .card > .card__body { flex: 1; }
-@media (min-width: 1280px) {
-  .overview-grid { grid-template-columns: minmax(0, 1fr) minmax(300px, .5fr); }
-  .overview-grid > .overview-grid__wide { grid-column: 1 / -1; }
+/* Independent stacks give cards their natural heights: adding agents or opening
+   a disclosure never stretches cards in the other lane. Columns total the
+   available content width: (width - 24px gutter) * 3/5 and * 2/5. The container
+   breakpoint also handles an expanded/collapsed sidebar without viewport hacks.
+   DOM and keyboard order stay column-first; small screens use the same order. */
+.overview-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-6); align-items: start; }
+.overview-lane { display: flex; flex-direction: column; gap: var(--space-6); min-width: 0; }
+.overview-lane > * { margin: 0; }
+.overview-activity .empty { padding-block: var(--space-4); }
+@container overview (min-width: 880px) {
+  .overview-grid { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
 }
 
 /* ---- Agents card ------------------------------------------------------------- */
@@ -110,7 +116,7 @@ a.agent__name:hover { text-decoration: underline; text-underline-offset: 3px; }
 
 /* ---- Workspaces card ----------------------------------------------------------- */
 .ws-grid { display: grid; gap: var(--space-3); grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); }
-.ws-grid > .ws-grid__create { grid-column: 1 / -1; } /* "create" is always its own slim row */
+.ws-section { display: grid; gap: var(--space-3); }
 .ws-tile.workspace-tile {
   display: flex; flex-direction: column; gap: var(--space-2); height: 100%; padding: var(--space-4);
   border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-surface); box-shadow: none;

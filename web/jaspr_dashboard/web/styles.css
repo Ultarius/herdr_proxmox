@@ -138,6 +138,8 @@ code { padding: 1px var(--space-1-5); border-radius: var(--radius-xs); backgroun
 .main-content { position: relative; overflow: auto; padding: var(--space-8); min-width: 0; min-height: 0; scroll-padding-top: var(--space-4); overscroll-behavior: contain; }
 .main-content:focus { outline: none; }
 .main-content > div { max-width: var(--content-max); margin: 0 auto; }
+.main-content--fluid > .page-frame { width: 100%; max-width: none; margin-inline: 0; }
+.topbar--fluid { padding-inline: var(--space-8); }
 .scrim { position: fixed; inset: 0; z-index: var(--z-overlay); padding: 0; border: 0; border-radius: 0; background: var(--color-scrim); box-shadow: none; }
 
 /* ---- Page header (every page, ui.dart pageHeader) ---------------------------- */
@@ -345,6 +347,7 @@ details.card > summary ~ :last-child { margin-bottom: var(--space-5); }
   }
   .sidebar.is-open { transform: none; visibility: visible; transition: transform var(--duration-slow) var(--ease-standard); }
   .main-content { padding: var(--space-6); }
+  .topbar--fluid { padding-inline: var(--space-6); }
 }
 @media (max-width: 767.98px) {
   .app { grid-template-columns: minmax(0, 1fr); }

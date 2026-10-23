@@ -458,6 +458,9 @@ class _DashboardAppState extends State<DashboardApp> {
   @override
   Component build(BuildContext context) {
     final state = connection.state;
+    final fluidOverview =
+        state.connected &&
+        const ['', '/', '/agents'].contains(currentRoute.path);
     final directory = connection.organizationDirectory.value;
     final orgs = List<Map<String, dynamic>>.from(
       directory['organizations'] ?? [],
@@ -832,7 +835,7 @@ class _DashboardAppState extends State<DashboardApp> {
                 events: {'click': (_) => showNotices()},
               ),
           ], classes: 'topbar__actions'),
-        ], classes: 'topbar'),
+        ], classes: fluidOverview ? 'topbar topbar--fluid' : 'topbar'),
         el(
           'main',
           [
@@ -850,7 +853,9 @@ class _DashboardAppState extends State<DashboardApp> {
               if (state.connected) _page() else _signIn(),
             ], classes: 'page-frame'),
           ],
-          classes: 'main-content',
+          classes: fluidOverview
+              ? 'main-content main-content--fluid'
+              : 'main-content',
           attributes: {
             'id': 'content',
             'tabindex': '-1',
