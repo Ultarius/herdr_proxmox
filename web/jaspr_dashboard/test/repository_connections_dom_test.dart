@@ -57,6 +57,17 @@ void main() {
           if (request.method == 'POST') {
             final body = Map<String, dynamic>.from(jsonDecode(request.body));
             requests.add(body);
+            if (body['action'] == 'discover') {
+              return http.Response(
+                jsonEncode({
+                  'repositories': [
+                    {'repository': 'owner/private', 'private': true},
+                  ],
+                  'next_page': null,
+                }),
+                200,
+              );
+            }
             if (['create', 'rotate'].contains(body['action']) &&
                 saveError != null) {
               return http.Response(jsonEncode({'error': saveError}), 503);
@@ -302,6 +313,57 @@ void main() {
       expect(
         nodes('.clone-project').single.textContent,
         isNot(contains('github_pat_test_fixture')),
+      );
+    },
+  );
+  test(
+    'PAT discovery fills the repository and connection name before saving',
+    () async {
+      nodes('summary').single.click();
+      await settle();
+      final authentication = nodes('select').first as web.HTMLSelectElement;
+      authentication.value = 'token';
+      authentication.dispatchEvent(
+        web.Event('change', web.EventInit(bubbles: true)),
+      );
+      await settle();
+      await field('GitHub personal access token', 'github_pat_test_fixture');
+      await click('Discover repositories');
+      expect(requests.last, {
+        'action': 'discover',
+        'token': 'github_pat_test_fixture',
+        'page': 1,
+      });
+      expect(requests.where((item) => item['action'] == 'create'), isEmpty);
+      final picker =
+          nodes('select').firstWhere(
+                (node) => node.textContent!.contains('Choose a repository'),
+              )
+              as web.HTMLSelectElement;
+      picker.value = 'owner/private';
+      picker.dispatchEvent(web.Event('change', web.EventInit(bubbles: true)));
+      await settle();
+      await field('GitHub repository (owner/repository)', 'owner/manual');
+      expect(
+        (nodes('select').firstWhere(
+                  (node) => node.textContent!.contains('Choose a repository'),
+                )
+                as web.HTMLSelectElement)
+            .value,
+        '',
+      );
+      await field('GitHub repository (owner/repository)', 'owner/private');
+      await click('Save token connection');
+      expect(requests.last, {
+        'action': 'create',
+        'token': 'github_pat_test_fixture',
+        'kind': 'token',
+        'repository': 'owner/private',
+        'label': 'owner/private',
+      });
+      expect(
+        (nodes('input[type=password]').single as web.HTMLInputElement).value,
+        isEmpty,
       );
     },
   );

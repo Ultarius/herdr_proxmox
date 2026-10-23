@@ -304,6 +304,19 @@ environment readiness is insufficient to mark project tests passed.
 5. Apply exact pins and ecosystem policies first. For ranges, apply a documented
    deterministic selection policy, record the selected exact version and freeze
    it for that task. Do not silently roll an active task to a newer release.
+   A numeric `.python-version` request such as `3.12` selects the highest
+   compatible patch in the pinned catalog; `3.12.1` stays exact. These version-file
+   requests use family semantics separately from PEP 440 project constraints
+   ([uv version requests](https://docs.astral.sh/uv/concepts/python-versions/)).
+   A `go.mod` `go` directive states a minimum toolchain version, including when
+   it specifies a patch ([Go toolchains](https://go.dev/doc/toolchain)).
+   Composer tilde ranges retain Composer's bounds: `~8.1` permits versions below
+   9.0, while `~8.1.2` stops below 8.2; npm tilde semantics remain separate
+   ([Composer constraints](https://getcomposer.org/doc/articles/versions.md)).
+   Composer bare versions and comparison bounds are zero-padded exact versions:
+   `8.1` means `8.1.0`, and `>8.1` admits `8.1.1`. Python family conflict checks
+   consider compatible minor versions as well as patch versions for major-only
+   requests such as `3`.
 6. Partition incompatible component requirements into separate environments when
    the build permits it. If one invocation genuinely requires incompatible
    versions, report a conflict rather than hiding it through separate probes.

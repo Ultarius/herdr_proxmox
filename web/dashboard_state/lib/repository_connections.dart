@@ -2,6 +2,12 @@ import 'dart:async';
 import 'dashboard_bloc.dart';
 
 const repositoryTokenLabel = 'Fine-grained GitHub token (HTTPS)';
+const repositoryCloneTokenGuidance =
+    'To clone with a GitHub personal access token (PAT), open Repository connections '
+    'and choose Fine-grained GitHub token (HTTPS). Enter your token and use Discover repositories, '
+    'or enter owner/repository manually. Save and test the connection, '
+    'then select it below. Cloning and pulling need Contents: Read-only access '
+    'to the selected repository. Enter the token in the token field, not the repository URL.';
 const repositoryTokenGuidance =
     'Select the repository owner and Only select repositories on GitHub. '
     'For cloning and pulling, grant Contents: Read-only; Metadata: Read-only is included. '
@@ -61,6 +67,67 @@ class RepositoryConnectionsController {
   List<Map<String, dynamic>> connections = [], bindings = [];
   String? message;
   String? pendingRemoval;
+  List<Map<String, dynamic>> discoveredRepositories = [];
+  int? nextRepositoryPage;
+  int discoveryRevision = 0;
+  bool resetRepositoryDiscovery({bool clearMessage = true}) {
+    final changed =
+        discoveredRepositories.isNotEmpty ||
+        nextRepositoryPage != null ||
+        (clearMessage && message != null);
+    discoveryRevision++;
+    discoveredRepositories = [];
+    nextRepositoryPage = null;
+    if (clearMessage) message = null;
+    return changed;
+  }
+
+  Future<void> discoverRepositories(String token, {bool more = false}) async {
+    if (!canManage || busy || refreshing || disposed) return;
+    final page = more ? nextRepositoryPage : 1;
+    if (page == null) return;
+    if (!more) resetRepositoryDiscovery();
+    final epoch = connection.generation, version = revision;
+    final discovery = discoveryRevision;
+    busy = true;
+    message = null;
+    onUpdate();
+    try {
+      final data = await connection.request('projects/connections', {
+        'action': 'discover',
+        'token': token.trim(),
+        'page': page,
+      });
+      if (!current(epoch, version) || discovery != discoveryRevision) return;
+      final values = List<Map<String, dynamic>>.from(
+        data['repositories'] ?? [],
+      );
+      final names = discoveredRepositories
+          .map((item) => item['repository'])
+          .toSet();
+      discoveredRepositories = [
+        ...discoveredRepositories,
+        ...values.where((item) => names.add(item['repository'])),
+      ];
+      nextRepositoryPage = data['next_page'] as int?;
+      message = data['limit_reached'] == true
+          ? 'Discovery reached its listing limit. Enter owner/repository manually for additional repositories.'
+          : discoveredRepositories.isEmpty
+          ? 'No repositories found. Check the token’s repository selection and organization approval, or enter owner/repository manually.'
+          : nextRepositoryPage != null
+          ? 'Showing ${discoveredRepositories.length} repositories so far. More repositories are available; load more or select one now. Test repository access before cloning.'
+          : 'Select a discovered repository, then save the connection. Test repository access before cloning.';
+    } catch (error) {
+      if (current(epoch, version) && discovery == discoveryRevision)
+        message = '$error';
+    } finally {
+      if (current(epoch, version)) {
+        busy = false;
+        onUpdate();
+      }
+    }
+  }
+
   void prepareRemoval(String? id) {
     pendingRemoval = id;
     onUpdate();
@@ -92,6 +159,7 @@ class RepositoryConnectionsController {
       bindings = [];
       message = null;
       pendingRemoval = null;
+      resetRepositoryDiscovery();
       onReset?.call();
       onChanged([]);
       onUpdate();

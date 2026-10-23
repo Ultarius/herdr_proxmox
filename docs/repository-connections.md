@@ -9,13 +9,33 @@ Jaspr mounts it with the clone card. The collapsed Flutter setup intentionally
 avoids fetching connection configuration. Both populate the clone dropdown when
 their panel loads and refuse retries with an unavailable saved connection.
 
-1. Give the connection a name and enter `owner/repository`.
+1. Give the connection a name and enter `owner/repository`, or use token discovery
+   below to fill both fields from a repository selection.
 2. Choose **SSH deploy key**, **Fine-grained GitHub token (HTTPS)**, or
    **Configured GitHub account (HTTPS)**.
    For a fine-grained token, use the link in this form, choose the correct resource
    owner and **Only select repositories**, then grant **Contents: Read-only**
    (Metadata read access is included). Organization approval may be required.
-   Paste the token into the password field and click **Save token connection**.
+   Paste the token into the password field. **Discover repositories** lists
+   a page of repositories visible to that token using GitHub's authenticated-user repository
+   API (`https://api.github.com/user/repos`). Choose a **Discovered repository**
+   to fill the repository and an empty connection name. **Load more repositories**
+   fetches another page of up to 100 results.
+   GitHub's `Link` header determines whether more pages exist, regardless of page
+   length. The panel explicitly reports when more repositories are available.
+   Listings stop after 1,000 pages (up to 100,000 repositories) and display a
+   listing-limit message if GitHub still reports another page. Manual entry
+   remains available. Pagination is not a snapshot: repository creation, renaming
+   or deletion between requests can shift results and omit a repository. Restart
+   discovery or enter its name manually when needed.
+   Discovery uses the pasted token
+   without saving it or changing the dashboard's publishing credentials. Editing
+   the token clears the results; account changes also discard outstanding results.
+   Metadata visibility does not prove Contents read permission, so test repository
+   access after saving. Empty results suggest checking token repository selection
+   or organization approval. Errors report invalid/expired credentials, denied or
+   rate-limited access, or unavailable responses; manual entry remains available.
+   Click **Save token connection** when the repository selection is ready.
    New connections accept PATs beginning with `github_pat_` (fine-grained) or
    `ghp_` (classic); a recognized prefix does not verify validity or permissions.
    OAuth/App credentials and refresh tokens are not accepted by this PAT form.
@@ -80,11 +100,23 @@ not authorize PR creation, publication, merging, deployment, submodule access or
 Git LFS credentials. Those workflows keep their existing configuration.
 
 The API is `GET /api/projects/connections` and `POST /api/projects/connections`
-with actions `create`, `rotate`, `verify_host`, `test`, `bind`, `unbind`, and `remove`. Listing, configuration and
+with actions `discover`, `create`, `rotate`, `verify_host`, `test`, `bind`, `unbind`, and `remove`. Listing, configuration and
 managed cloning are administrator operations. `projects/clone` accepts optional
 `connection_id`; durable job records retain that identifier, the credential-free
 URL and folder so retries can be reviewed. Requests have existing same-origin
 session checks. The shared client allows time for bounded host/access probes.
+
+`discover` is an administrator-only **POST to the existing connections endpoint**,
+with JSON body `{"action":"discover","token":"<PAT>","page":1}`. The raw PAT
+is sent from the browser to the gateway in this request body, then used by the
+gateway to authenticate a bounded request to `https://api.github.com/user/repos`.
+Use HTTPS for the dashboard connection when sending credentials over a network.
+Discovery does not save the PAT or echo it in its response. It returns
+`repositories` (repository names, private/archive flags), `next_page` (integer or
+null), and `limit_reached` (boolean). Page numbers must be between 1 and 1,000.
+Subsequent pages require resubmitting the PAT. It does not create a connection or
+change GitHub publication settings. This repository listing is unrelated to the
+product-discovery workflow.
 
 `create` accepts `label`, `repository` (`owner/repository`), `kind` (`ssh`,
 `github`, or `token`), and a required `token` only for `kind: token`. Supplying a

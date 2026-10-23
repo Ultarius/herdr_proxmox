@@ -25,6 +25,25 @@ TARGET = dict(os='linux', architecture='x64', libc='glibc')
 
 
 class SelectionTests(unittest.TestCase):
+    def test_discovered_minor_request_selects_latest_patch_and_exact_pin_stays_exact(self):
+        import project_inventory
+        import project_requirements
+        data = copy.deepcopy(python.catalog())
+        template = next(item for item in data['interpreters'].values()
+                        if item['name'] == 'cpython' and item['major'] == 3 and item['minor'] == 12
+                        and item['arch']['family'] == 'x86_64' and not item.get('variant'))
+        data['interpreters'] = {str(patch): dict(template, patch=patch) for patch in (0, 1, 14)}
+        for selected, expected in (('3.12', '3.12.14'), ('3.12.1', '3.12.1'),
+                                   ('>=3.12,<3.13', '3.12.14')):
+            with self.subTest(selected=selected), tempfile.TemporaryDirectory() as folder:
+                files = {'pyproject.toml': b'[project]\nrequires-python=">=3.12,<3.13"\n',
+                         '.python-version': selected.encode()}
+                report = project_requirements.analyse(Path(folder),
+                    inventory=project_inventory.from_paths(files), read=lambda name, limit=None: files.get(name))
+                requirement = report['components'][0]['requirements'][0]
+                declarations = project_requirements.declarations(requirement)
+                self.assertEqual(python.select(declarations, TARGET, data)['version'], expected)
+
     def test_range_selection_is_catalog_bounded_and_all_declarations_apply(self):
         value = python.select([('>=3.11', 'pep440'), ('<3.13', 'pep440')], TARGET)
         self.assertEqual(value, python.select([('>=3.11', 'pep440'), ('<3.13', 'pep440')], TARGET))

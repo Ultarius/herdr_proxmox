@@ -77,7 +77,7 @@ ECOSYSTEMS = (
                       _source('pyproject.toml', 'project.requires-python', kind='toml'),
                       _source('pyproject.toml', 'tool.poetry.dependencies.python', kind='toml',
                               notation='poetry'),
-                      _source('.python-version', kind='text', role='selection'))),
+                      _source('.python-version', kind='text', role='selection', notation='python-version'))),
          ),
          managers={'poetry.lock': 'poetry', 'Pipfile.lock': 'pipenv',
                    'uv.lock': 'uv', 'requirements.txt': 'pip'},
@@ -94,7 +94,7 @@ ECOSYSTEMS = (
     dict(id='go', label='Go', markers=('go.mod',),
          requirements=(
              dict(tool='go', label='Go', purpose='toolchain', executable='go',
-                  notation='gomod', sources=(_source('go.mod', 'go', kind='gomod'),)),
+                  notation='gomod', sources=(_source('go.mod', 'go', kind='gomod', minimum=True),)),
          ),
          managers={'go.sum': 'go modules'},
          dependency_fields=(),
@@ -478,10 +478,13 @@ def _conflicts(requirement, observations):
                    for item in observations if item['role'] == 'constraint' and not item['unreadable']]
     selections = sorted({item['value'] for item in observations
                          if item['role'] == 'selection' and not item['unreadable']})
+    families = {item['value'] for item in observations if item.get('notation') == 'python-version'}
     for constraint, notation in constraints:
         for selected in selections:
-            verdict = dependency_constraints.evaluate(constraint, selected,
-                                                      notation)
+            if selected in families:
+                verdict = dependency_constraints.family_verdict(selected, constraint, notation)
+            else:
+                verdict = dependency_constraints.evaluate(constraint, selected, notation)
             if verdict == dependency_constraints.VIOLATED:
                 conflicts.append(dict(kind='unsatisfied', role='selection', values=[selected],
                                       reason=f'The selected {selected} does not satisfy the declared '

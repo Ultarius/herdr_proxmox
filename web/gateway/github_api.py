@@ -121,7 +121,15 @@ class GitHub:
         if entry.get('mode') != 'fork' or entry.get('publishing_repository') != publishing:
             raise ValueError('Repository is not the configured fork for this project.')
 
-    def request(self, path, method='GET', body=None, token=None):
+    def request(self, path, method='GET', body=None, token=None, page_result=False):
+        """Return JSON, refusing partial lists unless the caller consumes page metadata.
+
+        page_result requires an explicit token and returns {items, has_next}.
+        Such results bypass the shared cache. Callers construct subsequent URLs
+        themselves; response Link URLs are never followed with credentials.
+        """
+        if page_result and (method != 'GET' or token is None):
+            raise ValueError('Paged GitHub requests require an explicit credential and GET.')
         if not path.startswith('/') or '\\' in path or '..' in path:
             raise ValueError('Invalid GitHub API path.')
         supplied_token = token is not None
@@ -152,10 +160,15 @@ class GitHub:
                 content = response.read(1_000_001)
                 if len(content) > 1_000_000:
                     raise ValueError('GitHub response exceeds the size limit.')
-                # Do not silently label an incomplete check/review list complete.
-                if 'rel="next"' in response.headers.get('Link', ''):
+                has_next = any('next' in (quoted or bare).split() for quoted, bare in
+                    re.findall(r';\s*rel\s*=\s*(?:"([^"]*)"|([^;,\s]+))',
+                               response.headers.get('Link', ''), re.IGNORECASE))
+                # Ordinary check/review callers must still refuse partial lists.
+                if not page_result and has_next:
                     raise ValueError('GitHub result exceeds the supported page size; inspect it on GitHub.')
                 result = json.loads(content)
+                if page_result:
+                    return dict(items=result, has_next=has_next)
                 if method == 'GET' and not supplied_token:
                     with self.lock:
                         if len(self.cache) >= 256:

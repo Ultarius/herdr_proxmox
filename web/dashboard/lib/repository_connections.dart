@@ -20,6 +20,7 @@ class _RepositoryConnectionsPanelState
       replacementToken = TextEditingController(),
       folder = TextEditingController();
   String kind = 'ssh';
+  bool tokenHasValue = false;
   String? rotatingId;
   late final RepositoryConnectionsController controller;
   List<Map<String, dynamic>> get connections => controller.connections;
@@ -34,6 +35,7 @@ class _RepositoryConnectionsPanelState
       BlocScope.get<DashboardBloc>(),
       onReset: () {
         token.clear();
+        tokenHasValue = false;
         replacementToken.clear();
         rotatingId = null;
       },
@@ -69,7 +71,12 @@ class _RepositoryConnectionsPanelState
       'kind': kind,
       if (kind == 'token') 'token': secret.trim(),
     });
-    if (mounted && saved && token.text == secret) token.clear();
+    if (mounted && saved && token.text == secret)
+      setState(() {
+        token.clear();
+        tokenHasValue = false;
+        controller.resetRepositoryDiscovery(clearMessage: false);
+      });
   }
 
   Future<void> rotateToken(String id) async {
@@ -112,6 +119,7 @@ class _RepositoryConnectionsPanelState
             TextField(
               key: const PageStorageKey('repository-connection-repository'),
               controller: repository,
+              onChanged: (_) => setState(() {}),
               decoration: const InputDecoration(
                 labelText: 'GitHub repository (owner/repository)',
               ),
@@ -136,6 +144,8 @@ class _RepositoryConnectionsPanelState
                   : (value) => setState(() {
                       kind = value!;
                       token.clear();
+                      tokenHasValue = false;
+                      controller.resetRepositoryDiscovery();
                     }),
             ),
             if (kind == 'token') ...[
@@ -148,6 +158,12 @@ class _RepositoryConnectionsPanelState
               TextField(
                 key: const PageStorageKey('repository-connection-token'),
                 controller: token,
+                onChanged: (value) {
+                  final hasValue = value.trim().isNotEmpty;
+                  final reset = controller.resetRepositoryDiscovery();
+                  if (hasValue != tokenHasValue || reset) setState(() {});
+                  tokenHasValue = hasValue;
+                },
                 enabled: !busy,
                 obscureText: true,
                 autofillHints: null,
@@ -157,6 +173,64 @@ class _RepositoryConnectionsPanelState
                   labelText: 'GitHub personal access token',
                 ),
               ),
+              TextButton(
+                onPressed: busy || token.text.trim().isEmpty
+                    ? null
+                    : () => controller.discoverRepositories(token.text),
+                child: const Text('Discover repositories'),
+              ),
+              const Text(
+                'Loads repositories visible to this token one page at a time. Discovery does not save the token or verify cloning access.',
+              ),
+              if (controller.discoveredRepositories.isNotEmpty)
+                DropdownButtonFormField<String>(
+                  key: ValueKey('discovered-${repository.text}'),
+                  isExpanded: true,
+                  initialValue:
+                      controller.discoveredRepositories.any(
+                        (item) => item['repository'] == repository.text,
+                      )
+                      ? repository.text
+                      : '',
+                  decoration: const InputDecoration(
+                    labelText: 'Discovered repository',
+                  ),
+                  items: [
+                    const DropdownMenuItem(
+                      value: '',
+                      child: Text('Choose a repository'),
+                    ),
+                    for (final item in controller.discoveredRepositories)
+                      DropdownMenuItem(
+                        value: '${item['repository']}',
+                        child: Text(
+                          '${item['repository']}${item['private'] == true ? ' (private)' : ''}${item['archived'] == true ? ' (archived)' : ''}',
+                        ),
+                      ),
+                  ],
+                  onChanged: busy
+                      ? null
+                      : (value) => setState(() {
+                          if (value != null && value.isNotEmpty) {
+                            repository.text = value;
+                            if (label.text.trim().isEmpty)
+                              label.text = value.substring(
+                                0,
+                                value.length.clamp(0, 80),
+                              );
+                          }
+                        }),
+                ),
+              if (controller.nextRepositoryPage != null)
+                TextButton(
+                  onPressed: busy
+                      ? null
+                      : () => controller.discoverRepositories(
+                          token.text,
+                          more: true,
+                        ),
+                  child: const Text('Load more repositories'),
+                ),
             ],
             FilledButton(
               onPressed: busy ? null : createConnection,

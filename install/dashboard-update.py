@@ -7,6 +7,7 @@ by the gateway build runner; the gateway enforces administrator approval and
 this worker re-verifies the approved build ID and SHA-256 before installing.
 """
 import errno
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -38,8 +39,9 @@ REQUIRED = ('web/gateway/server.py', 'web/public/index.html',
 RELEASE = re.compile(r'v[0-9]+\.[0-9]+\.[0-9]+')
 ALPHA = re.compile(r'alpha-[a-z0-9-]+-[a-f0-9]{12}-b[1-9][0-9]*')
 # Operator state that outlives any single deployment: task records and the
-# GitHub publishing credential.
+# GitHub publishing credential, plus repository connections and their secrets.
 PRESERVED_CONFIG = ('tasks.sqlite3', 'github.json')
+PRESERVED_DIRECTORIES = ('repository-connections',)
 BUILD_ID = re.compile(r'[a-f0-9]{32}')
 SHA256 = re.compile(r'[a-f0-9]{64}')
 SOURCE = re.compile(r'(?:[a-f0-9]{40}|[a-f0-9]{64})')
@@ -124,7 +126,7 @@ def deployment_storage(source, config_source=None):
         size, count = footprint(config_source)
         # Rollback also preserves current task records/credentials. Budget their
         # writes even if they have grown beyond the older saved configuration.
-        preserved = [footprint(CONFIG / name) for name in PRESERVED_CONFIG]
+        preserved = [footprint(CONFIG / name) for name in (*PRESERVED_CONFIG, *PRESERVED_DIRECTORIES)]
         allocations.append((CONFIG, size + sum(n for n, _ in preserved), count + sum(n for _, n in preserved)))
     require_storage(allocations)
 
@@ -259,7 +261,7 @@ def verify_config(config):
                     connection.close()
 
 
-def verify_backup(backup):
+def verify_backup(backup, *, allow_added_parts=False):
     """Always revalidate contents; a sidecar certificate is never a cache hit."""
     if backup.is_symlink() or not re.fullmatch(r'backup-[0-9]+', backup.name):
         raise ValueError('Only a completed backup directory can be restored.')
@@ -291,6 +293,9 @@ def verify_backup(backup):
             if (ROOT / name).exists() and not (backup / name).exists():
                 raise ValueError(f'Legacy backup is unverified: missing {name}; refusing a mixed deployment.')
         method = 'legacy-witness'
+    for name in ('install', 'VERSION', '.fvmrc', 'BUILD.json'):
+        if not (allow_added_parts and method == 'manifest') and (ROOT / name).exists() and not (backup / name).exists():
+            raise ValueError(f'Backup is missing {name}; refusing a mixed deployment.')
     verify_config(backup / 'config')
     evidence = dict(method=method, file_count=actual['file_count'],
                     digest=hashlib.sha256(json.dumps(actual, sort_keys=True).encode()).hexdigest())
@@ -531,45 +536,88 @@ def backup_current():
     return backup
 
 
-def restore(backup):
-    # Validate again immediately before any stop/removal, including automated
-    # recovery paths which do not pass through rollback's candidate selection.
-    evidence = verify_backup(backup)
+@contextmanager
+def configuration_stage():
+    folder = Path(tempfile.mkdtemp(prefix='herdr-restore-', dir=CONFIG.parent))
+    try:
+        yield folder
+    except BaseException:
+        if (folder / 'original').exists():
+            warn('Original configuration retained for recovery at ' + str(folder / 'original'))
+        else:
+            shutil.rmtree(folder)
+        raise
+    else:
+        shutil.rmtree(folder)
+
+
+def validate_preserved(config):
+    for name in (*PRESERVED_CONFIG, *PRESERVED_DIRECTORIES):
+        path = config / name
+        footprint(path)
+        if path.exists() and (path.is_dir() if name in PRESERVED_CONFIG else not path.is_dir()):
+            raise ValueError('Invalid preserved configuration path type: ' + str(path))
+
+
+def restore(backup, *, recovery=False):
+    # Never accumulate or delete the only surviving live credentials. An
+    # operator must recover and remove this private staging directory first.
+    for retained in CONFIG.parent.glob('herdr-restore-*'):
+        if (retained / 'original').exists():
+            raise ValueError('Configuration recovery required before another restore: ' + str(retained / 'original'))
+    validate_preserved(CONFIG)
+    validate_preserved(backup / 'config')
+    # Automatic recovery restores the exact snapshot taken before this attempt;
+    # parts added by the failed upgrade must disappear again. User-selected old
+    # backups retain the stricter compatibility guard.
+    evidence = verify_backup(backup, allow_added_parts=True) if recovery else verify_backup(backup)
     record_backup_verification(backup, evidence)
     service('stop')
-    # Tasks and GitHub credentials were created after this deployment backup.
-    # Restoring the older configuration directory must not silently discard
-    # them, and an older gateway cannot read them either way.
-    preserved = {}
-    for name in PRESERVED_CONFIG:
-        source = CONFIG / name
-        if source.is_file() and not source.is_symlink():
-            preserved[name] = source.read_bytes()
     try:
-        shutil.rmtree(ROOT / 'web')
-        shutil.copytree(backup / 'web', ROOT / 'web')
-        if (ROOT / 'install').exists():
-            shutil.rmtree(ROOT / 'install')
-        if (backup / 'install').exists():
-            shutil.copytree(backup / 'install', ROOT / 'install')
-        shutil.rmtree(CONFIG)
-        shutil.copytree(backup / 'config', CONFIG)
-        for name, content in preserved.items():
-            target = CONFIG / name
-            target.write_bytes(content)
-            target.chmod(0o600)
-        subprocess.run(['chown', '-R', 'herdr:herdr', str(CONFIG)], check=True)
-        (ROOT / 'VERSION').unlink(missing_ok=True)
-        if (backup / 'VERSION').exists():
-            shutil.copy2(backup / 'VERSION', ROOT / 'VERSION')
-        (ROOT / '.fvmrc').unlink(missing_ok=True)
-        if (backup / '.fvmrc').exists():
-            shutil.copy2(backup / '.fvmrc', ROOT / '.fvmrc')
-        (ROOT / 'BUILD.json').unlink(missing_ok=True)
-        if (backup / 'BUILD.json').exists():
-            shutil.copy2(backup / 'BUILD.json', ROOT / 'BUILD.json')
+        # Build the complete replacement beside CONFIG. Every fallible copy
+        # finishes while the original configuration is still intact.
+        with configuration_stage() as folder:
+            staging = Path(folder)
+            replacement = staging / 'replacement'
+            sizes = [footprint(CONFIG / name) for name in (*PRESERVED_CONFIG, *PRESERVED_DIRECTORIES)]
+            config_size, config_count = footprint(backup / 'config')
+            require_storage([(staging, config_size + sum(size for size, _ in sizes),
+                              config_count + sum(count for _, count in sizes))])
+            shutil.copytree(backup / 'config', replacement)
+            for name in (*PRESERVED_CONFIG, *PRESERVED_DIRECTORIES):
+                target, source = replacement / name, CONFIG / name
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink(missing_ok=True)
+                if source.is_dir():
+                    shutil.copytree(source, target)
+                elif source.is_file():
+                    shutil.copy2(source, target)
+                    target.chmod(0o600)
+            subprocess.run(['chown', '-R', 'herdr:herdr', str(replacement)], check=True)
+            shutil.rmtree(ROOT / 'web')
+            shutil.copytree(backup / 'web', ROOT / 'web')
+            if (ROOT / 'install').exists():
+                shutil.rmtree(ROOT / 'install')
+            if (backup / 'install').exists():
+                shutil.copytree(backup / 'install', ROOT / 'install')
+            original = staging / 'original'
+            CONFIG.rename(original)
+            try:
+                replacement.rename(CONFIG)
+            except OSError:
+                original.rename(CONFIG)
+                raise
+        for name in ('VERSION', '.fvmrc', 'BUILD.json'):
+            (ROOT / name).unlink(missing_ok=True)
+            if (backup / name).exists():
+                shutil.copy2(backup / name, ROOT / name)
     finally:
-        service('start')
+        if CONFIG.is_dir() and not CONFIG.is_symlink():
+            service('start')
+        else:
+            warn('Configuration recovery required: gateway left stopped because ' + str(CONFIG) + ' is unavailable.')
     return evidence
 
 
@@ -614,7 +662,7 @@ def rollback(actor=''):
     except Exception as error:
         error.recovery_backup = str(safety)
         try:
-            restore(safety)
+            restore(safety, recovery=True)
         except Exception as recovery:
             error.recovery_error = failure_message(recovery)
             warn(f'Rollback safety restore failed: {error.recovery_error}; backup: {safety}')
@@ -758,7 +806,7 @@ def main():
         rolled_back = False
         try:
             if replaced:
-                recovery_verification = restore(backup)
+                recovery_verification = restore(backup, recovery=True)
                 rolled_back = True
             elif stopped:
                 service('start')

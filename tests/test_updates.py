@@ -82,6 +82,213 @@ class UpdateTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'Legacy backup is unverified'):
                         worker.verify_backup(backup)
 
+    def test_manifest_backups_cannot_remove_newer_live_deployment_parts(self):
+        for name in ('install', 'VERSION', '.fvmrc', 'BUILD.json'):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+                state = Path(folder)
+                backup = self.legacy_backup(state)
+                root = self.legacy_backup(state, 'installed')
+                target = root / name
+                if name == 'install':
+                    target.mkdir()
+                elif not target.exists():
+                    target.write_text('live part')
+                (backup / name).unlink(missing_ok=True)
+                (backup / 'manifest.json').write_text(json.dumps(worker.backup_inventory(backup)))
+                mocks.enter_context(patch.object(worker, 'ROOT', root))
+                mocks.enter_context(patch.object(worker, 'CONFIG', root / 'config'))
+                mocks.enter_context(patch.object(worker, 'STATE', state))
+                service = mocks.enter_context(patch.object(worker, 'service'))
+                with self.assertRaisesRegex(ValueError, 'missing ' + name.replace('.', r'\.')):
+                    worker.restore(backup)
+                self.assertTrue(target.exists())
+                service.assert_not_called()
+
+    def test_double_configuration_rename_failure_leaves_service_stopped_and_blocks_retries(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            state = Path(folder)
+            backup = self.legacy_backup(state)
+            root = self.legacy_backup(state, 'installed')
+            (root / 'config/github.json').write_text('current credential')
+            rename = Path.rename
+            def fail_configuration(path, target):
+                if path.name in ('replacement', 'original'):
+                    raise OSError('configuration rename failed')
+                return rename(path, target)
+            for name, value in (('ROOT', root), ('CONFIG', root / 'config'), ('STATE', state)):
+                mocks.enter_context(patch.object(worker, name, value))
+            service = mocks.enter_context(patch.object(worker, 'service'))
+            warning = mocks.enter_context(patch.object(worker, 'warn'))
+            mocks.enter_context(patch.object(worker.subprocess, 'run'))
+            mocks.enter_context(patch.object(Path, 'rename', fail_configuration))
+            with self.assertRaisesRegex(OSError, 'configuration rename failed'):
+                worker.restore(backup)
+            self.assertEqual(service.call_args_list, [call('stop')])
+            self.assertFalse((root / 'config').exists())
+            retained = list(root.glob('herdr-restore-*/original'))
+            self.assertEqual(len(retained), 1)
+            self.assertEqual((retained[0] / 'github.json').read_text(), 'current credential')
+            self.assertTrue(any('left stopped' in item.args[0] for item in warning.call_args_list))
+            service.reset_mock()
+            with self.assertRaisesRegex(ValueError, 'recovery required'):
+                worker.restore(backup)
+            service.assert_not_called()
+            self.assertEqual(list(root.glob('herdr-restore-*/original')), retained)
+
+    def test_restore_preserves_current_repository_registry_and_credentials_as_one_set(self):
+        for scenario in ('created', 'rotated', 'removed', 'absent'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+                state = Path(folder)
+                backup = self.legacy_backup(state)
+                root = self.legacy_backup(state, 'installed')
+                current = root / 'config/repository-connections'
+                previous = backup / 'config/repository-connections'
+                old = {'connections.json': '{"connections":["old"],"bindings":{"app":"old"}}',
+                       'old/token.json': '{"token":"old-token"}'}
+                for name, content in old.items():
+                    target = previous / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content)
+                expected = dict(old)
+                if scenario == 'created':
+                    expected.update({'connections.json': '{"connections":["old","new"],"bindings":{"app":"new"}}',
+                                     'new/identity': 'new private key', 'new/identity.pub': 'new public key',
+                                     'new/known_hosts': 'verified host'})
+                elif scenario == 'rotated':
+                    expected['old/token.json'] = '{"token":"rotated-token"}'
+                else:
+                    expected = {'connections.json': '{"connections":[],"bindings":{}}'} if scenario == 'removed' else {}
+                for name, content in expected.items():
+                    target = current / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content)
+                    target.chmod(0o600)
+                for directory in [current, *(p for p in current.rglob('*') if p.is_dir())]:
+                    if directory.exists():
+                        directory.chmod(0o700)
+                (root / 'config/github.json').write_text('{"token":"current-publishing-token"}')
+                for name, value in (('ROOT', root), ('CONFIG', root / 'config'), ('STATE', state)):
+                    mocks.enter_context(patch.object(worker, name, value))
+                mocks.enter_context(patch.object(worker, 'service'))
+                mocks.enter_context(patch.object(worker.subprocess, 'run'))
+                worker.restore(backup)
+                actual = {p.relative_to(current).as_posix(): p.read_text()
+                          for p in current.rglob('*') if p.is_file()}
+                self.assertEqual(actual, expected)
+                self.assertEqual(current.exists(), scenario != 'absent')
+                self.assertIn('current-publishing-token', (root / 'config/github.json').read_text())
+                if sys.platform != 'win32' and current.exists():
+                    self.assertEqual(stat.S_IMODE(current.stat().st_mode), 0o700)
+                    for path in current.rglob('*'):
+                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700 if path.is_dir() else 0o600)
+
+    def test_restore_refuses_linked_repository_credentials_before_removing_live_files(self):
+        if sys.platform == 'win32':
+            self.skipTest('Creating symlinks requires Windows developer mode.')
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            state = Path(folder)
+            backup = self.legacy_backup(state)
+            root = self.legacy_backup(state, 'installed')
+            (root / 'config/repository-connections').symlink_to(backup / 'config', target_is_directory=True)
+            for name, value in (('ROOT', root), ('CONFIG', root / 'config'), ('STATE', state)):
+                mocks.enter_context(patch.object(worker, name, value))
+            service = mocks.enter_context(patch.object(worker, 'service'))
+            with self.assertRaisesRegex(ValueError, 'symbolic link'):
+                worker.restore(backup)
+            self.assertEqual((root / 'web/gateway/server.py').read_text(), 'gateway')
+            service.assert_not_called()
+
+    def test_preserved_copy_failure_leaves_live_credentials_intact(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            state = Path(folder)
+            backup = self.legacy_backup(state)
+            root = self.legacy_backup(state, 'installed')
+            current = root / 'config/repository-connections'
+            current.mkdir()
+            (current / 'connections.json').write_text('current registry')
+            original_copy = worker.shutil.copytree
+            def copy(source, destination, *args, **kwargs):
+                if Path(source) == current:
+                    raise OSError('preserved copy failed')
+                return original_copy(source, destination, *args, **kwargs)
+            for name, value in (('ROOT', root), ('CONFIG', root / 'config'), ('STATE', state)):
+                mocks.enter_context(patch.object(worker, name, value))
+            mocks.enter_context(patch.object(worker, 'service'))
+            mocks.enter_context(patch.object(worker.shutil, 'copytree', side_effect=copy))
+            with self.assertRaisesRegex(OSError, 'preserved copy failed'):
+                worker.restore(backup)
+            self.assertEqual((current / 'connections.json').read_text(), 'current registry')
+
+    def test_replacement_rename_failure_restores_original_and_budgets_beside_config(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            state = Path(folder)
+            backup = self.legacy_backup(state)
+            root = self.legacy_backup(state, 'installed')
+            (root / 'config/github.json').write_text('current credential')
+            rename = Path.rename
+            def fail_replacement(path, target):
+                if path.name == 'replacement':
+                    raise OSError('rename failed')
+                return rename(path, target)
+            for key, value in (('ROOT', root), ('CONFIG', root / 'config'), ('STATE', state)):
+                mocks.enter_context(patch.object(worker, key, value))
+            mocks.enter_context(patch.object(worker, 'service'))
+            mocks.enter_context(patch.object(worker.subprocess, 'run'))
+            mocks.enter_context(patch.object(Path, 'rename', fail_replacement))
+            budget = mocks.enter_context(patch.object(worker, 'require_storage'))
+            with self.assertRaisesRegex(OSError, 'rename failed'):
+                worker.restore(backup)
+            self.assertEqual((root / 'config/github.json').read_text(), 'current credential')
+            staged = [entry for record in budget.call_args_list for entry in record.args[0]
+                      if entry[0].name.startswith('herdr-restore-')]
+            self.assertEqual(len(staged), 1)
+            self.assertEqual(staged[0][0].parent, root)
+            self.assertGreaterEqual(staged[0][1], worker.footprint(backup / 'config')[0] + 4096)
+
+    def test_wrong_type_reserved_paths_are_rejected_before_stopping(self):
+        for live in (True, False):
+            for name in (*worker.PRESERVED_CONFIG, *worker.PRESERVED_DIRECTORIES):
+                with self.subTest(live=live, name=name), tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+                    state = Path(folder)
+                    backup = self.legacy_backup(state)
+                    root = self.legacy_backup(state, 'installed')
+                    target = (root if live else backup) / 'config' / name
+                    if name in worker.PRESERVED_CONFIG:
+                        target.mkdir()
+                    else:
+                        target.write_text('wrong type')
+                    for key, value in (('ROOT', root), ('CONFIG', root / 'config'), ('STATE', state)):
+                        mocks.enter_context(patch.object(worker, key, value))
+                    service = mocks.enter_context(patch.object(worker, 'service'))
+                    with self.assertRaises(ValueError):
+                        worker.restore(backup)
+                    service.assert_not_called()
+
+    def test_failed_configuration_restore_keeps_current_repository_credentials(self):
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            state = Path(folder)
+            backup = self.legacy_backup(state)
+            root = self.legacy_backup(state, 'installed')
+            current = root / 'config/repository-connections'
+            (current / 'connection').mkdir(parents=True)
+            (current / 'connections.json').write_text('{"connections":["connection"]}')
+            (current / 'connection/token.json').write_text('{"token":"rotated-token"}')
+            copytree = worker.shutil.copytree
+
+            def copy(source, destination, *args, **kwargs):
+                if Path(source) == backup / 'config':
+                    raise OSError('interrupted configuration copy')
+                return copytree(source, destination, *args, **kwargs)
+
+            for name, value in (('ROOT', root), ('CONFIG', root / 'config'), ('STATE', state)):
+                mocks.enter_context(patch.object(worker, name, value))
+            mocks.enter_context(patch.object(worker, 'service'))
+            mocks.enter_context(patch.object(worker.shutil, 'copytree', side_effect=copy))
+            with self.assertRaisesRegex(OSError, 'interrupted configuration copy'):
+                worker.restore(backup)
+            self.assertEqual((current / 'connection/token.json').read_text(), '{"token":"rotated-token"}')
+            self.assertEqual((current / 'connections.json').read_text(), '{"connections":["connection"]}')
+
     def test_legacy_backup_cannot_retain_a_newer_installer(self):
         with tempfile.TemporaryDirectory() as folder:
             state = Path(folder)
@@ -465,7 +672,7 @@ class UpdateTests(unittest.TestCase):
             restored = mocks.enter_context(patch.object(worker, 'restore', side_effect=ValueError('recovery unavailable')))
             with self.assertRaisesRegex(OSError, 'No space left on device'):
                 worker.main()
-            restored.assert_called_once_with(backup_path)
+            restored.assert_called_once_with(backup_path, recovery=True)
             saved = json.loads((base / 'state/status.json').read_text())
             self.assertFalse(saved['rolled_back'])
             self.assertEqual(saved['backup'], str(backup_path))
@@ -651,7 +858,7 @@ class UpdateTests(unittest.TestCase):
             mocks.enter_context(patch.object(worker, 'wait_for_ready', side_effect=ValueError('unhealthy')))
             with self.assertRaisesRegex(ValueError, 'unhealthy') as failure:
                 worker.rollback()
-            self.assertEqual(restored.call_args_list, [call(old), call(safety)])
+            self.assertEqual(restored.call_args_list, [call(old), call(safety, recovery=True)])
             self.assertEqual(failure.exception.recovery_backup, str(safety))
 
     def test_release_cannot_replace_local_deployment(self):

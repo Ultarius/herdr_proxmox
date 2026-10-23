@@ -427,6 +427,18 @@ class GitHubTests(unittest.TestCase):
             self.api.request('/user', token='y' * 40)
             self.assertIsNone(opener.open.call_args.args[0].get_header('If-none-match'))
 
+    def test_pagination_is_opt_in_and_explicit_token_results_are_not_cached(self):
+        opener = MagicMock()
+        response = opener.open.return_value.__enter__.return_value
+        response.read.return_value = b'[{"full_name":"owner/repo"}]'
+        response.headers = {'Link': '<https://api.github.com/user/repos?page=2>; rel="next"'}
+        with patch('github_api.build_opener', return_value=opener):
+            with self.assertRaisesRegex(ValueError, 'incomplete'):
+                self.api.request('/user/repos', token='x' * 40)
+            self.assertEqual(self.api.request('/user/repos', token='x' * 40, page_result=True),
+                             dict(items=[dict(full_name='owner/repo')], has_next=True))
+            self.assertEqual(self.api.cache, {})
+
 
 @unittest.skipUnless(shutil.which('git'), 'Git required')
 class ContributionTests(unittest.TestCase):

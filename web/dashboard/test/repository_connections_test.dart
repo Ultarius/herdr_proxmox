@@ -8,6 +8,140 @@ import 'package:herdr_dashboard/repository_connections.dart';
 import 'package:juice/juice.dart';
 
 void main() {
+  testWidgets(
+    'PAT picker paginates, follows manual edits, and clears stale errors',
+    (tester) async {
+      final posts = <Map<String, dynamic>>[];
+      var deny = false;
+      final connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.url.path.endsWith('/connections')) {
+            if (request.method == 'POST') {
+              final body = Map<String, dynamic>.from(jsonDecode(request.body));
+              posts.add(body);
+              if (body['action'] == 'discover') {
+                if (deny)
+                  return http.Response(
+                    '{"error":"GitHub access was denied or rate limited."}',
+                    403,
+                  );
+                return http.Response(
+                  jsonEncode({
+                    'repositories': [
+                      {
+                        'repository': body['page'] == 1
+                            ? 'owner/one'
+                            : 'owner/two',
+                      },
+                    ],
+                    'next_page': body['page'] == 1 ? 2 : null,
+                  }),
+                  200,
+                );
+              }
+              return http.Response('{}', 200);
+            }
+            return http.Response('{"connections":[],"bindings":[]}', 200);
+          }
+          return http.Response('{"workspaces":[],"agents":[]}', 200);
+        }),
+      );
+      BlocScope.register<DashboardBloc>(() => connection);
+      addTearDown(() async {
+        await tester.pumpWidget(const SizedBox.shrink());
+        await connection.disconnect();
+        BlocScope.endAll();
+      });
+      connection.connect('admin');
+      await tester.pumpAndSettle();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SingleChildScrollView(
+              child: RepositoryConnectionsPanel(onChanged: (_) {}),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      Future<void> click(String text) async {
+        await tester.pumpAndSettle();
+        await tester.ensureVisible(find.text(text).last);
+        await tester.tap(find.text(text).last);
+        await tester.pumpAndSettle();
+      }
+
+      await click('Repository connections');
+      await click('SSH deploy key');
+      await click(repositoryTokenLabel);
+      final token = find.widgetWithText(
+        TextField,
+        'GitHub personal access token',
+      );
+      await tester.enterText(token, 'github_pat_fixture');
+      await click('Discover repositories');
+      expect(posts.single['action'], 'discover');
+      expect(
+        find.textContaining('More repositories are available'),
+        findsOneWidget,
+      );
+      await click('Load more repositories');
+      expect(posts.last['page'], 2);
+      expect(find.text('Load more repositories'), findsNothing);
+      await click('Choose a repository');
+      await click('owner/two');
+      final repository = find.widgetWithText(
+        TextField,
+        'GitHub repository (owner/repository)',
+      );
+      expect(
+        tester.widget<TextField>(repository).controller!.text,
+        'owner/two',
+      );
+      expect(
+        tester
+            .widget<TextField>(
+              find.widgetWithText(TextField, 'Connection name'),
+            )
+            .controller!
+            .text,
+        'owner/two',
+      );
+      final picker = find.byWidgetPredicate(
+        (widget) =>
+            widget is DropdownButtonFormField<String> &&
+            widget.decoration.labelText == 'Discovered repository',
+      );
+      await tester.enterText(repository, 'owner/manual');
+      await tester.pumpAndSettle();
+      expect(tester.state<FormFieldState<String>>(picker).value, '');
+      await tester.enterText(repository, 'owner/two');
+      await tester.pumpAndSettle();
+      expect(tester.state<FormFieldState<String>>(picker).value, 'owner/two');
+      await click('Save token connection');
+      expect(posts.last, {
+        'action': 'create',
+        'kind': 'token',
+        'token': 'github_pat_fixture',
+        'repository': 'owner/two',
+        'label': 'owner/two',
+      });
+      expect(tester.widget<TextField>(token).controller!.text, isEmpty);
+      expect(find.textContaining('Token connection saved.'), findsOneWidget);
+      deny = true;
+      await tester.enterText(token, 'github_pat_expired');
+      await click('Discover repositories');
+      expect(find.textContaining('denied'), findsOneWidget);
+      await tester.enterText(token, 'github_pat_replacement');
+      await tester.pumpAndSettle();
+      expect(find.textContaining('denied'), findsNothing);
+      expect(picker, findsNothing);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await connection.disconnect();
+      BlocScope.endAll();
+    },
+  );
+
   for (final failFirst in [false, true]) {
     testWidgets(
       'token setup and rotation retain rejected pastes (failFirst=$failFirst)',

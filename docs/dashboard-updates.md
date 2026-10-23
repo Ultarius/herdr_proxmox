@@ -11,6 +11,26 @@ is wrong. Before stopping the gateway, it budgets the backup and replacement,
 retaining 256 MiB and 1,024 inodes of headroom. An upgrade backs up CONFIG but does
 not replace the live configuration. Rollback also budgets the configuration
 replacement and current task records/credentials that must survive restoration.
+The live `repository-connections` registry and its SSH keys, host trust and token
+files are preserved together. Connections created, rotated or removed since the
+backup keep their current state; rollback does not revive removed credentials.
+The complete replacement is staged in a private directory beside the live
+configuration, retaining credential permissions. All copies finish before the
+live configuration is replaced by rename. A failed replacement rename restores
+the original directory. Malformed reserved paths are refused before stopping
+the service. If `github.json` or `tasks.sqlite3` has been deleted from the live
+configuration, rollback keeps it absent rather than restoring an older copy.
+If both configuration renames fail, the gateway stays stopped and the original
+configuration is retained at the path reported in the worker warning. Further
+restores refuse to run until an operator recovers that configuration and removes
+the private `herdr-restore-*` staging directory. These recovery copies are not
+automatically pruned: they may contain the only surviving current credentials.
+Ordinary success and failures that recover the original directory clean up their
+staging directories. Manifest-backed and legacy backups both refuse restoration
+when they lack a deployment part present in the live installation (`install`,
+`VERSION`, `.fvmrc`, or `BUILD.json`).
+Automatic recovery of the snapshot created immediately before a failed update
+restores its exact manifest, including removing parts added by that failed update.
 Allocations on a shared device are summed and availability is sampled at every
 destination, rather than trusting the first path's report. These are conservative
 free-space checks, not a guarantee against quotas that filesystem APIs do not

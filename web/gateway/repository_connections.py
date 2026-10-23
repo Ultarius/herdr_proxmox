@@ -184,6 +184,29 @@ class RepositoryConnections:
                 raise
         return record
 
+    def discover_repositories(self, token, page=1):
+        """One bounded page of metadata; discovery never saves the supplied PAT."""
+        token = personal_token(token)
+        if type(page) is not int or not 1 <= page <= 1000:
+            raise ValueError('Invalid repository discovery page.')
+        response = self.github.request(
+            f'/user/repos?per_page=100&page={page}&sort=full_name&direction=asc',
+            token=token, page_result=True)
+        results, has_next = response['items'], response['has_next']
+        if not isinstance(results, list) or len(results) > 100:
+            raise ValueError('Invalid repository discovery response from GitHub.')
+        repositories = []
+        for item in results:
+            name = item.get('full_name') if isinstance(item, dict) else None
+            if (not isinstance(name, str) or not REPOSITORY.fullmatch(name)
+                    or any(part in ('.', '..') for part in name.split('/'))):
+                raise ValueError('Invalid repository discovery response from GitHub.')
+            repositories.append(dict(repository=name, private=item.get('private') is True,
+                                     archived=item.get('archived') is True))
+        return dict(repositories=repositories,
+                    limit_reached=page == 1000 and has_next,
+                    next_page=page + 1 if has_next and page < 1000 else None)
+
     def rotate(self, identifier, token):
         token = personal_token(token)
         with self.lock:
@@ -454,6 +477,7 @@ class RepositoryConnections:
             raise ValueError('Expected a repository connection request.')
         action = body.get('action')
         allowed = {'create': {'action', 'label', 'repository', 'kind', 'token'},
+                   'discover': {'action', 'token', 'page'},
                    'rotate': {'action', 'id', 'token'},
                    'verify_host': {'action', 'id'}, 'test': {'action', 'id', 'url'},
                    'bind': {'action', 'id', 'folder'}, 'unbind': {'action', 'id', 'folder'},
@@ -464,6 +488,8 @@ class RepositoryConnections:
             raise ValueError('Enter an existing project folder name.')
         if action == 'create':
             return self.create(body)
+        if action == 'discover':
+            return self.discover_repositories(body.get('token'), body.get('page', 1))
         if action == 'rotate':
             return self.rotate(body.get('id'), body.get('token'))
         if action == 'verify_host':

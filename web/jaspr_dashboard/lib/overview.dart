@@ -1376,6 +1376,8 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       'p',
     ),
     if (dashboardConnection.operator.value['role'] == 'admin')
+      _text('overview-disclosure__hint', repositoryCloneTokenGuidance, 'p'),
+    if (dashboardConnection.operator.value['role'] == 'admin')
       RepositoryConnectionsPanel(
         onChanged: (values) {
           if (mounted)

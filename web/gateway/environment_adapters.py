@@ -94,6 +94,20 @@ class Adapter:
         return [command for command in self.commands
                 if command not in optional or optional[command] in verified]
 
+    def bound_command(self, entry, name):
+        """Resolve primary, companion or receipt-verified optional commands."""
+        executable = self.command(entry['executables'][0], name)
+        if executable == entry['executables'][0]:
+            return executable
+        optional = {command for _, commands in self.component_commands for command in commands}
+        if name in optional and name in self.bound_commands(entry):
+            return executable
+        companions = [item for item in entry.get('companions', [])
+                      if item['name'] == name and executable in item.get('executables', [])]
+        if len(companions) != 1:
+            raise ValueError('The component has no verified companion binding for ' + name)
+        return executable
+
     def matches_evidence_path(self, entry, observed, receipts):
         if self.evidence_path:
             from environment_providers import invoke

@@ -59,7 +59,11 @@ class _RepositoryConnectionsPanelState
       'kind': kind,
       if (kind == 'token') 'token': secret.trim(),
     });
-    if (mounted && saved && token == secret) setState(() => token = '');
+    if (mounted && saved && token == secret)
+      setState(() {
+        token = '';
+        controller.resetRepositoryDiscovery(clearMessage: false);
+      });
   }
 
   Future<void> rotateToken(String id) async {
@@ -95,7 +99,7 @@ class _RepositoryConnectionsPanelState
           field(
             'GitHub repository (owner/repository)',
             repository,
-            (value) => repository = value,
+            (value) => setState(() => repository = value),
           ),
           select(
             'Authentication',
@@ -108,6 +112,7 @@ class _RepositoryConnectionsPanelState
             (value) => setState(() {
               kind = value;
               token = '';
+              controller.resetRepositoryDiscovery();
             }),
             disabled: busy,
           ),
@@ -125,13 +130,57 @@ class _RepositoryConnectionsPanelState
             field(
               'GitHub personal access token',
               token,
-              (value) => token = value,
+              (value) {
+                final changed = token.trim().isEmpty != value.trim().isEmpty;
+                token = value;
+                final reset = controller.resetRepositoryDiscovery();
+                if (changed || reset) setState(() {});
+              },
               password: true,
               autocomplete: 'off',
               spellcheck: false,
               autocorrect: false,
               disabled: busy,
             ),
+            button(
+              'Discover repositories',
+              () => controller.discoverRepositories(token),
+              disabled: busy || token.trim().isEmpty,
+            ),
+            el('p', [
+              text(
+                'Loads repositories visible to this token one page at a time. Discovery does not save the token or verify cloning access.',
+              ),
+            ]),
+            if (controller.discoveredRepositories.isNotEmpty)
+              select(
+                'Discovered repository',
+                controller.discoveredRepositories.any(
+                      (item) => item['repository'] == repository,
+                    )
+                    ? repository
+                    : '',
+                {
+                  '': 'Choose a repository',
+                  for (final item in controller.discoveredRepositories)
+                    '${item['repository']}':
+                        '${item['repository']}${item['private'] == true ? ' (private)' : ''}${item['archived'] == true ? ' (archived)' : ''}',
+                },
+                (value) => setState(() {
+                  if (value.isNotEmpty) {
+                    repository = value;
+                    if (label.trim().isEmpty)
+                      label = value.substring(0, value.length.clamp(0, 80));
+                  }
+                }),
+                disabled: busy,
+              ),
+            if (controller.nextRepositoryPage != null)
+              button(
+                'Load more repositories',
+                () => controller.discoverRepositories(token, more: true),
+                disabled: busy,
+              ),
           ],
           button(repositoryCreateLabel(kind), createConnection, disabled: busy),
           field(

@@ -251,8 +251,43 @@ class OtherEcosystemTests(unittest.TestCase):
     def test_go_module_version_from_the_directive(self):
         write(self.root, {'go.mod': 'module example.com/x\n\ngo 1.22.1\n\nrequire (\n)\n'})
         go = requirement(component(analyse(self.root)), 'go')
-        self.assertEqual(go['constraint'], '1.22.1')
+        self.assertEqual(go['constraint'], '>=1.22.1')
         self.assertEqual(go['observations'][0]['field'], 'go')
+
+    def test_go_directives_are_minimums_including_patch_releases(self):
+        from dependency_constraints import evaluate
+        for directive in ('1.22', '1.22.1'):
+            with self.subTest(directive=directive):
+                files = {'go.mod': ('module example.com/x\ngo ' + directive + '\n').encode()}
+                report = analyse(self.root, inventory=project_inventory.from_paths(files),
+                                 read=lambda name, limit=None: files.get(name))
+                go = requirement(component(report), 'go')
+                declarations = project_requirements.declarations(go)
+                self.assertEqual(declarations, [('>=' + directive, 'gomod')])
+                self.assertEqual(evaluate(declarations[0][0], '1.23.0', 'gomod'), 'satisfied')
+                self.assertEqual(evaluate('>=' + directive, '1.21.9', 'gomod'), 'violated')
+
+    def test_python_minor_selection_is_a_family_not_an_exact_pep440_version(self):
+        files = {'pyproject.toml': b'[project]\nrequires-python = ">=3.12.1,<3.13"\n',
+                 '.python-version': b'3.12\n'}
+        report = analyse(self.root, inventory=project_inventory.from_paths(files),
+                         read=lambda name, limit=None: files.get(name))
+        python = requirement(component(report), 'python')
+        self.assertEqual(python['selected'], '3.12')
+        self.assertFalse(python['conflicts'])
+        self.assertEqual(project_requirements.declarations(python),
+                         [('>=3.12.1,<3.13', 'pep440'), ('3.12', 'python-version')])
+
+    def test_python_family_conflicts_are_reported_before_preparation(self):
+        for selected in ('3.12', 'v3.12', 'V3.12'):
+            for constraint, conflict in (('>=3.13', True), ('>=3.12.1,<3.13', False)):
+                with self.subTest(selected=selected, constraint=constraint):
+                    files = {'pyproject.toml': ('[project]\nrequires-python="' + constraint + '"\n').encode(),
+                             '.python-version': selected.encode()}
+                    report = analyse(self.root, inventory=project_inventory.from_paths(files),
+                                     read=lambda name, limit=None: files.get(name))
+                    python = requirement(component(report), 'python')
+                    self.assertEqual(bool(python['conflicts']), conflict)
 
     def test_rust_workspace_pin_and_lockfile(self):
         write(self.root, {'Cargo.toml': '[package]\nname = "x"\n',

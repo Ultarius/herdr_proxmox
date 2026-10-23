@@ -125,6 +125,8 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
           ),
           const SizedBox(height: 16),
           if (BlocScope.get<DashboardBloc>().operator.value['role'] == 'admin')
+            const Text(repositoryCloneTokenGuidance),
+          if (BlocScope.get<DashboardBloc>().operator.value['role'] == 'admin')
             RepositoryConnectionsPanel(
               onChanged: (values) {
                 if (mounted)

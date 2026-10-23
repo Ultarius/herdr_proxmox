@@ -91,12 +91,7 @@ def main(arguments):
     import environment_providers
     environment_providers.verify_entry(entry)
     adapter = environment_adapters.get(entry['name'])
-    executable = adapter.command(entry['executables'][0], tool)
-    if executable != entry['executables'][0]:
-        companions = [item for item in entry.get('companions', [])
-                      if item['name'] == tool and executable in item.get('executables', [])]
-        if len(companions) != 1:
-            raise ValueError('The component has no verified companion binding for ' + tool)
+    executable = adapter.bound_command(entry, tool)
     environment = toolchain_policy.environment(dict(toolchains=[entry]))
     # The prepared shell owns the execution cache/output paths. Dispatch must
     # not replace them with fresh per-component caches on every command.
