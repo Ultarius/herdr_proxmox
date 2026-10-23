@@ -109,7 +109,7 @@ class _RepositoryConnectionsPanelState
               child: const Text('Refresh connections'),
             ),
             const Text(
-              'Use a repository-specific SSH key, a fine-grained GitHub token, or the configured GitHub account. Credentials remain in the container. These are separate from keys used to log into the container.',
+              'Add credentials for a private repository. Saved connections can be reused when cloning.',
             ),
             TextField(
               key: const PageStorageKey('repository-connection-name'),
@@ -149,11 +149,16 @@ class _RepositoryConnectionsPanelState
                     }),
             ),
             if (kind == 'token') ...[
-              const Text(repositoryTokenGuidance),
-              TextButton(
-                onPressed: () =>
-                    openExternalLink(Uri.parse(repositoryTokenUrl)),
-                child: const Text('Create a fine-grained token on GitHub'),
+              ExpansionTile(
+                title: const Text('Token permissions and setup'),
+                children: [
+                  const Text(repositoryTokenGuidance),
+                  TextButton(
+                    onPressed: () =>
+                        openExternalLink(Uri.parse(repositoryTokenUrl)),
+                    child: const Text('Create a fine-grained token on GitHub'),
+                  ),
+                ],
               ),
               TextField(
                 key: const PageStorageKey('repository-connection-token'),
@@ -180,7 +185,7 @@ class _RepositoryConnectionsPanelState
                 child: const Text('Discover repositories'),
               ),
               const Text(
-                'Loads repositories visible to this token one page at a time. Discovery does not save the token or verify cloning access.',
+                'Choose a repository below, or enter its name manually. Tokens are saved only when you save the connection.',
               ),
               if (controller.discoveredRepositories.isNotEmpty)
                 DropdownButtonFormField<String>(

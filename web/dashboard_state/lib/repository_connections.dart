@@ -3,11 +3,7 @@ import 'dashboard_bloc.dart';
 
 const repositoryTokenLabel = 'Fine-grained GitHub token (HTTPS)';
 const repositoryCloneTokenGuidance =
-    'To clone with a GitHub personal access token (PAT), open Repository connections '
-    'and choose Fine-grained GitHub token (HTTPS). Enter your token and use Discover repositories, '
-    'or enter owner/repository manually. Save and test the connection, '
-    'then select it below. Cloning and pulling need Contents: Read-only access '
-    'to the selected repository. Enter the token in the token field, not the repository URL.';
+    'For a private repository, add a GitHub token or SSH connection below, then select it to clone.';
 const repositoryTokenGuidance =
     'Select the repository owner and Only select repositories on GitHub. '
     'For cloning and pulling, grant Contents: Read-only; Metadata: Read-only is included. '

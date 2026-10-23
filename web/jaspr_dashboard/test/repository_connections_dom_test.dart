@@ -154,7 +154,7 @@ void main() {
   test(
     'SSH connection creation, verification, selection and clone retry use the explicit identity',
     () async {
-      nodes('summary').single.click();
+      nodes('.repository-connections > summary').single.click();
       await settle();
       await field('Connection name', 'Bevy SSH');
       await field('GitHub repository (owner/repository)', 'Ultarius/bevy_game');
@@ -256,9 +256,18 @@ void main() {
   test(
     'a fine-grained token can be saved, tested and selected for HTTPS cloning',
     () async {
-      nodes('summary').single.click();
+      nodes('.repository-connections > summary').single.click();
       await settle();
-      final authentication = nodes('select').first as web.HTMLSelectElement;
+      final authentication =
+          nodes('select').firstWhere(
+                (node) =>
+                    node.getAttribute('aria-label') == 'Authentication' ||
+                    node.parentElement?.textContent?.startsWith(
+                          'Authentication',
+                        ) ==
+                        true,
+              )
+              as web.HTMLSelectElement;
       authentication.value = 'token';
       authentication.dispatchEvent(
         web.Event('change', web.EventInit(bubbles: true)),
@@ -299,7 +308,15 @@ void main() {
       );
       await click('Test repository access');
       expect(requests.last['url'], 'https://github.com/owner/private.git');
-      final selector = nodes('select').last as web.HTMLSelectElement;
+      final selector =
+          nodes('select').firstWhere(
+                (node) =>
+                    node.parentElement?.textContent?.startsWith(
+                      'Repository connection',
+                    ) ==
+                    true,
+              )
+              as web.HTMLSelectElement;
       selector.value = 'key-one';
       selector.dispatchEvent(web.Event('change', web.EventInit(bubbles: true)));
       await settle();
@@ -319,9 +336,18 @@ void main() {
   test(
     'PAT discovery fills the repository and connection name before saving',
     () async {
-      nodes('summary').single.click();
+      nodes('.repository-connections > summary').single.click();
       await settle();
-      final authentication = nodes('select').first as web.HTMLSelectElement;
+      final authentication =
+          nodes('select').firstWhere(
+                (node) =>
+                    node.getAttribute('aria-label') == 'Authentication' ||
+                    node.parentElement?.textContent?.startsWith(
+                          'Authentication',
+                        ) ==
+                        true,
+              )
+              as web.HTMLSelectElement;
       authentication.value = 'token';
       authentication.dispatchEvent(
         web.Event('change', web.EventInit(bubbles: true)),
@@ -398,9 +424,18 @@ void main() {
   test(
     'failed token saves retain the masked paste and rotation preserves the connection',
     () async {
-      nodes('summary').single.click();
+      nodes('.repository-connections > summary').single.click();
       await settle();
-      final authentication = nodes('select').first as web.HTMLSelectElement;
+      final authentication =
+          nodes('select').firstWhere(
+                (node) =>
+                    node.getAttribute('aria-label') == 'Authentication' ||
+                    node.parentElement?.textContent?.startsWith(
+                          'Authentication',
+                        ) ==
+                        true,
+              )
+              as web.HTMLSelectElement;
       authentication.value = 'token';
       authentication.dispatchEvent(
         web.Event('change', web.EventInit(bubbles: true)),
@@ -478,7 +513,15 @@ void main() {
       );
       await settle();
       final restoredAuthentication =
-          nodes('select').first as web.HTMLSelectElement;
+          nodes('select').firstWhere(
+                (node) =>
+                    node.getAttribute('aria-label') == 'Authentication' ||
+                    node.parentElement?.textContent?.startsWith(
+                          'Authentication',
+                        ) ==
+                        true,
+              )
+              as web.HTMLSelectElement;
       restoredAuthentication.value = 'token';
       restoredAuthentication.dispatchEvent(
         web.Event('change', web.EventInit(bubbles: true)),
@@ -499,7 +542,7 @@ void main() {
   test(
     'account changes clear connection state and ignore a late access result',
     () async {
-      nodes('summary').single.click();
+      nodes('.repository-connections > summary').single.click();
       await settle();
       await field('Connection name', 'Previous account');
       await field('GitHub repository (owner/repository)', 'owner/private');

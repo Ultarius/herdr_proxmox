@@ -1376,25 +1376,10 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       'p',
     ),
     if (dashboardConnection.operator.value['role'] == 'admin')
-      _text('overview-disclosure__hint', repositoryCloneTokenGuidance, 'p'),
-    if (dashboardConnection.operator.value['role'] == 'admin')
-      RepositoryConnectionsPanel(
-        onChanged: (values) {
-          if (mounted)
-            setState(() {
-              connections = values;
-              if (unavailableConnection != null &&
-                  knownRepositoryConnection(values, unavailableConnection!)) {
-                connectionId = unavailableConnection!;
-                unavailableConnection = null;
-              }
-              if (!values.any((item) => item['id'] == connectionId))
-                if (connectionId.isNotEmpty) {
-                  unavailableConnection = connectionId;
-                  connectionId = '';
-                }
-            });
-        },
+      _text(
+        'overview-disclosure__hint',
+        'For a private repository, add a connection below.',
+        'p',
       ),
     el(
       'form',
@@ -1445,6 +1430,25 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
         },
       },
     ),
+    if (dashboardConnection.operator.value['role'] == 'admin')
+      RepositoryConnectionsPanel(
+        onChanged: (values) {
+          if (mounted)
+            setState(() {
+              connections = values;
+              if (unavailableConnection != null &&
+                  knownRepositoryConnection(values, unavailableConnection!)) {
+                connectionId = unavailableConnection!;
+                unavailableConnection = null;
+              }
+              if (!values.any((item) => item['id'] == connectionId))
+                if (connectionId.isNotEmpty) {
+                  unavailableConnection = connectionId;
+                  connectionId = '';
+                }
+            });
+        },
+      ),
     if (jobs.isNotEmpty)
       el(
         'ul',

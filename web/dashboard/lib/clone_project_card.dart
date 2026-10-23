@@ -126,28 +126,6 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
           const SizedBox(height: 16),
           if (BlocScope.get<DashboardBloc>().operator.value['role'] == 'admin')
             const Text(repositoryCloneTokenGuidance),
-          if (BlocScope.get<DashboardBloc>().operator.value['role'] == 'admin')
-            RepositoryConnectionsPanel(
-              onChanged: (values) {
-                if (mounted)
-                  setState(() {
-                    connections = values;
-                    if (unavailableConnection != null &&
-                        knownRepositoryConnection(
-                          values,
-                          unavailableConnection!,
-                        )) {
-                      connectionId = unavailableConnection!;
-                      unavailableConnection = null;
-                    }
-                    if (!values.any((item) => item['id'] == connectionId))
-                      if (connectionId.isNotEmpty) {
-                        unavailableConnection = connectionId;
-                        connectionId = '';
-                      }
-                  });
-              },
-            ),
           DropdownButtonFormField<String>(
             isExpanded: true,
             key: ValueKey(connectionId),
@@ -224,6 +202,29 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
                 : const Icon(Icons.download_outlined),
             label: Text(busy ? 'Cloning…' : 'Clone repository'),
           ),
+          const SizedBox(height: 20),
+          if (BlocScope.get<DashboardBloc>().operator.value['role'] == 'admin')
+            RepositoryConnectionsPanel(
+              onChanged: (values) {
+                if (mounted)
+                  setState(() {
+                    connections = values;
+                    if (unavailableConnection != null &&
+                        knownRepositoryConnection(
+                          values,
+                          unavailableConnection!,
+                        )) {
+                      connectionId = unavailableConnection!;
+                      unavailableConnection = null;
+                    }
+                    if (!values.any((item) => item['id'] == connectionId))
+                      if (connectionId.isNotEmpty) {
+                        unavailableConnection = connectionId;
+                        connectionId = '';
+                      }
+                  });
+              },
+            ),
           for (final job in jobs)
             ListTile(
               leading: Icon(

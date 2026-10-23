@@ -85,109 +85,124 @@ class _RepositoryConnectionsPanelState
       ? const Component.empty()
       : el('details', [
           el('summary', [text('Repository connections')]),
-          button(
-            'Refresh connections',
-            refresh,
-            disabled: busy || controller.refreshing,
-          ),
-          el('p', [
-            text(
-              'Use a repository-specific SSH key, a fine-grained GitHub token, or the configured GitHub account. Credentials remain in the container. These are separate from keys used to log into the container.',
-            ),
-          ]),
-          field('Connection name', label, (value) => label = value),
-          field(
-            'GitHub repository (owner/repository)',
-            repository,
-            (value) => setState(() => repository = value),
-          ),
-          select(
-            'Authentication',
-            kind,
-            {
-              'ssh': 'SSH deploy key',
-              'token': repositoryTokenLabel,
-              'github': 'Configured GitHub account (HTTPS)',
-            },
-            (value) => setState(() {
-              kind = value;
-              token = '';
-              controller.resetRepositoryDiscovery();
-            }),
-            disabled: busy,
-          ),
-          if (kind == 'token') ...[
-            el('p', [text(repositoryTokenGuidance)]),
-            el(
-              'a',
-              [text('Create a fine-grained token on GitHub')],
-              attributes: {
-                'href': repositoryTokenUrl,
-                'target': '_blank',
-                'rel': 'noopener noreferrer',
-              },
-            ),
-            field(
-              'GitHub personal access token',
-              token,
-              (value) {
-                final changed = token.trim().isEmpty != value.trim().isEmpty;
-                token = value;
-                final reset = controller.resetRepositoryDiscovery();
-                if (changed || reset) setState(() {});
-              },
-              password: true,
-              autocomplete: 'off',
-              spellcheck: false,
-              autocorrect: false,
-              disabled: busy,
-            ),
+          el('div', [
             button(
-              'Discover repositories',
-              () => controller.discoverRepositories(token),
-              disabled: busy || token.trim().isEmpty,
+              'Refresh connections',
+              refresh,
+              disabled: busy || controller.refreshing,
             ),
             el('p', [
               text(
-                'Loads repositories visible to this token one page at a time. Discovery does not save the token or verify cloning access.',
+                'Add credentials for a private repository. Saved connections can be reused when cloning.',
               ),
             ]),
-            if (controller.discoveredRepositories.isNotEmpty)
-              select(
-                'Discovered repository',
-                controller.discoveredRepositories.any(
-                      (item) => item['repository'] == repository,
-                    )
-                    ? repository
-                    : '',
-                {
-                  '': 'Choose a repository',
-                  for (final item in controller.discoveredRepositories)
-                    '${item['repository']}':
-                        '${item['repository']}${item['private'] == true ? ' (private)' : ''}${item['archived'] == true ? ' (archived)' : ''}',
+            select(
+              'Authentication',
+              kind,
+              {
+                'ssh': 'SSH deploy key',
+                'token': repositoryTokenLabel,
+                'github': 'Configured GitHub account (HTTPS)',
+              },
+              (value) => setState(() {
+                kind = value;
+                token = '';
+                controller.resetRepositoryDiscovery();
+              }),
+              disabled: busy,
+            ),
+            if (kind == 'token') ...[
+              el('details', [
+                el('summary', [text('Token permissions and setup')]),
+                el('p', [text(repositoryTokenGuidance)]),
+                el(
+                  'a',
+                  [text('Create a fine-grained token on GitHub')],
+                  attributes: {
+                    'href': repositoryTokenUrl,
+                    'target': '_blank',
+                    'rel': 'noopener noreferrer',
+                  },
+                ),
+              ], classes: 'repository-help'),
+              field(
+                'GitHub personal access token',
+                token,
+                (value) {
+                  final changed = token.trim().isEmpty != value.trim().isEmpty;
+                  token = value;
+                  final reset = controller.resetRepositoryDiscovery();
+                  if (changed || reset) setState(() {});
                 },
-                (value) => setState(() {
-                  if (value.isNotEmpty) {
-                    repository = value;
-                    if (label.trim().isEmpty)
-                      label = value.substring(0, value.length.clamp(0, 80));
-                  }
-                }),
+                password: true,
+                autocomplete: 'off',
+                spellcheck: false,
+                autocorrect: false,
                 disabled: busy,
               ),
-            if (controller.nextRepositoryPage != null)
               button(
-                'Load more repositories',
-                () => controller.discoverRepositories(token, more: true),
-                disabled: busy,
+                'Discover repositories',
+                () => controller.discoverRepositories(token),
+                disabled: busy || token.trim().isEmpty,
               ),
-          ],
-          button(repositoryCreateLabel(kind), createConnection, disabled: busy),
-          field(
-            'Existing project folder (direct child, optional)',
-            existingFolder,
-            (value) => setState(() => existingFolder = value),
-          ),
+              el('p', [
+                text(
+                  'Choose a repository below, or enter its name manually. Tokens are saved only when you save the connection.',
+                ),
+              ]),
+              if (controller.discoveredRepositories.isNotEmpty)
+                select(
+                  'Discovered repository',
+                  controller.discoveredRepositories.any(
+                        (item) => item['repository'] == repository,
+                      )
+                      ? repository
+                      : '',
+                  {
+                    '': 'Choose a repository',
+                    for (final item in controller.discoveredRepositories)
+                      '${item['repository']}':
+                          '${item['repository']}${item['private'] == true ? ' (private)' : ''}${item['archived'] == true ? ' (archived)' : ''}',
+                  },
+                  (value) => setState(() {
+                    if (value.isNotEmpty) {
+                      repository = value;
+                      if (label.trim().isEmpty)
+                        label = value.substring(0, value.length.clamp(0, 80));
+                    }
+                  }),
+                  disabled: busy,
+                ),
+              if (controller.nextRepositoryPage != null)
+                button(
+                  'Load more repositories',
+                  () => controller.discoverRepositories(token, more: true),
+                  disabled: busy,
+                ),
+            ],
+            el('div', [
+              field('Connection name', label, (value) => label = value),
+              field(
+                'GitHub repository (owner/repository)',
+                repository,
+                (value) => setState(() => repository = value),
+              ),
+            ], classes: 'repository-fields'),
+            button(
+              repositoryCreateLabel(kind),
+              createConnection,
+              disabled: busy,
+            ),
+          ], classes: 'repository-setup'),
+          if (connections.isNotEmpty)
+            el('details', [
+              el('summary', [text('Use an existing checkout')]),
+              field(
+                'Existing project folder (direct child, optional)',
+                existingFolder,
+                (value) => setState(() => existingFolder = value),
+              ),
+            ], classes: 'repository-existing'),
           for (final item in connections)
             el('section', [
               el('h4', [text(item['label'])]),
