@@ -152,8 +152,9 @@ is never fixed by automatically retrying with the other token.
 GitHub failures identify the repository, operation, and credential role in the
 UI and gateway journal (`journalctl -u herdr-web.service`). API error responses
 retain `source` and `github_status` and add `github_repository`,
-`github_operation`, and `github_credential_role` when known. Tokens and raw
-GitHub response bodies are not included in these diagnostics.
+`github_operation`, `github_credential_role`, and `github_request_id` when known.
+Complete GitHub response bodies and raw field values are not included in these
+diagnostics.
 Credential roles follow the selected credential: a separate PR credential is
 labelled `pull request token`, while its single-token fallback is labelled
 `push token`. Explicit credentials carry that role from the same configuration
@@ -163,18 +164,23 @@ An explicit credential without source metadata remains `provided token`.
 For PR creation failures (HTTP 422), Herdr reads at most 16 KiB of the error
 response and reports recognized validation categories: rejected head/base,
 missing or invalid title/body/draft fields, no commits, an existing PR, or
-unsupported draft PRs. Raw messages and field values are never copied into the
-UI or logs. API errors also expose these safe summaries as `github_validation`.
+unsupported draft PRs. Unfamiliar message strings are retained as bounded
+`GitHub detail` text after removing the exact request credential and echoed PR
+title/body, followed by credential, secret-assignment, URL, and control-character
+redaction. Arbitrary response objects and `value` fields are never dumped.
+API errors expose these summaries as `github_validation`.
 Summaries are limited to three short strings. Conflicting structured fields and
 message hints produce a neutral diagnostic. The flattened dashboard error keeps
 all complete summaries, with a 2000-character bound above the maximum formatted
 GitHub error size; the API array remains available for structured presentation.
-An unrecognized or malformed response keeps a generic error. A valid comparison
+Malformed, empty, oversized, and detail-free responses get distinct diagnostics.
+When GitHub supplies a request ID with the expected hexadecimal/colon format,
+it is shown in the error and exposed as `github_request_id` for support tracing.
+A valid comparison
 in a browser proves a diff exists for that browser session, but does not prove
 the PAT has the same access or that draft creation is supported. Retry the
 release PR action after updating the gateway to capture its validation reason;
 Herdr still reconciles an existing exact-head PR before creating another.
-
 
 Validate and save reports capability rather than asserting it. Account access
 and token permission are separate, and setup is read-only:

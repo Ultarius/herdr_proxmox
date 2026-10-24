@@ -983,7 +983,7 @@ class Handler(BaseHTTPRequestHandler):
             # 401 must not revoke a valid browser session or erase task state.
             details = {key: value for key, value in {
                 'github_repository': exc.repository, 'github_operation': exc.operation,
-                'github_credential_role': exc.credential_role}.items() if value is not None}
+                'github_credential_role': exc.credential_role, 'github_request_id': exc.request_id}.items() if value is not None}
             if exc.validation:
                 details['github_validation'] = list(exc.validation)
                 self.log_message('GitHub validation: %s', ' '.join(exc.validation))

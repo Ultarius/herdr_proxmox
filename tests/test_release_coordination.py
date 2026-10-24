@@ -257,6 +257,33 @@ class ReleaseCoordinationTests(unittest.TestCase):
             self.assertIn('GitHub rejected', current['pull_request']['error'])
             self.assertIn('pull request token.', current['pull_request']['error'])
 
+    def test_unknown_github_detail_and_request_id_reach_the_release_card(self):
+        import io
+        from unittest.mock import MagicMock
+        from urllib.error import HTTPError
+        from github_api import GitHub, GitHubError
+        release = self.published()
+        github = self.github(release)
+        opener = MagicMock()
+        opener.open.side_effect = HTTPError('https://api.github.com/repos/example/repo/pulls', 422, 'error',
+            {'X-GitHub-Request-Id': 'AB12:CD34:EF56'},
+            io.BytesIO(b'{"errors":[{"code":"custom","message":"Account cannot open this pull request."}]}'))
+        with patch('github_api.build_opener', return_value=opener), self.assertRaises(GitHubError) as caught:
+            GitHub(self.repo / 'diagnostic.json').request('/repos/example/repo/pulls', 'POST', dict(draft=True),
+                token='p' * 40, credential_role='pull request token')
+        def rejected(path, method='GET', body=None, **extra):
+            if method == 'POST':
+                raise caught.exception
+            return dict(object=dict(sha=release['resulting_sha']))
+        github.request.side_effect = rejected
+        self.queue_pull(release)
+        self.releases.advance(release['id'])
+        request = self.releases.get(release['id'])['pull_request']
+        self.assertEqual(request['state'], 'needs_attention')
+        self.assertIn('Account cannot open this pull request.', request['error'])
+        self.assertIn('GitHub request ID: AB12:CD34:EF56', request['error'])
+        self.assertNotIn('did not provide a recognized', request['error'])
+
     def test_lost_pr_response_reconciles_existing_exact_head_after_restart(self):
         release = self.published()
         github = self.github(release, lost=True)

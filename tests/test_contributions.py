@@ -219,7 +219,7 @@ class GitHubTests(unittest.TestCase):
                    'GitHub could not accept the base branch. Check it exists in the upstream repository.',
                    'GitHub reports an existing pull request for this branch. Reconcile it before retrying.')
         failure = GitHubError(422, repository='owner/' + 'r' * 100, operation='Create draft pull request with reviewed release details',
-                              credential_role='pull request token', validation=reasons)
+                              credential_role='pull request token', validation=reasons, request_id='AB12:CD34:EF56')
         self.assertGreater(len(str(failure)), 500)
         listener = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
         listener.token = 'admin'
@@ -236,6 +236,7 @@ class GitHubTests(unittest.TestCase):
                 urlopen(Request(endpoint, data=json.dumps(self.split_body()).encode(), headers={'Authorization': 'Bearer admin'}))
             self.assertEqual(caught.exception.code, 502)
             result = json.load(caught.exception)
+            self.assertEqual(result['github_request_id'], 'AB12:CD34:EF56')
             self.assertEqual(result['github_validation'], list(reasons))
             self.assertEqual(result['error'], str(failure))
             for reason in reasons:
@@ -589,7 +590,7 @@ class GitHubTests(unittest.TestCase):
                 self.assertNotIn('private-base', str(error))
                 self.assertNotIn('private-head', str(error))
 
-    def test_pull_validation_never_echoes_raw_messages_values_or_secrets(self):
+    def test_pull_validation_redacts_messages_and_never_echoes_field_values_or_secrets(self):
         secret = 'github_pat_' + 's' * 40
         payloads = [b'not JSON ' + secret.encode(), b'x' * 16385,
                     json.dumps({'message': secret, 'errors': [{'field': 'head', 'code': 'invalid', 'value': secret, 'message': secret}]}).encode(),
@@ -607,6 +608,48 @@ class GitHubTests(unittest.TestCase):
                 self.assertEqual(caught.exception.status, 422)
                 self.assertEqual(caught.exception.credential_role, 'provided token')
                 self.assertNotIn('refresh before retrying', str(caught.exception))
+
+    def test_unfamiliar_validation_keeps_redacted_message_and_github_request_id(self):
+        secret = 'p' * 40
+        title, description = 'Private release title', 'Private release description with internal metadata'
+        message = f'Account cannot open this pull request. {secret} password=hunter42 {title} {description} https://private.invalid/detail'
+        payload = {'message': 'Validation Failed', 'errors': [{'resource': 'PullRequest', 'code': 'custom', 'message': message,
+                                                              'value': 'raw-field-value-never-returned'}]}
+        opener = MagicMock()
+        opener.open.side_effect = HTTPError('https://api.github.com/repos/owner/repo/pulls', 422, 'error',
+            {'X-GitHub-Request-Id': 'AB12:CD34:EF56'}, io.BytesIO(json.dumps(payload).encode()))
+        with patch('github_api.build_opener', return_value=opener), self.assertRaises(GitHubError) as caught:
+            self.api.request('/repos/owner/repo/pulls', 'POST', {'title': title, 'body': description, 'draft': True}, token=secret)
+        error = caught.exception
+        self.assertIn('Account cannot open this pull request.', str(error))
+        self.assertIn('GitHub detail:', str(error))
+        self.assertEqual(error.request_id, 'AB12:CD34:EF56')
+        self.assertIn('GitHub request ID: AB12:CD34:EF56', str(error))
+        for private in (secret, 'hunter42', title, description, 'raw-field-value-never-returned', 'private.invalid'):
+            self.assertNotIn(private, str(error))
+
+    def test_validation_diagnostic_handles_top_level_long_and_unreadable_responses(self):
+        from github_api import pull_validation
+        secret = 'x' * 40
+        top = io.BytesIO(json.dumps({'message': 'This repository cannot accept this request.'}).encode())
+        self.assertEqual(pull_validation(top), ('GitHub detail: This repository cannot accept this request.',))
+        long = io.BytesIO(json.dumps({'errors': [{'message': 'Custom validation ' + 'long ' * 100 + secret}]}).encode())
+        reasons = pull_validation(long, token=secret)
+        self.assertLessEqual(len(reasons[0]), 240)
+        self.assertTrue(reasons[0].endswith('...'))
+        self.assertNotIn(secret, reasons[0])
+        for payload in (b'', b'<html>private proxy error</html>', b'x' * 16385, b'[]'):
+            result = pull_validation(io.BytesIO(payload))
+            self.assertTrue(result)
+            self.assertNotIn('private proxy error', str(result))
+        with self.assertRaises(GitHubError) as caught:
+            opener = MagicMock()
+            opener.open.side_effect = HTTPError('https://api.github.com/repos/owner/repo/pulls', 422, 'error',
+                {'X-GitHub-Request-Id': 'github_pat_private'}, io.BytesIO(b'{"message":"Validation Failed"}'))
+            with patch('github_api.build_opener', return_value=opener):
+                self.api.request('/repos/owner/repo/pulls', 'POST', {}, token=secret)
+        self.assertIsNone(caught.exception.request_id)
+        self.assertNotIn('github_pat_private', str(caught.exception))
 
     def test_errors_and_oversized_responses_never_expose_credentials(self):
         secret = 'github_pat_' + 's' * 40

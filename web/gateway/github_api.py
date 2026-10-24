@@ -36,17 +36,36 @@ class NoRedirect(HTTPRedirectHandler):
         return None  # Never forward Authorization to another origin.
 
 
-def pull_validation(error):
-    """Classify a bounded GitHub response; never echo arbitrary response text."""
+def pull_validation(error, *, token=None, body=None):
+    """Classify a bounded response, retaining redacted unfamiliar messages."""
+    def detail(value):
+        from discovery import redact
+        if not isinstance(value, str):
+            return None
+        # Remove exact request secrets/text before general redaction or clipping.
+        private_values = [token]
+        if isinstance(body, dict):
+            private_values.extend(body.get(key) for key in ('title', 'body'))
+        for private in private_values:
+            if isinstance(private, str) and private:
+                value = value.replace(private, '[request content omitted]')
+        value = ' '.join(redact(value).split())
+        if not value or value.lower().strip('. ') in ('validation failed', 'invalid request'):
+            return None
+        prefix = 'GitHub detail: '
+        limit = 240 - len(prefix)
+        if len(value) > limit:
+            value = value[:limit - 3].rsplit(' ', 1)[0] + '...'
+        return prefix + value
     try:
         raw = error.read(16385)
         if len(raw) > 16384:
-            return ()
+            return ('GitHub validation response exceeded the 16 KiB diagnostic limit.',)
         data = json.loads(raw)
     except (OSError, ValueError, TypeError, RecursionError, HTTPException):
-        return ()
+        return ('GitHub returned an unreadable or non-JSON validation response.',)
     if not isinstance(data, dict):
-        return ()
+        return ('GitHub returned a validation response in an unexpected format.',)
     errors = data.get('errors')
     entries = errors[:10] if isinstance(errors, list) else []
     # Some GitHub validations supply only a top-level message.
@@ -55,7 +74,8 @@ def pull_validation(error):
     fields = {'head', 'base', 'head_sha', 'base_sha', 'head_repo', 'title', 'body', 'draft'}
     codes = {'missing', 'missing_field', 'invalid', 'already_exists', 'unprocessable', 'custom'}
     for item in entries:
-        message = item.get('message') if isinstance(item, dict) else item
+        original_message = item.get('message') if isinstance(item, dict) else item
+        message = original_message
         message = message.lower() if isinstance(message, str) else ''
         field = item.get('field') if isinstance(item, dict) else None
         code = item.get('code') if isinstance(item, dict) else None
@@ -78,18 +98,21 @@ def pull_validation(error):
         elif field in fields and code in codes:
             reason = f'GitHub validation rejected {field} ({code}).'
         else:
-            continue
+            reason = detail(original_message)
+            if reason is None:
+                continue
         if reason not in reasons:
             reasons.append(reason)
-    return tuple(reasons[:3])
+    return tuple(reasons[:3]) or ('GitHub reports validation failure without usable field-level details.',)
 
 
 class GitHubError(ValueError):
-    def __init__(self, status, *, repository=None, operation=None, credential_role=None, validation=()):
+    def __init__(self, status, *, repository=None, operation=None, credential_role=None, validation=(), request_id=None):
         if (not isinstance(validation, (tuple, list)) or len(validation) > 3
                 or any(not isinstance(item, str) or not item or len(item) > 240 for item in validation)):
             raise TypeError('GitHub validation must contain at most three short summary strings.')
         self.status = status
+        self.request_id = request_id if isinstance(request_id, str) and re.fullmatch(r'[A-Fa-f0-9]{1,32}(?::[A-Fa-f0-9]{1,32}){1,7}', request_id) else None
         self.validation = validation = tuple(validation)
         self.repository = repository if isinstance(repository, str) and len(repository) <= 200 and REPOSITORY.fullmatch(repository) else None
         self.operation = operation = operation[:80] if isinstance(operation, str) else None
@@ -108,6 +131,8 @@ class GitHubError(ValueError):
             message = f'{operation or "Repository access"} for {self.repository} using {credential_role or "the selected token"}. {message}'
             if status == 404:
                 message += ' Check the repository name, token repository selection, resource owner, and organization approval.'
+        if self.request_id:
+            message += ' GitHub request ID: ' + self.request_id + '.'
         super().__init__(message)
 
 
@@ -262,7 +287,8 @@ class GitHub:
             status = error.code
             is_pull = method == 'POST' and re.fullmatch(r'/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls', path)
             try:
-                validation = pull_validation(error) if status == 422 and is_pull else ()
+                validation = pull_validation(error, token=token, body=body) if status == 422 and is_pull else ()
+                request_id = error.headers.get('X-GitHub-Request-Id') if error.headers else None
             finally:
                 error.close()
             if status == 304:
@@ -275,7 +301,7 @@ class GitHub:
             match = re.match(r'^/repos/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:[/?]|$)', path)
             raise GitHubError(status, repository=match[1] if match else None,
                               operation='Create draft pull request' if is_pull and isinstance(body, dict) and body.get('draft') else method + ' repository API request',
-                              credential_role=credential_role, validation=validation) from None
+                              credential_role=credential_role, validation=validation, request_id=request_id) from None
         except (OSError, ValueError) as error:
             if isinstance(error, GitHubError):
                 raise
@@ -307,7 +333,7 @@ class GitHub:
             info = self.request('/repos/' + repository, token=token)
         except GitHubError as error:
             raise GitHubError(error.status, repository=repository, operation=operation,
-                              credential_role=credential_role) from None
+                              credential_role=credential_role, validation=error.validation, request_id=error.request_id) from None
         return info if isinstance(info, dict) else {}
 
     def fork_repositories(self, upstream, publishing, config):
