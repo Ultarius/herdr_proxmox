@@ -31,7 +31,10 @@ class _DashboardAccessControlsState extends State<DashboardAccessControls> {
           pending = data['pending_mode'] as String?;
         });
     } catch (error) {
-      if (mounted) setState(() => message = error.toString());
+      if (mounted &&
+          connection.state.connected &&
+          epoch == connection.generation)
+        setState(() => message = error.toString());
     }
   }
 
@@ -112,7 +115,10 @@ class _DashboardAccessControlsState extends State<DashboardAccessControls> {
               : 'LAN access applies in 5 seconds. Reconnect using the LXC IP.';
         });
     } catch (error) {
-      if (mounted) setState(() => message = error.toString());
+      if (mounted &&
+          connection.state.connected &&
+          epoch == connection.generation)
+        setState(() => message = error.toString());
     } finally {
       if (mounted) setState(() => busy = false);
     }
