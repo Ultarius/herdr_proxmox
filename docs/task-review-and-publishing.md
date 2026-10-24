@@ -12,6 +12,64 @@ candidate, needs comparison against the latest changes. Independent acceptance
 review results remain visible separately. The full discussion and its proposal
 actions are under Activity & agents.
 
+## Back up all tasks
+
+As an administrator, choose **Tasks → Export all tasks** in either dashboard.
+The download is a timestamped `herdr-tasks-….sqlite3` file: a consistent SQLite
+backup of the complete task database, including tasks outside the latest-100
+dashboard listing and any active view filters. It preserves all stored task
+fields, full audit history, retry records, assignments, automation policies,
+release/revision records, knowledge and discovery records, and notification
+metadata stored in that database. Exporting does not modify tasks or pause work.
+
+The file contains task content and should be kept privately. It does not include
+Git repositories/worktrees, external build logs or artifact files, organization
+configuration, or saved credentials. Back those up separately. The authenticated
+administrator-only endpoint is `GET /api/tasks/export`; responses are not cached.
+Query parameters are ignored, so cache-busting parameters never filter the
+export. `GET /api/tasks/export/info` checks the estimated database size and the
+backup volume's free space without copying the database.
+
+Temporary copies use `task-backups/` beside the live database, rather than the
+system temp directory. Set the gateway's `HERDR_TASK_BACKUP_DIR` to a plain
+absolute directory on another writable volume when needed. The directory is
+created privately; each export has its own private scratch directory. The
+preflight requires the estimated database size plus a reserve of at least
+64 MiB (or 10% for larger databases). Space checks cannot reserve space against
+other applications, so a later storage failure still preserves the live store.
+Only one export can copy or stream at a time; overlapping requests return
+HTTP 409 with `Retry-After`. Cancelled downloads release the copy and lease.
+Copying has a five-minute limit, with separate, shorter lock-wait handling.
+
+Downloads up to 64 MiB use the dashboard's buffered path, with size checks
+against the preflight estimate, response header, and incoming chunks. It has
+a ten-minute header/inactivity timeout instead of the ordinary 30-second read
+timeout, and uses the filename supplied by the gateway. Larger backups in normal
+cookie-authenticated browser sessions use the browser's native download manager,
+which streams directly to disk without accumulating database bytes in JavaScript.
+Its filename comes directly from `Content-Disposition`. The dashboard reports
+that the download has started; check the browser's Downloads view for completion
+or errors. Task operations may resume once the download has been handed off.
+Bearer-only clients cannot hand authentication headers to a browser download;
+their buffered fallback is capped at 64 MiB. Sign in normally with a browser
+session or use the authenticated export API with an HTTP client that streams
+directly to disk for larger files. The API has no browser-size cap; use a
+sufficiently long client timeout and honor `Content-Disposition`.
+
+This is a database backup, not a dashboard configuration import. For recovery,
+pause automation and stop the gateway and agents first. Preserve the existing
+`tasks.sqlite3` and its `-wal`/`-shm` sidecars before replacing the database with
+the downloaded file; do not leave old sidecars next to the restored file. Use
+the same Herdr release initially, restore matching organization/project data,
+and inspect active tasks and pending operations before resuming automation.
+The restored database must be owned by `herdr:herdr`, have mode `0600`, and live
+in a directory writable by `herdr` (normally mode `0700`). Run
+`PRAGMA integrity_check;` on the restored database as `herdr` before starting
+writers, and require the single result `ok`. Check that the gateway user can
+write the database and create its journal/WAL sidecars. If integrity or access
+checks fail, leave writers stopped and preserve the original backup for recovery.
+Repository commits and external artifacts cannot be recovered from this file.
+
 ## Configure GitHub
 
 As a dashboard administrator, open Tasks → GitHub publishing, or choose

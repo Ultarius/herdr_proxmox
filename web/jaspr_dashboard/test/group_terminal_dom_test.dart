@@ -675,23 +675,76 @@ void main() {
       gate = true;
       terminal.replaceSnapshot(output(120));
       await until(() => held != null);
-      captured!.callMethod('scrollToLine'.toJS, 10.toJS);
-      expect(
-        terminal.followingOutput,
-        isFalse,
-        reason:
-            'Public xterm onScroll observes upward navigation without adapter calls',
-      );
-      await until(() => nodes('.xterm-viewport').single.scrollTop < 500);
-      // Script-created gestures test the listener path; trusted wheel/scrollbar
-      // browser input is covered separately by the external CDP interaction check.
-      nodes('.xterm').single.dispatchEvent(
-        web.WheelEvent(
-          'wheel',
-          web.WheelEventInit(deltaY: 1, bubbles: true, cancelable: true),
-        ),
-      );
-      captured!.callMethod('scrollToBottom'.toJS);
+      final viewport = nodes('.xterm-viewport').single;
+      Future<void> synchronizedScroll(int line, void Function() scroll) async {
+        final synchronized = Completer<void>();
+        double expectedTop() =>
+            line *
+            nodes('.xterm-rows > div').first.getBoundingClientRect().height;
+        final nativeScroll = ((web.Event _) {
+          if (!synchronized.isCompleted &&
+              terminal.viewportLine == line &&
+              expectedTop() > 0 &&
+              (viewport.scrollTop - expectedTop()).abs() <= 1) {
+            synchronized.complete();
+          }
+        }).toJS;
+        // Public scrolling updates the buffer immediately, but xterm updates
+        // its native scrollbar on a render frame and consumes that event to
+        // clear its synchronization guard. A loose scrollTop < 500 check also
+        // matches the stale reset position (zero), before either has happened.
+        viewport.addEventListener('scroll', nativeScroll);
+        try {
+          scroll();
+          await synchronized.future.timeout(
+            const Duration(seconds: 5),
+            onTimeout: () {
+              fail(
+                'Scroll did not synchronize: buffer=${terminal.viewportLine}, '
+                'target=$line, scrollTop=${viewport.scrollTop}, expected=${expectedTop()}',
+              );
+            },
+          );
+          // The adapter observes the native event in a microtask after xterm.
+          await Future<void>.microtask(() {});
+        } finally {
+          viewport.removeEventListener('scroll', nativeScroll);
+        }
+      }
+
+      await synchronizedScroll(10, () {
+        captured!.callMethod('scrollToLine'.toJS, 10.toJS);
+        expect(
+          terminal.followingOutput,
+          isFalse,
+          reason:
+              'Public xterm onScroll observes upward navigation without adapter calls',
+        );
+      });
+      await synchronizedScroll(terminal.lastViewportLine, () {
+        // Script-created gestures exercise the listener path. Trusted wheel
+        // input is covered separately by the external CDP interaction check.
+        // Target the same tail in the DOM and buffer: a one-pixel wheel queues
+        // an event near line 10 that can otherwise undo scrollToBottom before
+        // the next render frame, depending on browser scheduling.
+        nodes('.xterm').single.dispatchEvent(
+          web.WheelEvent(
+            'wheel',
+            web.WheelEventInit(
+              deltaY: viewport.scrollHeight.toDouble(),
+              bubbles: true,
+              cancelable: true,
+            ),
+          ),
+        );
+        expect(
+          viewport.scrollTop,
+          closeTo(viewport.scrollHeight - viewport.clientHeight, 1),
+          reason:
+              'The wheel gesture itself must move the native scrollbar to the tail',
+        );
+        captured!.callMethod('scrollToBottom'.toJS);
+      });
       await until(
         () => terminal.followingOutput,
         reason:

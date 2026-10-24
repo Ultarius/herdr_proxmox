@@ -72,6 +72,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   final http.Client client;
   String? _credential;
   int generation = 0;
+  bool get browserSession => _credential == '' && state.connected;
   Timer? _timer;
   Timer? _notificationTimer;
   final notificationRevision = ValueNotifier<int>(0);
@@ -333,6 +334,86 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
       throw Exception(message);
     }
     return response.bodyBytes;
+  }
+
+  /// Bounded downloads keep headers (including the authoritative filename)
+  /// and reject oversized bodies before collecting them in browser memory.
+  Future<http.Response> download(
+    String path, {
+    required int maximumBytes,
+    Duration timeout = const Duration(minutes: 10),
+  }) async {
+    final epoch = generation;
+    final request = http.Request('GET', Uri.base.resolve('/api/$path'));
+    if (_credential?.isNotEmpty == true)
+      request.headers['Authorization'] = 'Bearer $_credential';
+    final response = await client.send(request).timeout(timeout);
+    final limit = response.statusCode == 200 ? maximumBytes : 64 * 1024;
+    if ((response.contentLength ?? 0) > limit) {
+      await response.stream.listen(null).cancel();
+      throw StateError(
+        'This backup exceeds the browser download limit. Use a streaming HTTP client with the task export API.',
+      );
+    }
+    final content = BytesBuilder(copy: false);
+    final completed = Completer<void>();
+    StreamSubscription<List<int>>? subscription;
+    Timer? idle;
+    void fail(Object error, [StackTrace? stack]) {
+      if (completed.isCompleted) return;
+      idle?.cancel();
+      subscription?.cancel().ignore();
+      completed.completeError(error, stack);
+    }
+
+    void resetTimeout() {
+      idle?.cancel();
+      idle = Timer(
+        timeout,
+        () => fail(TimeoutException('Task backup transfer stalled', timeout)),
+      );
+    }
+
+    resetTimeout();
+    subscription = response.stream.listen(
+      (chunk) {
+        if (completed.isCompleted) return;
+        if (epoch != generation || _credential == null) {
+          fail(StateError('Dashboard connection changed.'));
+        } else if (content.length + chunk.length > limit) {
+          fail(
+            StateError(
+              'This backup exceeds the browser download limit. Use a streaming HTTP client with the task export API.',
+            ),
+          );
+        } else {
+          content.add(chunk);
+          resetTimeout();
+        }
+      },
+      onError: fail,
+      onDone: () {
+        idle?.cancel();
+        if (!completed.isCompleted) completed.complete();
+      },
+      cancelOnError: true,
+    );
+    await completed.future;
+    if (epoch != generation || _credential == null)
+      throw StateError('Dashboard connection changed.');
+    final result = http.Response.bytes(
+      content.takeBytes(),
+      response.statusCode,
+      headers: response.headers,
+    );
+    if (result.statusCode != 200) {
+      var message = 'Task export failed. Retry the export.';
+      try {
+        message = jsonDecode(result.body)['error'] ?? message;
+      } catch (_) {}
+      throw DashboardRequestException(result.statusCode, message);
+    }
+    return result;
   }
 
   Future<String> text(String path) async => utf8.decode(await bytes(path));

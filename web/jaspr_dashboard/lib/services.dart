@@ -33,6 +33,8 @@ void initializeServices() {
 String requestId() => ids.newRequestId();
 Future<void> downloadText(String content, String filename) =>
     artifacts.downloadArtifact(content, filename);
+Future<void> downloadTaskBackupLink(Uri uri) =>
+    artifacts.downloadTaskBackupLink(uri);
 Future<void> downloadBytes(
   Uint8List content,
   String filename, {

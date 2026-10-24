@@ -442,6 +442,16 @@ class GitHubTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which('git'), 'Git required')
 class ContributionTests(unittest.TestCase):
+    def test_task_backup_preserves_the_complete_live_schema_and_records(self):
+        from task_backup import export_database
+        with closing(self.service.connect()) as source:
+            before = list(source.iterdump())
+            with export_database(self.service.connect) as backup:
+                with closing(sqlite3.connect(backup)) as restored:
+                    self.assertEqual(list(restored.iterdump()), before)
+                    self.assertEqual(restored.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+            self.assertEqual(list(source.iterdump()), before, 'Export must not mutate live task records')
+
     def test_release_notifications_skip_noop_and_audit_only_saves_but_keep_progress(self):
         releases = self.service.releases
         created = releases.action('create', dict(request_id='notify-release', repository='repo', version='alpha.15'), 'admin', 'admin')

@@ -1,5 +1,5 @@
 """Local, authenticated dashboard gateway to the official Herdr CLI."""
-from contextlib import closing, nullcontext
+from contextlib import closing, nullcontext, ExitStack
 import hmac
 import secrets
 import time
@@ -202,6 +202,39 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def task_backup(self):
+        from datetime import datetime, timezone
+        from task_backup import BackupBusy, export_database
+        with ExitStack() as stack:
+            try:
+                backup = stack.enter_context(export_database(self.server.contributions.connect))
+                stream = stack.enter_context(backup.open('rb'))
+                size = backup.stat().st_size
+            except BackupBusy as error:
+                self.reply(409, {'error': str(error)}, retry_after=2)
+                return
+            except ValueError as error:
+                self.reply(503, {'error': str(error)})
+                return
+            except (OSError, sqlite3.Error):
+                self.reply(503, {'error': 'Could not export task storage. Check gateway storage and available disk space, then retry.'})
+                return
+            filename = 'herdr-tasks-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '.sqlite3'
+            try:
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/vnd.sqlite3')
+                self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('Content-Length', str(size))
+                self.end_headers()
+                while chunk := stream.read(65536):
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # Browser cancellation is routine. ExitStack still removes the
+                # copy and releases the export lease; no second response/log.
+                return
+
     def validation_artifact(self, run_id, kind='static'):
         try:
             archive, manifest = self.server.validation.artifact(run_id, kind)
@@ -333,6 +366,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith('/api/'):
             if not self.authenticated():
+                return
+            if urlsplit(self.path).path in ('/api/tasks/export', '/api/tasks/export/info'):
+                if self.operator['role'] != 'admin':
+                    self.reply(403, {'error': 'Only an administrator can export the task database.'})
+                    return
+                if urlsplit(self.path).path.endswith('/info'):
+                    from task_backup import BackupBusy, export_info
+                    try:
+                        self.reply(200, export_info(self.server.contributions.connect))
+                    except BackupBusy as error:
+                        self.reply(409, {'error': str(error)}, retry_after=2)
+                    except ValueError as error:
+                        self.reply(503, {'error': str(error)})
+                    except (OSError, sqlite3.Error):
+                        self.reply(503, {'error': 'Could not inspect task backup storage. Check storage and permissions, then retry.'})
+                else:
+                    self.task_backup()
                 return
             if urlsplit(self.path).path == '/api/organizations/automation':
                 org_id = (parse_qs(urlsplit(self.path).query).get('organization_id') or [''])[0]

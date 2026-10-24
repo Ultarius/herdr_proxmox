@@ -29,6 +29,22 @@ Future<void> downloadBinaryArtifact(
   );
 }
 
+/// Native same-origin downloads use the session cookie and server filename.
+Future<void> downloadTaskBackupLink(Uri uri) async {
+  if (uri.origin != Uri.base.origin ||
+      uri.path != '/api/tasks/export' ||
+      uri.hasQuery ||
+      uri.hasFragment) {
+    throw ArgumentError('Invalid task backup download URL');
+  }
+  final link = web.HTMLAnchorElement()
+    ..href = uri.toString()
+    ..download = '';
+  web.document.body!.appendChild(link);
+  link.click();
+  link.remove();
+}
+
 Future<void> downloadArtifact(String content, String filename) async {
   _save(
     web.Blob(

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:herdr_dashboard_state/publishing_connections.dart';
+import 'package:herdr_dashboard_state/task_backup.dart';
 import 'discovery_panel.dart';
 import 'routes.dart';
 import 'task_activity.dart';
@@ -116,9 +117,15 @@ List<String> taskRepositories(
 }
 
 class TasksPage extends StatefulWidget {
-  const TasksPage({super.key, this.taskId, this.coordinator});
+  const TasksPage({
+    super.key,
+    this.taskId,
+    this.coordinator,
+    this.saveTaskBackup,
+  });
   final String? taskId;
   final AppCoordinator? coordinator;
+  final TaskBackupSaver? saveTaskBackup;
   @override
   State<TasksPage> createState() => _TasksPageState();
 }
@@ -138,6 +145,14 @@ class _TasksPageState extends State<TasksPage> {
   String? readError;
   bool busy = false;
   bool configuringPublishing = false;
+  late final TaskBackupController backup;
+  bool get exportingTasks => backup.busy;
+  bool get backupFailed => backup.failed;
+  String? get backupMessage => backup.message;
+  void backupChanged() {
+    if (mounted) setState(() {});
+  }
+
   bool refreshing = false;
   bool connected = true;
   Future<void>? pending;
@@ -161,6 +176,18 @@ class _TasksPageState extends State<TasksPage> {
   @override
   void initState() {
     super.initState();
+    backup = TaskBackupController(
+      connection,
+      widget.saveTaskBackup ??
+          (file) => file.downloadUri != null
+              ? downloadTaskBackupLink(file.downloadUri!)
+              : downloadBinaryArtifact(
+                  file.bytes,
+                  file.filename,
+                  contentType: 'application/vnd.sqlite3',
+                ),
+    );
+    backup.addListener(backupChanged);
     generation = connection.generation;
     subscription = connection.stream.listen((_) {
       if (!mounted) return;
@@ -215,6 +242,8 @@ class _TasksPageState extends State<TasksPage> {
 
   @override
   void dispose() {
+    backup.removeListener(backupChanged);
+    backup.dispose();
     connection.notificationRevision.removeListener(notificationRefresh);
     timer?.cancel();
     subscription?.cancel();
@@ -406,6 +435,9 @@ class _TasksPageState extends State<TasksPage> {
     }
   }
 
+  Future<void> exportTasks() =>
+      backup.export(blocked: busy || configuringPublishing);
+
   Future<void> configure() async {
     if (!admin) {
       setState(
@@ -413,7 +445,11 @@ class _TasksPageState extends State<TasksPage> {
       );
       return;
     }
-    if (busy || configuringPublishing || !connection.state.connected) return;
+    if (busy ||
+        configuringPublishing ||
+        exportingTasks ||
+        !connection.state.connected)
+      return;
     final token = TextEditingController();
     final repos = TextEditingController(
       text: (github['repositories'] as List? ?? []).join('\n'),
@@ -1181,9 +1217,29 @@ class _TasksPageState extends State<TasksPage> {
                     label: const Text('Create task'),
                   ),
                   OutlinedButton.icon(
-                    onPressed: admin && !busy ? configure : null,
+                    onPressed:
+                        admin &&
+                            !busy &&
+                            !exportingTasks &&
+                            !configuringPublishing
+                        ? configure
+                        : null,
                     icon: const Icon(Icons.key),
                     label: const Text('GitHub publishing'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed:
+                        admin &&
+                            connection.state.connected &&
+                            !busy &&
+                            !configuringPublishing &&
+                            !exportingTasks
+                        ? exportTasks
+                        : null,
+                    icon: const Icon(Icons.download),
+                    label: Text(
+                      exportingTasks ? 'Exporting tasks…' : taskBackupLabel,
+                    ),
                   ),
                   IconButton(
                     onPressed: busy || refreshing ? null : refresh,
@@ -1207,6 +1263,27 @@ class _TasksPageState extends State<TasksPage> {
                     Text(
                       publicationSummary('${entry.key}', entry.value as Map),
                     ),
+              if (backupMessage != null)
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Semantics(
+                      liveRegion: true,
+                      child: Text(
+                        backupMessage!,
+                        style: backupFailed
+                            ? TextStyle(
+                                color: Theme.of(context).colorScheme.error,
+                              )
+                            : null,
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: backup.dismiss,
+                      child: const Text('Dismiss backup message'),
+                    ),
+                  ],
+                ),
               if (busy) const LinearProgressIndicator(),
               if ((error ?? readError) != null)
                 Padding(
@@ -2570,7 +2647,13 @@ class _TasksPageState extends State<TasksPage> {
                   'GitHub publishing is not configured. Local group review and validation remain available. Publishing requires GitHub setup.',
                 ),
                 TextButton.icon(
-                  onPressed: admin && !busy ? configure : null,
+                  onPressed:
+                      admin &&
+                          !busy &&
+                          !exportingTasks &&
+                          !configuringPublishing
+                      ? configure
+                      : null,
                   icon: const Icon(Icons.key),
                   label: const Text('Set up GitHub publishing'),
                 ),
