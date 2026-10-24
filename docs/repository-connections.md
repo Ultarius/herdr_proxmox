@@ -136,6 +136,48 @@ Repository connections, private keys and tokens are not part of configuration ex
 reconfigure them on a replacement container. Dashboard upgrades preserve the
 configuration directory. No live keys or remote grants are created by tests.
 
+## Removing old clones
+
+Administrators can use **Remove clone** beside a finished, failed, or interrupted
+entry in **Clone a project**. **Remove history entry** clears only that entry;
+the project folder and saved repository connection remain available.
+
+To delete the folder too, select **Also permanently delete the cloned folder**,
+type its exact folder name, then choose **Delete folder and history**. This
+permanently deletes all files in that folder, including local changes. Running
+clones cannot be removed. Folder deletion also refuses projects used by
+workspaces, managed jobs, or configured teams/agents, assigned repository
+connections, linked worktrees, and unsafe paths. Unassign a repository connection
+and close or reconfigure the relevant workspaces and project assignments first.
+The remote repository and GitHub credentials are not deleted or revoked.
+Older clone entries without a recorded original folder identity support
+history-only removal. The dashboard disables their folder-deletion option, and
+the gateway also refuses deletion. Inspect those folders before deleting them
+manually; their current contents may belong to a replacement project.
+
+The administrator-only endpoint is `POST /api/projects/jobs/remove` with `id`,
+optional boolean `delete_folder` (defaults to `false`), and `confirm_folder`
+matching the recorded folder name when deletion is requested. The gateway selects
+the folder from its stored clone job; requests cannot supply an arbitrary path.
+
+## Reusing a token for publishing
+
+To reuse a saved PAT for task publication, open **Tasks → GitHub publishing** and
+select its connection under **Publishing token source**. The selected connection
+must match the branch destination. Only its ID goes through the browser; the
+gateway validates and copies the token into publishing configuration. Saving a
+clone connection alone does not enable publishing. A token with Contents read
+access is insufficient for publishing. A saved connection in direct mode allows
+only its named repository in the publishing allowlist. For fork publication,
+the allowlist names the upstream and the branch destination must match the
+connection's fork. Every allowlist entry must target that same destination;
+enter a token manually to publish to multiple destinations (up to 20
+allowlisted repositories).
+Publishing needs Contents write and, when used for pull requests, Pull requests
+write. SSH deploy keys cannot authorize the GitHub API.
+Publishing retains its own copy: rotating or removing a connection does not
+change that copy. Reconfigure publishing explicitly to adopt a new token.
+
 ## Retiring a connection
 
 In either dashboard, click **Unassign project** beside every assigned checkout.

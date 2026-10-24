@@ -849,6 +849,152 @@ void main() {
     return {'workspaces': [], 'agents': []};
   }
 
+  Map<String, dynamic> savedPublishingResponse(http.Request request) {
+    if (request.url.path == '/api/projects/connections')
+      return {
+        'connections': [
+          {
+            'id': 'a' * 32,
+            'kind': 'token',
+            'label': 'Saved repository PAT',
+            'repository': 'owner/repo',
+            'token': 'must_not_reach_the_form',
+          },
+          {
+            'id': 'b' * 32,
+            'kind': 'token',
+            'label': 'Another saved PAT',
+            'repository': 'owner/other',
+          },
+          {
+            'id': 'c' * 32,
+            'kind': 'ssh',
+            'label': 'SSH connection',
+            'repository': 'owner/repo',
+          },
+          {
+            'id': 'd' * 32,
+            'kind': 'github',
+            'label': 'Configured account',
+            'repository': 'owner/repo',
+          },
+        ],
+      };
+    if (request.url.path == '/api/tasks')
+      return {
+        'tasks': [],
+        'github': {'configured': false},
+      };
+    if (request.url.path == '/api/github/configure')
+      return {'configured': true};
+    return {'workspaces': [], 'agents': []};
+  }
+
+  test(
+    'publishing reuses saved PAT metadata without sending a token from the browser',
+    () async {
+      await mount(const TasksPage(), savedPublishingResponse);
+      await click('GitHub publishing');
+      final source = field('Publishing token source') as web.HTMLSelectElement;
+      expect(source.options.length, 3);
+      expect(source.textContent, isNot(contains('SSH connection')));
+      expect(source.textContent, isNot(contains('Configured account')));
+      source.focus();
+      await choose('Publishing token source', 'a' * 32);
+      expect(field('Publishing token source'), same(source));
+      expect(web.document.activeElement, source);
+      expect(
+        elements(
+          'label',
+        ).where((label) => label.textContent == 'Personal access token'),
+        isEmpty,
+      );
+      expect(
+        (field('Allowed owner/repository (one per line)')
+                as web.HTMLTextAreaElement)
+            .value,
+        'owner/repo',
+      );
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('gateway copies this token'),
+      );
+      expect(
+        web.document.getElementById('task-dom-test')!.outerHTML,
+        isNot(contains('must_not_reach_the_form')),
+      );
+      expect(posts, isEmpty);
+      await click('Validate and save');
+      expect(posts.single, {
+        'path': '/api/github/configure',
+        'connection_id': 'a' * 32,
+        'repositories': ['owner/repo'],
+        'publication': {
+          'owner/repo': {'mode': 'direct'},
+        },
+      });
+      expect(elements('.dialog'), isEmpty);
+    },
+  );
+
+  test(
+    'saved publishing source updates suggested repositories and preserves deliberate edits',
+    () async {
+      await mount(const TasksPage(), savedPublishingResponse);
+      await click('GitHub publishing');
+      await choose('Publishing token source', 'a' * 32);
+      await choose('Publishing token source', 'b' * 32);
+      expect(
+        (field('Allowed owner/repository (one per line)')
+                as web.HTMLTextAreaElement)
+            .value,
+        'owner/other',
+      );
+      await type(
+        'Allowed owner/repository (one per line)',
+        'custom/repository',
+      );
+      await choose('Publishing token source', 'a' * 32);
+      expect(
+        (field('Allowed owner/repository (one per line)')
+                as web.HTMLTextAreaElement)
+            .value,
+        'custom/repository',
+      );
+      await click('Cancel');
+      expect(posts, isEmpty);
+    },
+  );
+
+  test(
+    'switching to a saved token clears the manual secret and switching back starts empty',
+    () async {
+      await mount(const TasksPage(), savedPublishingResponse);
+      await click('GitHub publishing');
+      await type('Personal access token', 'github_pat_${'m' * 40}');
+      await choose('Publishing token source', 'a' * 32);
+      await choose('Publishing token source', '');
+      expect(
+        (field('Personal access token') as web.HTMLInputElement).value,
+        isEmpty,
+      );
+      await click('Cancel');
+      expect(posts, isEmpty);
+    },
+  );
+
+  test(
+    'a role change cannot submit a selected saved publishing source',
+    () async {
+      await mount(const TasksPage(), savedPublishingResponse);
+      await click('GitHub publishing');
+      await choose('Publishing token source', 'a' * 32);
+      connection!.operator.value = {'role': 'operator'};
+      await click('Validate and save');
+      expect(posts, isEmpty);
+    },
+  );
+
   test(
     'publishing sends a separate PR token without asking for its account',
     () async {

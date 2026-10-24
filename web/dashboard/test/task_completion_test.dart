@@ -5,6 +5,7 @@ import 'package:http/testing.dart';
 import 'package:juice/juice.dart';
 import 'package:herdr_dashboard/dashboard_bloc.dart';
 import 'package:herdr_dashboard/tasks_page.dart';
+import 'helpers/dashboard_connection.dart';
 
 void main() {
   testWidgets(
@@ -66,69 +67,75 @@ void main() {
           );
         }),
       );
-      BlocScope.register<DashboardBloc>(() => connection);
-      connection.connect('token');
-      connection.operator.value = {'role': 'admin'};
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: Scaffold(body: TasksPage(taskId: 'task')),
-        ),
-      );
-      await tester.pumpAndSettle();
-      expect(
-        tester
-            .widget<FilledButton>(
-              find.widgetWithText(FilledButton, 'Review and publish on GitHub'),
-            )
-            .onPressed,
-        isNull,
-      );
-      expect(
-        find.textContaining('This is not an approval verdict.'),
-        findsOneWidget,
-      );
-      expect(
-        find.textContaining('A draft alone does not record that decision.'),
-        findsOneWidget,
-      );
-      expect(find.text('Add a regression test.'), findsOneWidget);
-      await tester.tap(find.text('Set up GitHub publishing'));
-      await tester.pumpAndSettle();
-      expect(
-        find.textContaining('Contents write, Pull requests write'),
-        findsOneWidget,
-      );
-      await tester.enterText(
-        find.widgetWithText(TextField, 'Personal access token'),
-        'github_pat_test_token',
-      );
-      await tester.enterText(
-        find.widgetWithText(
-          TextField,
-          'Allowed owner/repository (one per line)',
-        ),
-        'owner/repo',
-      );
-      await tester.tap(find.text('Validate and save'));
-      await tester.pumpAndSettle();
-      expect(configuration?['repositories'], ['owner/repo']);
-      expect(configuration?['token'], 'github_pat_test_token');
-      final meeting = (task['meeting_results'] as List).single as Map;
-      meeting['candidate'] = 'a' * 40;
-      await tester.tap(find.byTooltip('Refresh task'));
-      await tester.pumpAndSettle();
-      expect(find.textContaining('This review concerns an earlier candidate.'), findsOneWidget);
-      meeting.remove('candidate');
-      await tester.tap(find.byTooltip('Refresh task'));
-      await tester.pumpAndSettle();
-      expect(find.textContaining('This older review has no recorded candidate.'), findsOneWidget);
-      await tester.tap(find.text('Read full group review'));
-      await tester.pumpAndSettle();
-      expect(find.text('Review team review'), findsOneWidget);
-      expect(find.text('Draft created'), findsOneWidget);
-      await tester.pumpWidget(const SizedBox.shrink());
-      await connection.disconnect();
-      await BlocScope.reset();
+      await withDashboardConnection(tester, connection, () async {
+        connection.operator.value = {'role': 'admin'};
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: TasksPage(taskId: 'task')),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(
+          tester
+              .widget<FilledButton>(
+                find.widgetWithText(
+                  FilledButton,
+                  'Review and publish on GitHub',
+                ),
+              )
+              .onPressed,
+          isNull,
+        );
+        expect(
+          find.textContaining('This is not an approval verdict.'),
+          findsOneWidget,
+        );
+        expect(
+          find.textContaining('A draft alone does not record that decision.'),
+          findsOneWidget,
+        );
+        expect(find.text('Add a regression test.'), findsOneWidget);
+        await tester.tap(find.text('Set up GitHub publishing'));
+        await tester.pumpAndSettle();
+        expect(
+          find.textContaining('Contents write, Pull requests write'),
+          findsOneWidget,
+        );
+        await tester.enterText(
+          find.widgetWithText(TextField, 'Personal access token'),
+          'github_pat_test_token',
+        );
+        await tester.enterText(
+          find.widgetWithText(
+            TextField,
+            'Allowed owner/repository (one per line)',
+          ),
+          'owner/repo',
+        );
+        await tester.tap(find.text('Validate and save'));
+        await tester.pumpAndSettle();
+        expect(configuration?['repositories'], ['owner/repo']);
+        expect(configuration?['token'], 'github_pat_test_token');
+        final meeting = (task['meeting_results'] as List).single as Map;
+        meeting['candidate'] = 'a' * 40;
+        await tester.tap(find.byTooltip('Refresh task'));
+        await tester.pumpAndSettle();
+        expect(
+          find.textContaining('This review concerns an earlier candidate.'),
+          findsOneWidget,
+        );
+        meeting.remove('candidate');
+        await tester.tap(find.byTooltip('Refresh task'));
+        await tester.pumpAndSettle();
+        expect(
+          find.textContaining('This older review has no recorded candidate.'),
+          findsOneWidget,
+        );
+        await tester.tap(find.text('Read full group review'));
+        await tester.pumpAndSettle();
+        expect(find.text('Review team review'), findsOneWidget);
+        expect(find.text('Draft created'), findsOneWidget);
+      });
     },
   );
 
@@ -174,56 +181,53 @@ void main() {
           );
         }),
       );
-      BlocScope.register<DashboardBloc>(() => connection);
-      connection.connect('token');
-      connection.operator.value = {'role': 'admin'};
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: Scaffold(body: TasksPage(taskId: 'task')),
-        ),
-      );
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Mark task done'));
-      await tester.pumpAndSettle();
-      expect(
-        tester
-            .widget<FilledButton>(
-              find.widgetWithText(FilledButton, 'Confirm completion'),
-            )
-            .onPressed,
-        isNull,
-      );
-      await tester.enterText(
-        find.byType(TextField),
-        'Reviewed the implementation already included upstream.',
-      );
-      await tester.tap(find.byType(CheckboxListTile));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Confirm completion'));
-      await tester.pumpAndSettle();
-      expect(submitted!['inspected'], isTrue);
-      expect(submitted!['head_sha'], 'b' * 40);
-      expect(submitted!['upstream_sha'], 'a' * 40);
-      expect(submitted!['outcome'], 'incorporated_elsewhere');
-      expect(
-        submitted!['reason'],
-        'Reviewed the implementation already included upstream.',
-      );
-      expect(find.text('Done \u00b7 repo'), findsOneWidget);
-      expect(find.text('Done: incorporated elsewhere'), findsOneWidget);
-      expect(
-        find.text(
-          'No verified required checks for this candidate at completion. Done is not validation.',
-        ),
-        findsOneWidget,
-      );
-      expect(find.textContaining('Candidate: ${'b' * 40}'), findsOneWidget);
-      expect(find.text('Mark task done'), findsNothing);
-      expect(find.text('Validate latest commit'), findsNothing);
-      expect(tester.takeException(), isNull);
-      await tester.pumpWidget(const SizedBox.shrink());
-      await connection.disconnect();
-      await BlocScope.reset();
+      await withDashboardConnection(tester, connection, () async {
+        connection.operator.value = {'role': 'admin'};
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: TasksPage(taskId: 'task')),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Mark task done'));
+        await tester.pumpAndSettle();
+        expect(
+          tester
+              .widget<FilledButton>(
+                find.widgetWithText(FilledButton, 'Confirm completion'),
+              )
+              .onPressed,
+          isNull,
+        );
+        await tester.enterText(
+          find.byType(TextField),
+          'Reviewed the implementation already included upstream.',
+        );
+        await tester.tap(find.byType(CheckboxListTile));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Confirm completion'));
+        await tester.pumpAndSettle();
+        expect(submitted!['inspected'], isTrue);
+        expect(submitted!['head_sha'], 'b' * 40);
+        expect(submitted!['upstream_sha'], 'a' * 40);
+        expect(submitted!['outcome'], 'incorporated_elsewhere');
+        expect(
+          submitted!['reason'],
+          'Reviewed the implementation already included upstream.',
+        );
+        expect(find.text('Done \u00b7 repo'), findsOneWidget);
+        expect(find.text('Done: incorporated elsewhere'), findsOneWidget);
+        expect(
+          find.text(
+            'No verified required checks for this candidate at completion. Done is not validation.',
+          ),
+          findsOneWidget,
+        );
+        expect(find.textContaining('Candidate: ${'b' * 40}'), findsOneWidget);
+        expect(find.text('Mark task done'), findsNothing);
+        expect(find.text('Validate latest commit'), findsNothing);
+        expect(tester.takeException(), isNull);
+      });
     },
   );
   testWidgets(
@@ -285,38 +289,35 @@ void main() {
           );
         }),
       );
-      BlocScope.register<DashboardBloc>(() => connection);
-      connection.connect('token');
-      connection.operator.value = {'role': 'admin'};
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: Scaffold(body: TasksPage(taskId: 'task')),
-        ),
-      );
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Discuss with group'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Start group review'));
-      await tester.pumpAndSettle();
-      expect(posts, contains('/api/tasks/review_policy'));
-      expect(posts, contains('/api/tasks/discuss'));
-      await tester.tap(find.text('Activity & agents'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Project Review review'));
-      await tester.pumpAndSettle();
-      await tester.ensureVisible(find.text('Create draft'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Create draft'));
-      await tester.pumpAndSettle();
-      expect(posts, contains('/api/tasks/proposal'));
-      expect(posts.any((p) => p.endsWith('/launch')), isFalse);
-      expect(find.textContaining('Assigned: Maya'), findsOneWidget);
-      expect(find.text('Draft created'), findsOneWidget);
-      expect(find.text('Open follow-up draft'), findsOneWidget);
-      expect(tester.takeException(), isNull);
-      await tester.pumpWidget(const SizedBox.shrink());
-      await connection.disconnect();
-      await BlocScope.reset();
+      await withDashboardConnection(tester, connection, () async {
+        connection.operator.value = {'role': 'admin'};
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: TasksPage(taskId: 'task')),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Discuss with group'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Start group review'));
+        await tester.pumpAndSettle();
+        expect(posts, contains('/api/tasks/review_policy'));
+        expect(posts, contains('/api/tasks/discuss'));
+        await tester.tap(find.text('Activity & agents'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Project Review review'));
+        await tester.pumpAndSettle();
+        await tester.ensureVisible(find.text('Create draft'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Create draft'));
+        await tester.pumpAndSettle();
+        expect(posts, contains('/api/tasks/proposal'));
+        expect(posts.any((p) => p.endsWith('/launch')), isFalse);
+        expect(find.textContaining('Assigned: Maya'), findsOneWidget);
+        expect(find.text('Draft created'), findsOneWidget);
+        expect(find.text('Open follow-up draft'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      });
     },
   );
   testWidgets(
@@ -362,103 +363,100 @@ void main() {
           );
         }),
       );
-      BlocScope.register<DashboardBloc>(() => connection);
-      connection.connect('token');
-      connection.operator.value = {'role': 'admin'};
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: Scaffold(body: TasksPage(taskId: 'task')),
-        ),
-      );
-      await tester.pumpAndSettle();
-      expect(find.text('Queued \u00b7 repo'), findsOneWidget);
-      expect(find.textContaining('Queued for this agent'), findsOneWidget);
-      expect(find.textContaining('order 2'), findsOneWidget);
-      expect(find.text("Waiting on: Nora's active session"), findsOneWidget);
-      expect(
-        find.textContaining('Session run \u00b7 persona_sent'),
-        findsOneWidget,
-      );
-      expect(find.textContaining('inspect it in Org chart'), findsOneWidget);
-      await tester.tap(find.text('Change queue order'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.byTooltip('Later'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Save queue order'));
-      await tester.pumpAndSettle();
-      expect(posts.single['mode'], 'move');
-      expect(posts.single['position'], 3);
-      await tester.tap(find.text('Cancel queued assignment'));
-      await tester.pumpAndSettle();
-      expect(posts.last['mode'], 'cancel');
-      expect(posts.last['task_id'], 'task');
-      expect(tester.takeException(), isNull);
-      await tester.pumpWidget(const SizedBox.shrink());
-      await connection.disconnect();
-      await BlocScope.reset();
+      await withDashboardConnection(tester, connection, () async {
+        connection.operator.value = {'role': 'admin'};
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: TasksPage(taskId: 'task')),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('Queued \u00b7 repo'), findsOneWidget);
+        expect(find.textContaining('Queued for this agent'), findsOneWidget);
+        expect(find.textContaining('order 2'), findsOneWidget);
+        expect(find.text("Waiting on: Nora's active session"), findsOneWidget);
+        expect(
+          find.textContaining('Session run \u00b7 persona_sent'),
+          findsOneWidget,
+        );
+        expect(find.textContaining('inspect it in Org chart'), findsOneWidget);
+        await tester.tap(find.text('Change queue order'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byTooltip('Later'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Save queue order'));
+        await tester.pumpAndSettle();
+        expect(posts.single['mode'], 'move');
+        expect(posts.single['position'], 3);
+        await tester.tap(find.text('Cancel queued assignment'));
+        await tester.pumpAndSettle();
+        expect(posts.last['mode'], 'cancel');
+        expect(posts.last['task_id'], 'task');
+        expect(tester.takeException(), isNull);
+      });
     },
   );
-  testWidgets('a blocked agent shows the decision banner and sends audited keys', (
-    tester,
-  ) async {
-    tester.view.physicalSize = const Size(500, 1400);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
-    final task = <String, dynamic>{
-      'id': 'task',
-      'title': 'Blocked task',
-      'state': 'implementing',
-      'repository': 'repo',
-      'organization_id': 'org',
-      'assigned_agent': {'name': 'Nora'},
-      'availability': {
-        'state': 'decision',
-        'action': 'interact',
-        'run_id': 'run',
-        'profile_id': 'worker',
-        'code': 'agent_blocked',
-        'preview': 'Allow Bash?',
-      },
-    };
-    final posts = <Map<String, dynamic>>[];
-    final connection = DashboardBloc(
-      client: MockClient((request) async {
-        if (request.method == 'POST') {
-          posts.add(Map<String, dynamic>.from(jsonDecode(request.body)));
-        }
-        return http.Response(
-          jsonEncode(
-            request.url.path.endsWith('/tasks')
-                ? {
-                    'tasks': [task],
-                    'github': {},
-                  }
-                : task,
+  testWidgets(
+    'a blocked agent shows the decision banner and sends audited keys',
+    (tester) async {
+      tester.view.physicalSize = const Size(500, 1400);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final task = <String, dynamic>{
+        'id': 'task',
+        'title': 'Blocked task',
+        'state': 'implementing',
+        'repository': 'repo',
+        'organization_id': 'org',
+        'assigned_agent': {'name': 'Nora'},
+        'availability': {
+          'state': 'decision',
+          'action': 'interact',
+          'run_id': 'run',
+          'profile_id': 'worker',
+          'code': 'agent_blocked',
+          'preview': 'Allow Bash?',
+        },
+      };
+      final posts = <Map<String, dynamic>>[];
+      final connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.method == 'POST') {
+            posts.add(Map<String, dynamic>.from(jsonDecode(request.body)));
+          }
+          return http.Response(
+            jsonEncode(
+              request.url.path.endsWith('/tasks')
+                  ? {
+                      'tasks': [task],
+                      'github': {},
+                    }
+                  : task,
+            ),
+            200,
+          );
+        }),
+      );
+      await withDashboardConnection(tester, connection, () async {
+        connection.operator.value = {'role': 'admin'};
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: TasksPage(taskId: 'task')),
           ),
-          200,
         );
-      }),
-    );
-    BlocScope.register<DashboardBloc>(() => connection);
-    connection.connect('token');
-    connection.operator.value = {'role': 'admin'};
-    await tester.pumpWidget(
-      const MaterialApp(home: Scaffold(body: TasksPage(taskId: 'task'))),
-    );
-    await tester.pumpAndSettle();
-    expect(find.text('Nora needs your decision'), findsOneWidget);
-    expect(find.textContaining('Allow Bash?'), findsOneWidget);
-    await tester.tap(find.text('Send Escape'));
-    await tester.pumpAndSettle();
-    expect(posts.single['key'], 'esc');
-    expect(posts.single['profile_id'], 'worker');
-    expect(posts.single['organization_id'], 'org');
-    expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox.shrink());
-    await connection.disconnect();
-    await BlocScope.reset();
-  });
+        await tester.pumpAndSettle();
+        expect(find.text('Nora needs your decision'), findsOneWidget);
+        expect(find.textContaining('Allow Bash?'), findsOneWidget);
+        await tester.tap(find.text('Send Escape'));
+        await tester.pumpAndSettle();
+        expect(posts.single['key'], 'esc');
+        expect(posts.single['profile_id'], 'worker');
+        expect(posts.single['organization_id'], 'org');
+        expect(tester.takeException(), isNull);
+      });
+    },
+  );
   testWidgets(
     'a ready startup session offers Start implementation with rotation context',
     (tester) async {
@@ -501,30 +499,27 @@ void main() {
           );
         }),
       );
-      BlocScope.register<DashboardBloc>(() => connection);
-      connection.connect('token');
-      connection.operator.value = {'role': 'admin'};
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: Scaffold(body: TasksPage(taskId: 'task')),
-        ),
-      );
-      await tester.pumpAndSettle();
-      expect(find.text('Start implementation'), findsOneWidget);
-      expect(
-        find.text(
-          'Nora is ready. Starting this task archives the startup conversation and opens a dedicated task execution.',
-        ),
-        findsOneWidget,
-      );
-      expect(find.textContaining('Blocked by'), findsNothing);
-      await tester.tap(find.text('Start implementation'));
-      await tester.pumpAndSettle();
-      expect(posts.single, endsWith('/tasks/launch'));
-      expect(tester.takeException(), isNull);
-      await tester.pumpWidget(const SizedBox.shrink());
-      await connection.disconnect();
-      await BlocScope.reset();
+      await withDashboardConnection(tester, connection, () async {
+        connection.operator.value = {'role': 'admin'};
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: TasksPage(taskId: 'task')),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('Start implementation'), findsOneWidget);
+        expect(
+          find.text(
+            'Nora is ready. Starting this task archives the startup conversation and opens a dedicated task execution.',
+          ),
+          findsOneWidget,
+        );
+        expect(find.textContaining('Blocked by'), findsNothing);
+        await tester.tap(find.text('Start implementation'));
+        await tester.pumpAndSettle();
+        expect(posts.single, endsWith('/tasks/launch'));
+        expect(tester.takeException(), isNull);
+      });
     },
   );
   testWidgets(
@@ -566,30 +561,27 @@ void main() {
           );
         }),
       );
-      BlocScope.register<DashboardBloc>(() => connection);
-      connection.connect('token');
-      connection.operator.value = {'role': 'admin'};
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: Scaffold(body: TasksPage(taskId: 'task')),
-        ),
-      );
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Archive inspected session and start'));
-      await tester.pumpAndSettle();
-      expect(posts, isEmpty);
-      await tester.tap(find.text('Cancel'));
-      await tester.pumpAndSettle();
-      expect(posts, isEmpty);
-      await tester.tap(find.text('Archive inspected session and start'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('I inspected it; archive and start'));
-      await tester.pumpAndSettle();
-      expect(posts.single['inspected_general_session'], 'general');
-      expect(tester.takeException(), isNull);
-      await tester.pumpWidget(const SizedBox.shrink());
-      await connection.disconnect();
-      await BlocScope.reset();
+      await withDashboardConnection(tester, connection, () async {
+        connection.operator.value = {'role': 'admin'};
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: TasksPage(taskId: 'task')),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Archive inspected session and start'));
+        await tester.pumpAndSettle();
+        expect(posts, isEmpty);
+        await tester.tap(find.text('Cancel'));
+        await tester.pumpAndSettle();
+        expect(posts, isEmpty);
+        await tester.tap(find.text('Archive inspected session and start'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('I inspected it; archive and start'));
+        await tester.pumpAndSettle();
+        expect(posts.single['inspected_general_session'], 'general');
+        expect(tester.takeException(), isNull);
+      });
     },
   );
   testWidgets('a busy agent offers a precise blocker and the queue action', (
@@ -627,25 +619,22 @@ void main() {
         );
       }),
     );
-    BlocScope.register<DashboardBloc>(() => connection);
-    connection.connect('token');
-    connection.operator.value = {'role': 'admin'};
-    await tester.pumpWidget(
-      const MaterialApp(
-        home: Scaffold(body: TasksPage(taskId: 'task')),
-      ),
-    );
-    await tester.pumpAndSettle();
-    expect(find.text('Blocked by: Open work'), findsOneWidget);
-    expect(find.text('Start implementation'), findsNothing);
-    await tester.tap(find.text('Queue for this agent'));
-    await tester.pumpAndSettle();
-    expect(posts.single['mode'], 'queue');
-    expect(posts.single['task_id'], 'task');
-    expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox.shrink());
-    await connection.disconnect();
-    await BlocScope.reset();
+    await withDashboardConnection(tester, connection, () async {
+      connection.operator.value = {'role': 'admin'};
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(body: TasksPage(taskId: 'task')),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Blocked by: Open work'), findsOneWidget);
+      expect(find.text('Start implementation'), findsNothing);
+      await tester.tap(find.text('Queue for this agent'));
+      await tester.pumpAndSettle();
+      expect(posts.single['mode'], 'queue');
+      expect(posts.single['task_id'], 'task');
+      expect(tester.takeException(), isNull);
+    });
   });
   testWidgets('a verified finished blocker offers hand off and start', (
     tester,
@@ -680,98 +669,93 @@ void main() {
         );
       }),
     );
-    BlocScope.register<DashboardBloc>(() => connection);
-    connection.connect('token');
-    connection.operator.value = {'role': 'admin'};
-    await tester.pumpWidget(
-      const MaterialApp(
-        home: Scaffold(body: TasksPage(taskId: 'task')),
-      ),
-    );
-    await tester.pumpAndSettle();
-    expect(find.text('Verify handoff and start'), findsOneWidget);
-    expect(find.text('Inspect previous task'), findsOneWidget);
-    expect(find.text('Launch task agent'), findsNothing);
-    expect(find.text('Queue instead'), findsOneWidget);
-    await tester.tap(find.text('Verify handoff and start'));
-    await tester.pumpAndSettle();
-    expect(posts.single, endsWith('/tasks/launch'));
-    expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox.shrink());
-    await connection.disconnect();
-    await BlocScope.reset();
+    await withDashboardConnection(tester, connection, () async {
+      connection.operator.value = {'role': 'admin'};
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(body: TasksPage(taskId: 'task')),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Verify handoff and start'), findsOneWidget);
+      expect(find.text('Inspect previous task'), findsOneWidget);
+      expect(find.text('Launch task agent'), findsNothing);
+      expect(find.text('Queue instead'), findsOneWidget);
+      await tester.tap(find.text('Verify handoff and start'));
+      await tester.pumpAndSettle();
+      expect(posts.single, endsWith('/tasks/launch'));
+      expect(tester.takeException(), isNull);
+    });
   });
-  testWidgets('task automation links to organization settings instead of editing shared policy', (
-    tester,
-  ) async {
-    tester.view.physicalSize = const Size(500, 1400);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
-    final task = <String, dynamic>{
-      'id': 'task',
-      'title': 'Next task',
-      'state': 'draft',
-      'repository': 'repo',
-      'organization_id': 'org',
-      'source': {
-        'task_id': 'parent',
-        'auto_queued': {'at': 'today'},
-      },
-    };
-    final posts = <Map<String, dynamic>>[];
-    final connection = DashboardBloc(
-      client: MockClient((request) async {
-        if (request.method == 'POST') {
-          posts.add(Map<String, dynamic>.from(jsonDecode(request.body)));
-        }
-        return http.Response(
-          jsonEncode(
-            request.url.path.endsWith('/tasks')
-                ? {
-                    'tasks': [task],
-                    'github': {},
-                    'automation': {
-                      'org': {
-                        'auto_queue_proposals': true,
-                        'paused': false,
-                        'max_per_meeting': 1,
-                        'max_open_per_agent': 2,
-                        'max_follow_up_depth': 1,
-                        'daily_cap': 5,
+  testWidgets(
+    'task automation links to organization settings instead of editing shared policy',
+    (tester) async {
+      tester.view.physicalSize = const Size(500, 1400);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final task = <String, dynamic>{
+        'id': 'task',
+        'title': 'Next task',
+        'state': 'draft',
+        'repository': 'repo',
+        'organization_id': 'org',
+        'source': {
+          'task_id': 'parent',
+          'auto_queued': {'at': 'today'},
+        },
+      };
+      final posts = <Map<String, dynamic>>[];
+      final connection = DashboardBloc(
+        client: MockClient((request) async {
+          if (request.method == 'POST') {
+            posts.add(Map<String, dynamic>.from(jsonDecode(request.body)));
+          }
+          return http.Response(
+            jsonEncode(
+              request.url.path.endsWith('/tasks')
+                  ? {
+                      'tasks': [task],
+                      'github': {},
+                      'automation': {
+                        'org': {
+                          'auto_queue_proposals': true,
+                          'paused': false,
+                          'max_per_meeting': 1,
+                          'max_open_per_agent': 2,
+                          'max_follow_up_depth': 1,
+                          'daily_cap': 5,
+                        },
                       },
-                    },
-                  }
-                : task,
+                    }
+                  : task,
+            ),
+            200,
+          );
+        }),
+      );
+      await withDashboardConnection(tester, connection, () async {
+        connection.operator.value = {'role': 'admin'};
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(body: TasksPage(taskId: 'task')),
           ),
-          200,
         );
-      }),
-    );
-    BlocScope.register<DashboardBloc>(() => connection);
-    connection.connect('token');
-    connection.operator.value = {'role': 'admin'};
-    await tester.pumpWidget(
-      const MaterialApp(
-        home: Scaffold(body: TasksPage(taskId: 'task')),
-      ),
-    );
-    await tester.pumpAndSettle();
-    expect(
-      find.text('Auto-queued from group review of task parent.'),
-      findsOneWidget,
-    );
-    await tester.ensureVisible(find.text('Automation settings'));
-    await tester.tap(find.text('Automation settings'));
-    await tester.pumpAndSettle();
-    expect(find.text('Organization settings'), findsOneWidget);
-    expect(find.text('Edit policy'), findsNothing);
-    expect(posts, isEmpty);
-    expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox.shrink());
-    await connection.disconnect();
-    await BlocScope.reset();
-  });
+        await tester.pumpAndSettle();
+        expect(
+          find.text('Auto-queued from group review of task parent.'),
+          findsOneWidget,
+        );
+        await tester.ensureVisible(find.text('Automation settings'));
+        await tester.tap(find.text('Automation settings'));
+        await tester.pumpAndSettle();
+        expect(find.text('Organization settings'), findsOneWidget);
+        expect(find.text('Edit policy'), findsNothing);
+        expect(posts, isEmpty);
+        expect(tester.takeException(), isNull);
+      });
+    },
+  );
   testWidgets('a free agent offers a parallel template instance', (
     tester,
   ) async {
@@ -801,22 +785,21 @@ void main() {
         );
       }),
     );
-    BlocScope.register<DashboardBloc>(() => connection);
-    connection.connect('token');
-    connection.operator.value = {'role': 'admin'};
-    await tester.pumpWidget(
-      const MaterialApp(home: Scaffold(body: TasksPage(taskId: 'task'))),
-    );
-    await tester.pumpAndSettle();
-    await tester.ensureVisible(find.textContaining('Instance of'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.textContaining('Instance of'));
-    await tester.pumpAndSettle();
-    expect(posts.single['as_instance'], true);
-    expect(posts.single['task_id'], 'task');
-    expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox.shrink());
-    await connection.disconnect();
-    await BlocScope.reset();
+    await withDashboardConnection(tester, connection, () async {
+      connection.operator.value = {'role': 'admin'};
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(body: TasksPage(taskId: 'task')),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.textContaining('Instance of'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.textContaining('Instance of'));
+      await tester.pumpAndSettle();
+      expect(posts.single['as_instance'], true);
+      expect(posts.single['task_id'], 'task');
+      expect(tester.takeException(), isNull);
+    });
   });
 }

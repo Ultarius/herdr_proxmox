@@ -41,10 +41,16 @@ void main() {
   late ClientAppBinding binding;
   late List<Map<String, dynamic>> connections, jobs, requests, bindings;
   Completer<http.Response>? pendingProbe;
+  Completer<http.Response>? pendingRemoval;
   String? saveError;
+  String? removalError;
+  final deletedFolders = <String>[];
   setUp(() async {
     pendingProbe = null;
+    pendingRemoval = null;
     saveError = null;
+    removalError = null;
+    deletedFolders.clear();
     connections = [];
     bindings = [];
     jobs = [];
@@ -106,6 +112,25 @@ void main() {
           } else {
             response = {'connections': connections, 'bindings': bindings};
           }
+        } else if (path == '/api/projects/jobs/remove') {
+          final body = Map<String, dynamic>.from(jsonDecode(request.body));
+          requests.add({'action': 'remove_clone', ...body});
+          if (pendingRemoval != null) {
+            final outcome = await pendingRemoval!.future;
+            if (outcome.statusCode == 200)
+              jobs.removeWhere((job) => job['id'] == body['id']);
+            return outcome;
+          }
+          if (removalError != null)
+            return http.Response(jsonEncode({'error': removalError}), 400);
+          jobs.removeWhere((job) => job['id'] == body['id']);
+          response = {
+            'removed': true,
+            'folder_deleted': body['delete_folder'] == true,
+            'message': body['delete_folder'] == true
+                ? 'Clone folder and history entry deleted.'
+                : 'Clone history entry removed. Existing files were preserved.',
+          };
         } else if (path == '/api/projects/jobs') {
           response = {'jobs': jobs};
         } else if (path == '/api/projects/clone') {
@@ -137,7 +162,7 @@ void main() {
     );
     binding = ClientAppBinding();
     binding.attachRootComponent(
-      CloneProjectCard(onCloned: (_) {}),
+      CloneProjectCard(onCloned: (_) {}, onDeleted: deletedFolders.add),
       attachTo: '#repository-test',
     );
     await settle();
@@ -145,11 +170,193 @@ void main() {
   tearDown(() async {
     if (pendingProbe != null && !pendingProbe!.isCompleted)
       pendingProbe!.complete(http.Response('{}', 503));
+    if (pendingRemoval != null && !pendingRemoval!.isCompleted)
+      pendingRemoval!.complete(http.Response('{}', 503));
     binding.detachRootComponent();
     web.document.getElementById('repository-test')!.remove();
     await connection.disconnect();
     BlocScope.endAll();
   });
+
+  Future<void> until(bool Function() ready) async {
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (!ready()) {
+      if (DateTime.now().isAfter(deadline))
+        fail(
+          'Clone removal did not settle: ${nodes('.clone-project').firstOrNull?.textContent}',
+        );
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+  }
+
+  Future<void> mountJobs(String state, {bool legacy = false}) async {
+    binding.detachRootComponent();
+    jobs = [
+      {
+        'id': 'a' * 32,
+        'folder': 'old-repo',
+        'cwd': '/projects/old-repo',
+        'state': state,
+        if (!legacy) 'destination_identity': [1, 2],
+      },
+    ];
+    binding.attachRootComponent(
+      CloneProjectCard(onCloned: (_) {}, onDeleted: deletedFolders.add),
+      attachTo: '#repository-test',
+    );
+    await until(() => nodes('.clone-job').length == 1);
+  }
+
+  test(
+    'clone history removal defaults to preserving files and can be cancelled',
+    () async {
+      await mountJobs('failed');
+      await click('Remove clone');
+      expect(
+        nodes('.clone-removal').single.textContent,
+        contains(
+          'remote repository and saved GitHub credentials are not deleted or revoked',
+        ),
+      );
+      expect(
+        nodes(
+          '.clone-removal__confirm',
+        ).single.classList.contains('btn--danger'),
+        isFalse,
+      );
+      expect(
+        requests.where((request) => request['action'] == 'remove_clone'),
+        isEmpty,
+      );
+      expect(
+        (nodes('.clone-removal input[type=checkbox]').single
+                as web.HTMLInputElement)
+            .checked,
+        isFalse,
+      );
+      await click('Cancel removal');
+      await until(() => nodes('.clone-removal').isEmpty);
+      expect(web.document.activeElement, nodes('.clone-remove').single);
+      await click('Remove clone');
+      await click('Remove history entry');
+      await until(() => nodes('.clone-job').isEmpty);
+      expect(requests.last, {
+        'action': 'remove_clone',
+        'id': 'a' * 32,
+        'delete_folder': false,
+      });
+      expect(
+        nodes('.clone-project').single.textContent,
+        contains('files were preserved'),
+      );
+    },
+  );
+
+  test(
+    'deleting a clone folder requires opting in and typing its exact name',
+    () async {
+      await mountJobs('completed');
+      await click('Remove clone');
+      final checkbox =
+          nodes('.clone-removal input[type=checkbox]').single
+              as web.HTMLInputElement;
+      checkbox.click();
+      await until(() => nodes('.clone-removal input[type=text]').isNotEmpty);
+      final confirm = nodes(
+        'button',
+      ).firstWhere((item) => item.textContent == 'Delete folder and history');
+      expect(confirm.hasAttribute('disabled'), isTrue);
+      expect(confirm.classList.contains('btn--danger'), isTrue);
+      await field('Type old-repo to confirm deletion', 'wrong');
+      expect(confirm.hasAttribute('disabled'), isTrue);
+      await field('Type old-repo to confirm deletion', 'old-repo');
+      await until(() => !confirm.hasAttribute('disabled'));
+      await click('Delete folder and history');
+      await until(() => nodes('.clone-job').isEmpty);
+      expect(requests.last, {
+        'action': 'remove_clone',
+        'id': 'a' * 32,
+        'delete_folder': true,
+        'confirm_folder': 'old-repo',
+      });
+      expect(deletedFolders, ['/projects/old-repo']);
+    },
+  );
+
+  test(
+    'running clones cannot be removed and non-admins have no removal controls',
+    () async {
+      await mountJobs('running');
+      expect(nodes('.clone-remove').single.hasAttribute('disabled'), isTrue);
+      connection.operator.value = {'role': 'operator'};
+      await until(() => nodes('.clone-remove').isEmpty);
+      expect(nodes('.clone-job'), hasLength(1));
+    },
+  );
+
+  test(
+    'legacy clone entries allow history-only removal and focus its safe action',
+    () async {
+      await mountJobs('completed', legacy: true);
+      await click('Remove clone');
+      final checkbox =
+          nodes('.clone-removal input[type=checkbox]').single
+              as web.HTMLInputElement;
+      expect(checkbox.disabled, isTrue);
+      expect(
+        nodes('.clone-removal').single.textContent,
+        contains('no verified original folder identity'),
+      );
+      expect(
+        web.document.activeElement,
+        nodes('.clone-removal__confirm').single,
+      );
+      await click('Remove history entry');
+      await until(() => nodes('.clone-job').isEmpty);
+      expect(requests.last['delete_folder'], isFalse);
+      expect(deletedFolders, isEmpty);
+    },
+  );
+
+  test(
+    'removal failure retains the entry and pending deletion prevents duplicate requests',
+    () async {
+      await mountJobs('interrupted');
+      removalError = 'This project is in use.';
+      await click('Remove clone');
+      await click('Remove history entry');
+      await until(
+        () => nodes(
+          '.clone-project',
+        ).single.textContent!.contains('This project is in use.'),
+      );
+      expect(nodes('.clone-job'), hasLength(1));
+      removalError = null;
+      pendingRemoval = Completer<http.Response>();
+      await click('Remove history entry');
+      expect(
+        nodes('button')
+            .where((button) => button.textContent == 'Removing…')
+            .single
+            .hasAttribute('disabled'),
+        isTrue,
+      );
+      final before = requests
+          .where((request) => request['action'] == 'remove_clone')
+          .length;
+      nodes(
+        'button',
+      ).firstWhere((item) => item.textContent == 'Removing…').click();
+      expect(
+        requests.where((request) => request['action'] == 'remove_clone'),
+        hasLength(before),
+      );
+      pendingRemoval!.complete(
+        http.Response('{"removed":true,"message":"Removed."}', 200),
+      );
+      await until(() => nodes('.clone-job').isEmpty);
+    },
+  );
 
   test(
     'SSH connection creation, verification, selection and clone retry use the explicit identity',

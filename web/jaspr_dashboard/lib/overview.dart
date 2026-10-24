@@ -8,6 +8,7 @@ import 'navigation.dart';
 import 'repository_connections.dart';
 import 'storage_panel.dart';
 import 'package:herdr_dashboard_state/repository_connections.dart';
+import 'package:herdr_dashboard_state/clone_jobs.dart';
 
 String agentName(Map<String, dynamic> agent) =>
     '${agent['display_name'] ?? agent['name'] ?? agent['agent'] ?? agent['pane_id'] ?? 'Agent'}';
@@ -800,7 +801,12 @@ class _OverviewPageState extends State<OverviewPage> {
               },
             ),
           ], classes: 'overview-disclosure__section'),
-          CloneProjectCard(onCloned: (path) => setState(() => cwd = path)),
+          CloneProjectCard(
+            onCloned: (path) => setState(() => cwd = path),
+            onDeleted: (path) {
+              if (cwd == path) setState(() => cwd = '');
+            },
+          ),
         ],
         classes: 'overview-disclosure__body overview-disclosure__body--split',
       ),
@@ -1273,8 +1279,9 @@ class _SystemHealthState extends State<SystemHealth> {
 }
 
 class CloneProjectCard extends StatefulComponent {
-  const CloneProjectCard({required this.onCloned, super.key});
+  const CloneProjectCard({required this.onCloned, this.onDeleted, super.key});
   final void Function(String) onCloned;
+  final void Function(String)? onDeleted;
   @override
   State<CloneProjectCard> createState() => _CloneProjectCardState();
 }
@@ -1291,21 +1298,67 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
   String? completed;
   bool polling = false;
   String? result;
+  String? pendingRemoval, removing;
+  bool deleteCloneFolder = false;
+  String removalConfirmation = '';
+  int jobsRevision = 0;
+  bool jobsLoaded = false;
+  int? removalGeneration;
+  late final DashboardBloc cloneConnection;
+  StreamSubscription? cloneSubscription;
+  late int cloneGeneration;
+  late bool cloneCanRemove;
   @override
   void initState() {
     super.initState();
+    cloneConnection = dashboardConnection;
+    cloneGeneration = cloneConnection.generation;
+    cloneCanRemove = canRemove;
+    cloneConnection.operator.addListener(cloneSessionChanged);
+    cloneSubscription = cloneConnection.stream.listen(
+      (_) => cloneSessionChanged(),
+    );
     refreshJobs();
     timer = Timer.periodic(const Duration(seconds: 3), (_) => refreshJobs());
   }
 
+  void cloneSessionChanged() {
+    if (!mounted) return;
+    if (cloneGeneration == cloneConnection.generation &&
+        cloneCanRemove == canRemove)
+      return;
+    setState(() {
+      cloneCanRemove = canRemove;
+      if (cloneGeneration != cloneConnection.generation) {
+        cloneGeneration = cloneConnection.generation;
+        jobsRevision++;
+        jobs = [];
+        jobsLoaded = false;
+        completed = null;
+        busy = false;
+        removing = null;
+        result = null;
+      }
+      if (!canRemove || removalGeneration != cloneGeneration)
+        pendingRemoval = null;
+    });
+  }
+
   Future<void> refreshJobs() async {
     final connection = dashboardConnection;
-    if (polling || !connection.state.connected) return;
+    if (polling || removing != null || !connection.state.connected) return;
     polling = true;
     final epoch = connection.generation;
+    final revision = jobsRevision;
     try {
       final data = await connection.request('projects/jobs');
-      if (!mounted || epoch != connection.generation) return;
+      if (!mounted ||
+          epoch != connection.generation ||
+          revision != jobsRevision)
+        return;
+      final firstLoad = !jobsLoaded;
+      final previousStates = {for (final job in jobs) job['id']: job['state']};
+      jobsLoaded = true;
       final next = List<Map<String, dynamic>>.from(data['jobs'] ?? []);
       if (jsonEncode(next) != jsonEncode(jobs)) setState(() => jobs = next);
       final latest = jobs.firstOrNull;
@@ -1314,12 +1367,15 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
           result?.startsWith('Clone queued.') == true) {
         setState(() => result = null);
       }
-      if (latest?['state'] == 'completed' && latest?['id'] != completed) {
+      if (latest?['state'] == 'completed' &&
+          latest?['id'] != completed &&
+          (firstLoad ||
+              ['queued', 'running'].contains(previousStates[latest?['id']]))) {
         completed = latest!['id'] as String;
         component.onCloned(latest['cwd'] as String);
       }
     } catch (exception) {
-      if (mounted && epoch == connection.generation)
+      if (mounted && epoch == connection.generation && revision == jobsRevision)
         setState(
           () => result =
               'Clone status unavailable; the server job may still be running. $exception',
@@ -1366,9 +1422,84 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
     }
   }
 
+  bool get canRemove =>
+      dashboardConnection.state.connected &&
+      dashboardConnection.operator.value['role'] == 'admin';
+
+  void prepareRemoval(Map<String, dynamic> job) {
+    if (busy || !canRemove) return;
+    setState(() {
+      pendingRemoval = '${job['id']}';
+      removalGeneration = dashboardConnection.generation;
+      deleteCloneFolder = false;
+      removalConfirmation = '';
+    });
+    context.binding.addPostFrameCallback(() {
+      if (!mounted) return;
+      (web.document.querySelector(
+                '#clone-removal-$pendingRemoval input:not(:disabled), #clone-removal-$pendingRemoval .clone-removal__confirm',
+              )
+              as web.HTMLElement?)
+          ?.focus();
+    });
+  }
+
+  Future<void> removeClone(Map<String, dynamic> job) async {
+    if (busy ||
+        !canRemove ||
+        removalGeneration != dashboardConnection.generation ||
+        pendingRemoval != job['id'] ||
+        (deleteCloneFolder && !cloneFolderIdentityAvailable(job)) ||
+        (deleteCloneFolder && removalConfirmation != job['folder']))
+      return;
+    final connection = dashboardConnection;
+    final epoch = connection.generation;
+    final id = '${job['id']}';
+    jobsRevision++;
+    setState(() {
+      busy = true;
+      removing = id;
+      result = null;
+    });
+    try {
+      final data = await connection.request('projects/jobs/remove', {
+        'id': id,
+        'delete_folder': deleteCloneFolder,
+        if (deleteCloneFolder) 'confirm_folder': removalConfirmation,
+      });
+      if (!mounted || epoch != connection.generation || !canRemove) return;
+      setState(() {
+        jobs.removeWhere((item) => item['id'] == id);
+        pendingRemoval = null;
+        result = '${data['message']}';
+      });
+      if (data['folder_deleted'] == true)
+        component.onDeleted?.call('${job['cwd']}');
+      context.binding.addPostFrameCallback(() {
+        if (!mounted) return;
+        (web.document.querySelector(
+                  '.clone-project .clone-remove:not(:disabled), .clone-project button[type=submit]',
+                )
+                as web.HTMLElement?)
+            ?.focus();
+      });
+    } catch (error) {
+      if (mounted && epoch == connection.generation)
+        setState(() => result = '$error');
+    } finally {
+      if (mounted && epoch == connection.generation)
+        setState(() {
+          busy = false;
+          removing = null;
+        });
+    }
+  }
+
   @override
   void dispose() {
     timer?.cancel();
+    cloneConnection.operator.removeListener(cloneSessionChanged);
+    cloneSubscription?.cancel();
     super.dispose();
   }
 
@@ -1496,6 +1627,110 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
                   () => component.onCloned(job['cwd'] as String),
                   small: true,
                 ),
+              if (canRemove) ...[
+                dom.button(
+                  [icon('trash-2'), text('Remove clone')],
+                  type: dom.ButtonType.button,
+                  classes: 'btn btn--ghost btn--sm clone-remove',
+                  disabled:
+                      busy ||
+                      ![
+                        'completed',
+                        'failed',
+                        'interrupted',
+                      ].contains(job['state']),
+                  attributes: {
+                    'id': 'clone-remove-${job['id']}',
+                    'aria-label': 'Remove clone ${job['folder']}',
+                    'aria-expanded':
+                        '${pendingRemoval == job['id'] && removalGeneration == dashboardConnection.generation}',
+                    if (pendingRemoval == job['id'] &&
+                        removalGeneration == dashboardConnection.generation)
+                      'aria-controls': 'clone-removal-${job['id']}',
+                  },
+                  onClick: () => prepareRemoval(job),
+                ),
+                if (pendingRemoval == job['id'] &&
+                    removalGeneration == dashboardConnection.generation)
+                  el(
+                    'div',
+                    [
+                      el('p', [
+                        text(
+                          'Remove ${job['folder']} from clone history? Your files are kept unless you choose deletion below.',
+                        ),
+                      ]),
+                      el('p', [text(cloneRemovalPreservationNotice)]),
+                      if (!cloneFolderIdentityAvailable(job))
+                        el('p', [text(legacyCloneRemovalNotice)]),
+                      el('label', [
+                        dom.input<bool>(
+                          type: dom.InputType.checkbox,
+                          checked: deleteCloneFolder,
+                          disabled: busy || !cloneFolderIdentityAvailable(job),
+                          onChange: (value) =>
+                              setState(() => deleteCloneFolder = value),
+                        ),
+                        text('Also permanently delete the cloned folder'),
+                      ], classes: 'clone-removal__option'),
+                      if (deleteCloneFolder) ...[
+                        el('p', [
+                          text(
+                            'This deletes ${job['cwd']} and all files inside, including local changes. This cannot be undone.',
+                          ),
+                        ]),
+                        field(
+                          'Type ${job['folder']} to confirm deletion',
+                          removalConfirmation,
+                          (value) =>
+                              setState(() => removalConfirmation = value),
+                          disabled: busy,
+                          autocomplete: 'off',
+                          spellcheck: false,
+                        ),
+                      ],
+                      el('div', [
+                        button(
+                          'Cancel removal',
+                          () {
+                            setState(() => pendingRemoval = null);
+                            context.binding.addPostFrameCallback(() {
+                              if (mounted)
+                                (web.document.getElementById(
+                                          'clone-remove-${job['id']}',
+                                        )
+                                        as web.HTMLElement?)
+                                    ?.focus();
+                            });
+                          },
+                          disabled: busy,
+                          small: true,
+                        ),
+                        button(
+                          removing == job['id']
+                              ? 'Removing…'
+                              : deleteCloneFolder
+                              ? 'Delete folder and history'
+                              : 'Remove history entry',
+                          () => removeClone(job),
+                          disabled:
+                              busy ||
+                              (deleteCloneFolder &&
+                                  removalConfirmation != job['folder']),
+                          variant: deleteCloneFolder ? 'danger' : 'primary',
+                          small: true,
+                          classes: 'clone-removal__confirm',
+                        ),
+                      ], classes: 'actions'),
+                    ],
+                    classes: 'clone-removal',
+                    attributes: {
+                      'id': 'clone-removal-${job['id']}',
+                      'role': 'group',
+                      'aria-label': 'Remove clone ${job['folder']}',
+                    },
+                  ),
+              ],
             ], classes: 'job-row clone-job'),
         ],
         classes: 'clone-jobs',

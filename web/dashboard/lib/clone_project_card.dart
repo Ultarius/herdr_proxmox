@@ -3,10 +3,12 @@ import 'dart:convert';
 import 'dashboard_bloc.dart';
 import 'repository_connections.dart';
 import 'package:herdr_dashboard_state/repository_connections.dart';
+import 'package:herdr_dashboard_state/clone_jobs.dart';
 
 class CloneProjectCard extends StatefulWidget {
-  const CloneProjectCard({super.key, required this.onCloned});
+  const CloneProjectCard({super.key, required this.onCloned, this.onDeleted});
   final ValueChanged<String> onCloned;
+  final ValueChanged<String>? onDeleted;
   @override
   State<CloneProjectCard> createState() => _CloneProjectCardState();
 }
@@ -22,22 +24,76 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
   List<Map<String, dynamic>> jobs = [];
   String? completed;
   bool polling = false;
+  String? pendingRemoval, removing;
+  bool deleteCloneFolder = false, jobsLoaded = false;
+  String removalConfirmation = '';
+  int jobsRevision = 0;
+  int? removalGeneration;
+  late final DashboardBloc cloneConnection;
+  StreamSubscription? cloneSubscription;
+  late int cloneGeneration;
+  late bool cloneCanRemove;
+  final removalTriggers = <String, FocusNode>{};
+  final deletionOptionFocus = FocusNode();
+  final removalActionFocus = FocusNode();
+
+  bool get canRemove {
+    final connection = BlocScope.get<DashboardBloc>();
+    return connection.state.connected &&
+        connection.operator.value['role'] == 'admin';
+  }
 
   @override
   void initState() {
     super.initState();
+    cloneConnection = BlocScope.get<DashboardBloc>();
+    cloneGeneration = cloneConnection.generation;
+    cloneCanRemove = canRemove;
+    cloneConnection.operator.addListener(cloneSessionChanged);
+    cloneSubscription = cloneConnection.stream.listen(
+      (_) => cloneSessionChanged(),
+    );
     refreshJobs();
     timer = Timer.periodic(const Duration(seconds: 3), (_) => refreshJobs());
   }
 
+  void cloneSessionChanged() {
+    if (!mounted) return;
+    if (cloneGeneration == cloneConnection.generation &&
+        cloneCanRemove == canRemove)
+      return;
+    setState(() {
+      cloneCanRemove = canRemove;
+      if (cloneGeneration != cloneConnection.generation) {
+        cloneGeneration = cloneConnection.generation;
+        jobsRevision++;
+        jobs = [];
+        jobsLoaded = false;
+        completed = null;
+        busy = false;
+        removing = null;
+        result = null;
+      }
+      if (!canRemove || removalGeneration != cloneGeneration)
+        pendingRemoval = null;
+    });
+  }
+
   Future<void> refreshJobs() async {
     final connection = BlocScope.get<DashboardBloc>();
-    if (polling || !connection.state.connected) return;
+    if (polling || removing != null || !connection.state.connected) return;
     polling = true;
     final epoch = connection.generation;
+    final revision = jobsRevision;
     try {
       final data = await connection.request('projects/jobs');
-      if (!mounted || epoch != connection.generation) return;
+      if (!mounted ||
+          epoch != connection.generation ||
+          revision != jobsRevision)
+        return;
+      final firstLoad = !jobsLoaded;
+      final previousStates = {for (final job in jobs) job['id']: job['state']};
+      jobsLoaded = true;
       final next = List<Map<String, dynamic>>.from(data['jobs'] ?? []);
       if (jsonEncode(next) != jsonEncode(jobs)) setState(() => jobs = next);
       final latest = jobs.firstOrNull;
@@ -46,12 +102,15 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
           result?.startsWith('Clone queued.') == true) {
         setState(() => result = null);
       }
-      if (latest?['state'] == 'completed' && latest?['id'] != completed) {
+      if (latest?['state'] == 'completed' &&
+          latest?['id'] != completed &&
+          (firstLoad ||
+              ['queued', 'running'].contains(previousStates[latest?['id']]))) {
         completed = latest!['id'] as String;
         widget.onCloned(latest['cwd'] as String);
       }
     } catch (exception) {
-      if (mounted && epoch == connection.generation)
+      if (mounted && epoch == connection.generation && revision == jobsRevision)
         setState(
           () => result =
               'Clone status unavailable; the server job may still be running. $exception',
@@ -63,11 +122,213 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
 
   String? result;
 
+  Future<void> removeClone(Map<String, dynamic> job) async {
+    final connection = BlocScope.get<DashboardBloc>();
+    if (busy ||
+        !canRemove ||
+        pendingRemoval != job['id'] ||
+        removalGeneration != connection.generation ||
+        (deleteCloneFolder && !cloneFolderIdentityAvailable(job)) ||
+        (deleteCloneFolder && removalConfirmation != job['folder']))
+      return;
+    final epoch = connection.generation;
+    final id = '${job['id']}';
+    jobsRevision++;
+    setState(() {
+      busy = true;
+      removing = id;
+      result = null;
+    });
+    try {
+      final data = await connection.request('projects/jobs/remove', {
+        'id': id,
+        'delete_folder': deleteCloneFolder,
+        if (deleteCloneFolder) 'confirm_folder': removalConfirmation,
+      });
+      if (!mounted || epoch != connection.generation || !canRemove) return;
+      setState(() {
+        jobs.removeWhere((item) => item['id'] == id);
+        pendingRemoval = null;
+        result = '${data['message']}';
+      });
+      if (data['folder_deleted'] == true)
+        widget.onDeleted?.call('${job['cwd']}');
+    } catch (error) {
+      if (mounted && epoch == connection.generation)
+        setState(() => result = '$error');
+    } finally {
+      if (mounted && epoch == connection.generation)
+        setState(() {
+          busy = false;
+          removing = null;
+        });
+    }
+  }
+
+  Widget removalControls(Map<String, dynamic> job) => Padding(
+    padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        MergeSemantics(
+          child: Semantics(
+            expanded: pendingRemoval == job['id'],
+            controlsNodes: pendingRemoval == job['id']
+                ? {'clone-removal-${job['id']}'}
+                : const {},
+            child: TextButton.icon(
+              focusNode: removalTriggers.putIfAbsent(
+                '${job['id']}',
+                () => FocusNode(),
+              ),
+              onPressed:
+                  busy ||
+                      ![
+                        'completed',
+                        'failed',
+                        'interrupted',
+                      ].contains(job['state'])
+                  ? null
+                  : () {
+                      setState(() {
+                        pendingRemoval = '${job['id']}';
+                        removalGeneration =
+                            BlocScope.get<DashboardBloc>().generation;
+                        deleteCloneFolder = false;
+                        removalConfirmation = '';
+                      });
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        if (mounted)
+                          (cloneFolderIdentityAvailable(job)
+                                  ? deletionOptionFocus
+                                  : removalActionFocus)
+                              .requestFocus();
+                      });
+                    },
+              icon: const Icon(Icons.delete_outline),
+              label: Text(
+                'Remove clone',
+                semanticsLabel: 'Remove clone ${job['folder']}',
+              ),
+            ),
+          ),
+        ),
+        if (pendingRemoval == job['id'] &&
+            removalGeneration == BlocScope.get<DashboardBloc>().generation)
+          Semantics(
+            identifier: 'clone-removal-${job['id']}',
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                border: Border.all(
+                  color: Theme.of(context).colorScheme.outlineVariant,
+                ),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Remove ${job['folder']} from clone history? Files are kept unless you choose deletion below.',
+                  ),
+                  const Text(cloneRemovalPreservationNotice),
+                  if (!cloneFolderIdentityAvailable(job))
+                    const Text(legacyCloneRemovalNotice),
+                  CheckboxListTile(
+                    focusNode: deletionOptionFocus,
+                    contentPadding: EdgeInsets.zero,
+                    controlAffinity: ListTileControlAffinity.leading,
+                    title: const Text(
+                      'Also permanently delete the cloned folder',
+                    ),
+                    value: deleteCloneFolder,
+                    onChanged: busy || !cloneFolderIdentityAvailable(job)
+                        ? null
+                        : (value) => setState(
+                            () => deleteCloneFolder = value ?? false,
+                          ),
+                  ),
+                  if (deleteCloneFolder) ...[
+                    Text(
+                      'This deletes ${job['cwd']} and all files inside, including local changes. This cannot be undone.',
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      key: ValueKey('clone-removal-${job['id']}'),
+                      initialValue: removalConfirmation,
+                      enabled: !busy,
+                      autocorrect: false,
+                      decoration: InputDecoration(
+                        labelText: 'Type ${job['folder']} to confirm deletion',
+                        border: const OutlineInputBorder(),
+                      ),
+                      onChanged: (value) =>
+                          setState(() => removalConfirmation = value),
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      TextButton(
+                        onPressed: busy
+                            ? null
+                            : () {
+                                setState(() => pendingRemoval = null);
+                                removalTriggers['${job['id']}']?.requestFocus();
+                              },
+                        child: const Text('Cancel removal'),
+                      ),
+                      FilledButton(
+                        focusNode: removalActionFocus,
+                        onPressed:
+                            busy ||
+                                (deleteCloneFolder &&
+                                    removalConfirmation != job['folder'])
+                            ? null
+                            : () => removeClone(job),
+                        style: deleteCloneFolder
+                            ? FilledButton.styleFrom(
+                                backgroundColor: Theme.of(
+                                  context,
+                                ).colorScheme.error,
+                                foregroundColor: Theme.of(
+                                  context,
+                                ).colorScheme.onError,
+                              )
+                            : null,
+                        child: Text(
+                          removing == job['id']
+                              ? 'Removing…'
+                              : deleteCloneFolder
+                              ? 'Delete folder and history'
+                              : 'Remove history entry',
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
+    ),
+  );
+
   @override
   void dispose() {
     timer?.cancel();
+    cloneConnection.operator.removeListener(cloneSessionChanged);
+    cloneSubscription?.cancel();
     url.dispose();
     folder.dispose();
+    for (final node in removalTriggers.values) {
+      node.dispose();
+    }
+    deletionOptionFocus.dispose();
+    removalActionFocus.dispose();
     super.dispose();
   }
 
@@ -226,46 +487,57 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
               },
             ),
           for (final job in jobs)
-            ListTile(
-              leading: Icon(
-                job['state'] == 'completed'
-                    ? Icons.check_circle_outline
-                    : job['state'] == 'failed'
-                    ? Icons.error_outline
-                    : Icons.download_outlined,
-              ),
-              title: Text('${job['folder']} · ${job['state']}'),
-              subtitle: Text(
-                (job['error'] as String? ?? '').isNotEmpty
-                    ? job['error'] as String
-                    : job['cwd'] as String,
-              ),
-              trailing:
-                  ['failed', 'interrupted'].contains(job['state']) &&
-                      job['url'] != null
-                  ? TextButton(
-                      onPressed: () => setState(() {
-                        url.text = '${job['url']}';
-                        connectionId = '${job['connection_id'] ?? ''}';
-                        unavailableConnection =
-                            knownRepositoryConnection(connections, connectionId)
-                            ? null
-                            : connectionId;
-                        if (unavailableConnection != null) connectionId = '';
-                        final previous = '${job['folder']}';
-                        folder.text =
-                            '${previous.substring(0, previous.length.clamp(0, 70))}-retry';
-                        result =
-                            'The previous folder was preserved. Review the new folder name, then clone again.';
-                      }),
-                      child: const Text('Retry in a new folder'),
-                    )
-                  : job['state'] == 'completed'
-                  ? TextButton(
-                      onPressed: () => widget.onCloned(job['cwd'] as String),
-                      child: const Text('Use project'),
-                    )
-                  : null,
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                ListTile(
+                  leading: Icon(
+                    job['state'] == 'completed'
+                        ? Icons.check_circle_outline
+                        : job['state'] == 'failed'
+                        ? Icons.error_outline
+                        : Icons.download_outlined,
+                  ),
+                  title: Text('${job['folder']} · ${job['state']}'),
+                  subtitle: Text(
+                    (job['error'] as String? ?? '').isNotEmpty
+                        ? job['error'] as String
+                        : job['cwd'] as String,
+                  ),
+                  trailing:
+                      ['failed', 'interrupted'].contains(job['state']) &&
+                          job['url'] != null
+                      ? TextButton(
+                          onPressed: () => setState(() {
+                            url.text = '${job['url']}';
+                            connectionId = '${job['connection_id'] ?? ''}';
+                            unavailableConnection =
+                                knownRepositoryConnection(
+                                  connections,
+                                  connectionId,
+                                )
+                                ? null
+                                : connectionId;
+                            if (unavailableConnection != null)
+                              connectionId = '';
+                            final previous = '${job['folder']}';
+                            folder.text =
+                                '${previous.substring(0, previous.length.clamp(0, 70))}-retry';
+                            result =
+                                'The previous folder was preserved. Review the new folder name, then clone again.';
+                          }),
+                          child: const Text('Retry in a new folder'),
+                        )
+                      : job['state'] == 'completed'
+                      ? TextButton(
+                          onPressed: () =>
+                              widget.onCloned(job['cwd'] as String),
+                          child: const Text('Use project'),
+                        )
+                      : null,
+                ),
+                if (canRemove) removalControls(job),
+              ],
             ),
           if (result != null)
             Padding(

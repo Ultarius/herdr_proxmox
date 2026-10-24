@@ -214,7 +214,7 @@ class RepositoryConnections:
             if record['kind'] != 'token':
                 raise ValueError('Only a connection-specific GitHub token can be rotated here.')
             if self.active_credentials.get(identifier):
-                raise ValueError('This connection is in use. Wait for its Git operation to finish before rotating it.')
+                raise ValueError('This connection is in use. Wait for its current operation to finish before rotating it.')
             credential = self._token_file(record)
             data = self.load()
             updated = data['connections'][identifier]
@@ -237,6 +237,42 @@ class RepositoryConnections:
                 or (os.name != 'nt' and info.st_mode & 0o077)):
             raise ValueError('Repository token files must be regular files with mode 0600 in their managed directory.')
         return credential
+
+    def configure_publishing(self, body):
+        """Copy an explicitly selected PAT into independently validated publishing.
+
+        Only the identifier crosses the browser boundary. Pin the connection
+        during validation so removal/rotation cannot change the selected secret.
+        A repository-scoped connection may write only to its own destination;
+        fork publication may still name a separate, readable upstream.
+        """
+        if not isinstance(body, dict) or 'token' in body:
+            raise ValueError('Choose a saved repository token or enter a token, not both.')
+        if set(body) - {'connection_id', 'repositories', 'publication', 'pr_token', 'pr_login', 'clear_pr_credential'}:
+            raise ValueError('Invalid saved-token publishing configuration fields.')
+        repositories, publication = body.get('repositories'), body.get('publication') or {}
+        if (not isinstance(repositories, list) or not 1 <= len(repositories) <= 20
+                or any(not isinstance(name, str) or not REPOSITORY.fullmatch(name) for name in repositories)):
+            raise ValueError('Allowlist 1–20 repositories as owner/repository.')
+        if not isinstance(publication, dict):
+            raise ValueError('Invalid publication settings.')
+        with self._active_connection(body.get('connection_id')) as record:
+            if record['kind'] != 'token':
+                raise ValueError('Choose a saved personal access token connection. SSH keys cannot authorize the GitHub API.')
+            for repository in repositories:
+                entry = publication.get(repository, {'mode': 'direct'})
+                if not isinstance(entry, dict) or entry.get('mode') not in ('direct', 'fork'):
+                    raise ValueError('Choose direct or fork publication for each repository.')
+                destination = entry.get('publishing_repository') if entry['mode'] == 'fork' else repository
+                if not isinstance(destination, str) or destination.lower() != record['repository'].lower():
+                    raise ValueError(f'Allowlisted repository {repository} has branch destination {destination or "(missing)"}; '
+                                     f'the selected connection permits only {record["repository"]}. '
+                                     'Correct or remove this allowlist entry, select a matching connection, '
+                                     'or enter a token manually for multiple branch destinations.')
+            from github_api import GitHub
+            token = personal_token(GitHub(self._token_file(record)).configuration().get('token'))
+            configuration = {key: value for key, value in body.items() if key != 'connection_id'}
+            return self.github.configure(dict(configuration, token=token))
 
     def verify_host(self, identifier):
         record = self.get(identifier)
@@ -268,18 +304,23 @@ class RepositoryConnections:
         return self.get(identifier)
 
     @contextmanager
-    def credentials(self, identifier, url):
+    def _active_connection(self, identifier):
         with self.lock:
             record = self.get(identifier)
             self.active_credentials[identifier] = self.active_credentials.get(identifier, 0) + 1
         try:
-            with self._credentials(record, url) as environment:
-                yield environment
+            yield record
         finally:
             with self.lock:
                 self.active_credentials[identifier] -= 1
                 if not self.active_credentials[identifier]:
                     del self.active_credentials[identifier]
+
+    @contextmanager
+    def credentials(self, identifier, url):
+        with self._active_connection(identifier) as record:
+            with self._credentials(record, url) as environment:
+                yield environment
 
     @contextmanager
     def _credentials(self, record, url):
@@ -428,7 +469,7 @@ class RepositoryConnections:
             if identifier in data['bindings'].values():
                 raise ValueError('Unassign every project using this connection before removing it.')
             if self.active_credentials.get(identifier):
-                raise ValueError('This connection is in use. Wait for its Git operation to finish before removing it.')
+                raise ValueError('This connection is in use. Wait for its current operation to finish before removing it.')
             self._remove_key_directory(identifier)
             del data['connections'][identifier]
             self.save(data)

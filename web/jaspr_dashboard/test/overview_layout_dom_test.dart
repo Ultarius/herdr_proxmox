@@ -20,6 +20,8 @@ void main() {
   late DashboardBloc connection;
   late web.HTMLDivElement root;
   late List<Map<String, dynamic>> agents;
+  late List<Map<String, dynamic>> cloneJobs;
+  final assets = <web.Element>[];
 
   web.HTMLElement node(String selector) =>
       root.querySelector(selector)! as web.HTMLElement;
@@ -63,12 +65,14 @@ void main() {
         )).toJS,
       );
       web.document.head!.appendChild(link);
+      assets.add(link);
       await loaded.future.timeout(const Duration(seconds: 5));
     }
     binding = ClientAppBinding();
   });
 
   setUp(() {
+    cloneJobs = [];
     agents = [
       {'name': 'Review agent', 'agent_status': 'idle'},
     ];
@@ -83,6 +87,10 @@ void main() {
     await BlocScope.reset();
     root.textContent = '';
     web.window.history.replaceState(null, '', '#/');
+  });
+  tearDownAll(() {
+    for (final asset in assets) asset.remove();
+    root.remove();
   });
 
   Future<void> mount({String route = '/'}) async {
@@ -131,7 +139,7 @@ void main() {
             'groups': [],
           },
           '/api/projects/connections' => {'connections': [], 'bindings': []},
-          '/api/projects/jobs' => {'jobs': []},
+          '/api/projects/jobs' => {'jobs': cloneJobs},
           '/api/storage' => {'inventory': {}, 'policy': {}},
           '/api/integration' => {'alerts': []},
           _ => <String, dynamic>{},
@@ -146,6 +154,57 @@ void main() {
     );
     await settle();
   }
+
+  test(
+    'clone deletion confirmation fits a phone-width workspace with real styles',
+    () async {
+      cloneJobs = [
+        {
+          'id': 'a' * 32,
+          'folder': 'older-repository-with-a-long-project-name',
+          'cwd':
+              '/home/herdr/projects/older-repository-with-a-long-project-name',
+          'state': 'failed',
+          'destination_identity': [1, 2],
+        },
+      ];
+      await mount();
+      final main = node('.main-content');
+      root.style.width = '${390 + root.clientWidth - main.clientWidth}px';
+      await toggle('#overview-project-form');
+      node('.clone-remove').click();
+      final deadline = DateTime.now().add(const Duration(seconds: 5));
+      Future<void> until(bool Function() ready) async {
+        while (!ready()) {
+          if (DateTime.now().isAfter(deadline))
+            fail('Clone deletion controls did not render');
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+      }
+
+      await until(
+        () => root.querySelector('.clone-removal input[type=checkbox]') != null,
+      );
+      (node('.clone-removal input[type=checkbox]') as web.HTMLInputElement)
+          .click();
+      await until(
+        () => root.querySelector('.clone-removal input[type=text]') != null,
+      );
+      for (final selector in [
+        '.clone-removal',
+        '.clone-job',
+        '#overview-project-form',
+      ]) {
+        final element = node(selector);
+        expect(
+          element.scrollWidth,
+          lessThanOrEqualTo(element.clientWidth + 1),
+          reason: '$selector must wrap inside its available width',
+        );
+      }
+      expect(main.scrollWidth, lessThanOrEqualTo(main.clientWidth + 1));
+    },
+  );
 
   test(
     'wide overview fills available width and its columns stack independently',

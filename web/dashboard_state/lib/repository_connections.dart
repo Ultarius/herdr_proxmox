@@ -8,7 +8,8 @@ const repositoryTokenGuidance =
     'Select the repository owner and Only select repositories on GitHub. '
     'For cloning and pulling, grant Contents: Read-only; Metadata: Read-only is included. '
     'Pushing requires Contents: Read and write. Organization approval may be required. '
-    'This token is saved for this connection in the container; it does not change GitHub publishing settings. '
+    'Saving this connection does not change GitHub publishing. To reuse its token, '
+    'open Tasks → GitHub publishing and choose it as the publishing token source. '
     'Keep tokens out of repository URLs.';
 const repositoryTokenUrl =
     'https://github.com/settings/personal-access-tokens/new?contents=read';

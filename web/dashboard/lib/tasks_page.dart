@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:herdr_dashboard_state/publishing_connections.dart';
 import 'discovery_panel.dart';
 import 'routes.dart';
 import 'task_activity.dart';
@@ -136,6 +137,7 @@ class _TasksPageState extends State<TasksPage> {
   // A failed list read must not erase an action failure, and vice versa.
   String? readError;
   bool busy = false;
+  bool configuringPublishing = false;
   bool refreshing = false;
   bool connected = true;
   Future<void>? pending;
@@ -170,6 +172,8 @@ class _TasksPageState extends State<TasksPage> {
         generation = connection.generation;
         setState(() {
           tasks = [];
+          busy = false;
+          configuringPublishing = false;
           github = {};
           storage = {};
           error = null;
@@ -403,6 +407,13 @@ class _TasksPageState extends State<TasksPage> {
   }
 
   Future<void> configure() async {
+    if (!admin) {
+      setState(
+        () => error = 'Only an administrator can configure GitHub publishing.',
+      );
+      return;
+    }
+    if (busy || configuringPublishing || !connection.state.connected) return;
     final token = TextEditingController();
     final repos = TextEditingController(
       text: (github['repositories'] as List? ?? []).join('\n'),
@@ -426,6 +437,26 @@ class _TasksPageState extends State<TasksPage> {
         .toList();
     final epoch = connection.generation;
     try {
+      setState(() {
+        busy = true;
+        configuringPublishing = true;
+      });
+      var sources = <Map<String, String>>[];
+      String? sourceError;
+      try {
+        sources = await publishingTokenConnections(connection);
+      } catch (_) {
+        sourceError = publishingSourcesUnavailable;
+      }
+      if (!mounted ||
+          epoch != connection.generation ||
+          !admin ||
+          !connection.state.connected)
+        return;
+      // Waiting for operator input is not an in-flight request. Keep the
+      // separate guard active to prevent opening duplicate setup dialogs.
+      setState(() => busy = false);
+      final selection = PublishingTokenSelection(sources);
       final setupRoute = DialogRoute<bool>(
         context: context,
         builder: (context) => StatefulBuilder(
@@ -441,16 +472,39 @@ class _TasksPageState extends State<TasksPage> {
                     const Text(
                       'Use a fine-grained token for selected repositories: Contents write, Pull requests write, Checks read, and Commit statuses read. Workflow changes may also require Workflows write. Setup verifies account access; it cannot prove the token has these write permissions. Keep branch protection enabled.\n\nAgents and gateway share a Linux user; this credential is not isolated from same-user agents. Use only trusted agents and repositories.',
                     ),
-                    TextField(
-                      controller: token,
-                      obscureText: true,
-                      enableSuggestions: false,
-                      autocorrect: false,
+                    DropdownButtonFormField<String>(
+                      key: const ValueKey('publishing-token-source'),
+                      initialValue: selection.selectedId,
+                      isExpanded: true,
                       decoration: const InputDecoration(
-                        labelText: 'Personal access token',
+                        labelText: publishingTokenSourceLabel,
                       ),
-                      maxLength: 255,
+                      items: [
+                        for (final option in selection.options.entries)
+                          DropdownMenuItem(
+                            value: option.key,
+                            child: Text(option.value),
+                          ),
+                      ],
+                      onChanged: (value) => setDialogState(() {
+                        repos.text = selection.select(value, repos.text);
+                        token.clear();
+                      }),
                     ),
+                    if (sourceError != null) Text(sourceError),
+                    if (!selection.manual)
+                      const Text(savedPublishingTokenNotice),
+                    if (selection.manual)
+                      TextField(
+                        controller: token,
+                        obscureText: true,
+                        enableSuggestions: false,
+                        autocorrect: false,
+                        decoration: const InputDecoration(
+                          labelText: 'Personal access token',
+                        ),
+                        maxLength: 255,
+                      ),
                     TextField(
                       controller: repos,
                       minLines: 2,
@@ -520,7 +574,11 @@ class _TasksPageState extends State<TasksPage> {
       final confirmed = await Navigator.of(context).push(setupRoute);
       // Keep controllers alive until the dialog has left the overlay.
       await setupRoute.completed;
-      if (confirmed != true || !mounted || epoch != connection.generation)
+      if (confirmed != true ||
+          !mounted ||
+          epoch != connection.generation ||
+          !admin ||
+          !connection.state.connected)
         return;
       setState(() {
         busy = true;
@@ -536,7 +594,8 @@ class _TasksPageState extends State<TasksPage> {
             : {'mode': 'direct'};
       }
       await connection.request('github/configure', {
-        'token': token.text.trim(),
+        if (selection.manual) 'token': token.text.trim(),
+        if (!selection.manual) 'connection_id': selection.selectedId,
         'repositories': listed(),
         'publication': publication,
       });
@@ -551,7 +610,11 @@ class _TasksPageState extends State<TasksPage> {
       for (final controller in forks.values) {
         controller.dispose();
       }
-      if (mounted) setState(() => busy = false);
+      if (mounted && epoch == connection.generation)
+        setState(() {
+          busy = false;
+          configuringPublishing = false;
+        });
     }
   }
 

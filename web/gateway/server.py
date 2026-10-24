@@ -1,5 +1,5 @@
 """Local, authenticated dashboard gateway to the official Herdr CLI."""
-from contextlib import closing
+from contextlib import closing, nullcontext
 import hmac
 import secrets
 import time
@@ -227,6 +227,35 @@ class Handler(BaseHTTPRequestHandler):
         # Minimal gateways used for setup can serve organization storage before
         # the background integration watcher is attached.
         return watcher.annotate_profiles(data) if watcher else data
+
+    def prepare_clone_usage(self):
+        workspaces = listing(command('workspace', 'list'), 'workspaces')
+        if any(not workspace.get('cwd') for workspace in workspaces):
+            raise ValueError('Could not verify a workspace directory. The clone folder was preserved.')
+        return lambda target: self.clone_project_in_use(target, workspaces)
+
+    def clone_project_in_use(self, target, workspaces):
+        def overlaps(value):
+            if not isinstance(value, str) or not value:
+                return False
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                path = self.server.projects.root / path
+            path = path.resolve()
+            return path.is_relative_to(target) or target.is_relative_to(path)
+
+        organizations = self.server.organizations
+        if organizations.checkout_in_use(target):
+            return True
+        data = organizations.snapshot(directory=True)
+        if any(overlaps(item.get('project')) for item in data['profiles']):
+            return True
+        if any(overlaps(item.get('project_dir')) for item in data['organizations']):
+            return True
+        for workspace in workspaces:
+            if overlaps(workspace['cwd']):
+                return True
+        return False
 
     def session_key(self):
         cookies = SimpleCookie()
@@ -674,6 +703,7 @@ class Handler(BaseHTTPRequestHandler):
         actor = getattr(self, 'operator', {}).get('name', 'dashboard_operator')
         role = getattr(self, 'operator', {}).get('role', 'operator')
         actions = {f'/api/workspaces/{name}': name for name in ('create', 'focus', 'rename')}
+        actions['/api/projects/jobs/remove'] = 'remove_clone'
         actions['/api/organizations/templates'] = 'templates'
         actions['/api/organizations/templates/library'] = 'template_library'
         actions['/api/storage'] = 'storage'
@@ -737,7 +767,10 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == '/api/github/configure':
                 if role != 'admin':
                     raise ValueError('Only an administrator can configure GitHub publishing.')
-                self.reply(200, self.server.github.configure(body))
+                if isinstance(body, dict) and 'connection_id' in body:
+                    self.reply(200, self.server.repository_connections.configure_publishing(body))
+                else:
+                    self.reply(200, self.server.github.configure(body))
             elif self.path == '/api/tasks/discovery':
                 self.reply(200, self.server.contributions.discovery.action(body, actor, role))
             elif self.path.startswith('/api/tasks/'):
@@ -821,6 +854,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.reply(403, dict(error='Only an administrator can clone with a managed repository connection.'))
                     return
                 self.reply(200, self.server.projects.start(body))
+            elif self.path == '/api/projects/jobs/remove':
+                if role != 'admin':
+                    self.reply(403, {'error': 'Only an administrator can remove clone history or project folders.'})
+                    return
+                self.reply(200, self.server.projects.remove(body, prepare_usage=self.prepare_clone_usage))
             elif self.path == '/api/knowledge':
                 self.reply(200, self.server.contributions.knowledge.action(body, actor, role))
             elif self.path == '/api/models':
@@ -882,7 +920,10 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path in organization_actions:
                 self.reply(200, self.server.organizations.action(organization_actions[self.path], body))
             else:
-                self.reply(200, workspace_action(actions[self.path], body))
+                projects = getattr(self.server, 'projects', None)
+                reservation = projects.lock if projects is not None and self.path == '/api/workspaces/create' else nullcontext()
+                with reservation:
+                    self.reply(200, workspace_action(actions[self.path], body))
         except GitHubError as exc:
             # HTTP 401 is reserved for dashboard authentication. An upstream
             # 401 must not revoke a valid browser session or erase task state.

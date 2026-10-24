@@ -216,6 +216,9 @@ details.overview-disclosure > .overview-disclosure__summary {
 .clone-job { padding-block: var(--space-2-5); }
 .clone-job__text { display: flex; flex-direction: column; flex: 1 1 200px; min-width: 0; }
 .clone-job__detail { font-family: var(--font-mono); font-size: var(--text-xs-size); line-height: var(--text-xs-leading); color: var(--color-text-tertiary); overflow-wrap: anywhere; }
+.clone-removal { flex: 1 0 100%; min-width: 0; display: grid; gap: var(--space-3); padding: var(--space-4); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-sunken); overflow-wrap: anywhere; }
+.clone-removal p { margin: 0; }
+.clone-removal__option { display: flex; align-items: center; gap: var(--space-2); }
 .overview-disclosure .code-output { margin: 0; }
 
 /* ---- Small screens ----------------------------------------------------------------- */

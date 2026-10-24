@@ -15,7 +15,42 @@ actions are under Activity & agents.
 ## Configure GitHub
 
 As a dashboard administrator, open Tasks → GitHub publishing, or choose
-Set up GitHub publishing on a task. Supply:
+Set up GitHub publishing on a task.
+
+You can choose a saved personal-access-token connection from **Publishing token
+source** instead of pasting its token again. First save the token under
+**Repository connections**, then select it here. The browser sends only its
+connection ID; the gateway reads the private token file and runs the same
+identity and account-access validation as manual setup. Selecting a connection
+suggests its repository when the allowlist is empty; deliberate allowlist edits
+are preserved. Validation and saving remain explicit, and setup never publishes
+a branch or opens a pull request.
+
+The connection must name the branch destination: its own repository for direct
+publication, or the configured fork for fork publication. SSH deploy keys and
+connections referring to the already-configured GitHub account are not PAT
+sources. Successful cloning proves read access only; the reused PAT still needs
+the publishing permissions below. In direct mode a saved connection permits only
+one allowlisted repository: the repository named by that connection. In fork
+mode the allowlist names the upstream, while its branch destination must match
+the saved connection's fork. Every allowlist entry must use that same branch
+destination. To publish to different destinations, enter a token manually; that
+path supports up to 20 allowlisted repositories. A scope error identifies the
+offending allowlist entry, its destination, and the selected connection's scope.
+
+Publishing stores an independent copy of the selected token. Rotating or removing
+the repository connection does not update that copy; reopen publishing setup and
+validate/save again to copy a replacement. Revoking the PAT on GitHub invalidates
+every copy of that same PAT. Existing separate PR credentials remain configured
+unless explicitly replaced or removed.
+
+API callers use administrator-only `POST /api/github/configure` with
+`connection_id` in place of `token`, alongside the usual `repositories` and
+optional `publication` fields. Supplying both credential sources is rejected.
+The optional `pr_token`, `pr_login`, and `clear_pr_credential` fields keep their
+existing behavior.
+
+For either a saved connection or a manually entered token, supply:
 
 - A fine-grained personal access token belonging to an account with push access
   to the selected repositories. Select the repository owner as resource owner,

@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:herdr_dashboard_state/task_execution.dart';
 import 'package:herdr_dashboard_state/task_validation_environment.dart';
+import 'package:herdr_dashboard_state/publishing_connections.dart';
 import 'native_task_ui.dart';
 import '../navigation.dart';
 import '../services.dart';
@@ -130,6 +131,7 @@ class _TasksPageState extends State<TasksPage> {
   // A failed list read must not erase an action failure, and vice versa.
   String? readError;
   bool busy = false;
+  bool configuringPublishing = false;
   bool refreshing = false;
   bool connected = true;
   Future<void>? pending;
@@ -158,6 +160,8 @@ class _TasksPageState extends State<TasksPage> {
         generation = connection.generation;
         setState(() {
           tasks = [];
+          busy = false;
+          configuringPublishing = false;
           releases = [];
           github = {};
           storage = {};
@@ -424,6 +428,13 @@ class _TasksPageState extends State<TasksPage> {
   }
 
   Future<void> configure() async {
+    if (!admin) {
+      setState(
+        () => error = 'Only an administrator can configure GitHub publishing.',
+      );
+      return;
+    }
+    if (busy || configuringPublishing || !connection.state.connected) return;
     final token = TextEditingController();
     final prToken = TextEditingController();
     var clearPrCredential = false;
@@ -449,6 +460,26 @@ class _TasksPageState extends State<TasksPage> {
         .toList();
     final epoch = connection.generation;
     try {
+      setState(() {
+        busy = true;
+        configuringPublishing = true;
+      });
+      var sources = <Map<String, String>>[];
+      String? sourceError;
+      try {
+        sources = await publishingTokenConnections(connection);
+      } catch (_) {
+        sourceError = publishingSourcesUnavailable;
+      }
+      if (!mounted ||
+          epoch != connection.generation ||
+          !admin ||
+          !connection.state.connected)
+        return;
+      // Waiting for operator input is not an in-flight request. Keep the
+      // separate guard active to prevent opening duplicate setup dialogs.
+      setState(() => busy = false);
+      final selection = PublishingTokenSelection(sources);
       final setupRoute = DialogRoute<bool>(
         context: context,
         builder: (context) => StatefulBuilder(
@@ -464,16 +495,39 @@ class _TasksPageState extends State<TasksPage> {
                     const Text(
                       'The push token needs Contents write on the branch destination. Workflow changes may require Workflows write. If this token also handles upstream PRs, it needs Pull requests write there. Setup verifies identity and account access; actual publishing verifies token permissions. Keep branch protection enabled.\n\nAgents and gateway share a Linux user; credentials are not isolated from same-user agents. Use only trusted agents and repositories.',
                     ),
-                    TextField(
-                      controller: token,
-                      obscureText: true,
-                      enableSuggestions: false,
-                      autocorrect: false,
+                    DropdownButtonFormField<String>(
+                      key: const ValueKey('publishing-token-source'),
+                      initialValue: selection.selectedId,
+                      isExpanded: true,
                       decoration: const InputDecoration(
-                        labelText: 'Personal access token',
+                        labelText: publishingTokenSourceLabel,
                       ),
-                      maxLength: 255,
+                      items: [
+                        for (final option in selection.options.entries)
+                          DropdownMenuItem(
+                            value: option.key,
+                            child: Text(option.value),
+                          ),
+                      ],
+                      onChanged: (value) => setDialogState(() {
+                        repos.text = selection.select(value, repos.text);
+                        token.clear();
+                      }),
                     ),
+                    if (sourceError != null) Text(sourceError),
+                    if (!selection.manual)
+                      const Text(savedPublishingTokenNotice),
+                    if (selection.manual)
+                      TextField(
+                        controller: token,
+                        obscureText: true,
+                        enableSuggestions: false,
+                        autocorrect: false,
+                        decoration: const InputDecoration(
+                          labelText: 'Personal access token',
+                        ),
+                        maxLength: 255,
+                      ),
                     const Text(
                       'An optional separate token handles upstream PR operations while the token above pushes the branch. '
                       'For a split between personal accounts, the upstream account needs write access to the fork, '
@@ -573,7 +627,11 @@ class _TasksPageState extends State<TasksPage> {
       final confirmed = await Navigator.of(context).push(setupRoute);
       // Keep controllers alive until the dialog has left the overlay.
       await setupRoute.completed;
-      if (confirmed != true || !mounted || epoch != connection.generation)
+      if (confirmed != true ||
+          !mounted ||
+          epoch != connection.generation ||
+          !admin ||
+          !connection.state.connected)
         return;
       setState(() {
         busy = true;
@@ -589,7 +647,8 @@ class _TasksPageState extends State<TasksPage> {
             : {'mode': 'direct'};
       }
       await connection.request('github/configure', {
-        'token': token.text.trim(),
+        if (selection.manual) 'token': token.text.trim(),
+        if (!selection.manual) 'connection_id': selection.selectedId,
         'repositories': listed(),
         'publication': publication,
         if (prToken.text.trim().isNotEmpty) 'pr_token': prToken.text.trim(),
@@ -608,7 +667,11 @@ class _TasksPageState extends State<TasksPage> {
       for (final controller in forks.values) {
         controller.dispose();
       }
-      if (mounted) setState(() => busy = false);
+      if (mounted && epoch == connection.generation)
+        setState(() {
+          busy = false;
+          configuringPublishing = false;
+        });
     }
   }
 
