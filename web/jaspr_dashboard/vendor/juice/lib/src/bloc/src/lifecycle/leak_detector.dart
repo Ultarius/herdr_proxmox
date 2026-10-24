@@ -1,4 +1,7 @@
 import 'package:juice/src/foundation.dart';
+import 'package:logger/web.dart' show Level;
+
+import '../telemetry.dart';
 
 import '../juice_logger.dart';
 import 'lifecycle.dart';
@@ -61,10 +64,10 @@ class LeakDetector {
   static void enable() {
     assert(() {
       _enabled = true;
-      JuiceLoggerConfig.logger.log('Leak detection enabled', context: {
-        'type': 'leak_detection',
-        'action': 'enable',
-      });
+      if (JuiceLoggerConfig.logs(Level.info)) {
+        JuiceLoggerConfig.logger.record(
+            const JuiceTelemetry(JuiceTelemetryKind.leakDetectionEnabled));
+      }
       return true;
     }());
   }
@@ -270,8 +273,8 @@ class LeakDetector {
 /// Key for tracking individual leases.
 ///
 /// Keyed by a monotonic [sequence], not a timestamp: two leases acquired in
-/// the same clock tick used to share a key, the second overwrote the first,
-/// and a real leak went unreported.
+/// the same clock tick would share a timestamp key, the second overwriting
+/// the first, and a real leak would go unreported.
 class _LeakKey {
   final BlocId blocId;
   final int sequence;

@@ -1,7 +1,7 @@
 name: juice
-version: 1.10.0
+version: 2.0.0
 publish_to: none
-description: Juice 1.10.0 bloc core with a DOM framework adapter.
+description: Juice 2.0.0 bloc core with a DOM framework adapter.
 environment:
   sdk: '>=3.12.0 <4.0.0'
 dependencies:

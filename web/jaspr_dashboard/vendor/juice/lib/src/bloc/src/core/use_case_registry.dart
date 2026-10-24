@@ -13,6 +13,7 @@ import '../use_case_builders/use_case_builder.dart';
 /// registry.register(UseCaseBuilder(
 ///   typeOfEvent: IncrementEvent,
 ///   useCaseGenerator: () => IncrementUseCase(),
+///   concurrency: EventConcurrency.sequential,
 /// ));
 ///
 /// final builder = registry.getBuilder(IncrementEvent);
@@ -43,9 +44,6 @@ class UseCaseRegistry {
 
   /// Checks if a builder exists for the event type.
   bool hasBuilder(Type eventType) => _builders.containsKey(eventType);
-
-  /// The number of registered builders.
-  int get builderCount => _builders.length;
 
   /// All registered builders.
   ///

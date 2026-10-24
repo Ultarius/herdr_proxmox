@@ -6,6 +6,8 @@ import '../stream_status.dart';
 import '../juice_logger.dart';
 import '../../../ui/src/widget_support.dart';
 import 'state_manager.dart';
+import 'type_names.dart';
+import '../telemetry.dart';
 
 /// Handles emission of StreamStatus with proper logging and group management.
 ///
@@ -61,7 +63,9 @@ class StatusEmitter<TState extends BlocState> {
   ///
   /// [event] - The event that triggered this update.
   /// [newState] - The new state to emit. If null, uses current state.
-  /// [groups] - The rebuild groups to notify.
+  /// [groups] - The rebuild groups to notify. The event ADOPTS this set on
+  ///   its first emit (a later emit merges into a new set): do not mutate a
+  ///   set after passing it.
   /// [skipIfSame] - If true, skips emission when newState equals current state.
   ///   This helps prevent unnecessary widget rebuilds when state hasn't changed.
   void emitUpdate(
@@ -72,22 +76,22 @@ class StatusEmitter<TState extends BlocState> {
   }) {
     if (skipIfSame && newState == state) {
       if (JuiceLoggerConfig.logs(Level.info)) {
-        _logger.log('Skipping duplicate state emission', context: {
-          'type': 'state_emission_skipped',
-          'bloc': _blocName,
-          'event': event.runtimeType.toString(),
-        });
+        _logger.record(JuiceTelemetry(
+          JuiceTelemetryKind.emissionSkipped,
+          bloc: _blocName,
+          event: typeName(event.runtimeType),
+        ));
       }
       return;
     }
-    _emit(StreamStatus.updating, 'update', event, newState, groups);
+    _emit(EmissionKind.update, event, newState, groups);
   }
 
   /// Emits a waiting status.
   ///
   /// Used to indicate an async operation is in progress.
   void emitWaiting(EventBase event, TState? newState, Set<String>? groups) {
-    _emit(StreamStatus.waiting, 'waiting', event, newState, groups);
+    _emit(EmissionKind.waiting, event, newState, groups);
   }
 
   /// Emits a failure status.
@@ -103,112 +107,89 @@ class StatusEmitter<TState extends BlocState> {
     Object? error,
     StackTrace? errorStackTrace,
   }) {
-    _emitFailure(event, newState, groups, error, errorStackTrace);
+    _emit(EmissionKind.failure, event, newState, groups,
+        error: error, errorStackTrace: errorStackTrace);
   }
 
   /// Emits a canceling status.
   ///
   /// Used to indicate an operation was cancelled.
   void emitCancel(EventBase event, TState? newState, Set<String>? groups) {
-    _emit(StreamStatus.canceling, 'cancel', event, newState, groups);
+    _emit(EmissionKind.cancel, event, newState, groups);
+  }
+
+  /// Re-emits the current status carrying [event] — no state change, no
+  /// groups: a signal to listeners that watch events.
+  void emitEvent(EventBase event) {
+    if (_droppedAfterClose(EmissionKind.event, event)) return;
+    _stateManager.emit(_stateManager.current.copyWith(event: event));
   }
 
   /// The close fence. A use case still running when its bloc closes (the
   /// user left mid-fetch) must not crash on its next emit — that emit is
-  /// dropped, and logged as `emission_after_close` so it stays visible. It
-  /// used to throw `StateError`, which surfaced as a bloc error and, under
-  /// `RetryableUseCaseBuilder`, was retried against the closed bloc.
-  bool _droppedAfterClose(String statusName, EventBase event, {Object? error}) {
+  /// dropped, and logged as `emission_after_close` so it stays visible.
+  bool _droppedAfterClose(EmissionKind kind, EventBase event, {Object? error}) {
     if (!_stateManager.isClosed) return false;
-    _logger.log('Emission after close dropped', level: Level.warning, context: {
-      'type': 'emission_after_close',
-      'status': statusName,
-      'bloc': _blocName,
-      'event': event.runtimeType.toString(),
-      if (error != null) 'error': error.toString(),
-    });
+    _logger.record(JuiceTelemetry(
+      JuiceTelemetryKind.emissionAfterClose,
+      status: kind,
+      bloc: _blocName,
+      event: typeName(event.runtimeType),
+      error: error,
+    ));
     return true;
   }
 
   void _emit(
-    StreamStatus<TState> Function(TState, TState, EventBase?) factory,
-    String statusName,
+    EmissionKind kind,
     EventBase event,
     TState? newState,
-    Set<String>? groupsToRebuild,
-  ) {
-    if (_droppedAfterClose(statusName, event)) return;
-
-    if (JuiceLoggerConfig.logs(Level.info)) {
-      _logger.log('Emitting $statusName', context: {
-        'type': 'state_emission',
-        'status': statusName,
-        // Objects, not strings: a logger that prints stringifies them itself;
-        // one that drops the line (release, a silent sink) pays nothing.
-        'state': newState ?? state,
-        'bloc': _blocName,
-        'groups': groupsToRebuild,
-        'event': event.runtimeType.toString(),
-      });
-    }
-
-    // Apply default groups if not specified
-    final groups = groupsToRebuild ?? rebuildAlways;
-
-    // Validate group constraints
-    assert(
-      !groups.contains('*') || groups.length == 1,
-      "Cannot mix '*' with other groups",
-    );
-
-    // Merge groups onto the event
-    event.groupsToRebuild = {...?event.groupsToRebuild, ...groups};
-
-    // Emit the status
-    _stateManager.emit(factory(newState ?? state, state, event));
-  }
-
-  /// Internal helper for emitting failure status with error context.
-  void _emitFailure(
-    EventBase event,
-    TState? newState,
-    Set<String>? groupsToRebuild,
+    Set<String>? groupsToRebuild, {
     Object? error,
     StackTrace? errorStackTrace,
-  ) {
-    if (_droppedAfterClose('failure', event, error: error)) return;
+  }) {
+    if (_droppedAfterClose(kind, event, error: error)) return;
 
-    _logger.log('Emitting failure', context: {
-      'type': 'state_emission',
-      'status': 'failure',
-      // Objects, not strings: a logger that prints stringifies them itself;
-      // one that drops the line (release, a silent sink) pays nothing.
-      'state': newState ?? state,
-      'bloc': _blocName,
-      'groups': groupsToRebuild,
-      'event': event.runtimeType.toString(),
-      'error': error?.toString(),
-    });
+    // A failure emission is never chatter: it is logged whatever the floor.
+    if (kind == EmissionKind.failure || JuiceLoggerConfig.logs(Level.info)) {
+      _logger.record(JuiceTelemetry(
+        JuiceTelemetryKind.stateEmitted,
+        status: kind,
+        // Live objects: a logger that prints stringifies them itself; one
+        // that drops the entry pays nothing.
+        state: newState ?? state,
+        bloc: _blocName,
+        groups: groupsToRebuild,
+        event: typeName(event.runtimeType),
+        error: error,
+        stackTrace: errorStackTrace,
+      ));
+    }
 
-    // Apply default groups if not specified
     final groups = groupsToRebuild ?? rebuildAlways;
-
-    // Validate group constraints
     assert(
       !groups.contains('*') || groups.length == 1,
       "Cannot mix '*' with other groups",
     );
+    // The event accumulates the groups of every emit made for it. The first
+    // emit adopts the caller's set as is (no copy); a later emit merges.
+    final existing = event.groupsToRebuild;
+    event.groupsToRebuild = existing == null || existing.isEmpty
+        ? groups
+        : {...existing, ...groups};
 
-    // Merge groups onto the event
-    event.groupsToRebuild = {...?event.groupsToRebuild, ...groups};
-
-    // Emit the failure status with error context
-    _stateManager.emit(StreamStatus.failure(
-      newState ?? state,
-      state,
-      event,
-      error: error,
-      errorStackTrace: errorStackTrace,
-    ));
+    final current = state;
+    final next = newState ?? current;
+    _stateManager.emit(switch (kind) {
+      EmissionKind.update => UpdatingStatus<TState>(next, current, event),
+      EmissionKind.waiting => WaitingStatus<TState>(next, current, event),
+      EmissionKind.cancel => CancelingStatus<TState>(next, current, event),
+      EmissionKind.failure => FailureStatus<TState>(next, current, event,
+          error: error, errorStackTrace: errorStackTrace),
+      // An event re-emission and a navigation are not statuses this builds.
+      EmissionKind.event ||
+      EmissionKind.navigate =>
+        throw ArgumentError.value(kind, 'kind', 'not a status'),
+    });
   }
 }

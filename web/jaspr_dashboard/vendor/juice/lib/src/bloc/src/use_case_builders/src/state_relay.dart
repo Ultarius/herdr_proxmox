@@ -1,4 +1,5 @@
 import '../../../bloc.dart';
+import '../../core/type_names.dart';
 
 /// Relays state changes from one bloc to another by transforming states into events.
 ///
@@ -50,7 +51,7 @@ class StateRelay<TSourceBloc extends JuiceBloc<TSourceState>,
   ///   If not provided, all state changes are relayed.
   /// * [sourceScope] - Optional scope key for resolving source bloc.
   /// * [destScope] - Optional scope key for resolving destination bloc.
-  /// * [resolver] - Optional custom resolver (legacy). If not provided, uses BlocScope.
+  /// * [resolver] - Optional resolver. If not provided, uses BlocScope.
   StateRelay({
     required this.toEvent,
     this.when,
@@ -58,11 +59,10 @@ class StateRelay<TSourceBloc extends JuiceBloc<TSourceState>,
     this.destScope,
     BlocDependencyResolver? resolver,
   }) : _customResolver = resolver {
-    Future.microtask(() {
-      if (!_isInitialized && !_isClosed) {
-        _initialize();
-      }
-    });
+    // Synchronous: a relay against an unregistered or closed bloc throws
+    // HERE, at construction, where the developer is looking — not as an
+    // uncaught error from a microtask nobody awaits.
+    _initialize();
   }
 
   /// Function that transforms source bloc state into an event for destination bloc.
@@ -78,7 +78,7 @@ class StateRelay<TSourceBloc extends JuiceBloc<TSourceState>,
   /// Optional scope key for resolving destination bloc.
   final Object? destScope;
 
-  /// Custom resolver for legacy compatibility.
+  /// The resolver, when not BlocScope.
   final BlocDependencyResolver? _customResolver;
 
   /// The source bloc whose states will be transformed.
@@ -96,9 +96,6 @@ class StateRelay<TSourceBloc extends JuiceBloc<TSourceState>,
   /// Subscription to the source bloc's stream.
   StreamSubscription<dynamic>? _subscription;
 
-  /// Whether the relay has been initialized.
-  bool _isInitialized = false;
-
   /// Whether the relay has been closed.
   bool _isClosed = false;
 
@@ -106,8 +103,6 @@ class StateRelay<TSourceBloc extends JuiceBloc<TSourceState>,
   bool get isClosed => _isClosed;
 
   void _initialize() {
-    if (_isClosed) return;
-
     try {
       if (_customResolver != null) {
         _sourceBloc = _customResolver.resolve<TSourceBloc>();
@@ -124,14 +119,16 @@ class StateRelay<TSourceBloc extends JuiceBloc<TSourceState>,
       }
 
       _setupRelay();
-      _isInitialized = true;
     } catch (e, stackTrace) {
-      JuiceLoggerConfig.logger.logError(
-        'Failed to initialize StateRelay between $TSourceBloc and $TDestBloc',
-        e,
-        stackTrace,
-      );
-      throw StateError('StateRelay initialization failed: $e');
+      // Nothing half-built survives: the leases go back before the error
+      // (the real one, with its trace) reaches the constructor's caller.
+      _isClosed = true;
+      _sourceLease?.dispose();
+      _sourceLease = null;
+      _destLease?.dispose();
+      _destLease = null;
+      _recordFailure('initialize', e, stackTrace);
+      rethrow;
     }
   }
 
@@ -157,25 +154,29 @@ class StateRelay<TSourceBloc extends JuiceBloc<TSourceState>,
           final event = toEvent(state);
           _destBloc.send(event);
         } catch (e, stackTrace) {
-          JuiceLoggerConfig.logger.logError(
-            'Error in StateRelay<$TSourceBloc, $TDestBloc>',
-            e,
-            stackTrace,
-          );
-          // Don't close on transformer errors - just log and continue
+          _recordFailure('transform', e, stackTrace);
         }
       },
-      onError: (error, stackTrace) async {
-        JuiceLoggerConfig.logger.logError(
-          'Stream error in StateRelay<$TSourceBloc, $TDestBloc>',
-          error,
-          stackTrace,
-        );
+      onError: (Object error, StackTrace stackTrace) async {
+        _recordFailure('stream', error, stackTrace);
         await close();
       },
       onDone: () async => await close(),
     );
   }
+
+  /// The one error entry this relay records; [site] says which step
+  /// failed (`initialize`, `transform`, `stream`).
+  void _recordFailure(String site, Object error, StackTrace stackTrace) =>
+      JuiceLoggerConfig.logger.record(JuiceTelemetry(
+        JuiceTelemetryKind.relayFailed,
+        relay: 'StateRelay',
+        site: site,
+        sourceBloc: typeName(TSourceBloc),
+        destBloc: typeName(TDestBloc),
+        error: error,
+        stackTrace: stackTrace,
+      ));
 
   /// Closes the relay and releases all resources.
   ///
@@ -223,7 +224,7 @@ class StatusRelay<TSourceBloc extends JuiceBloc<TSourceState>,
   /// * [when] - Optional predicate to filter which status changes trigger relay.
   /// * [sourceScope] - Optional scope key for resolving source bloc.
   /// * [destScope] - Optional scope key for resolving destination bloc.
-  /// * [resolver] - Optional custom resolver (legacy). If not provided, uses BlocScope.
+  /// * [resolver] - Optional resolver. If not provided, uses BlocScope.
   StatusRelay({
     required this.toEvent,
     this.when,
@@ -231,11 +232,10 @@ class StatusRelay<TSourceBloc extends JuiceBloc<TSourceState>,
     this.destScope,
     BlocDependencyResolver? resolver,
   }) : _customResolver = resolver {
-    Future.microtask(() {
-      if (!_isInitialized && !_isClosed) {
-        _initialize();
-      }
-    });
+    // Synchronous: a relay against an unregistered or closed bloc throws
+    // HERE, at construction, where the developer is looking — not as an
+    // uncaught error from a microtask nobody awaits.
+    _initialize();
   }
 
   /// Function that transforms source StreamStatus into an event for destination bloc.
@@ -250,7 +250,7 @@ class StatusRelay<TSourceBloc extends JuiceBloc<TSourceState>,
   /// Optional scope key for resolving destination bloc.
   final Object? destScope;
 
-  /// Custom resolver for legacy compatibility.
+  /// The resolver, when not BlocScope.
   final BlocDependencyResolver? _customResolver;
 
   late TSourceBloc _sourceBloc;
@@ -258,15 +258,12 @@ class StatusRelay<TSourceBloc extends JuiceBloc<TSourceState>,
   BlocLease<TSourceBloc>? _sourceLease;
   BlocLease<TDestBloc>? _destLease;
   StreamSubscription<dynamic>? _subscription;
-  bool _isInitialized = false;
   bool _isClosed = false;
 
   /// Whether this relay has been closed.
   bool get isClosed => _isClosed;
 
   void _initialize() {
-    if (_isClosed) return;
-
     try {
       if (_customResolver != null) {
         _sourceBloc = _customResolver.resolve<TSourceBloc>();
@@ -283,14 +280,16 @@ class StatusRelay<TSourceBloc extends JuiceBloc<TSourceState>,
       }
 
       _setupRelay();
-      _isInitialized = true;
     } catch (e, stackTrace) {
-      JuiceLoggerConfig.logger.logError(
-        'Failed to initialize StatusRelay between $TSourceBloc and $TDestBloc',
-        e,
-        stackTrace,
-      );
-      throw StateError('StatusRelay initialization failed: $e');
+      // Nothing half-built survives: the leases go back before the error
+      // (the real one, with its trace) reaches the constructor's caller.
+      _isClosed = true;
+      _sourceLease?.dispose();
+      _sourceLease = null;
+      _destLease?.dispose();
+      _destLease = null;
+      _recordFailure('initialize', e, stackTrace);
+      rethrow;
     }
   }
 
@@ -313,24 +312,29 @@ class StatusRelay<TSourceBloc extends JuiceBloc<TSourceState>,
           final event = toEvent(status);
           _destBloc.send(event);
         } catch (e, stackTrace) {
-          JuiceLoggerConfig.logger.logError(
-            'Error in StatusRelay<$TSourceBloc, $TDestBloc>',
-            e,
-            stackTrace,
-          );
+          _recordFailure('transform', e, stackTrace);
         }
       },
-      onError: (error, stackTrace) async {
-        JuiceLoggerConfig.logger.logError(
-          'Stream error in StatusRelay<$TSourceBloc, $TDestBloc>',
-          error,
-          stackTrace,
-        );
+      onError: (Object error, StackTrace stackTrace) async {
+        _recordFailure('stream', error, stackTrace);
         await close();
       },
       onDone: () async => await close(),
     );
   }
+
+  /// The one error entry this relay records; [site] says which step
+  /// failed (`initialize`, `transform`, `stream`).
+  void _recordFailure(String site, Object error, StackTrace stackTrace) =>
+      JuiceLoggerConfig.logger.record(JuiceTelemetry(
+        JuiceTelemetryKind.relayFailed,
+        relay: 'StatusRelay',
+        site: site,
+        sourceBloc: typeName(TSourceBloc),
+        destBloc: typeName(TDestBloc),
+        error: error,
+        stackTrace: stackTrace,
+      ));
 
   /// Closes the relay and releases all resources.
   Future<void> close() async {

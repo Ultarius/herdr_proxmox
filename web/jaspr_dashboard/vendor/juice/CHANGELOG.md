@@ -1,0 +1,983 @@
+# Changelog
+
+## [2.0.0] - 2026-10-14
+
+The breaking set, shipped together (ROADMAP "The 2.0 docket"). Each entry
+states the contract and, where code must change, the migration; the
+step-by-step guide is
+[upgrading-to-2.0.md](https://github.com/kehmka/juice/blob/main/doc/guides/upgrading-to-2.0.md) (in the repository, not in this archive).
+
+### Breaking
+- **`concurrency:` is required on every builder** — `UseCaseBuilder`,
+  `UseCaseBuilder.typed`, `StatefulUseCaseBuilder`, `RetryableUseCaseBuilder`,
+  `InlineUseCaseBuilder`; `UseCaseBuilderBase.concurrency` is abstract. A mode
+  is a decision, and the compiler asks for it. *Migration:* add
+  `concurrency: EventConcurrency.concurrent` where that is what you meant,
+  or pick `sequential` (shared-state mutation), `droppable` (exclusive
+  flows) or `restartable` (latest input wins). The opt-in lint rule
+  `juice_missing_concurrency_mode` is retired.
+- **`EventConcurrency` gains `restartable`** — an exhaustive `switch` over
+  the enum needs the case (see Added).
+- **`UpdateEvent` carries no state and no type parameter.** `newState` is
+  gone and `UpdateEvent<TState>` is `UpdateEvent`; it re-emits the bloc's
+  current state under the groups / status / aviator it names. A state
+  change is an event a use case handles. *Migration:* a 1.x
+  `UpdateEvent(newState: x)` fails to compile — on purpose, with no `dart
+  fix`: send the event whose use case produces `x`. Tests seed a state with
+  `JuiceBloc.seedState`.
+- **The vendored `bloc` base is gone** — `Bloc`, `BlocBase`, `Emitter`,
+  `BlocEventSink`, `EventTransformer` / `EventMapper`, `GlobalBlocResolver`.
+  `JuiceBloc` still implements `StateStreamableSource`, `Emittable` and
+  `ErrorSink` (`bloc_interfaces.dart`). *Migration:* register with
+  `BlocScope` (`doc/concepts/dependency.md`); a `BlocDependencyResolver` is
+  passed explicitly where an API takes one.
+- **`StateRelay`, `StatusRelay` and `EventSubscription` initialise
+  synchronously and throw** when a bloc is unregistered or closed — from
+  the constructor (for `EventSubscription`, the subscribing bloc's
+  constructor), not as an uncaught error from a microtask nobody awaits.
+  The error is the resolver's own: a `StateError` from `BlocScope`, a
+  custom `resolver:`'s error unchanged (1.x wrapped it in
+  `StateError('StateRelay initialization failed: …')`). A failed
+  initialisation holds no lease. `EventSubscription.initialize()` on a
+  closed subscription throws `StateError` (1.x did nothing). *Migration:* register the
+  blocs before constructing the relay. Never build a relay inside a bloc's
+  own constructor: a bloc leased while its own factory runs fails at the
+  scope with a `StateError`; wire relays in the composition root. Two blocs
+  that subscribe to each other through `EventSubscription` cannot be
+  constructed — subscribe one way.
+- **`sendAndWait` fails loud.** It throws `StateError` (through the
+  returned future) the moment processing ends with no terminal status for
+  the event — dropped by a `droppable` builder, no use case registered, a
+  use case that emitted nothing, a close during the wait — instead of
+  waiting out the timeout; on a closed or closing bloc the returned future
+  fails (the call no longer throws). `sendAndWaitResult`, `sendForResult`
+  and `BlocTester.sendAndWaitForResult` are built on it:
+  `sendAndWaitForResult` answers for THAT event, not for the first
+  non-waiting status of any event; `sendAndWaitResult` fails the event's
+  `result` on every failure of the wait (closed bloc, no handler, nothing
+  emitted, timeout, close mid-wait), not only on a missing terminal status.
+  *Migration:* a test that relied on the timeout gets the error at once.
+- **`StatefulUseCaseBuilder` cannot be `restartable`** (`ArgumentError` at
+  registration): one instance serves every run and cannot be fenced per
+  run.
+- **Dead surface removed:** `JuiceBloc.logger`, `JuiceAsyncBuilder.waiting`
+  (could never fire), `denyRebuild`'s unused `key`, and
+  `RelayUseCaseBuilder` (`StateRelay` / `StatusRelay` replace it —
+  `doc/concepts/relay-use-cases.md`). *Migration:* drop the arguments and
+  calls; nothing observable changes. (Internal, never exported, also gone:
+  `UseCaseContext.getState` / `getOldState` / `navigateAsync`,
+  `AviatorManager.navigateAsync` / `hasAviator` / `aviatorCount` /
+  `aviatorNames`, `UseCaseRegistry.builderCount`,
+  `EventDispatcher.handlerCount`.)
+- **`JuiceLogger` gains `record(JuiceTelemetry entry)`.** The framework's
+  telemetry — every use-case span, emission, lifecycle, binding and error
+  entry — is one typed object per entry (`JuiceTelemetry`, a closed
+  `JuiceTelemetryKind` vocabulary, values live), not a message plus a
+  `Map<String, dynamic>`. `log` / `logError` stay for free-form lines.
+  *Migration:* every logger implementation adds `record`; the forwarding
+  one-liner (`e.isError ? logError(e.message, e.error!, e.stackTrace ??
+  StackTrace.empty, context: e.toMap()) : log(e.message, level: e.level,
+    context: e.toMap())`) reproduces the 1.x lines, `toMap()` being the 1.x
+  context map with its keys (`streamBindings` and `blocsEnded` included).
+  On the wire: `message` is a constant per kind (the interpolated status,
+  reason or callback is a field); a sequential run's escaped failure is
+  `sequential_run_error` and a failed supersede `supersede_error` instead
+  of sharing `use_case_error` / `use_case_superseded`; `lifecycle` is the
+  enum name; new kinds for retries (`retry_scheduled`, `retry_exhausted`),
+  relay and subscription failures (`relay_error`, `event_subscription` ·
+  `error`) and `get` on a leased bloc; the retry kinds (`retry_scheduled`,
+  `retry_exhausted`, `retry_abandoned`) replace 1.x's free-form retry lines
+  and carry `attempt`, `bloc` and a live `error` — the 1.x keys
+  `maxRetries`, `delayMs` and `totalAttempts` are gone; the framework's
+  other free-form lines are gone too (the dispatcher's fallback warning,
+  `Closing StatefulUseCase`, `Disposing all blocs`, `BlocErrorHandler`'s
+  debug prints). `stream_binding` / `refused` carries `reason` (`bloc is
+  closed`, `bloc is closing`, `run superseded`); a binding callback that
+  throws is `stream_binding` / `callback_error` with `callback` (`onData`,
+  `onError`, `onDone`); `state_emission_superseded` carries `status`. A
+  thrown use-case error is two lines — `use_case_error` (the executor's
+  span-closer, with `executionId`) and `bloc_error` — not three; a bloc's
+  close is one `bloc_lifecycle` · `close` entry (the scope no longer logs
+  its own beside it). A refused `send` logs at warning. Every info-level
+  kind, lifecycle and leases included, is built only when the telemetry
+  floor keeps it (1.x bypassed the floor for those). The reference:
+  `packages/juice/doc/TELEMETRY.md`. `DevtoolsJuiceLogger`
+  (`juice_observability` 0.6.0) implements it and posts the same payload
+  shape, plus the new kinds.
+
+### Changed
+- **A Juice widget keeps its bloc subscription across parent rebuilds.**
+  Every widget form keys its subscription on the bloc instance(s)
+  (`SubscriptionKey`); the rebuild groups and `onStateChange` are applied
+  through `JuiceAsyncBuilder`'s `where`, read from the CURRENT widget on
+  every emission — a rebuilt widget's filter applies to the kept
+  subscription.
+- **The send path has one awaited hop.** `send`, `dispatch` and the mode
+  wrappers return the handler's future through; the executor keeps the one
+  structural await (it closes the telemetry span). Contracts kept: an
+  un-awaited send of an unhandled event fails its future and never throws
+  into the caller's frame; `send` on a closed bloc returns a completed
+  future; `sequential` keeps order past a failed run; `droppable` frees its
+  slot after a failed or dropped run; the span pair closes on success and
+  on error. Async stack traces are shorter.
+- `sendCancellable` always goes through `send` (a refusal is logged, never
+  silent). `RetryableUseCaseBuilder` stops before `onRetry` and the backoff
+  once its run is superseded. `BlocScope` fails loud on a bloc resolved
+  while its own factory runs.
+- **The first emit for an event adopts the caller's group set** (no copy;
+  a later emit for the same event merges into a new set). Do not mutate a
+  set after passing it to an emit.
+- **`BlocErrorHandler` prints nothing of its own in debug builds**: the
+  error is on the logger as a `blocError` entry with its stack trace; the
+  handler's `logger` and `onError` callbacks are unchanged.
+- Core line coverage gate raised from 90% to 99% in CI
+  (`tool/coverage_check.sh 99`); the lines left uncovered are unreachable by
+  construction and stay in the count.
+
+### Added
+- **`EventConcurrency.restartable` — latest input wins.** A same-type event
+  arriving while one runs supersedes it and starts at once. The superseded
+  run is fenced: every emit and navigation it attempts is dropped (logged
+  `state_emission_superseded`), the stream bindings it created are
+  cancelled, and a `CancellableEvent` is cancelled so a loop can bail;
+  `BlocUseCase.isSuperseded` is the check for any other event (read from
+  the run's zone, correct after any await), `JuiceBloc.isSuperseded(event)`
+  the check from outside a use case. `sendAndWait` on a superseded
+  event answers with a `CancelingStatus` for that event (not emitted);
+  `sendAndWaitResult` answers canceled and fails the event's result. The
+  span still closes, flagged `superseded: true`; the supersede logs
+  `use_case_superseded`. **Side effects already performed are not rolled
+  back.** The fence is per RUN: the same event instance re-sent is two runs
+  and only the first is fenced (a re-sent `CancellableEvent` is not
+  pre-cancelled); a dispatch made from inside a run — a nested send, a
+  queued sequential run, a listener the run created — is its own run; a
+  superseded run can no longer bind a stream (refused); a run whose use
+  case RETURNED is not superseded by a later same-type send. The other
+  modes pay nothing: the fence is built only into restartable runs'
+  contexts.
+- **`JuiceBloc.bindStream` / `unbind` / `StreamBinding`** — the bloc owns
+  every stream it listens to. `bindStream(stream, onData, {key, onError,
+  onDone, cancelOnError})` runs `onData` per item while the bloc is open,
+  is cancelled at the start of `close()` before the use cases close, and a
+  `key` makes the start idempotent (a re-bind replaces, `unbind(key)`
+  stops). Errors are loud: with no `onError` the error goes to the bloc's
+  error handler and the binding is cancelled (`cancelOnError: false` keeps
+  listening); an `onData`, `onError` or `onDone` that throws goes to the
+  error handler (`callback_error`), and an `onData` throw leaves the
+  binding active. A bind on a closing bloc or from a superseded run is
+  refused with an inert binding. `StreamBinding` exposes `key`, `isActive`,
+  `done` (completes when the binding stops, never errors) and `cancel()`;
+  `JuiceBloc.activeBindingCount` counts the live ones. Replaces the
+  `StreamSubscription` field, `isClosed` guard and manual cancel every
+  stream-reading bloc hand-rolled: the eight family blocs that read a
+  stream (connectivity, lifecycle, llm, location, media, notifications,
+  power, realtime) are migrated in their 2.0-wave versions.
+- **`JuiceBloc.seedState(state, {groups})`** — a `@visibleForTesting` seam
+  that puts a bloc into a state without running a use case, as a normal
+  `UpdatingStatus` emission carrying an `UpdateEvent`; `juiceTest(seed:)`
+  uses it. Throws on a closed or closing bloc.
+- **`JuiceAsyncBuilder.streamKey` and `where`** — the subscription is
+  replaced only when the key changes; `where` filters items live.
+- **`UseCase.navigate`** (`@internal`) — the navigation half of
+  `emitUpdate(aviatorName:)`, wired by the executor; inline use cases
+  navigate through it, under the restartable fence. A wrapper use case
+  that forwards an inner use case's emits by hand must forward `navigate`
+  too if the inner one navigates directly.
+- **`JuiceTelemetry`, `JuiceTelemetryKind`, `EmissionKind`** — the typed
+  telemetry vocabulary (`packages/juice/doc/TELEMETRY.md`); `EmissionKind`
+  is the `status` an emission entry carries (`update`, `waiting`,
+  `failure`, `cancel`, `event`, `navigate`).
+
+### Fixed
+- A stream error no longer reverts a Juice widget to its initial status:
+  `JuiceAsyncBuilder` builds the error with the last status the current
+  subscription delivered (a `ValueStream`'s seed counts), reset on every
+  re-subscribe.
+- A use-case generator that throws (a failing DI lookup) is a use-case
+  error with its span and reaches `onError`; it was a silent miss. A
+  `sequential` run whose failure escapes the executor is logged and the
+  queue goes on. An unhandled-event fallback that throws fails the send.
+- `bindStream`: a throwing `onError` / `onDone` is the bloc's error; a
+  stream whose `listen` throws leaves no binding behind; every cancel —
+  unbind, replace, on error, at supersede, at close — is logged if it
+  fails; `StreamBinding.cancel()` is memoized, so every caller awaits the
+  one teardown.
+- `emitEvent` goes through the close fence like every other emission
+  (`emission_after_close`, status `event`).
+- `juiceTest` reports a `build()` that throws as that error, and counts
+  stream-binding errors (`errors:` to expect them).
+- `StateManager` allocates nothing per emit when nothing taps it.
+- A Juice widget's `error:` builder receives the builder's own
+  `BuildContext`, not the `State`'s outer one.
+- `BlocTester` records emissions synchronously, inside the emit — the same
+  tap `sendAndWait` completes from — so an assertion right after
+  `sendAndWaitForResult` sees the status it returned. The stream-fed record
+  ran one microtask behind (`expectWasFailure()` after a returned
+  `FailureStatus` could fail).
+
+### Performance
+- **A send costs 0.66 µs with the telemetry chatter on and 0.44 µs with it
+  off, from 2.83 and 1.95 on the 2.0 tree before this work** (the bare
+  benchmark bloc on the Mac, release, median of 5; 1.10.0 had measured
+  2.72 and 1.82 there; a restartable send 2.75 → 1.06; 20,000 sends in
+  flight 4.70 → 2.00 each). In the dispatch scenario — the one that runs
+  bloc and Riverpod on the same work — the sequential release-default send
+  is 0.73 µs on the Mac against bloc's 1.04 and 0.63 on the phone against
+  1.03; with every telemetry record built it ties bloc; in burst bloc
+  leads (`benchmarks/RESULTS.md` §16–§17). The telemetry entries are typed
+  records, one allocation each, priced against the context maps they
+  replace in §17b. Four
+  `Type.toString()` calls per send — the event name, the use-case name
+  twice, the builder's — cost 0.27 µs each; they are gone from the path
+  below the telemetry floor, and above it every type name comes from a
+  memo (`Map<Type, String>`, bounded by the types a program dispatches).
+  The span's `Stopwatch` exists only when the span is logged (the error
+  line carries `elapsedMicros` only then). The emitter builds the status
+  directly instead of through a factory closure, and the first emit adopts
+  the caller's group set instead of copying it (the contract is under
+  Changed). `BlocUseCase.useCaseName` is computed on first use, not per
+  instance. The widgets' group filter no longer allocates an intersection
+  set per emission per widget (`any(contains)`, 0.03 µs instead of 0.06).
+  Measured in `benchmarks/RESULTS.md` §15.
+
+## [1.10.0] - 2026-09-29
+
+Includes everything listed under 1.9.1 below, which was never published on
+its own; the additions make this a minor.
+
+### Added
+- **`LevelAwareJuiceLogger` — the telemetry cost follows the consumer.**
+  An optional interface (`Level get minLevel`): a logger declares the
+  lowest level it keeps, and the framework does not build a per-event
+  entry below it. A logger that only `implements JuiceLogger` keeps
+  everything, as before. `JuiceLoggerConfig.minLevel` (below) is a global
+  floor on top — the effective level is the HIGHER of the two.
+- **`DefaultJuiceLogger` declares what its filter already does.** The
+  `logger` package's default filter decides inside an `assert`: it keeps
+  lines at or above `Logger.level` in debug and NOTHING in profile or
+  release. The default logger now declares exactly that, so an app that
+  never configures a logger pays for no chatter in release — about a third
+  of a dispatch (benchmarks §9) — and loses no line it ever printed. A
+  caller-supplied `Logger` has an unreadable filter and is declared
+  `Level.all`, unchanged.
+  **One thing to check if you wrap the default logger:** only the
+  CONFIGURED logger's declaration counts. A wrapper that does not implement
+  the interface still receives everything; one that delegates `minLevel` to
+  an inner `DefaultJuiceLogger` receives no chatter outside debug. Declare
+  what your logger consumes.
+- **`JuiceLoggerConfig.minLevel` — the global floor for the framework's
+  own per-event chatter.** Every use-case execution logs a span pair and every
+  emission logs an entry, at `Level.info`; building those context maps is
+  ~40% of a dispatch even when the logger drops them (benchmarks §4, §6:
+  ~0.7 of ~1.7 µs per send on an iPhone 17 Pro Max). Below `minLevel` the
+  framework does not build them — the logger is not called for that entry.
+  Default `Level.all`: nothing changes unless set. `Level.warning` in
+  release is the whole gain for a logger that declares nothing. Never
+  gates `logError`, `emission_after_close`, `event_ignored`, or a failure
+  emission's entry: those stay loud. `DevtoolsJuiceLogger` (observability
+  ≥ 0.5.1) declares `Level.all` while a listener is attached, so the panel
+  works without touching this. Pinned by
+  `test/bloc/telemetry_level_test.dart`.
+
+## [1.9.1] - 2026-09-28
+
+Dispatch-cost release, driven by the new benchmarks (`benchmarks/`,
+Juice vs bloc vs Riverpod). No signatures change; one contract does:
+**`JuiceLogger` context values are now live objects** (the emission's
+`'state'` is the state, `'groups'` the caller's set), not strings. A custom
+logger must stringify lazily — after its own level check — and must not
+retain the context map. `DefaultJuiceLogger` and `DevtoolsJuiceLogger`
+already do; see the `JuiceLogger` class doc.
+
+### Fixed
+- **Leaner telemetry on the emit path.** The status emitter put the
+  state's `toString()` and the groups' `toString()` into its log context on
+  every emission, whatever the logger; it now passes the objects (loggers
+  that print stringify them). The executor names a span's use case and
+  event once. With the logger fix below, default-logger dispatch measured
+  12.54 → 6.50 µs per event (release, `benchmarks/RESULTS.md`).
+- **`DefaultJuiceLogger` no longer formats lines it will drop.** Every
+  emission logs a context holding the state; the line was built eagerly —
+  `'$message | Context: $context'`, i.e. the state's `toString()` — on
+  EVERY emission, in release too, where logger's default filter then
+  discards it. With the default printer the message is now a closure the
+  printer evaluates only when the line passes the filter. A caller-supplied
+  `Logger` keeps eager strings (its printer may not evaluate function
+  messages, e.g. `LogfmtPrinter`). Found by the new benchmarks
+  (`benchmarks/`).
+
+### Docs
+- Measured where a dispatch's time goes (`benchmarks/RESULTS.md` §4): the
+  fresh use-case instance per event costs ~0.34 µs of a ~5 µs send; the
+  rest is telemetry context construction and the async executor.
+
+## [1.9.0] - 2026-09-26
+
+Robustness release: the guarantees Juice documents now hold under stress —
+closing mid-flight, failing closes, stale leases, mis-registered use cases —
+and the core is Web/WASM-compatible.
+
+### Added
+- **`UseCaseBuilder.typed(() => FooUseCase())`** — type-checked registration.
+  The event type is inferred from the use case, so pairing
+  `typeOfEvent: SaveEvent` with a `LoadUseCase` is a compile error instead of
+  a dispatch-time cast failure. The use case's bloc type is checked when the
+  bloc registers the builder: registered on the wrong bloc, it throws
+  `ArgumentError` from that bloc's constructor. Takes `concurrency` and
+  `initialEventBuilder`. Additive; the constructor is unchanged.
+- **Events that return a value, in core**: `ResultEvent<T>` (moved to its
+  own library), `OperationResult`, and the `ResultEventOps` extension —
+  `bloc.sendForResult(event)` / `bloc.sendAndWaitResult(event)`. Promoted
+  from `juice_storage` (2.3.0 now builds on them) so the family has one way
+  to await an event's value. Stricter than storage's original: a closed or
+  closing bloc throws at once, and an event whose processing ends without a
+  terminal status (dropped by a `droppable` builder, or its use case emitted
+  nothing) throws `StateError` instead of waiting out the timeout. The
+  terminal status is captured synchronously at emit time (an internal
+  emission tap), not from the asynchronously delivered stream.
+- **`juiceTest`** (`package:juice/testing.dart`) — declarative bloc tests:
+  `build` / `seed` / `act` / `wait` / `skip` / `expect` / `errors` /
+  `verify`, plus `runJuiceTest` to call the body directly. No fixed sleeps
+  (`act` returns the `send()` futures, which complete when processing does);
+  the bloc is closed BEFORE asserting; each emission's rebuild groups are
+  snapshotted at emit time (they accumulate on a multi-emit event);
+  `isUpdatingStatus` / `isWaitingStatus` / `isFailureStatus` /
+  `isCancelingStatus` match kind, state and groups; an unexpected use-case
+  error fails the test; a use case still running at close fails it (the
+  "act didn't await" leak). `BlocTester` remains. Dogfooded: juice_theme's
+  behavior tests are ported and now assert groups with no `settle()`.
+  Adds `test_api` (its public `scaffolding.dart`, the `test` flutter_test
+  re-exports) and `meta` as dependencies, used only by `testing.dart`.
+- **`JuiceBloc.isClosing`** — true once `close()` has started, and stays
+  true (monotonic; `isClosed` marks completion). Formalizes the flag
+  `juice_sync`'s `SyncBloc` already declared, which now overrides it.
+
+### Changed
+- **The close fence.** An emit after the bloc has closed (a use case still
+  running when the user left) is dropped and logged as
+  `emission_after_close` (warning) instead of throwing `StateError` — which
+  surfaced as a bloc error and, under `RetryableUseCaseBuilder`, was retried
+  against the closed bloc. From the moment `close()` starts, new events are
+  refused (`send`, `sendCancellable`), and `sendAndWait` throws `StateError`
+  at once instead of waiting out its timeout.
+- **`close()` is memoized**: a second caller awaits the same teardown instead
+  of returning before it finishes.
+- **`RetryableUseCaseBuilder`** abandons the retry loop (`retry_abandoned`)
+  when the bloc closes during backoff.
+- **`package:juice/juice.dart` re-exports `package:logger/web.dart`**, not
+  `logger.dart`: everything except `FileOutput` / `AdvancedFileOutput`
+  (nothing in the family uses them). logger's own web stub for those imports
+  `dart:io` — in every release through 2.8.0 — which made juice
+  WASM-incompatible. An app writing log files imports
+  `package:logger/logger.dart` directly.
+
+### Fixed
+- **A stale lease can no longer close a replacement bloc.** A lease taken
+  before `BlocScope.end<T>()` / `endFeature` and released after a new
+  instance was created decremented the NEW instance's count and auto-closed
+  it under the widgets using it. Leases now remember their instance. Every
+  release also settles `LeakDetector`, so a lease released during a close is
+  no longer reported as a leak.
+- **A `close()` that throws no longer wedges its entry.** `BlocScope` reports
+  it (`bloc_close_error`), rethrows to the caller, and always clears the
+  entry — it used to leave it "closing" forever, so every later `get` /
+  `lease` threw. `leaseAsync` waits through a failed close.
+- **`FeatureScope.end()` can no longer hang.** A feature bloc whose close
+  threw left the end event uncompleted forever; the event now fails with the
+  error, after the scope is still removed and `ScopeEndedNotification` still
+  published. `start()` / `end()` fall back to direct disposal when the
+  `ScopeLifecycleBloc` is closed or closing (its refused events never
+  complete).
+- **Use-case wiring runs inside the telemetry span**: a wiring failure logs
+  its `use_case_error` END and reaches `onError` (it was a START with no END,
+  swallowed silently in `sequential` mode). The wrong-bloc cast now names the
+  use case, the bloc it expects, and the bloc it was registered on.
+- pub.dev static analysis: two doc comments with bare angle brackets.
+
+Found by the new tests:
+- **`StatelessJuiceWidget` / `2` / `3` rebuilt with a different `scope`** kept
+  leasing and streaming the OLD bloc while its `bloc` getter read the new
+  one (and a leased new bloc was never leased, so the getter threw). The
+  lease holders now re-lease on a scope change — new lease first, then the
+  old one released.
+- **`JuiceAsyncBuilder`**: a stream closing right after an error threw
+  "Snapshot data must not be null" (done now keeps the error); a future
+  failing after unmount wrote to a disposed notifier, and a replaced
+  future's late error overwrote the current snapshot (the error path now has
+  the success path's guard).
+- **`AviatorManager.navigate`** dropped the future of async navigation, so an
+  unknown deep link or a failing auth/data step — on the path of every
+  `emitUpdate(aviatorName:)` — escaped as an uncaught zone error. Now logged
+  as `aviator_error`.
+- **Inline use cases navigating** (`ctx.emit.failure(aviatorName: …)`)
+  emitted an extra `UpdatingStatus` that overwrote the failure/waiting/
+  cancel and widened the groups to `*` (every widget rebuilt). Navigation
+  no longer emits.
+- **`CancellableEvent` equality is identity.** The value-style `==` compared
+  only the runtime type and the cancelled flag (two different orders were
+  equal), and `hashCode` changed on `cancel()`, losing the event in any
+  Set/Map. `TimeoutSupport`'s override is gone too.
+- **A `TimeoutSupport` timer is stopped when its use case finishes**; it
+  used to fire later and mark a completed event timed out and cancelled.
+- Docs: the default `groups: {'*'}` rebuilds on `rebuildAlways` broadcasts
+  only, not "on all state changes" (behavior unchanged, now pinned);
+  `JuiceWidgetState2/3.close()` runs once ALL blocs have closed.
+
+### Quality
+- pana 160/160 locally (1.8.1 scored 140: platform support and static
+  analysis).
+- **Core line coverage 55.8% → 94.4%**, now gated at 90% in CI
+  (`tool/coverage_check.sh`, `melos run coverage:juice`). The vendored,
+  unused `Bloc<Event, State>` base (`bloc.dart`, `emitter.dart`,
+  `bloc_support.dart`, `bloc_base.dart`, `global_bloc_resolver.dart`) is
+  excluded and flagged for removal in 2.0.0. The suite grew from 217 to
+  479 tests; every exported widget is now tested (`JuiceBuilder*`,
+  `JuiceWidgetState*` and the `JuiceExceptionWidget` had none).
+
+## [1.8.1] - 2026-09-25
+
+### Fixed
+- **`sendAndWait` returns instead of timing out.** It awaited `send()` —
+  which completes only after the use case has finished emitting — and only
+  then subscribed to the non-replaying `stream`, so it had already missed its
+  own result and threw `TimeoutException` unless some unrelated emission
+  followed. It now subscribes before sending, and matches only statuses
+  caused by the event it sent (the pattern `juice_storage`'s
+  `sendAndWaitResult` already used).
+- **Two listeners on one `select()` / `selectWith()` stream both fire.** The
+  1.8.0 `previous` lived in one closure shared by every subscription, so the
+  first listener advanced it and the second saw "equal" and never emitted.
+  `previous` is now per subscription, seeded from the state when THAT
+  listener subscribes (what the 1.8.0 doc already claimed). Still broadcast.
+- **`JuiceSelector` / `JuiceSelectorWith`:**
+  - swapping the `bloc:` prop shows the new bloc's value at once — it stayed
+    on the old bloc's value until the projection next changed
+    (`StreamBuilder` applies `initialData` only once);
+  - a new `selector` closure (e.g. over a changed row id) takes effect on
+    rebuild — the first build's closure was used forever;
+  - `groups` are compared by value, so an inline `{Group.x}` literal no
+    longer resubscribes on every parent rebuild, and a changed set takes
+    effect.
+  The widgets hold the displayed value and compare each considered emission
+  against it directly (no `StreamBuilder`).
+- **`FeatureScope` ids are a monotonic counter.** They were
+  `DateTime.now().microsecondsSinceEpoch`, and equality is by id: two scopes
+  created in the same clock tick (routine on web's millisecond clock) were
+  EQUAL, so their `BlocId`s collided — they shared blocs, and ending one
+  closed the other's.
+- **`LeakDetector` keys leases by a sequence number**, not a timestamp: two
+  leases acquired in the same tick shared a key, the second overwrote the
+  first, and a real leak went unreported.
+
+### Changed
+- **`flutter_test` is no longer a runtime dependency** (it is a dev
+  dependency). It was only used by `package:juice/testing.dart`'s
+  `BlocTester`, which now asserts through the pure-Dart `package:matcher`
+  (`matcher/expect.dart`) — the same `expect` `flutter_test` re-exports, so
+  `BlocTester` behaves identically inside `test` and `testWidgets`. Consumer
+  apps no longer get the test framework in their dependency graph.
+- Dropped the unused `cupertino_icons` dependency (template leftover).
+- `unused_catch_stack` in `emitter.dart` (flagged by current analyzers).
+
+### Tests
+- `test/bloc/state_selector_test.dart`: two listeners on one stream; a late
+  listener is seeded at ITS subscription; broadcast preserved;
+  `sendAndWait` returns its own event's status and ignores others'.
+- `test/ui/juice_selector_test.dart`: bloc swap (both widgets), selector
+  change, value-equal vs changed inline groups.
+- `test/bloc/lifecycle_ids_test.dart`: 1000 back-to-back scopes are
+  distinct; two same-tick leases are both tracked.
+
+## [1.8.0] - 2026-09-21
+
+### Added
+- **`JuiceSelector` / `JuiceSelectorWith` / `bloc.select` / `bloc.selectWith`
+  take `groups`.** Select-style rebuilds now live INSIDE the rebuild-groups
+  vocabulary instead of beside it: with `groups`, an emission whose
+  `groupsToRebuild` do not intersect them is ignored entirely (not projected,
+  not remembered — the same `denyRebuild` filter every Juice widget uses),
+  and only then is the selected value compared. "In this group's blast
+  radius, only if this cell moved" — the shape for a hot cell (a list row's
+  one field, a ticker) under a group that covers a whole section. Without
+  `groups` the previous behavior stands: every emission is compared.
+  `rebuildAlways` passes the group filter as it does everywhere.
+
+### Fixed
+- **A selector's first emission is now compared, not passed.** `previous` is
+  seeded from `bloc.state` at subscription, so an emission equal to the
+  current value no longer rebuilds the widget once for nothing. The old
+  doc claimed the stream "emits immediately with the current value"; it
+  never did (`bloc.stream` does not replay) — the doc now says so, and the
+  widgets keep seeding `initialData` from state.
+- **`selectWith` with a nullable projection dedupes.** The old
+  `previous != null &&` guard skipped the comparison whenever the previous
+  value was `null`, re-emitting on every emission. `previous` is now typed
+  `T`, so `null` participates.
+
+### Tests
+- `test/bloc/state_selector_test.dart` (stream) and
+  `test/ui/juice_selector_test.dart` (widget): the selector had shipped with
+  zero tests. Pins: no replay; `==` dedup; ungrouped projects every emission;
+  grouped ignores other groups entirely; `rebuildAlways` reaches a grouped
+  selector; nullable dedup; the widget rebuilds on its group when the value
+  changes, and not on another group, and not on an equal value.
+
+## [1.7.2] - 2026-09-16
+
+### Changed
+- Patch, not minor: no API or behavior change. `ScopeLifecycleBloc` — the
+  framework's own bloc — now declares its
+  `EventConcurrency` modes like every package in the family:
+  `StartScopeEvent` → `sequential` (mutates the scopes map; atomic today),
+  `EndScopeEvent` → `concurrent`, explicit, keeping its per-scope
+  singleflight (`getOrCreateEndingFuture`): independent scopes end in
+  parallel, the same scope ends once.
+
+### Docs
+- README: the `skipIfSame` bullet (BlocSignal tee-up item 4) and the install
+  snippet, both of which had drifted after 1.7.1 shipped.
+
+## [1.7.1] - 2026-08-21
+
+- Docs: README gains the 1.7.0 telemetry-pair bullet and a current install
+  snippet (was `^1.4.0`). No code changes.
+
+## [1.7.0] - 2026-08-21
+
+### New Features
+
+#### Use-case telemetry pair — spans become possible
+
+Every use-case execution now logs exactly two structured entries sharing a
+process-unique `executionId`: the existing `use_case_execution` start (which
+gains the id), and a new end entry — `use_case_completed` with
+`elapsedMicros` on success, or the existing `use_case_error` (which gains
+`executionId` + `elapsedMicros`) on throw. A telemetry consumer (e.g.
+`juice_observability`'s `DevtoolsJuiceLogger`) can now draw honest duration
+spans, including when same-type events overlap under
+`EventConcurrency.concurrent`.
+
+Note: `use_case_error` has two sources sharing the type — the executor's
+span-closing entry (has `executionId`) and `BlocErrorHandler`'s summary
+(has `bloc`/`state`). Span consumers key on `executionId` presence.
+
+Additive, log-schema only; no behavior changes.
+
+## [1.6.0] - 2026-06-23
+
+### New Features
+
+#### EntityStatus — per-item async state for collections
+
+`StreamStatus` is bloc-grained: it can say "the bloc is waiting/failing", not
+"row 7 of a list is in flight while the rest are fine". `EntityStatus` models
+per-item async lifecycle (a row uploading, deleting, re-reading, retrying) as
+persistent, queryable STATE.
+
+- **`EntityStatus`** (sealed: `EntityIdle` / `EntityWaiting` / `EntityFailure(error)`)
+  with `.when` / `.maybeWhen` — the `StreamStatus` vocabulary at the entity grain.
+- **`EntityStatuses<K>`**: an immutable key→status map for `BlocState` (idle ==
+  absent, so it tracks work, not collection size; value equality for clean diffing).
+- **`BlocUseCase.guardEntity<K, T>`**: brackets async work as waiting → idle, or
+  failure(error) on throw, with cleanup guaranteed — kills the stuck-spinner
+  footgun. `read`/`write` closures keep it decoupled from any state shape (a bloc
+  can hold several status maps).
+- Exported from `package:juice/juice.dart`. 10 tests; example-first GUIDE +
+  reference SPEC.
+
+Graduated from the `entity-status-prototype` branch after an app trial (the
+Glean review re-read flow). Additive and backward-compatible.
+
+## [1.5.0] - 2026-05-28
+
+### New Features
+
+#### Per-event-type concurrency modes
+
+- Added `EventConcurrency { concurrent, sequential, droppable }`, set per event
+  via `UseCaseBuilder(..., concurrency: ...)` (and the other builders).
+- **`sequential`** — same-type events queue and run one at a time to completion
+  (including their awaits), in send order. Eliminates the "read state before an
+  await, write a stale value after" race for that event type.
+- **`droppable`** — a same-type event arriving while one is running is dropped.
+  Replaces hand-rolled "busy" guard flags.
+- **`concurrent`** (default) — unchanged behavior; fully backward-compatible.
+- Implemented as a thin wrapper at the `EventDispatcher` (per-type FIFO tail /
+  running flag); use cases, executor, status emitter, and state manager are
+  untouched. Queued sequential runs are skipped after `close()` (no
+  emit-after-close).
+
+`restartable` is planned for 1.6 (needs cooperative cancellation + emit
+suppression for superseded runs).
+
+## [1.4.0] - 2026-04-18
+
+### Changed
+
+- Repositioned Juice as a lifecycle-aware application framework rather than a generic state-management package
+- Treated `packages/juice` as the canonical implementation source in repository docs and release messaging
+- Tightened package hygiene for publishing, including moving `flutter_test` out of runtime dependencies
+
+### Documentation
+
+- Refreshed README and onboarding guidance to point users toward the strongest standalone examples
+- Clarified that the repository-root `example/` app is a showcase, not the primary architecture reference
+
+## [1.3.0] - 2025-01-17
+
+### Improvements
+
+#### Widget Immutability & Lifecycle Management
+- **StatelessJuiceWidget**: Removed internal bloc storage pattern for cleaner implementation
+- **JuiceWidgetState**: Made classes `abstract` (users must subclass, not instantiate directly)
+- **Unmodifiable groups**: Widget `groups` parameter is now wrapped with `Set.unmodifiable()` to preserve immutability
+- **Stricter generics**: `JuiceWidgetState` now requires `JuiceBloc<BlocState>` instead of raw `JuiceBloc` for better type safety
+
+#### JuiceWidgetState Lifecycle
+- Lease acquisition moved from lazy getter to `initState()` for deterministic lifecycle
+- Removed `setState()` call from stream filter (no side effects in predicates)
+- Added `_lastStatus` guard so `prepareForUpdate()` only runs on actual status changes, not parent rebuilds
+- Added `scope` parameter support (scope1/scope2/scope3 for multi-bloc variants) for feature parity with StatelessJuiceWidget
+
+#### Internal API
+- Added `BlocScope.peekExisting()` and `maybePeekExisting()` (internal, marked with `@internal`)
+  - Read-only access to existing bloc instances without creating or incrementing lease count
+  - Used by StatelessJuiceWidget for cleaner bloc access after lease holder ensures instance exists
+
+### Documentation
+- Updated `prepareForUpdate()` documentation to clarify it only runs on actual status changes
+- Added documentation noting legacy resolver users are responsible for bloc lifecycle management
+
+---
+
+## [1.2.0] - 2025-01-11
+
+### New Features
+
+#### ScopeLifecycleBloc - Reactive Scope Lifecycle Management
+- Added `ScopeLifecycleBloc` as a permanent bloc that tracks `FeatureScope` lifecycle events
+- Provides stream-based notifications for scope state changes:
+  - `ScopeStartedNotification` - Emitted when a scope starts
+  - `ScopeEndingNotification` - Emitted when scope cleanup begins (includes `CleanupBarrier`)
+  - `ScopeEndedNotification` - Emitted when cleanup completes (includes success/timeout status)
+- Enables reactive patterns for scope-aware features
+
+#### CleanupBarrier - Deterministic Async Cleanup
+- Added `CleanupBarrier` for coordinating async cleanup when scopes end
+- Ensures in-flight operations complete or cancel before scope fully closes
+- Features:
+  - `barrier.add(Future)` - Register cleanup tasks
+  - Configurable timeout (default: 30 seconds) prevents hung cleanup
+  - `cleanupCompleted` flag indicates success vs timeout
+
+```dart
+// Subscribe to lifecycle notifications
+lifecycleBloc.notifications.listen((notification) {
+  if (notification is ScopeEndingNotification) {
+    // Register cleanup work on the barrier
+    notification.barrier.add(_cancelPendingRequests());
+    notification.barrier.add(_saveUnsavedData());
+  }
+});
+```
+
+### Improvements
+
+#### Aviator Async Support
+- `NavigateWhere` now supports `FutureOr<void>` for async navigation handlers
+- Added `navigateAsync` method to `AviatorManager` for awaitable navigation
+- Added `navigateAsync` to `UseCaseContext` for use cases that need to await navigation completion
+
+```dart
+// Sync navigation (fire-and-forget)
+emitUpdate(aviatorName: 'home', aviatorArgs: {'tab': 'profile'});
+
+// Async navigation in use case
+await context.navigateAsync('authCheck', {'returnTo': '/dashboard'});
+```
+
+### Example App
+- Added "Lifecycle Demo" showcasing ScopeLifecycleBloc capabilities:
+  - Spawns parallel simulated async tasks with progress tracking
+  - Demonstrates CleanupBarrier canceling in-flight tasks on scope end
+  - Visual phase indicator (Idle → Active → Cleanup → Ended)
+  - Color-coded event log showing all lifecycle notifications
+  - Toggle for slow cleanup to test barrier timeout behavior
+- Fixed chat example WebSocket connection (switched to maintained echo server)
+
+---
+
+## [1.1.3] - 2025-01-10
+
+### Fixes
+- Events sent to a closed bloc are now gracefully ignored with a log message instead of throwing an error
+- Fixed `JuiceWidgetState`, `JuiceWidgetState2`, `JuiceWidgetState3` to use `BlocScope` when `GlobalBlocResolver` is not configured
+  - Previously threw `LateInitializationError` when using `BlocScope.register` pattern
+  - Now properly acquires and releases bloc leases with lifecycle management
+- Resolved pub.dev analyzer warnings:
+  - Removed unnecessary imports in `bloc_scope.dart`, `event_subscription.dart`, `relay_use_case_builder.dart`, `bloc_tester.dart`
+  - Updated constructors in `StatelessJuiceWidget` to use Dart 3 super parameters
+- Fixed CI workflow: Updated Flutter to 3.27.1 for Dart SDK 3.5.4 compatibility
+
+### Maintenance
+- Added GitHub Sponsors funding link
+- Code formatting pass across all packages
+
+### Known Issues
+- 9 analyzer hints remain for `State` type parameter naming (shadows Flutter's `State` class)
+  - Will be renamed to `TState` in v2.0.0 as a breaking change
+
+---
+
+## [1.1.2] - 2025-01-04
+
+### New Features
+
+#### Inline Use Cases
+- Added `InlineUseCaseBuilder` for simple, stateless operations
+- Reduces boilerplate for operations that don't need dedicated class files
+- Features:
+  - `InlineContext<TBloc, TState>` with typed state access
+  - `InlineEmitter` with clean `emit.update/waiting/failure/cancel` API
+  - `Set<Object>` groups support (accepts `RebuildGroup`, enums, or strings)
+
+```dart
+() => InlineUseCaseBuilder<CounterBloc, CounterState, IncrementEvent>(
+  typeOfEvent: IncrementEvent,
+  handler: (ctx, event) async {
+    ctx.emit.update(
+      newState: ctx.state.copyWith(count: ctx.state.count + 1),
+      groups: {CounterGroups.counter},
+    );
+  },
+)
+```
+
+#### Type-Safe Rebuild Groups
+- Added `RebuildGroup` class for compile-time safe rebuild groups
+- Prevents typos, enables IDE autocomplete, supports refactoring
+- Built-in `RebuildGroup.all` and `RebuildGroup.optOut`
+- Extensions: `.toStringSet()` and `.toSet()` for conversion
+
+```dart
+abstract class CounterGroups {
+  static const counter = RebuildGroup('counter');
+  static const display = RebuildGroup('counter:display');
+}
+
+// Usage
+emitUpdate(groupsToRebuild: {CounterGroups.counter}.toStringSet());
+```
+
+#### Retryable Use Cases
+- Added `RetryableUseCaseBuilder` for automatic retry with configurable backoff
+- Wraps any use case with retry logic, eliminating boilerplate
+- Features:
+  - Configurable `maxRetries` (default: 3)
+  - Multiple backoff strategies: `FixedBackoff`, `ExponentialBackoff`, `LinearBackoff`
+  - Custom retry conditions via `retryWhen` predicate
+  - `onRetry` callback for logging/metrics
+  - Respects `CancellableEvent` for early termination
+
+```dart
+() => RetryableUseCaseBuilder<MyBloc, MyState, FetchDataEvent>(
+  typeOfEvent: FetchDataEvent,
+  useCaseGenerator: () => FetchDataUseCase(),
+  maxRetries: 3,
+  backoff: ExponentialBackoff(
+    initial: Duration(seconds: 1),
+    maxDelay: Duration(seconds: 30),
+    jitter: true,
+  ),
+)
+```
+
+### Deprecated
+- `UpdateEvent.newState` parameter is now deprecated
+  - State changes should go through dedicated use cases to maintain clean architecture
+  - Will be removed in v2.0.0
+  - Use `UpdateEvent` only for navigation triggers and status resets
+
+### Documentation
+- Added comprehensive dartdoc to `UpdateEvent` with usage examples
+- Clarified correct vs incorrect usage patterns
+
+### Tests
+- Added 13 inline use case tests
+- Added 10 RebuildGroup tests
+- Added 15 RetryableUseCaseBuilder tests
+- Total: 131 tests
+
+---
+
+## [1.1.1] - 2025-01-04
+
+### Documentation
+- Added comprehensive library-level dartdoc to `juice.dart`
+- Improved pub.dev documentation score
+
+### Fixes
+- Suppressed `must_be_immutable` analyzer warnings (intentional design for late-initialized bloc fields)
+
+---
+
+## [1.1.0] - 2025-01-04
+
+### New Features
+
+#### BlocScope Lifecycle Management
+- Introduced `BlocScope` for semantic bloc lifecycle control
+- Added three lifecycle options:
+  - `BlocLifecycle.permanent` - App-level blocs that live for entire app lifetime
+  - `BlocLifecycle.feature` - Blocs scoped to a feature, disposed together via `FeatureScope`
+  - `BlocLifecycle.leased` - Widget-level blocs with automatic reference-counted disposal
+- Added `BlocLease<T>` for safe bloc access with automatic cleanup
+- Added `BlocScope.diagnostics<T>()` for debugging bloc state
+- Added `BlocScope.debugDump()` for development diagnostics
+
+#### Cross-Bloc Communication
+- Added `EventSubscription` for listening to events from one bloc and forwarding to another
+- Added `StateRelay` for simple state-to-event transformation between blocs
+- Added `StatusRelay` for full StreamStatus access when reacting to state changes
+- Added `when` predicate filtering for both event subscriptions and relays
+
+### Deprecated
+- `RelayUseCaseBuilder` is now deprecated in favor of `StateRelay` and `StatusRelay`
+  - `StateRelay` - Use when you only need to react to state changes (most common)
+  - `StatusRelay` - Use when you need to handle waiting/error states
+  - Will be removed in v2.0.0
+
+### Bug Fixes
+- Fixed race condition in `EventSubscription` initialization when `close()` called before microtask executes
+- Fixed race condition in `RelayUseCaseBuilder` initialization
+- Fixed unsafe dynamic cast in `UseCaseExecutor` - replaced with type-safe `setBloc()` method
+- Fixed forced non-null access in `widget_support.dart` with safe null-coalescing
+- Fixed inconsistent default groups in `StatelessJuiceWidget2` (now uses `{"*"}` like other variants)
+
+### Improvements
+- Added bloc type context to relay error messages for better debugging
+- Added warning log when `EventDispatcher` uses unhandled event fallback
+- Simplified verbose error throwing patterns in `JuiceAsyncBuilder` with helper getters
+- Removed ambiguous `_Disposable` interface from `JuiceBloc`, documented `dispose()` method
+- Added event type to state emission logs for improved observability
+
+### Tests
+- Added comprehensive test suite for `BlocScope` lifecycle management (20 tests)
+- Added `EventSubscription` tests covering transformation, filtering, and race conditions (10 tests)
+- Added `RelayUseCaseBuilder` tests covering relay, error handling, and multi-relay scenarios (10 tests)
+- Added `StateRelay` and `StatusRelay` tests (13 tests)
+- Added resource cleanup tests for bloc close, stream cleanup, and lease disposal (9 tests)
+- Total: 62 new tests, 93 tests overall
+
+### Documentation
+- Updated README to use `BlocScope` instead of `GlobalBlocResolver`
+- Added comprehensive documentation for lifecycle management
+- Added cross-bloc communication examples
+- Updated Best Practices with lifecycle and communication guidelines
+
+### Migration Guide
+`GlobalBlocResolver` is still available for backwards compatibility, but `BlocScope` is now the recommended approach:
+
+```dart
+// Before (still works)
+GlobalBlocResolver().resolver = BlocResolver();
+
+// After (recommended)
+BlocScope.register<MyBloc>(
+  () => MyBloc(),
+  lifecycle: BlocLifecycle.permanent,
+);
+```
+
+---
+
+## [1.0.4] - 2025-02-08
+
+### Tests
+- Created new `StatelessJuiceWidget` tests to verify rebuild behavior across groups.
+- Added BLoC lifecycle tests ensuring proper close and cleanup.
+- Increased test coverage for error-handling and wildcard group rebuild logic.
+
+### Maintenance
+- Version bump in `pubspec.yaml` to `1.0.4`.
+
+## [1.0.3] - 2025-02-07
+
+### Documentation
+- Updated `README.md` with various improvements.
+- Improved package documentation for better clarity.
+- Improved dart doc processing
+
+### Maintenance
+- Version bump in `pubspec.yaml` to `1.0.3`.
+
+## [1.0.2] - 2025-01-30
+
+### Documentation
+- Updated `README.md` with various improvements.
+- Improved package documentation for better clarity.
+- Removed misleading `copyWith` mention in comments within `bloc_state.dart`.
+- Properly escaped angle brackets in dartdoc comments
+
+### Community & Support
+- Added initial setup for `FUNDING.yaml` to support sponsorship options.
+
+### Maintenance
+- Version bump in `pubspec.yaml` to `1.0.2`.
+
+## [1.0.1] - 2025-01-23
+
+### Enhancements
+- Added `StatusChecks` extension for `StreamStatus`:
+  - Includes methods for type-checking (`isUpdatingFor`, `isWaitingFor`, etc.).
+  - Added safe casting methods (`tryCastToUpdating`, `tryCastToWaiting`, etc.).
+  - Introduced a `match` method for pattern-matching on `StreamStatus` types.
+  - Simplified handling of `StreamStatus` across widgets and logic.
+
+### Developer Experience
+- Improved type safety and reduced boilerplate for handling transient states.
+- Enhanced readability and maintainability of `StreamStatus` usage.
+
+## [1.0.0] - 2025-01-16
+
+### Core Features
+- Introduced JuiceBloc with use case-driven state management
+- Implemented StreamStatus<T> for type-safe state transitions (Updating/Waiting/Failure)
+- Added group-based widget rebuilding system for performance optimization
+- Created StatelessJuiceWidget for reactive UI updates
+
+### Use Case System
+- Introduced BlocUseCase for structured business logic
+- Added StatefulUseCaseBuilder for singleton use cases
+- Implemented RelayUseCaseBuilder for bloc-to-bloc communication
+- Added UpdateUseCase for quick state updates
+
+### Navigation
+- Implemented Aviator system for declarative navigation
+- Added DeepLinkAviator for handling deep linking
+- Created base AviatorBase class for custom navigation handlers
+
+### Dependency Resolution
+- Added BlocDependencyResolver interface
+- Implemented GlobalBlocResolver for centralized bloc management
+- Created CompositeResolver for flexible dependency injection
+
+### Widgets
+- StatelessJuiceWidget and JuiceWidgetState for single bloc binding
+- StatelessJuiceWidget2 and StatelessJuiceWidget3 for multiple bloc bindings
+- Added JuiceAsyncBuilder for stream handling
+
+### Logging & Error Handling
+- Implemented JuiceLogger interface
+- Added DefaultJuiceLogger with configurable options
+- Created structured error handling system
+
+### Developer Experience
+- Added comprehensive code documentation
+- Implemented type-safe APIs throughout
+- Created builder patterns for common operations
+
+## Initial Contributors
+- Kevin Ehmka
+
+Note: This is the first stable release of Juice, a state management solution designed to provide a clean architecture plus bloc approach to Flutter applications.

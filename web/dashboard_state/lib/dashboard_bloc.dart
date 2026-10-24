@@ -59,14 +59,13 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   DashboardBloc({http.Client? client})
     : client = client ?? http.Client(),
       super(const DashboardState(), [
-        () => UseCaseBuilder(
-          typeOfEvent: DashboardCommand,
-          useCaseGenerator: () => DashboardUseCase(),
+        () => UseCaseBuilder.typed(
+          () => DashboardUseCase(),
           concurrency: EventConcurrency.droppable,
         ),
-        () => UseCaseBuilder(
-          typeOfEvent: DisconnectDashboard,
-          useCaseGenerator: () => DisconnectUseCase(),
+        () => UseCaseBuilder.typed(
+          () => DisconnectUseCase(),
+          concurrency: EventConcurrency.concurrent,
         ),
       ]);
   final http.Client client;
@@ -140,6 +139,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   }
 
   void connect(String token) {
+    if (isClosing) return;
     _credential = token;
     generation++;
     send(DashboardCommand('refresh'));
@@ -419,13 +419,16 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   Future<String> text(String path) async => utf8.decode(await bytes(path));
 
   @override
-  void dispose() {
-    _notificationTimer?.cancel();
-    _timer?.cancel();
-    _credential = null;
-    generation++;
-    client.close();
-    super.dispose();
+  Future<void> close() {
+    // Scope teardown and dispose() both enter this awaitable ownership boundary.
+    if (!isClosing) {
+      _notificationTimer?.cancel();
+      _timer?.cancel();
+      _credential = null;
+      generation++;
+      client.close();
+    }
+    return super.close();
   }
 }
 

@@ -46,12 +46,9 @@ abstract class UseCaseBuilderBase {
   /// Creates the use case instance that will handle events.
   UseCaseGenerator get generator;
 
-  /// How same-type events are processed relative to one another.
-  ///
-  /// Defaults to [EventConcurrency.concurrent] (events may interleave at awaits).
-  /// Use [EventConcurrency.sequential] for events that mutate shared state, or
-  /// [EventConcurrency.droppable] for exclusive flows.
-  EventConcurrency get concurrency => EventConcurrency.concurrent;
+  /// How same-type events are processed relative to one another. Every
+  /// builder declares it; a mode is a decision, never a default.
+  EventConcurrency get concurrency;
 
   /// Cleanup method called when the use case is disposed.
   ///
@@ -71,11 +68,13 @@ abstract class UseCaseBuilderBase {
 ///     () => UseCaseBuilder(
 ///       typeOfEvent: IncrementEvent,
 ///       useCaseGenerator: () => IncrementUseCase(),
+///       concurrency: EventConcurrency.sequential,
 ///     ),
 ///     () => UseCaseBuilder(
 ///       typeOfEvent: LoadDataEvent,
 ///       useCaseGenerator: () => LoadDataUseCase(),
 ///       initialEventBuilder: () => LoadDataEvent(), // Auto-fires on init
+///       concurrency: EventConcurrency.droppable,
 ///     ),
 ///   ]);
 /// }
@@ -90,7 +89,7 @@ class UseCaseBuilder implements UseCaseBuilderBase {
     required this.typeOfEvent,
     required this.useCaseGenerator,
     UseCaseEventBuilder? initialEventBuilder,
-    this.concurrency = EventConcurrency.concurrent,
+    required this.concurrency,
   })  : _initialEventBuilder = initialEventBuilder,
         _acceptsBloc = null,
         _useCaseBlocType = null;
@@ -110,7 +109,8 @@ class UseCaseBuilder implements UseCaseBuilderBase {
   /// case, so it cannot disagree with it.
   ///
   /// ```dart
-  /// () => UseCaseBuilder.typed(() => LoadFooUseCase()),
+  /// () => UseCaseBuilder.typed(() => LoadFooUseCase(),
+  ///     concurrency: EventConcurrency.droppable),
   /// () => UseCaseBuilder.typed(() => SaveFooUseCase(),
   ///     concurrency: EventConcurrency.sequential),
   /// ```
@@ -123,12 +123,12 @@ class UseCaseBuilder implements UseCaseBuilderBase {
   /// bloc's constructor, not on the first event.
   ///
   /// The event must be the use case's exact event class (events match by
-  /// runtime type — AGENTS gotcha 2); a use case declared over an abstract
-  /// base event should keep the explicit constructor.
+  /// runtime type); a use case declared over an abstract base event keeps
+  /// the explicit constructor.
   static UseCaseBuilder
       typed<TBloc extends JuiceBloc, TEvent extends EventBase>(
     UseCase<TBloc, TEvent> Function() useCaseGenerator, {
-    EventConcurrency concurrency = EventConcurrency.concurrent,
+    required EventConcurrency concurrency,
     TEvent Function()? initialEventBuilder,
   }) {
     return UseCaseBuilder._typed(

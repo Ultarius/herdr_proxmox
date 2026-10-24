@@ -6,7 +6,7 @@ dependencies:
   flutter:
     sdk: flutter
   http: 1.6.0
-  juice: 1.10.0
+  juice: 2.0.0
   herdr_dashboard_state:
     path: ../dashboard_state
   zenrouter: 3.0.0

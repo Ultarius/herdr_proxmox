@@ -41,9 +41,8 @@ class OrganizationCommand extends EventBase {
 class OrganizationBloc extends JuiceBloc<OrganizationState> {
   OrganizationBloc(this.connection)
     : super(const OrganizationState(), [
-        () => UseCaseBuilder(
-          typeOfEvent: OrganizationCommand,
-          useCaseGenerator: () => OrganizationUseCase(),
+        () => UseCaseBuilder.typed(
+          () => OrganizationUseCase(),
           concurrency: EventConcurrency.droppable,
         ),
       ]);

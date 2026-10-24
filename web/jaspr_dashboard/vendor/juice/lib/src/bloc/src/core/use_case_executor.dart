@@ -6,6 +6,9 @@ import '../cancellable_event.dart';
 import '../juice_bloc.dart';
 import '../usecase.dart';
 import '../juice_logger.dart';
+import 'restartable_run.dart';
+import 'type_names.dart';
+import '../telemetry.dart';
 import '../use_case_builders/use_case_builder.dart';
 
 /// Context provided to use cases for state emission.
@@ -18,8 +21,6 @@ import '../use_case_builders/use_case_builder.dart';
 /// ```dart
 /// final context = UseCaseContext(
 ///   bloc: myBloc,
-///   getState: () => myBloc.state,
-///   getOldState: () => myBloc.oldState,
 ///   emitUpdate: (newState, groups) => statusEmitter.emitUpdate(...),
 ///   emitWaiting: (newState, groups) => statusEmitter.emitWaiting(...),
 ///   emitFailure: (newState, groups) => statusEmitter.emitFailure(...),
@@ -30,12 +31,6 @@ import '../use_case_builders/use_case_builder.dart';
 class UseCaseContext<TBloc, TState extends BlocState> {
   /// The bloc instance.
   final TBloc bloc;
-
-  /// Returns the current state.
-  final TState Function() getState;
-
-  /// Returns the previous state.
-  final TState Function() getOldState;
 
   /// Emits an updating status.
   ///
@@ -61,27 +56,16 @@ class UseCaseContext<TBloc, TState extends BlocState> {
   /// Triggers navigation (fire-and-forget).
   ///
   /// If the aviator's navigation is async, this will not wait for completion.
-  /// Use [navigateAsync] if you need to await the navigation.
   final void Function(String? aviator, Map<String, dynamic>? args) navigate;
-
-  /// Triggers navigation and awaits completion.
-  ///
-  /// Use this when the aviator performs async operations (auth checks,
-  /// data loading) that must complete before proceeding.
-  final Future<void> Function(String? aviator, Map<String, dynamic>? args)
-      navigateAsync;
 
   const UseCaseContext({
     required this.bloc,
-    required this.getState,
-    required this.getOldState,
     required this.emitUpdate,
     required this.emitWaiting,
     required this.emitFailure,
     required this.emitCancel,
     required this.emitEvent,
     required this.navigate,
-    required this.navigateAsync,
   });
 }
 
@@ -135,59 +119,58 @@ class UseCaseExecutor<TBloc, TState extends BlocState> {
   ///
   /// Every execution logs exactly two structured entries: the
   /// `use_case_execution` start, and — sharing its `executionId` — either
-  /// `use_case_completed` (with `elapsedMicros`) or `use_case_error` (also
-  /// with `elapsedMicros`). A span consumer closes on whichever arrives.
+  /// `use_case_completed` (with `elapsedMicros`) or `use_case_error` (with
+  /// `elapsedMicros` when the span was being timed — the chatter was on
+  /// when the use case started; a generator that throws then closes a span
+  /// that never opened). A span consumer closes on whichever arrives.
+  /// Below the telemetry floor only the error line is built.
   Future<void> execute(UseCaseBuilderBase builder, EventBase event) async {
-    final useCase = builder.generator();
-    final context = _contextFactory(event);
     final executionId = _nextExecutionId++;
-    // Named once per execution (runtimeType.toString() isn't free, and the
-    // span logs it up to three times).
-    final useCaseName = useCase.runtimeType.toString();
-    final eventName = event.runtimeType.toString();
-
-    // Chatter (the span pair) is built only above JuiceLoggerConfig.minLevel;
-    // the error end of a span is never gated.
+    // Built only when a line will carry them: the two type names and the
+    // stopwatch are the span's content, not the send's.
     final chatter = JuiceLoggerConfig.logs(Level.info);
-    if (chatter) {
-      _logger.log('Executing use case', context: {
-        'type': 'use_case_execution',
-        'useCase': useCaseName,
-        'event': eventName,
-        'executionId': executionId,
-      });
-    }
-
-    final stopwatch = Stopwatch()..start();
+    final stopwatch = chatter ? (Stopwatch()..start()) : null;
+    final run = RestartableRun.current;
+    UseCase? useCase;
     try {
-      // Wiring is INSIDE the span: a wiring failure (a use case registered on
-      // the wrong bloc fails its setBloc cast) used to escape before the try —
-      // a START with no END, the error skipping onError, and in sequential
-      // mode swallowed by the dispatcher with no log at all.
+      // The generator and the context are inside the try: a throwing
+      // generator (a DI lookup) is a use-case error, not a silent miss.
+      useCase = builder.generator();
+      final context = _contextFactory(event);
+      if (chatter) {
+        _logger.record(JuiceTelemetry(
+          JuiceTelemetryKind.useCaseStarted,
+          useCase: typeName(useCase.runtimeType),
+          event: typeName(event.runtimeType),
+          executionId: executionId,
+        ));
+      }
       _wireUseCase(useCase, context);
       await useCase.execute(event);
+      run?.complete();
       if (chatter) {
-        _logger.log('Use case completed', context: {
-          'type': 'use_case_completed',
-          'useCase': useCaseName,
-          'event': eventName,
-          'executionId': executionId,
-          'elapsedMicros': stopwatch.elapsedMicroseconds,
-        });
+        _logger.record(JuiceTelemetry(
+          JuiceTelemetryKind.useCaseCompleted,
+          useCase: typeName(useCase.runtimeType),
+          event: typeName(event.runtimeType),
+          executionId: executionId,
+          elapsedMicros: stopwatch!.elapsedMicroseconds,
+          superseded: run?.isSuperseded ?? false,
+        ));
       }
     } catch (error, stackTrace) {
-      _logger.logError(
-        'Use case execution failed',
-        error,
-        stackTrace,
-        context: {
-          'type': 'use_case_error',
-          'useCase': useCaseName,
-          'event': eventName,
-          'executionId': executionId,
-          'elapsedMicros': stopwatch.elapsedMicroseconds,
-        },
-      );
+      run?.complete();
+      _logger.record(JuiceTelemetry(
+        JuiceTelemetryKind.useCaseFailed,
+        // A generator that threw left no use case: the builder names it.
+        useCase: typeName((useCase ?? builder).runtimeType),
+        event: typeName(event.runtimeType),
+        executionId: executionId,
+        elapsedMicros: stopwatch?.elapsedMicroseconds,
+        superseded: run?.isSuperseded ?? false,
+        error: error,
+        stackTrace: stackTrace,
+      ));
       _onError(error, stackTrace, event);
     } finally {
       // The work is over: a still-running timeout must not fire later and
@@ -248,5 +231,6 @@ class UseCaseExecutor<TBloc, TState extends BlocState> {
     };
 
     useCase.emitEvent = ({EventBase? event}) => context.emitEvent(event);
+    useCase.navigate = context.navigate;
   }
 }

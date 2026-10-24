@@ -9,17 +9,40 @@ suite. The obsolete iframe wrapper has been removed.
 
 ## Business behavior and framework boundary
 
-`web/dashboard_state/lib` contains the original dashboard and organization blocs,
-integration helpers and secure request-ID implementation. Their implementations
-are unchanged. Existing Flutter bloc imports forward to the shared package.
-The gateway and business repositories were not modified by this migration.
+`web/dashboard_state/lib` contains the shared dashboard and organization blocs,
+integration helpers and secure request-ID implementation. Existing Flutter bloc
+imports forward to the shared package. The Juice 2.0 upgrade updates use-case
+registration and runtime contracts as described below; the shared package remains
+the boundary between application behavior and either UI framework.
 
-Juice 1.10.0 imports Flutter foundation and `dart:ui` from its core. The Jaspr
-package uses the private, licensed core adapter under `vendor/juice`, retaining
-its event dispatch, state, lifecycle, concurrency and use-case implementations.
-The adapter replaces Flutter foundation types with browser-compatible notifier
-primitives and excludes Flutter widgets. The original Flutter regression suite
-continues to resolve published Juice.
+The Jaspr package uses the private, MIT-licensed Juice **2.0.0** adapter under
+`vendor/juice`. It retains upstream event dispatch, state, lifecycle, concurrency,
+use-case and typed telemetry logic, replaces Flutter foundation types with a
+small pure-Dart notifier/annotation shim, and excludes Flutter widgets and
+`JuiceWidgetSupport`. The browser build remains independent of Flutter and
+`dart:ui`. The Flutter regression suite resolves the published Juice package.
+The adapter retains upstream `package:juice/testing.dart` and core testing
+helpers, excluding Flutter async/selector/UI widgets. Rebuild-group helpers and
+the framework-independent portion of widget support remain available; Flutter
+widget APIs and tests are outside this adapter's scope.
+
+Juice 2.0 requires an explicit `EventConcurrency` on each use-case builder.
+Shared dashboard registrations use `UseCaseBuilder.typed` for checked event and
+use-case pairing. Dashboard and organization commands remain `droppable` so a
+duplicate request cannot repeat an in-flight write; disconnect is `concurrent`
+so it can reset the session immediately. `DashboardBloc.close()` owns timer and
+HTTP-client cleanup, including scope teardown and calls through `dispose()`.
+The new runtime exposes typed `JuiceTelemetry` records; the obsolete 1.x vendored
+`Bloc`/`BlocBase`/`Emitter`, event-transformer and global resolver APIs are no
+longer included. Keeping upstream implementations does not imply unchanged
+per-event scheduling, cancellation or error behavior across the major upgrade;
+the adapter and both dashboard trees require regression verification.
+
+The source is the [Juice 2.0.0 pub.dev archive](https://pub.dev/api/archives/juice-2.0.0.tar.gz),
+published **15 October 2026**, verified against SHA-256
+`96e02ef03529f74d4443bd25567914789e91102a9ffbb6ac8f06a5688ccf9711`.
+The vendored `LICENSE` retains the upstream MIT license; the adapter README
+records its framework boundary and provenance.
 
 Handlers previously embedded in widget state were mechanically ported with their
 API payloads, admin gates, polling, generation guards, idempotency keys, inspection
@@ -90,7 +113,7 @@ DOM renderer. No Canvas/WebGL terminal addon is included.
 At the initial migration checkpoint, `c721d84` on **13 October 2026**,
 local verification recorded **188 Flutter tests**, **10 Jaspr VM tests** and
 **56 Chrome tests** (run serially for shared browser focus), clean analyzers, optimized compilation, production asset
-packaging, version-guard mock build, and unchanged shared implementation contents.
+packaging and a version-guard mock build.
 Browser inspection includes desktop/mobile layouts and zero iframe/canvas elements.
 The browser suites cover permissions, inspection/approval gates, stale accounts,
 exact build identities, durable retry IDs, dialogs, controlled native fields,

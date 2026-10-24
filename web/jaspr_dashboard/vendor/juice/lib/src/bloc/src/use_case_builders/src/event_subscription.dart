@@ -1,6 +1,7 @@
-// ignore_for_file: deprecated_member_use_from_same_package
+import 'package:logger/web.dart' show Level;
 
 import '../../../bloc.dart';
+import '../../core/type_names.dart';
 
 /// Subscribes to specific events from another bloc and executes a local use case.
 ///
@@ -8,7 +9,7 @@ import '../../../bloc.dart';
 /// allowing a bloc to react to specific events emitted by another bloc,
 /// without needing to know the source bloc's state structure.
 ///
-/// Unlike [RelayUseCaseBuilder] which observes all state changes,
+/// Unlike [StateRelay] / [StatusRelay], which observe state changes,
 /// EventSubscription filters for specific event types, resulting in
 /// cleaner, more targeted inter-bloc communication.
 ///
@@ -44,7 +45,7 @@ class EventSubscription<
   /// * [useCaseGenerator] - Creates the use case that handles the local event.
   /// * [when] - Optional predicate to filter which source events trigger execution.
   /// * [statusTypes] - Which status types to listen for. Defaults to [UpdatingStatus] only.
-  /// * [resolver] - Optional custom bloc resolver (legacy). If not provided, uses BlocScope.
+  /// * [resolver] - Optional custom bloc resolver. If not provided, uses BlocScope.
   /// * [scope] - Optional scope key for resolving scoped bloc instances.
   EventSubscription({
     required this.toEvent,
@@ -71,7 +72,6 @@ class EventSubscription<
   /// Optional scope key for resolving scoped bloc instances.
   final Object? scope;
 
-  /// Custom resolver for legacy compatibility.
   final BlocDependencyResolver? _customResolver;
 
   /// The source bloc to subscribe to.
@@ -82,9 +82,6 @@ class EventSubscription<
 
   /// Subscription to the source bloc's stream.
   StreamSubscription<dynamic>? _subscription;
-
-  /// Whether the subscription has been initialized.
-  bool _isInitialized = false;
 
   /// Whether the subscription has been closed.
   bool _isClosed = false;
@@ -99,11 +96,17 @@ class EventSubscription<
     _onEvent = handler;
   }
 
-  /// Initializes the subscription. Called by JuiceBloc.
+  /// Initializes the subscription. Called by JuiceBloc at registration.
+  ///
+  /// Synchronous: a subscription to an unregistered or closed bloc throws
+  /// HERE, from the subscribing bloc's constructor, where the developer is
+  /// looking — not as an uncaught error from a microtask nobody awaits.
   void initialize() {
-    if (!_isInitialized && !_isClosed) {
-      Future.microtask(() => _initialize());
+    if (_isClosed) {
+      throw StateError(
+          'EventSubscription<$TSourceBloc, $TSourceEvent> is closed');
     }
+    _initialize();
   }
 
   // ============================================================
@@ -133,16 +136,10 @@ class EventSubscription<
   Type get sourceBlocType => TSourceBloc;
 
   void _initialize() {
-    // Guard against race condition: close() may have been called
-    // after initialize() scheduled this microtask but before it executed
-    if (_isClosed) return;
-
     try {
       if (_customResolver != null) {
-        // Legacy path: use custom resolver directly
         _sourceBloc = _customResolver.resolve<TSourceBloc>();
       } else {
-        // New path: use BlocScope with lease for proper lifecycle management
         _sourceLease = BlocScope.lease<TSourceBloc>(scope: scope);
         _sourceBloc = _sourceLease!.bloc;
       }
@@ -152,24 +149,21 @@ class EventSubscription<
       }
 
       _setupSubscription();
-      _isInitialized = true;
 
-      JuiceLoggerConfig.logger.log(
-        'EventSubscription initialized',
-        context: {
-          'type': 'event_subscription',
-          'action': 'initialize',
-          'sourceBloc': TSourceBloc.toString(),
-          'sourceEvent': TSourceEvent.toString(),
-          'localEvent': TLocalEvent.toString(),
-        },
-      );
+      if (JuiceLoggerConfig.logs(Level.info)) {
+        JuiceLoggerConfig.logger.record(JuiceTelemetry(
+          JuiceTelemetryKind.eventSubscriptionInitialized,
+          sourceBloc: typeName(TSourceBloc),
+          sourceEvent: typeName(TSourceEvent),
+          localEvent: typeName(TLocalEvent),
+        ));
+      }
     } catch (e, stackTrace) {
-      JuiceLoggerConfig.logger.logError(
-        'Failed to initialize EventSubscription for $TSourceBloc.$TSourceEvent',
-        e,
-        stackTrace,
-      );
+      _isClosed = true;
+      _sourceLease?.dispose();
+      _sourceLease = null;
+      _recordFailure('initialize', e, stackTrace);
+      rethrow;
     }
   }
 
@@ -205,37 +199,22 @@ class EventSubscription<
         try {
           final localEvent = toEvent(event);
 
-          JuiceLoggerConfig.logger.log(
-            'EventSubscription triggered',
-            context: {
-              'type': 'event_subscription',
-              'action': 'trigger',
-              'sourceBloc': TSourceBloc.toString(),
-              'sourceEvent': event.runtimeType.toString(),
-              'localEvent': localEvent.runtimeType.toString(),
-            },
-          );
+          if (JuiceLoggerConfig.logs(Level.info)) {
+            JuiceLoggerConfig.logger.record(JuiceTelemetry(
+              JuiceTelemetryKind.eventSubscriptionTriggered,
+              sourceBloc: typeName(TSourceBloc),
+              sourceEvent: typeName(event.runtimeType),
+              localEvent: typeName(localEvent.runtimeType),
+            ));
+          }
 
           _onEvent?.call(localEvent);
         } catch (e, stackTrace) {
-          JuiceLoggerConfig.logger.logError(
-            'Error in EventSubscription transformer',
-            e,
-            stackTrace,
-            context: {
-              'sourceBloc': TSourceBloc.toString(),
-              'sourceEvent': TSourceEvent.toString(),
-            },
-          );
+          _recordFailure('transform', e, stackTrace);
         }
       },
-      onError: (error, stackTrace) {
-        JuiceLoggerConfig.logger.logError(
-          'Stream error in EventSubscription',
-          error,
-          stackTrace,
-        );
-      },
+      onError: (Object error, StackTrace stackTrace) =>
+          _recordFailure('stream', error, stackTrace),
       onDone: () => close(),
     );
   }
@@ -252,14 +231,25 @@ class EventSubscription<
     _sourceLease?.dispose();
     _sourceLease = null;
 
-    JuiceLoggerConfig.logger.log(
-      'EventSubscription closed',
-      context: {
-        'type': 'event_subscription',
-        'action': 'close',
-        'sourceBloc': TSourceBloc.toString(),
-        'sourceEvent': TSourceEvent.toString(),
-      },
-    );
+    if (JuiceLoggerConfig.logs(Level.info)) {
+      JuiceLoggerConfig.logger.record(JuiceTelemetry(
+        JuiceTelemetryKind.eventSubscriptionClosed,
+        sourceBloc: typeName(TSourceBloc),
+        sourceEvent: typeName(TSourceEvent),
+      ));
+    }
   }
+
+  /// The one error entry this subscription records; [site] says which step
+  /// failed (`initialize`, `transform`, `stream`).
+  void _recordFailure(String site, Object error, StackTrace stackTrace) =>
+      JuiceLoggerConfig.logger.record(JuiceTelemetry(
+        JuiceTelemetryKind.eventSubscriptionFailed,
+        site: site,
+        sourceBloc: typeName(TSourceBloc),
+        sourceEvent: typeName(TSourceEvent),
+        localEvent: typeName(TLocalEvent),
+        error: error,
+        stackTrace: stackTrace,
+      ));
 }

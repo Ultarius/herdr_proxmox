@@ -1,6 +1,7 @@
-// ignore_for_file: deprecated_member_use_from_same_package
-
 import 'package:juice/juice.dart';
+
+import 'core/restartable_run.dart';
+import 'core/type_names.dart';
 
 /// Base class for bloc-specific use cases that provides logging and naming capabilities.
 ///
@@ -13,18 +14,22 @@ import 'package:juice/juice.dart';
 /// - Error tracking
 abstract class BlocUseCase<TBloc extends JuiceBloc, TEvent extends EventBase>
     extends UseCase<TBloc, TEvent> {
-  /// Name of the use case, automatically set from the runtime type
-  late final String useCaseName;
-
-  BlocUseCase() {
-    useCaseName = runtimeType.toString();
-  }
+  /// Name of the use case: its runtime type's name.
+  String get useCaseName => typeName(runtimeType);
 
   /// Execute the use case logic for the given event.
   ///
   /// This method must be implemented by concrete use cases to define their behavior.
   @override
   Future<void> execute(TEvent event);
+
+  /// Under `EventConcurrency.restartable`: true once a newer same-type
+  /// event has superseded this run. Every emission after
+  /// that point is dropped, so a long loop checks this (or its
+  /// `CancellableEvent.isCancelled`, which supersede sets too) and returns.
+  /// Always false under the other modes. Read from the run's zone, so it is
+  /// correct after any `await`.
+  bool get isSuperseded => RestartableRun.current?.isSuperseded ?? false;
 
   /// Logs a message with the use case name as prefix.
   ///
@@ -35,7 +40,7 @@ abstract class BlocUseCase<TBloc extends JuiceBloc, TEvent extends EventBase>
       {Level level = Level.info, Map<String, dynamic>? context}) {
     final enrichedContext = {
       'useCase': useCaseName,
-      'bloc': bloc.runtimeType.toString(),
+      'bloc': typeName(bloc.runtimeType),
       ...?context,
     };
 
@@ -53,7 +58,7 @@ abstract class BlocUseCase<TBloc extends JuiceBloc, TEvent extends EventBase>
   void logState(String stateDescription, {Map<String, dynamic>? context}) {
     final enrichedContext = {
       'useCase': useCaseName,
-      'bloc': bloc.runtimeType.toString(),
+      'bloc': typeName(bloc.runtimeType),
       'state': bloc.state.toString(),
       ...?context,
     };
@@ -128,7 +133,7 @@ abstract class BlocUseCase<TBloc extends JuiceBloc, TEvent extends EventBase>
       {Map<String, dynamic>? context}) {
     final enrichedContext = {
       'useCase': useCaseName,
-      'bloc': bloc.runtimeType.toString(),
+      'bloc': typeName(bloc.runtimeType),
       'state': bloc.state.toString(),
       ...?context,
     };
@@ -149,8 +154,8 @@ abstract class BlocUseCase<TBloc extends JuiceBloc, TEvent extends EventBase>
 /// - Stream status changes (update/waiting/failure)
 /// - Widget rebuild control via groups
 ///
-/// **Note**: The [UpdateEvent.newState] parameter is deprecated. State changes
-/// should go through dedicated use cases to maintain clean architecture.
+/// It re-emits the bloc's CURRENT state (an `UpdateEvent` carries none since
+/// 2.0.0); state changes go through dedicated use cases.
 class UpdateUseCase<TBloc extends JuiceBloc>
     extends BlocUseCase<TBloc, UpdateEvent> {
   @override
@@ -158,21 +163,21 @@ class UpdateUseCase<TBloc extends JuiceBloc>
     switch (event.resetStatusTo) {
       case ResetStreamType.onUpdate:
         emitUpdate(
-            newState: event.newState ?? bloc.state,
+            newState: bloc.state,
             groupsToRebuild: event.groupsToRebuild,
             aviatorName: event.aviatorName,
             aviatorArgs: event.aviatorArgs);
         break;
       case ResetStreamType.onFailure:
         emitFailure(
-            newState: event.newState ?? bloc.state,
+            newState: bloc.state,
             groupsToRebuild: event.groupsToRebuild,
             aviatorName: event.aviatorName,
             aviatorArgs: event.aviatorArgs);
         break;
       case ResetStreamType.onWaiting:
         emitWaiting(
-            newState: event.newState ?? bloc.state,
+            newState: bloc.state,
             groupsToRebuild: event.groupsToRebuild,
             aviatorName: event.aviatorName,
             aviatorArgs: event.aviatorArgs);
