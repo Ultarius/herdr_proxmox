@@ -353,6 +353,10 @@ def reconcile(service, task):
             task = service.perform('pull', dict(head_sha=head, reviewed=True, title=preview['title'], body=preview['body']),
                                    task['id'], ACTOR)
             flow = task['delivery_workflow']
+            if (task.get('manual_pr') or {}).get('state') == 'awaiting_manual_pr':
+                flow.update(state='awaiting_manual_pr', failure_stage='manual_pr', remote_check_after=time.time() + 30)
+                service.save(task, 'delivery_awaiting_manual_pr', ACTOR)
+                return
         if flow.get('failure_stage') != 'github_checks':
             flow['failure_stage'] = 'github_checks'
             service.save(task, 'delivery_remote_inspection', ACTOR)
@@ -490,7 +494,8 @@ def verify_pull(service, task, head):
         return False
     if current.get('mergeable') is False:
         raise ValueError('GitHub reports merge conflicts; repair and revalidate before completing delivery.')
-    checks = service.github.request('/repos/' + task['github_repository'] + '/commits/' + head + '/check-runs')
+    from github_checks import optional_evidence
+    checks, check_error = optional_evidence(service.github, '/repos/' + task['github_repository'] + '/commits/' + head + '/check-runs', 'check_runs')
     entries = checks.get('check_runs', []) if isinstance(checks, dict) else None
     if not isinstance(entries, list) or any(not isinstance(check, dict) for check in entries):
         raise ValueError('GitHub returned invalid CI evidence.')
@@ -498,7 +503,11 @@ def verify_pull(service, task, head):
         return False
     if any(check.get('conclusion') not in ('success', 'neutral', 'skipped') for check in entries):
         raise ValueError('GitHub CI failed for the published candidate.')
-    statuses = service.github.request('/repos/' + task['github_repository'] + '/commits/' + head + '/status')
+    statuses, status_error = optional_evidence(service.github, '/repos/' + task['github_repository'] + '/commits/' + head + '/status', 'statuses')
+    task['checks_unavailable'] = {key: value for key, value in (('check_runs', check_error), ('statuses', status_error)) if value}
+    if check_error or status_error:
+        task['delivery_workflow'].pop('github_verification', None)
+        return False
     records = statuses.get('statuses') if isinstance(statuses, dict) else None
     if not isinstance(records, list) or any(not isinstance(status, dict) for status in records):
         raise ValueError('GitHub returned invalid commit status evidence.')

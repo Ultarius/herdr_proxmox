@@ -482,6 +482,104 @@ void main() {
   );
 
   test(
+    'a live policy error leaves release details readable and disables PR writes until recovery',
+    () async {
+      final published = release(state: 'published')
+        ..['manual_pr_required'] = true
+        ..['resulting_sha'] = 'c' * 40
+        ..['pull_preview'] = {
+          'title': 'Release title',
+          'body': 'Reviewed description',
+        };
+      state.replaceReleases([
+        Map<String, dynamic>.from(published)
+          ..['publication_error'] = 'Operator policy requires repair.',
+      ]);
+      await settle();
+      task('release:release-one').click();
+      await settle();
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('Operator policy requires repair.'),
+      );
+      expect(
+        nodes(
+          'button',
+        ).any((e) => e.textContent == 'Check for operator-created release PR'),
+        isFalse,
+      );
+      expect(state.releaseActions, isEmpty);
+      state.replaceReleases([published]);
+      await settle();
+      expect(
+        nodes(
+          'button',
+        ).any((e) => e.textContent == 'Check for operator-created release PR'),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'manual release PR handoff shows compare link and adopts without another publication',
+    () async {
+      const compare =
+          'https://github.com/SourceOwner/project/compare/main...ForkOwner:project:herdr%2Frelease-branch?expand=1';
+      final published = release(state: 'published')
+        ..['resulting_sha'] = 'c' * 40
+        ..['revision'] = {'digest': 'manifest-digest'}
+        ..['manual_pr_required'] = true
+        ..['pull_preview'] = {
+          'title': 'Operator release',
+          'body': 'Copy to GitHub.',
+        }
+        ..['pull_request'] = {
+          'state': 'awaiting_manual_pr',
+          'message': 'Open a draft PR, then check here to adopt it.',
+          'compare_url': compare,
+        };
+      state.replaceReleases([published]);
+      await settle();
+      task('release:release-one').click();
+      await settle();
+      final link = nodes('a').singleWhere(
+        (e) => e.textContent == 'Open GitHub comparison and create draft PR',
+      );
+      expect(link.getAttribute('href'), compare);
+      expect(link.getAttribute('rel'), 'noopener noreferrer');
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('preserves the existing PR’s text'),
+      );
+      await click('Check for operator-created release PR');
+      expect(state.releaseActions.single, containsPair('action', 'pull'));
+      expect(state.releaseActions.single, containsPair('head_sha', 'c' * 40));
+      expect(state.releaseActions.single, containsPair('reviewed', true));
+      state.replaceReleases([
+        Map<String, dynamic>.from(published)
+          ..['pull_request'] = {
+            'state': 'complete',
+            'origin': 'adopted',
+            'number': 42,
+            'url': 'https://github.com/SourceOwner/project/pull/42',
+          },
+      ]);
+      await settle();
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('Operator-created PR adopted'),
+      );
+      expect(
+        nodes(
+          'button',
+        ).any((e) => e.textContent == 'Check for operator-created release PR'),
+        isFalse,
+      );
+      expect(state.releaseActions.length, 1);
+    },
+  );
+
+  test(
     'edited release PR preview requires review again when the combined SHA changes',
     () async {
       final published = release(state: 'published')

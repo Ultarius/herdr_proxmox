@@ -135,7 +135,7 @@ class RepositoryConnections:
         if not isinstance(label, str) or not 1 <= len(label.strip()) <= 80 or any(ord(c) < 32 for c in label):
             raise ValueError('Enter a connection name of at most 80 characters.')
         if not isinstance(repository, str) or not REPOSITORY.fullmatch(repository) or any(p in ('.', '..') for p in repository.split('/')):
-            raise ValueError('Enter owner/repository, for example Ultarius/bevy_game.')
+            raise ValueError('Enter owner/repository, for example SourceOwner/project.')
         if kind not in ('ssh', 'github', 'token'):
             raise ValueError('Choose SSH, a GitHub token, or the configured GitHub account.')
         token = body.get('token')

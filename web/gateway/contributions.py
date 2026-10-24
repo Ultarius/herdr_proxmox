@@ -154,7 +154,10 @@ def fork_publication(task):
     return publishing_repository(task).lower() != task['github_repository'].lower()
 
 
-def push(repository, branch, sha, github, publishing, *, release_lookup=None):
+def push(repository, branch, sha, github, publishing, *, upstream=None, release_lookup=None):
+    if not isinstance(upstream, str) or not REPOSITORY.fullmatch(upstream):
+        raise ValueError('Publication requires its recorded upstream.')
+    github.allow_publishing(upstream, publishing)
     if not isinstance(branch, str) or not isinstance(sha, str) or not SHA.fullmatch(sha):
         raise ValueError('Only a task branch and full reviewed commit, or a recorded release run, may be published.')
     if not BRANCH.fullmatch(branch):
@@ -186,9 +189,15 @@ def push(repository, branch, sha, github, publishing, *, release_lookup=None):
         script = Path(__file__).with_name('github_askpass.py')
         helper.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' ' + shlex.quote(str(script)) + ' "$@"\n')
         helper.chmod(0o700)
-        environment = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        environment = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')
+                       and k not in ('GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_PAT', 'GH_ENTERPRISE_TOKEN')}
+        # Git/askpass receive only the fork credential, never the shared PR store.
+        credential_file = Path(folder) / 'push-credential.json'
+        descriptor = os.open(credential_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as credential_output:
+            json.dump({'token': github.configuration()['token']}, credential_output)
         environment.update(GIT_ASKPASS=str(helper), GIT_TERMINAL_PROMPT='0',
-                           HERDR_GITHUB_CONFIG=str(github.path.resolve()), GIT_CONFIG_NOSYSTEM='1',
+                           HERDR_GITHUB_CONFIG=str(credential_file), HERDR_REPOSITORY=publishing, GIT_CONFIG_NOSYSTEM='1',
                            GIT_CONFIG_GLOBAL=os.devnull)
         # A repository can define url.insteadOf or helpers. Push from a fresh
         # bare configuration using only its immutable objects, not its config.
@@ -200,7 +209,7 @@ def push(repository, branch, sha, github, publishing, *, release_lookup=None):
         (bare / 'objects/info/alternates').write_bytes((objects.resolve().as_posix() + '\n').encode())
         # Exact SHA refspec avoids racing an agent's next commit. Disable hooks
         # and credential helpers; token-bearing URLs are never persisted.
-        arguments = ['git', '-c', 'credential.helper=', '-c', 'core.hooksPath=' + folder,
+        arguments = ['git', '-c', 'credential.useHttpPath=true', '-c', 'credential.helper=', '-c', 'core.hooksPath=' + folder,
                      '-c', 'http.followRedirects=false', '--git-dir=' + str(bare), 'push', '--no-force',
                      'https://github.com/' + publishing + '.git', sha + ':refs/heads/' + branch]
         try:
@@ -214,8 +223,8 @@ def push(repository, branch, sha, github, publishing, *, release_lookup=None):
         if result.returncode:
             raise ValueError('Branch push was rejected or authentication failed. '
                              'Account access and token write permissions are separate: check the publishing account, '
-                             'repository selection and Contents write (or classic repo scope). Workflow changes also '
-                             'need Workflows write (or classic workflow scope). No force-push was attempted.' + push_detail(folder))
+                             'repository selection and Contents write. Workflow changes also '
+                             'need Workflows write. No force-push was attempted.' + push_detail(folder))
 
 
 def matching_pull(task, pulls):
@@ -3307,7 +3316,7 @@ class Contributions:
                     # that history, so this task can only be closed.
                     raise ValueError('The published branch moved on the remote. This task cannot be '
                                      'republished; close it and create a new task.')
-                push(path, task['branch'], head, self.github, destination)
+                push(path, task['branch'], head, self.github, destination, upstream=task['github_repository'])
                 remote_head = self.remote_head(task)
             if remote_head != head:
                 raise ValueError('Remote branch does not match the reviewed commit; refresh before retrying.')
@@ -3315,6 +3324,9 @@ class Contributions:
             # be redirected elsewhere by a later configuration change.
             task.update(publish=dict(state='complete', head_sha=head, at=stamp(), repository=destination),
                         candidate_changed=False)
+            if self.github.publication_mode(task['github_repository']) == 'manual_adoption' and not task.get('pull'):
+                task['manual_pr'] = self.github.manual_pull(task['github_repository'], destination, task['branch'], pull_preview(task)['base'])
+                task['pull_notice'] = task['manual_pr']['message']
             # A task that already has a pull request stays in its pull state.
             task['state'] = 'pr_open' if task.get('pull') else 'published'
             if (task.get('pr_repair') or {}).get('candidate') == head:
@@ -3351,11 +3363,39 @@ class Contributions:
             owner = destination.split('/')[0]
             fork = destination.lower() != upstream.lower()
             self.github.allow(upstream)
-            found = self.github.find_pull(upstream, task['branch'], owner, preview['base'])
+            manual = self.github.publication_mode(upstream) == 'manual_adoption'
+            listing_error = None
+            try:
+                found = self.github.find_pull(upstream, task['branch'], owner, preview['base'])
+            except GitHubError as error:
+                if not manual or error.status not in (403, 404):
+                    raise
+                found = []
+                listing_error = error.status
             if not isinstance(found, list):
                 raise ValueError('GitHub returned an invalid pull request list.')
-            pull = matching_pull(task, found)
+            candidates = [item for item in found if isinstance(item, dict) and isinstance(item.get('head'), dict)
+                          and item['head'].get('sha') == published and item.get('state') == 'open' and item.get('draft') is True] if manual else found
+            pull = matching_pull(task, candidates)
+            if manual and pull is None and matching_pull(task, found) is not None:
+                raise ValueError('Adoption requires an open draft PR for the exact published candidate and configured repositories.')
             reused = pull is not None
+            if manual:
+                if pull is None:
+                    handoff = self.github.manual_pull(upstream, destination, task['branch'], preview['base'])
+                    if listing_error:
+                        handoff['message'] = 'The upstream PR list is unavailable. Restore upstream PR read access, then check for the operator-created PR. The fork branch remains published.'
+                        handoff['listing_status'] = listing_error
+                    handoff['head_visibility'] = self.github.probe_published_head(upstream, destination, task['branch'], published)
+                    if any(isinstance(item, dict) and isinstance(item.get('head'), dict) and item['head'].get('ref') == task['branch'] for item in found):
+                        handoff['message'] = 'A PR may exist but its repository/base identity is not verifiable with the upstream credential. It was not adopted. Inspect GitHub access and PR metadata.'
+                    task['manual_pr'] = handoff
+                    task['pull_notice'] = handoff['message']
+                    return self.save(task, 'awaiting_manual_pr', actor)
+                if ((pull.get('head') or {}).get('sha') != published or pull.get('state') != 'open'
+                        or pull.get('draft') is not True):
+                    raise ValueError('Adoption requires an open draft PR for the exact published candidate and configured repositories.')
+                task.pop('manual_pr', None)
             if pull is None:
                 if (body.get('head_sha') != published or body.get('reviewed') is not True
                         or 'title' not in body or 'body' not in body):
@@ -3380,7 +3420,7 @@ class Contributions:
                 try:
                     # The optional PR credential is separate from the credential
                     # used to push the branch. Existing single-token setups fall back.
-                    credential = self.github.pr_credential()
+                    credential = self.github.pr_credential(upstream)
                     pull = self.github.request('/repos/' + upstream + '/pulls', 'POST', payload,
                                                token=credential.token, credential_role=credential.role)
                 except GitHubError as error:
@@ -3394,7 +3434,10 @@ class Contributions:
                 except (ValueError, OSError) as error:
                     raise ValueError('The branch is already published. PR creation has an uncertain result; retry to reconcile any existing PR. ' + str(error)) from None
             self.record_pull(task, pull)
-            task['pull_notice'] = ('An existing PR was reused. Its title and description were not changed.'
+            if manual:
+                task['pull']['origin'] = 'adopted'
+            task['pull_notice'] = ('Operator-created draft PR adopted. Its title and description were preserved.' if manual else
+                                   'An existing PR was reused. Its title and description were not changed.'
                                    if reused else 'Draft PR created with the approved title and description.')
             if body.get('reviewed') is True:
                 # Record only text that was actually applied. A reused pull
@@ -3464,13 +3507,18 @@ class Contributions:
                 # Ancillary evidence failing cannot hide a completed PR merge.
                 if (task.get('pull'), task.get('state'), task.get('merge_sha')) != previous:
                     self.save(task, 'pull_status', actor)
-                check_response = self.github.request(prefix + '/commits/' + task['pull']['head_sha'] + '/check-runs?per_page=100')
-                status_response = self.github.request(prefix + '/commits/' + task['pull']['head_sha'] + '/status?per_page=100')
+                from github_checks import optional_evidence
+                check_response, check_error = optional_evidence(self.github, prefix + '/commits/' + task['pull']['head_sha'] + '/check-runs?per_page=100', 'check_runs')
+                status_response, status_error = optional_evidence(self.github, prefix + '/commits/' + task['pull']['head_sha'] + '/status?per_page=100', 'statuses')
+                task['checks_unavailable'] = {key: value for key, value in (('check_runs', check_error), ('statuses', status_error)) if value}
+
                 if not isinstance(check_response, dict) or not isinstance(status_response, dict):
                     raise ValueError('GitHub returned an invalid check evidence response.')
                 checks = check_response.get('check_runs', [])
                 statuses = status_response.get('statuses', [])
-                reviews = self.github.request(prefix + '/pulls/' + str(task['pull']['number']) + '/reviews?per_page=100')
+                reviews, review_error = optional_evidence(self.github, prefix + '/pulls/' + str(task['pull']['number']) + '/reviews?per_page=100', None)
+                if review_error:
+                    task['checks_unavailable']['reviews'] = review_error
                 if not isinstance(checks, list) or not isinstance(statuses, list) or not isinstance(reviews, list):
                     raise ValueError('GitHub returned an invalid check evidence list.')
                 if (any(not isinstance(c, dict) for c in checks + statuses + reviews)
@@ -3493,6 +3541,9 @@ class Contributions:
         A task records the result so a later configuration change cannot move
         an already published branch.
         """
+        policy = self.github.protected_policy(upstream)
+        if isinstance(policy, dict):
+            return policy['fork']
         try:
             entry = self.github.publication_settings().get(upstream) or {}
         except ValueError:
@@ -3535,13 +3586,16 @@ class Contributions:
                 or pull['base']['repo'].get('full_name', '').lower() != upstream.lower()):
             raise ValueError('Pull request does not match this task repositories and branches.')
         head = pull['head']['sha']
-        if not SHA.fullmatch(str(head)) or not isinstance(pull.get('number'), int):
+        if not SHA.fullmatch(str(head)) or type(pull.get('number')) is not int or pull['number'] < 1:
             raise ValueError('GitHub returned an invalid pull request identity.')
         if task.get('pull', {}).get('head_sha') != head:
             task.update(checks=[], statuses=[], reviews=[], last_sync=None)
+        origin = (task.get('pull') or {}).get('origin')
         task['pull'] = dict(number=pull['number'], url='https://github.com/' + task['github_repository'] + '/pull/' + str(pull['number']),
                             state=pull['state'], draft=pull.get('draft', False), head_sha=head,
                             mergeable=pull.get('mergeable'), mergeable_state=pull.get('mergeable_state'))
+        if origin:
+            task['pull']['origin'] = origin
         task['candidate_changed'] = head != task.get('head_sha')
         # The pull request list reports a merge as merged_at and omits the
         # resulting commit; only the single record carries it. Never report an

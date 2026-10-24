@@ -1049,7 +1049,13 @@ def main():
     organizations = OrganizationStore(DATABASE, PROJECTS, command, runtime_status=cli_setup.status, runtime_ready=cli_setup.ready,
                                       model_validator=lambda profile: model_catalog.validate_selection(cli_setup, PROJECTS, profile),
                                       template_catalog=lambda project: team_templates.catalog(cli_setup, PROJECTS, project))
-    github = GitHub(DATABASE.parent / 'github.json')
+    github = GitHub(DATABASE.parent / 'github.json', require_root_policy=True)
+    # Missing policy means no protected projects; a present invalid file is a
+    # deployment error and must never silently remove protection at startup.
+    try:
+        github.validate_policy()
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
     contributions = Contributions(DATABASE.with_name('tasks.sqlite3'), PROJECTS, organizations, github)
     run_logs = RunLogs(DATABASE.parent / 'run-logs', BIN)
     ssh_access = SshAccess()

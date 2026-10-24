@@ -21,3 +21,7 @@ Future<void> downloadBinaryArtifact(
     'Artifact download is available in the web dashboard.',
   );
 }
+
+Future<void> openGitHubCompare(Uri uri) async => throw UnsupportedError(
+  'Open the displayed GitHub comparison URL in your browser.',
+);

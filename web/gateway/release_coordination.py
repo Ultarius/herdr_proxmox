@@ -307,20 +307,44 @@ def advance_pull(manager, release, repository):
     base = revision['base_ref'].removeprefix('refs/remotes/origin/')
     identity = dict(github_repository=upstream, publishing_repository=destination, branch=branch, base_ref=base)
     owner = destination.split('/')[0]
+    manual = github.publication_mode(upstream) == 'manual_adoption'
     def existing():
-        found = github.find_pull(upstream, branch, owner, base)
+        try:
+            found = github.find_pull(upstream, branch, owner, base)
+        except GitHubError as error:
+            if not manual or error.status not in (403, 404):
+                raise
+            existing.listing_error = error.status
+            found = []
         if not isinstance(found, list):
             raise ValueError('GitHub returned an invalid pull request list.')
-        return matching_pull(identity, found)
+        existing.last_found = found
+        candidates = [item for item in found if isinstance(item, dict) and isinstance(item.get('head'), dict)
+                      and item['head'].get('sha') == sha and item.get('state') == 'open' and item.get('draft') is True] if manual else found
+        return matching_pull(identity, candidates)
     pull = existing()
     reused = pull is not None
+    if manual and pull is None:
+        handoff = github.manual_pull(upstream, destination, branch, base)
+        if getattr(existing, 'listing_error', None):
+            handoff['message'] = 'The upstream PR list is unavailable. Restore read access, then check for the operator-created PR. The fork branch remains published.'
+            handoff['listing_status'] = existing.listing_error
+        handoff['head_visibility'] = github.probe_published_head(upstream, destination, branch, sha)
+        if any(isinstance(item, dict) and isinstance(item.get('head'), dict) and item['head'].get('ref') == branch for item in getattr(existing, 'last_found', [])):
+            handoff['message'] = 'PR metadata is incomplete; the operator PR cannot be adopted without its full repository identity.'
+        request.update(handoff)
+        request['error'] = None
+        manager.save(release)
+        return
+    if manual and (pull.get('draft') is not True or pull.get('state') != 'open'):
+        raise ValueError('Only an open operator-created draft PR for the reviewed release may be adopted.')
     if pull is None:
         payload = dict(title=request['title'], body=request['body'], base=base, draft=True,
                        head=branch if destination.lower() == upstream.lower() else owner + ':' + branch)
         if destination.lower() != upstream.lower() and owner.lower() == upstream.split('/')[0].lower():
             payload['head_repo'] = destination.split('/')[1]
         try:
-            credential = github.pr_credential()
+            credential = github.pr_credential(upstream)
             pull = github.request('/repos/' + upstream + '/pulls', 'POST', payload,
                                   token=credential.token, credential_role=credential.role)
         except GitHubError as error:
@@ -336,7 +360,7 @@ def advance_pull(manager, release, repository):
         raise ValueError('GitHub PR does not match the reviewed release head, repositories and base.')
     release['pull_request'] = dict(state='complete', number=pull['number'],
         url=f"https://github.com/{upstream}/pull/{pull['number']}", head_sha=sha,
-        manifest=revision['digest'], reused=reused, draft=pull.get('draft') is True, recorded_at=stamp(),
+        manifest=revision['digest'], reused=reused, origin='adopted' if manual else ('reconciled' if reused else 'created'), draft=pull.get('draft') is True, recorded_at=stamp(),
         remote_state='pr_open', next_refresh_at=time.time() + 60)
     manager.save(release)
 

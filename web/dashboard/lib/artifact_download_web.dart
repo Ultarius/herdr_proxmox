@@ -62,3 +62,20 @@ Future<void> downloadArtifact(String content, String filename) async {
     filename,
   );
 }
+
+Future<void> openGitHubCompare(Uri uri) async {
+  if (uri.scheme != 'https' ||
+      uri.host != 'github.com' ||
+      !uri.path.contains('/compare/') ||
+      uri.userInfo.isNotEmpty ||
+      uri.hasFragment) {
+    throw ArgumentError('Invalid GitHub compare URL');
+  }
+  final link = web.HTMLAnchorElement()
+    ..href = uri.toString()
+    ..target = '_blank'
+    ..rel = 'noopener noreferrer';
+  web.document.body!.appendChild(link);
+  link.click();
+  link.remove();
+}

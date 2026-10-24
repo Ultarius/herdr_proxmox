@@ -93,7 +93,7 @@ void main() {
           posts.clear();
           final control = find.widgetWithText(
             SwitchListTile,
-            'Automatically publish a validated draft PR',
+            'Publish verified branch and follow the configured PR/adoption workflow',
           );
           final switchTile = tester.widget<SwitchListTile>(control);
           final canPublish = configured && executor == 'service';

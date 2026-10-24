@@ -849,6 +849,154 @@ void main() {
     return {'workspaces': [], 'agents': []};
   }
 
+  for (final state in ['absent', 'empty']) {
+    test(
+      'administrator sees never-enabled publishing policy: $state',
+      () async {
+        await mount(
+          const TasksPage(),
+          (r) => r.url.path == '/api/tasks'
+              ? {
+                  'tasks': [],
+                  'github': {
+                    'configured': true,
+                    'protected_publication_state': state,
+                  },
+                }
+              : {'workspaces': [], 'agents': []},
+        );
+        final text = elements(
+          '.task-page__intro',
+        ).first.parentElement!.textContent!;
+        expect(
+          text,
+          contains(
+            state == 'absent'
+                ? 'operator policy file is absent'
+                : 'no protected repositories',
+          ),
+        );
+      },
+    );
+  }
+
+  Map<String, dynamic> protectedGithub() => {
+    'configured': true,
+    'pr_configured': true,
+    'repositories': ['SourceOwner/project'],
+    'publication': {
+      'SourceOwner/project': {
+        'mode': 'fork',
+        'publishing_repository': 'stale/fork',
+      },
+    },
+    'protected_publication': {
+      'sourceowner/project': {
+        'fork': 'ForkOwner/project',
+        'arrangement': 'manual_adoption',
+      },
+    },
+  };
+
+  test(
+    'protected publishing setup offers only the fixed fork and cannot clear its upstream PAT',
+    () async {
+      await mount(
+        const TasksPage(),
+        (r) => r.url.path == '/api/tasks'
+            ? {'tasks': [], 'github': protectedGithub()}
+            : {'workspaces': [], 'agents': []},
+      );
+      await click('GitHub publishing');
+      expect(
+        elements('option').where((e) => e.textContent == 'Direct'),
+        isEmpty,
+      );
+      final fork =
+          field('Fork for SourceOwner/project (owner/repository)')
+              as web.HTMLInputElement;
+      expect(fork.readOnly, isTrue);
+      expect(fork.value, 'ForkOwner/project');
+      final remove =
+          elements('label')
+                  .firstWhere(
+                    (e) =>
+                        e.textContent?.contains(
+                          'Remove separate PR credential',
+                        ) ==
+                        true,
+                  )
+                  .querySelector('input')
+              as web.HTMLInputElement;
+      expect(remove.disabled, isTrue);
+      await type('Personal access token', 'github_pat_push');
+      await type('Upstream fine-grained PAT (required)', 'github_pat_upstream');
+      await click('Validate and save');
+      expect(posts.single['publication'], {
+        'SourceOwner/project': {
+          'mode': 'fork',
+          'publishing_repository': 'ForkOwner/project',
+        },
+      });
+      expect(posts.single['pr_token'], 'github_pat_upstream');
+      expect(posts.single['clear_pr_credential'], isNull);
+    },
+  );
+
+  for (final link in [
+    'https://github.com/SourceOwner/project/compare/main...ForkOwner:project:herdr%2Ftask-branch?expand=1',
+    'https://evil.example/compare/main',
+  ]) {
+    test(
+      'manual PR handoff renders only a verified GitHub compare link: $link',
+      () async {
+        final task = publishedTask()
+          ..['github_repository'] = 'SourceOwner/project'
+          ..['manual_pr'] = {
+            'state': 'awaiting_manual_pr',
+            'message': 'Open the operator draft PR, then check for adoption.',
+            'compare_url': link,
+          }
+          ..['checks_unavailable'] = {
+            'check_runs': {'github_status': 403},
+          };
+        await mount(
+          const TasksPage(taskId: 'task'),
+          (r) => r.url.path == '/api/tasks'
+              ? {
+                  'tasks': [task],
+                  'github': protectedGithub(),
+                }
+              : taskResponse(r, task),
+        );
+        final links = elements('a')
+            .where(
+              (e) =>
+                  e.textContent == 'Open GitHub comparison and create draft PR',
+            )
+            .toList();
+        expect(
+          links,
+          hasLength(link.startsWith('https://github.com/') ? 1 : 0),
+        );
+        if (links.isNotEmpty) {
+          expect(links.single.getAttribute('href'), link);
+          expect(links.single.getAttribute('rel'), 'noopener noreferrer');
+        }
+        expect(
+          elements('*').any(
+            (e) =>
+                e.textContent?.contains(
+                  'Delivery remains pending; unavailable checks are not passing checks.',
+                ) ==
+                true,
+          ),
+          isTrue,
+        );
+      },
+    );
+  }
+
   Map<String, dynamic> savedPublishingResponse(http.Request request) {
     if (request.url.path == '/api/projects/connections')
       return {

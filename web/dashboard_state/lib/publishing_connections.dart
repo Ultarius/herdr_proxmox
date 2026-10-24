@@ -5,20 +5,61 @@ const manualPublishingTokenLabel = 'Enter a new token';
 const publishingSourcesUnavailable =
     'Saved connections could not be loaded. Enter a token manually, or reopen this dialog to retry.';
 const publishingPushTokenNotice =
-    'The push token needs Contents write on the branch destination. Workflow changes may require Workflows write. '
-    'If this token also handles upstream PRs, it needs Pull requests write there. Setup verifies identity and account access; '
-    'actual publishing verifies token permissions. Keep branch protection enabled.\n\n'
-    'Agents and gateway share a Linux user; credentials are not isolated from same-user agents. Use only trusted agents and repositories.';
+    'The push token needs Contents read/write and Metadata read on the branch destination. '
+    'Add Workflows read/write only for workflow file changes. Protected publication accepts distinct fine-grained tokens only; '
+    'the prefix proves format, not access. Herdr never pushes a protected upstream. '
+    'Agents and gateway share a Linux user; file permissions do not isolate same-user agents.';
 const publishingPrTokenNotice =
-    'An optional separate token handles the private upstream while the token above pushes to the fork. '
-    'Select the upstream repository and grant Pull requests write, Contents read for base-branch checks, '
-    'Checks read, and Commit statuses read for status monitoring. '
-    'The PR account needs access to the fork as required by GitHub, but its token does not need the fork selected for setup. '
-    'Leave blank to preserve an existing PR credential; without one, the push token is used for both repositories.';
+    'Protected private-fork publication requires a separate upstream fine-grained token: Pull requests read/write, '
+    'Contents read, Metadata read, Checks read and Commit statuses read. Do not grant upstream Contents write. '
+    'A fine-grained token cannot select another owner’s private fork. You open the draft PR on GitHub; Herdr verifies and adopts it. '
+    'Leave blank only to preserve an existing upstream credential, which setup revalidates.';
 const publishingModeNotice =
-    'Direct publishes the branch and PR in the same repository. Through a fork publishes the branch to the fork '
-    'and opens the PR upstream. With separate tokens, upstream reads and PR operations use the PR token; '
-    'fork access and Git pushes use the push token. Setup is read-only and does not prove write permissions.';
+    'The operator’s fork-only policy is enforced by the gateway: branches go only to its configured fork. '
+    'For private personal repositories under different owners, open the draft PR using the compare link, then check for adoption. '
+    'Setup reads do not prove PR creation or check-monitoring capability. These settings use one credential pair for every allowed repository. Unprotected repositories retain their configured publication mode.';
+
+String? publishingPolicyNotice(
+  Map github,
+) => switch (github['protected_publication_state']) {
+  'absent' =>
+    'Fork-only protection is not configured: the operator policy file is absent. Publishing uses ordinary repository settings.',
+  'empty' =>
+    'Fork-only protection is not enabled: the operator policy contains no protected repositories. Publishing uses ordinary repository settings.',
+  _ => null,
+};
+
+Map? protectedPublishingPolicy(Map github, String upstream) {
+  final policies = github['protected_publication'];
+  if (policies is! Map) return null;
+  final value = policies[upstream.toLowerCase()];
+  return value is Map ? value : null;
+}
+
+bool manualPrRequired(Map github, String upstream) {
+  final entries = github['publication'];
+  final entry = entries is Map ? entries[upstream] : null;
+  return protectedPublishingPolicy(github, upstream)?['arrangement'] ==
+          'manual_adoption' ||
+      entry is Map && entry['arrangement'] == 'manual_adoption';
+}
+
+Uri? githubCompareUri(Object? value) {
+  if (value is! String) return null;
+  final uri = Uri.tryParse(value);
+  if (uri == null ||
+      uri.scheme != 'https' ||
+      uri.host != 'github.com' ||
+      uri.port != 443 ||
+      uri.userInfo.isNotEmpty ||
+      uri.hasFragment ||
+      !RegExp(
+        r'^/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/compare/[^\s]+$',
+      ).hasMatch(uri.path))
+    return null;
+  return uri;
+}
+
 const savedPublishingTokenNotice =
     'Every branch destination must match this connection’s repository. Direct mode allows '
     'only that one repository; fork mode lists the upstream and must target this connection’s fork. '

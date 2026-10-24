@@ -164,19 +164,76 @@ the folder from its stored clone job; requests cannot supply an arbitrary path.
 
 To reuse a saved PAT for task publication, open **Tasks → GitHub publishing** and
 select its connection under **Publishing token source**. The selected connection
-must match the branch destination. Only its ID goes through the browser; the
-gateway validates and copies the token into publishing configuration. Saving a
-clone connection alone does not enable publishing. A token with Contents read
-access is insufficient for publishing. A saved connection in direct mode allows
-only its named repository in the publishing allowlist. For fork publication,
-the allowlist names the upstream and the branch destination must match the
-connection's fork. Every allowlist entry must target that same destination;
-enter a token manually to publish to multiple destinations (up to 20
-allowlisted repositories).
-Publishing needs Contents write and, when used for pull requests, Pull requests
-write. SSH deploy keys cannot authorize the GitHub API.
-Publishing retains its own copy: rotating or removing a connection does not
-change that copy. Reconfigure publishing explicitly to adopt a new token.
+must name the branch destination. The browser sends its ID; the gateway reads
+and copies its private token, then independently validates publishing setup.
+Successful cloning proves read access only, and saving a clone connection does
+not enable publishing.
+
+For protected publication, the saved connection must name the operator-configured
+fork and supplies only the **fork push PAT**. Paste the distinct
+**upstream PAT** separately in publishing setup. Both must be fine-grained
+`github_pat_` tokens. The fork token needs Contents read/write and Metadata read,
+plus Workflows read/write only when workflow files may change. The upstream
+PAT selects the upstream with Contents read, Metadata read, Pull requests
+read/write, and available check/status read permissions; do not grant upstream
+Contents write. The backend enforces no upstream writes independently, because
+it cannot inspect the absence of a scope. A prefix proves format only.
+
+The protected deployment policy permits pushes only to its configured fork.
+Root supplies it at `/etc/herdr/publishing-policy.json`, mode `0444` or `0644`,
+under trusted root-owned directories. Every parent must be root-owned and not
+group/other-writable. Each protected entry has exactly this shape (fictional names):
+
+```json
+{"upstream":"SourceOwner/project","fork":"ForkOwner/project","mode":"fork_only","arrangement":"manual_adoption"}
+```
+
+Place entries in `{"version":1,"protected":[...]}`. `mode` and `arrangement` have
+the fixed values shown above; the upstream and fork must differ. Run as root:
+
+```sh
+python3 /opt/herdr-web/web/gateway/publication_policy.py --arm /etc/herdr/publishing-policy.json
+```
+
+This creates `/etc/herdr/publishing-policy.required`. Once enabled, deleting or
+emptying the policy fails closed across restarts. Back up both external files.
+Production ignores `HERDR_PUBLISHING_POLICY`; that override is for development
+and tests. The product example is empty. The installer
+preserves existing contents, and releases/rollbacks never replace this external
+file; root may change it without a release. Browser setup cannot edit or clear it.
+Missing or empty means no protected projects only on a never-enabled deployment.
+Tasks shows the absent/empty policy state to administrators. A present invalid policy refuses gateway
+startup; a live failure disables GitHub writes, reports a policy error, and leaves
+credential reads, clone/fetch and task/release listing available. Two private personal owners cannot be selected by a
+single fine-grained PAT. Herdr pushes the reviewed branch, gives the operator a
+GitHub comparison link, and verifies/adopts the draft PR the operator opens.
+Adoption requires complete head/base repository identities, refs, and the
+approved head SHA. Inaccessible metadata leaves adoption pending; unreadable
+check/status evidence is not a successful check.
+
+Ordinary repository connections still accept `github_pat_` and `ghp_` PATs for
+clone/fetch; protected publishing rejects classic tokens. SSH deploy keys cannot
+authorize the upstream PR API. Unprotected publishing retains its configured
+direct/fork support. A saved connection in direct mode allows only its named
+repository; in fork mode every allowlist entry must target the connection's
+fork. Manual token entry can serve multiple permitted destinations, up to 20
+allowlisted repositories, but cannot bypass the protected write policy.
+
+The root update worker refuses to erase a non-empty release-tree policy until
+all its mappings exist in the enabled external policy. Migrate before upgrading
+and update an older installed root worker first.
+
+The policy schema currently supports manual adoption only. Publishing stores
+one global push/upstream credential pair for the configured projects; policy
+entries do not provide independent credential slots.
+
+Publishing retains its own copy of the fork token. Rotating or removing the
+repository connection does not update it; reopen publishing setup to validate
+and copy a replacement. A preserved upstream credential is revalidated for the
+protected mapping, and protected publishing never falls back to the fork token.
+Both credentials stay in private server-side storage. The isolated Git publisher
+uses a temporary `0600` push-only file and repository-scoped askpass prompts;
+the upstream PAT is not loaded by that helper.
 
 ## Retiring a connection
 

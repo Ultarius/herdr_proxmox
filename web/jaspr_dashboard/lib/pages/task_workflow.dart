@@ -3,6 +3,8 @@ import 'dart:math' as math;
 import 'dart:js_interop';
 import 'package:jaspr/dom.dart' as dom;
 import 'package:web/web.dart' as web;
+import 'package:herdr_dashboard_state/publishing_connections.dart'
+    show githubCompareUri;
 import 'package:herdr_dashboard_state/task_execution.dart';
 import '../ui.dart';
 import '../navigation.dart' as navigation;

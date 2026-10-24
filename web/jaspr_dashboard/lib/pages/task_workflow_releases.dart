@@ -264,9 +264,27 @@ extension _Releases on _TaskWorkflowState {
     final preview = release['pull_preview'] as Map? ?? {};
     final stale =
         releasePullSha != null && releasePullSha != release['resulting_sha'];
+    canAct = canAct && release['publication_error'] == null;
     return section('Release pull request', [
+      if (release['publication_error'] != null)
+        notice(release['publication_error'], error: true),
       if (pull != null) ...[
         term('PR request', pull['state']),
+        if (pull['message'] != null) notice(pull['message']),
+        if (githubCompareUri(pull['compare_url']) != null)
+          el(
+            'a',
+            [text('Open GitHub comparison and create draft PR')],
+            attributes: {
+              'href': '${pull['compare_url']}',
+              'target': '_blank',
+              'rel': 'noopener noreferrer',
+            },
+          ),
+        if (pull['origin'] == 'adopted')
+          notice(
+            'Operator-created PR adopted after exact head, base and repository verification.',
+          ),
         if (pull['remote_state'] != null)
           term('Observed GitHub status', pull['remote_state']),
         if (pull['merge_sha'] != null)
@@ -305,7 +323,7 @@ extension _Releases on _TaskWorkflowState {
           release['state'] == 'published' &&
           !['queued', 'complete'].contains(pull?['state'])) ...[
         notice(
-          'Review the public title and description for this exact combined commit. This creates a draft PR; merging and deployment are separate.',
+          'Review this exact combined commit. For manual adoption, copy the title and description into your draft PR on GitHub. Herdr preserves the existing PR’s text when adopting it. Merging and deployment are separate.',
         ),
         field(
           'Release PR title',
@@ -336,7 +354,10 @@ extension _Releases on _TaskWorkflowState {
           ),
         ],
         button(
-          pull?['state'] == 'needs_attention'
+          release['manual_pr_required'] == true ||
+                  pull?['state'] == 'awaiting_manual_pr'
+              ? 'Check for operator-created release PR'
+              : pull?['state'] == 'needs_attention'
               ? 'Reconcile or create draft release PR'
               : 'Create reviewed draft release PR',
           () => releaseAction('pull', release, {

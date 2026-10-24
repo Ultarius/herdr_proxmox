@@ -337,6 +337,12 @@ class ReleaseCandidates:
                 review.pop('prompt', None)
             if release['state'] == 'published':
                 release['pull_preview'] = pull_preview(release)
+                release.pop('publication_error', None)
+                try:
+                    release['manual_pr_required'] = self.service.github.publication_mode(release['publication']['upstream']) == 'manual_adoption'
+                except ValueError as error:
+                    release['publication_error'] = str(error)
+                    release['manual_pr_required'] = False
         if release['state'] == 'collecting' or assembling:
             if tasks is None:
                 tasks = self.service.task_records([member['task_id'] for member in members], db)
@@ -1031,7 +1037,14 @@ class ReleaseCandidates:
         if project_git.git(repository, 'rev-parse', 'refs/heads/' + release['branch']).strip() != release['resulting_sha']:
             raise ValueError('Release branch moved after validation; inspect it before publication.')
         self.service.github.allow(publication['upstream'])
+        handoff = None
+        if self.service.github.publication_mode(publication['upstream']) == 'manual_adoption':
+            base = release['revision']['base_ref'].removeprefix('refs/remotes/origin/')
+            handoff = dict(self.service.github.manual_pull(publication['upstream'], publication['destination'], publication['branch'], base),
+                           head_sha=release['resulting_sha'], manifest=release['revision']['digest'])
         push(repository, publication['branch'], release['resulting_sha'], self.service.github, publication['destination'],
-             release_lookup=self.get)
+             upstream=publication['upstream'], release_lookup=self.get)
         release.update(state='published', published_at=stamp())
+        if handoff is not None:
+            release['pull_request'] = handoff
         self.save(release)

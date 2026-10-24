@@ -105,49 +105,137 @@ unless explicitly replaced or removed.
 API callers use administrator-only `POST /api/github/configure` with
 `connection_id` in place of `token`, alongside the usual `repositories` and
 optional `publication` fields. Supplying both credential sources is rejected.
-The optional `pr_token`, `pr_login`, and `clear_pr_credential` fields keep their
-existing behavior.
+`pr_token`, `pr_login`, and `clear_pr_credential` retain their existing behavior
+for unprotected repositories. Protected publishing requires a new or preserved
+upstream credential; clearing it or falling back to the push token is refused.
+A preserved credential is revalidated against the current protected mapping.
 
-For either a saved connection or a manually entered token, supply:
+### Protected private-fork publication
 
-- A fine-grained personal access token belonging to an account with push access
-  to each branch destination. Select its owner as resource owner,
-  choose the repositories, set an expiry, and obtain organization approval if
-  the organization requires it.
-- Repository permissions: Contents write, Pull requests write, Checks read and
-  Commit statuses read. Publishing workflow changes may also require Workflows
-  write. Keep branch protection enabled.
-- An allowlist of 1–20 repositories, one `owner/repository` per line. For this
-  repository that is `Ultarius/herdr_proxmox`. The task's GitHub origin must match
-  an allowlisted repository.
+Protected mappings are deployment data in `/etc/herdr/publishing-policy.json`,
+outside the replaceable release tree. The product ships only an empty example;
+no project is protected by default. As root, create or replace the policy with
+your own upstream and fork names before enabling protected publication:
 
-Each allowlisted repository also chooses a publication mode:
+```json
+{"version": 1, "protected": [
+  {"upstream": "SourceOwner/project", "fork": "ForkOwner/project",
+   "mode": "fork_only", "arrangement": "manual_adoption"}
+]}
+```
 
-- **Direct** pushes the task branch and opens the pull request in the same
-  repository. The account needs push access there, as before.
-- **Through a fork** pushes the task branch to your fork and opens the pull
-  request upstream. The fork must be created on GitHub first; Herdr selects an
-  existing fork rather than creating one. Setup verifies that the fork belongs
-  to the upstream's fork network and that the account can write to it, and it
-  no longer requires push access to the upstream — that requirement would
-  contradict the purpose of contributing through a fork.
+These are fictional example names. Keep `/etc/herdr` root-owned, mode `0755`,
+and the file root-owned with mode `0444` or `0644`; no ancestor may be writable
+by other users. The root installer creates an empty policy only if none exists
+and validates existing files without replacing their contents. After writing a
+non-empty policy, run as root:
 
-The upstream repository always remains the source of the base branch and the
-pull request target. Only the branch destination moves to the fork.
+```sh
+python3 /opt/herdr-web/web/gateway/publication_policy.py --arm /etc/herdr/publishing-policy.json
+```
 
-For private repositories under different owners, use two fine-grained tokens:
-the push token selects the fork and grants Contents write (plus Workflows write
-when needed). The separate PR token selects the upstream and grants Pull requests
-write, Contents read for base-branch checks, Checks read, and Commit statuses
-read for monitoring. Metadata read is included by GitHub. The PR account must
-have the fork access required by GitHub for cross-account PR creation; Herdr
-does not require its token to select the fork during setup.
+This standalone standard-library validator creates the root-owned companion
+`/etc/herdr/publishing-policy.required` with mode `0444`. The gateway requires
+this marker before enabling a non-empty production policy. Once enabled, a
+missing or empty policy is an error even after a gateway restart; it cannot
+silently turn a protected project into an ordinary publishing target. Re-running
+the root installer also validates and enables a non-empty policy. Dashboard updates
+and rollbacks leave this external file alone. Root can change the protected set
+without a Herdr release; ordinary publishing setup cannot edit or clear it.
+Back up both the policy and its `.required` companion separately: task database
+backups and dashboard rollback do not restore them.
+`HERDR_PUBLISHING_POLICY` selects another path only in development/tests. The
+production gateway pins `/etc/herdr/publishing-policy.json` and ignores that
+environment override. All ancestors of the policy and marker must be root-owned
+and not group/other-writable (`/`, `/etc`, and `/etc/herdr` for the default path).
+If migrating from the release-tree prototype, copy every existing protected
+upstream/fork mapping to this external path and enable it before switching
+versions. The updated root worker refuses replacement or rollback while legacy
+mappings are missing from the external policy or protection is not enabled;
+validation happens before stopping the gateway. An already-installed older
+worker cannot gain this check retroactively: migrate and update the root worker
+before initiating an upgrade. Releases never activate a bundled example as a
+project-specific mapping.
 
-Setup and publication preflight inspect the upstream with the PR token and the
-fork with the push token. Subsequent upstream branch/check/review reads use the
-PR token as well. Omitting a separate PR token keeps the single-token behavior,
-which requires that credential to access both repositories. A missing permission
-is never fixed by automatically retrying with the other token.
+On a fresh deployment without the `.required` marker, an absent or empty policy
+means no protected projects and ordinary publishing proceeds. The administrator
+sees distinct absent/empty-policy notices in Tasks. A running gateway also
+remembers that it observed protection and rejects an unexpected empty policy.
+To deliberately disable protection, root must remove the `.required` companion,
+replace the policy with the empty example, restart the gateway, and revalidate
+publishing settings. Removing only the policy never disables enabled protection.
+A present invalid, unreadable, insecure or unsupported policy refuses gateway
+startup with an operator-facing error. If it becomes invalid while the gateway
+is running, credential reads, clone/fetch, and task/release listing remain
+available; the snapshot exposes `protected_publication_error`. GitHub writes
+fail closed until root repairs the file, because an unreadable protected set
+cannot safely identify which repositories are unprotected.
+
+The protected upstream is never a Git push destination, even if a legacy task,
+a release record, or another repository's configuration names it. Backend
+checks authorize the configured fork at the final push boundary. Direct mode
+and upstream destination options are unavailable for protected repositories.
+Herdr does not merge PRs or deploy releases.
+
+This policy schema implements `fork_only` with `manual_adoption`. It does not
+represent protected automatic PR creation. Unprotected repositories retain their
+existing automatic direct/fork workflow.
+
+Publishing currently stores **one global credential pair**, shared by the
+allowlist. Multiple policy entries do not create independent per-project
+credentials; every configured project must be accessible with that same pair.
+Independent credential slots and their setup UI require a separate migration.
+
+Supply two **distinct fine-grained PATs**:
+
+| Credential | Resource owner and selected repository | Permissions |
+| --- | --- | --- |
+| Fork push PAT | `ForkOwner`, selecting `ForkOwner/project` | Contents read/write; Metadata read; Workflows read/write only when publishing workflow-file changes |
+| Upstream PAT | `SourceOwner`, selecting `SourceOwner/project` | Pull requests read/write; Contents read; Metadata read; Checks read and Commit statuses read for available monitoring; no Contents write |
+
+Protected setup accepts only `github_pat_` tokens. A prefix proves format, not
+validity, permissions, or access. Classic PATs and OAuth/App tokens are refused
+for this workflow; ordinary repository cloning and unprotected publishing keep
+their existing credential support. A saved repository connection supplies the
+**fork push PAT**; enter the separate upstream PAT in publishing setup. An
+upstream PAT is never substituted for a Git push credential, and the push PAT
+is never substituted for protected upstream PR operations.
+
+The upstream PAT's lack of Contents write is an operator requirement that Herdr
+cannot inspect. Herdr enforces the behavior independently: it refuses upstream
+branch writes, merges, and unrelated mutation endpoints even if an overpowered
+credential were supplied. Keep branch protection enabled.
+
+Both repositories are private and have different personal owners. A single
+fine-grained PAT cannot select the other owner's private repository, and two
+PATs do not combine into one authorization for PR creation. The supported
+protected arrangement is therefore: **Herdr pushes the reviewed branch to the
+fork; the operator opens the draft PR on GitHub; Herdr verifies and adopts it**.
+It never attempts automatic PR creation for this policy and never changes
+credential type or destination to work around missing access.
+
+Setup reads upstream/fork metadata with their respective credentials, checks
+fork-network identity and the publishing account's reported write access, and
+records read-only branch capabilities. Repository metadata access does not
+prove Contents read. Probes of an existing default/base branch use the upstream
+credential; an unavailable private fork is a manual-adoption diagnostic, not a
+reason to prevent an authorized fork push. A not-yet-published release branch
+is not required to exist at setup. After publication, the exact head branch may
+be probed with the upstream credential; if readable its SHA must match the
+approved commit. An unavailable fork-branch probe is diagnostic: adoption can
+still succeed when the PR itself exposes complete matching head/base repository,
+ref and SHA metadata. Missing PR identity evidence leaves adoption pending.
+
+Git push uses an isolated publisher and a temporary `0600` push-only credential
+file. Repository-scoped askpass prompts include the destination path and are
+refused for any other repository. The PR token is not loaded by that helper.
+This is credential-handling separation, not OS isolation from other processes
+running as the same Unix user.
+
+Unprotected repositories retain their configured publication modes: Direct
+publishes a task branch and PR in the same repository; Through a fork publishes
+the branch to an existing configured fork and targets the upstream. Protected
+policy overrides those ordinary choices and all upstream fallbacks.
 
 GitHub failures identify the repository, operation, and credential role in the
 UI and gateway journal (`journalctl -u herdr-web.service`). API error responses
@@ -156,9 +244,10 @@ retain `source` and `github_status` and add `github_repository`,
 Complete GitHub response bodies and raw field values are not included in these
 diagnostics.
 Credential roles follow the selected credential: a separate PR credential is
-labelled `pull request token`, while its single-token fallback is labelled
-`push token`. Explicit credentials carry that role from the same configuration
-snapshot as the selected secret; the request URL does not determine its source.
+labelled `pull request token`, while the single-token fallback for unprotected
+repositories is labelled `push token`. Protected publication has no fallback.
+Explicit credentials carry that role from the same configuration snapshot as
+the selected secret; the request URL does not determine its source.
 An explicit credential without source metadata remains `provided token`.
 
 For PR creation failures (HTTP 422), Herdr reads at most 16 KiB of the error
@@ -176,48 +265,43 @@ GitHub error size; the API array remains available for structured presentation.
 Malformed, empty, oversized, and detail-free responses get distinct diagnostics.
 When GitHub supplies a request ID with the expected hexadecimal/colon format,
 it is shown in the error and exposed as `github_request_id` for support tracing.
-A valid comparison
-in a browser proves a diff exists for that browser session, but does not prove
-the PAT has the same access or that draft creation is supported. Retry the
-release PR action after updating the gateway to capture its validation reason;
-Herdr still reconciles an existing exact-head PR before creating another.
+A valid browser comparison proves a diff exists for that browser session, but
+does not prove the PAT can read enough metadata for adoption. Protected flows
+check for the operator-created PR; only unprotected automatic flows may create
+a new PR after checking for an existing exact-head match.
 
-Validate and save reports capability rather than asserting it. Account access
-and token permission are separate, and setup is read-only:
+Validate and save is read-only: it never creates a branch or PR to prove write
+permission. Account write access and token write permission are distinct; the
+latter is unproven until a real fork publication succeeds. Read probes do not
+prove automatic PR creation, adoption, or check-monitoring capability.
 
-```
-Fork access: verified
-Account write access to the fork: verified
-Token write capability: not yet exercised
-Upstream PR creation: supported | not_exercised
-```
+### Open and adopt the protected draft PR
 
-Setup never creates a branch or pull request to prove write access. Fine-grained
-PR write permission is reported as `not_exercised` until a real operation succeeds.
-One fine-grained token is limited to a single resource owner; separate fork and
-upstream tokens allow this private cross-owner setup without granting either
-token access to both repositories. Account access and GitHub's fork/PR rules
-still apply.
+After publishing a task or release, use **Open GitHub comparison and create
+draft PR**. The link identifies the upstream base and published fork head. On
+GitHub, review the diff and copy or complete the suggested title and description,
+then create the draft PR as the operator. Return to Herdr and choose **Check for
+operator-created PR** or **Check for operator-created release PR**. Delivery
+may also reconcile the matching PR during a later poll.
 
-The gateway needs working Internet routing and DNS. Publishing uploads the exact
-reviewed commit; it does not merge or deploy it. Pull request creation and
-subsequent GitHub review are separate actions in the task workflow.
+Adoption verifies an open draft PR's head repository/ref, upstream base
+repository/ref, and exact approved head SHA. It records the origin as `adopted`
+and preserves the operator's title and description; it does not claim that
+Herdr created the PR or applied preview edits. A retry reuses the same verified
+PR. A changed candidate needs its own current publication and review.
 
-A task records the destination used for it. Before publication an administrator
-can switch between the upstream repository and its configured fork; the change
-is audited. Once the branch is published the destination is frozen, so a retry
-can never be redirected to a different repository. Tasks created before fork
-mode existed keep publishing directly.
+If no matching PR exists, the branch remains published and Herdr shows
+`awaiting_manual_pr` with the comparison link. If GitHub hides or omits the head
+repository metadata, Herdr cannot verify the identity and does not adopt the PR.
+A visible browser comparison or an operator-created PR is not proof that the
+upstream PAT can read enough API metadata for adoption. The record stays pending
+with an explanation; Herdr does not guess an identity from a branch name or
+weaken the match to make adoption succeed.
 
-After publication, open Changes → Open draft PR. The dashboard fetches a fresh
-preview and states both destinations — the repository the branch is published to
-and the repository the draft PR is opened into — together with the source branch
-in `owner:branch` form, the target branch and the exact candidate SHA. It lets
-you edit the public title and Markdown description. Cancel sends no PR request.
-Create draft PR submits the edited text with explicit approval for that SHA; a
-changed candidate requires a new preview. New PR creation without this approval
-is rejected by the gateway, including requests from an older dashboard version.
-Existing PR reconciliation remains available.
+A task or release retains its recorded destination. Protected records cannot
+be redirected to the upstream, including records created before this policy.
+A published/frozen revision is not silently retargeted. Ordinary unprotected
+flows retain the reviewed, exact-SHA PR-creation and reconciliation behavior.
 
 The suggested body includes task context, current-candidate validation and
 check results, acceptance-review state, discussion references, follow-up task
@@ -251,12 +335,13 @@ Pull request discovery and validation both check identities: the head must be
 the recorded publishing repository and branch, and the base must be the upstream
 repository and the task's recorded base branch. Matching a branch name alone
 would not be enough — it could attach another account's pull request to this
-task. Checks, reviews and merge status are always read from the upstream pull
-request, and the upstream base branch must exist before a pull request is
-created. Both account repository access and token permissions limit authority;
+task. Checks, reviews and merge status are read from the upstream pull
+request when the credential can read them. The upstream base branch must exist
+before a pull request is created. Both account repository access and token permissions limit authority;
 setup's read-only account-access check cannot guarantee token write permission.
-Fine-grained tokens need Contents write, plus Workflows write when workflows
-change; classic tokens use the corresponding repo and workflow scopes.
+The fork push token needs Contents write, plus Workflows write when workflows
+change. The upstream token remains Contents read-only. Protected publishing
+accepts fine-grained PATs only.
 
 Tokens are stored server-side with restrictive file permissions and omitted from
 snapshots. Gateway and agents currently share a Linux user, so this is not
@@ -264,6 +349,12 @@ credential isolation from same-user agents. The setup dialog explains this.
 
 GitHub reference:
 [managing your personal access tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
+
+Check-runs, commit-status, and review reads that GitHub denies with 403/404 are
+recorded as unavailable while readable PR and evidence fields can still refresh.
+`checks_unavailable` is not a passing result: delivery cannot claim verification
+or complete its check barrier from missing evidence. A real successful API read
+is required before reporting that a monitoring capability works.
 
 ## Repair an existing PR’s merge conflicts
 

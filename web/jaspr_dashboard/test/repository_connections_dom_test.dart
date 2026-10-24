@@ -363,19 +363,22 @@ void main() {
     () async {
       nodes('.repository-connections > summary').single.click();
       await settle();
-      await field('Connection name', 'Bevy SSH');
-      await field('GitHub repository (owner/repository)', 'Ultarius/bevy_game');
+      await field('Connection name', 'Project SSH');
+      await field(
+        'GitHub repository (owner/repository)',
+        'SourceOwner/project',
+      );
       await click('Create SSH connection');
       expect(requests.last, {
         'action': 'create',
-        'label': 'Bevy SSH',
-        'repository': 'Ultarius/bevy_game',
+        'label': 'Project SSH',
+        'repository': 'SourceOwner/project',
         'kind': 'ssh',
       });
       expect(nodes('pre').single.textContent, 'ssh-ed25519 PUBLIC test');
       expect(
         nodes('a').single.getAttribute('href'),
-        'https://github.com/Ultarius/bevy_game/settings/keys',
+        'https://github.com/SourceOwner/project/settings/keys',
       );
       await click('Verify GitHub host key');
       expect(requests.last, {'action': 'verify_host', 'id': 'key-one'});
@@ -383,7 +386,7 @@ void main() {
       expect(requests.last, {
         'action': 'test',
         'id': 'key-one',
-        'url': 'git@github.com:Ultarius/bevy_game.git',
+        'url': 'git@github.com:SourceOwner/project.git',
       });
       final selector =
           nodes('label')
@@ -406,12 +409,12 @@ void main() {
                   )
                   .querySelector('input')
               as web.HTMLInputElement;
-      expect(url.value, 'git@github.com:Ultarius/bevy_game.git');
+      expect(url.value, 'git@github.com:SourceOwner/project.git');
       await click('Clone project');
       expect(requests.last, {
         'action': 'clone',
-        'url': 'git@github.com:Ultarius/bevy_game.git',
-        'folder': 'bevy_game',
+        'url': 'git@github.com:SourceOwner/project.git',
+        'folder': 'project',
         'connection_id': 'key-one',
       });
       expect(
@@ -426,17 +429,17 @@ void main() {
       await click('Retry in a new folder');
       expect(requests.length, before);
       await click('Clone project');
-      expect(requests.last['folder'], 'bevy_game-retry');
+      expect(requests.last['folder'], 'project-retry');
       expect(requests.last['connection_id'], 'key-one');
       await field(
         'Existing project folder (direct child, optional)',
-        'bevy_game',
+        'project',
       );
       await click('Assign to existing project');
       expect(requests.last, {
         'action': 'bind',
         'id': 'key-one',
-        'folder': 'bevy_game',
+        'folder': 'project',
       });
       expect(
         nodes('button')
@@ -448,7 +451,7 @@ void main() {
       expect(requests.last, {
         'action': 'unbind',
         'id': 'key-one',
-        'folder': 'bevy_game',
+        'folder': 'project',
       });
       final beforeRemoval = requests.length;
       await click('Remove connection');

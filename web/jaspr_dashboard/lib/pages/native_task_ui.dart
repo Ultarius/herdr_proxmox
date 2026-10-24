@@ -740,6 +740,7 @@ class TextField extends StatefulComponent {
     this.minLines,
     this.maxLines,
     this.obscureText = false,
+    this.readOnly = false,
     this.enableSuggestions = true,
     this.autocorrect = true,
     this.validator,
@@ -749,7 +750,7 @@ class TextField extends StatefulComponent {
   final void Function(String)? onChanged;
   final InputDecoration decoration;
   final int? maxLength, minLines, maxLines;
-  final bool obscureText, enableSuggestions, autocorrect;
+  final bool obscureText, readOnly, enableSuggestions, autocorrect;
   final String? Function(String?)? validator;
   final dynamic buildCounter;
   @override
@@ -766,6 +767,7 @@ class TextFormField extends TextField {
     super.minLines,
     super.maxLines,
     super.obscureText,
+    super.readOnly,
     super.validator,
     super.buildCounter,
   });
@@ -821,6 +823,7 @@ class _TextFieldState extends State<TextField> {
   }
 
   void input(String text) {
+    if (component.readOnly) return;
     local = text;
     component.controller?.text = text;
     component.onChanged?.call(text);
@@ -847,6 +850,7 @@ class _TextFieldState extends State<TextField> {
         placeholder: component.decoration.hintText,
         onInput: input,
         attributes: {
+          if (component.readOnly) 'readonly': '',
           'value': value,
           if (component.maxLength != null)
             'maxlength': '${component.maxLength}',
@@ -862,6 +866,7 @@ class _TextFieldState extends State<TextField> {
         value: value,
         onInput: input,
         attributes: {
+          if (component.readOnly) 'readonly': '',
           if (component.maxLength != null)
             'maxlength': '${component.maxLength}',
           'autocomplete': component.obscureText ? 'new-password' : 'off',

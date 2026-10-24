@@ -573,12 +573,15 @@ reports the service executor afterward. Automatic validation and publication
 remain explicit policy choices. The direct root command
 `bash /opt/herdr-web/install/build-install.sh` remains available.
 
-**Automatically publish a validated draft PR** additionally authorizes pushing
-the task branch to its recorded upstream/fork destination and publishing generated
-task/check details as a draft PR. It requires the durable build service and GitHub
-setup, and enables verification. Authorization records the operator, destination
-and branch. Disable publication before changing the destination. Merge and
-deployment remain manual; publication does not establish acceptance of the code.
+Automatic publication additionally authorizes the reviewed task branch to be
+pushed to its recorded destination. The protected private-fork workflow uses only the fork configured by the
+operator for that upstream.
+It never pushes any upstream branch. The operator opens the draft PR through
+the comparison link, and Herdr adopts it after checking the exact approved SHA,
+head repository/ref, and upstream base repository/ref. The adoption record does
+not claim Herdr created the PR, and it preserves the operator's PR text.
+Unprotected repositories retain their configured publication workflow. Merge
+and deployment remain manual; publication does not establish acceptance.
 
 Delivery waits for matching required checks, verifies a clean unchanged task tree
 and completion receipt, uses the normal push/PR recovery paths, and checks the
@@ -599,23 +602,58 @@ errors, exhausted repairs, and publishing/authentication failures require an
 operator decision; the worker must not weaken checks, change credentials,
 switch destinations or publish independently.
 
-Enabling publication refreshes the authenticated account, repository access,
-write access reported for that account, and fork-network identity when used.
-Known incompatible fine-grained authentication for a cross-owner fork PR is
-rejected. These checks run again before publication writes. Account permission
-does not establish token write permission: the UI labels it unproven until
-actual writes succeed. Configure repository selection and Contents/Pull requests
-write permissions (and Workflows write when needed), or appropriate classic
-token scopes, on GitHub. Setup checks never create disposable public branches/PRs.
+Enabling publication refreshes identity, repository access, reported publishing
+account write access, and fork-network identity. Setup is read-only and does
+not prove a token may write. It never creates disposable branches or PRs.
 
-The dashboard currently stores one credential for both branch push and PR
-creation. For a cross-owner fork such as `Cobchuu/herdr_proxmox` into
-`Ultarius/herdr_proxmox`, the fork owner's fine-grained token cannot enable
-automatic delivery through this preflight. A suitably scoped classic token is
-the currently supported alternative, subject to account access and repository
-policies. Separate push and upstream PR credentials would require additional
-credential storage, routing and verification support; they are not a current
-configuration option. Automatic verification without publication remains usable.
+Protected publishing requires two distinct `github_pat_` fine-grained PATs:
+the fork owner's PAT selects only the fork with Contents read/write and Metadata
+read (plus Workflows read/write for workflow changes); the upstream owner's PAT
+selects only the upstream with Pull requests read/write, Contents read, Metadata
+read, and available check/status read permissions. Do not grant upstream
+Contents write. Herdr cannot inspect the absence of that permission, but its
+backend denies upstream pushes, branch/ref mutations, merges, and unrelated
+mutation endpoints regardless of credential strength. A token prefix proves
+format only. Classic PATs are still supported by ordinary clone connections,
+but not by this protected publishing workflow.
+
+Private repositories under different personal owners cannot both be selected
+by one fine-grained PAT. Herdr therefore reports manual PR adoption for this
+protected arrangement instead of attempting creation with the upstream PAT.
+An unreadable private fork in a read-only capability probe does not prevent a
+permitted fork push. After publishing, use the comparison link to open the draft
+PR on GitHub, then check for adoption. If the upstream PAT cannot read the PR's
+full head/base repository metadata, adoption remains pending; Herdr does not
+substitute another credential or guess identity. Denied check/status reads are
+recorded as `checks_unavailable`, not as successful checks, and cannot satisfy
+verification or delivery completion.
+
+The operator supplies protected mappings in `/etc/herdr/publishing-policy.json`,
+root-owned with mode `0444` or `0644` under root-owned, non-writable directories.
+The product ships an empty example; an absent/empty policy protects no projects
+only on a never-enabled deployment. Tasks explicitly displays that state.
+The installer preserves existing content, and dashboard updates do not replace
+this external file. Root may change it without a release; publishing setup
+cannot edit it. A present invalid policy refuses gateway startup. A live policy
+failure disables GitHub writes and reports `protected_publication_error`, while
+credential reads, clone/fetch, and task/release listing remain available.
+Each `protected` entry contains exactly `upstream`, `fork`, `mode: "fork_only"`,
+and `arrangement: "manual_adoption"`; the [publishing setup guide](task-review-and-publishing.md#protected-private-fork-publication)
+provides a complete fictional JSON example. After writing the mapping, root runs
+`python3 /opt/herdr-web/web/gateway/publication_policy.py --arm /etc/herdr/publishing-policy.json`.
+This creates root-owned `/etc/herdr/publishing-policy.required`, mode `0444`.
+Production requires this marker before enabling a non-empty policy and refuses
+a missing/empty enabled policy across restarts. Back up both external files.
+Every parent directory of both files must be root-owned and not group/other-writable.
+Production pins the `/etc/herdr` path; environment overrides apply only to development/tests.
+The updated root worker blocks upgrades/rollback until any legacy release-tree
+mappings are migrated and enabled externally. An older installed worker must be
+updated after root performs the migration and before initiating an upgrade.
+This schema supports manual adoption; publishing still uses one global credential
+pair rather than independent per-project slots. Git askpass receives
+a temporary `0600` push-only credential file and accepts prompts only for the
+recorded fork. Both tokens remain server-side and are omitted from snapshots,
+logs, task records, and prompts. Shared Unix-user access is not OS isolation.
 
 A publishing failure report includes the failed stage, whether the branch was
 already uploaded, and the required operator action. Late failures after a

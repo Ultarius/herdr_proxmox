@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 REPOSITORY = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
@@ -137,12 +137,18 @@ class GitHubError(ValueError):
 
 
 class GitHub:
-    def __init__(self, path):
+    def __init__(self, path, *, policy_path=None, require_root_policy=False):
         self.path = Path(path)
+        self.policy_path = Path(policy_path) if policy_path is not None else Path('/etc/herdr/publishing-policy.json' if require_root_policy else os.environ.get('HERDR_PUBLISHING_POLICY', '/etc/herdr/publishing-policy.json'))
+        self.require_root_policy = require_root_policy
         self.lock = threading.RLock()
         self.cache = {}
+        self._candidate_credentials = threading.local()
+        self._policy_was_protected = False
 
-    def configuration(self):
+    def configuration(self, *, validate=False):
+        # Clone/fetch and askpass read credentials independently of publication
+        # policy. Publishing boundaries explicitly validate the selected policy.
         if not self.path.exists():
             return {}
         if self.path.is_symlink() or self.path.stat().st_size > 16384:
@@ -150,7 +156,7 @@ class GitHub:
         if os.name != 'nt' and self.path.stat().st_mode & 0o077:
             raise ValueError('GitHub credential file must have mode 0600.')
         try:
-            data = json.loads(self.path.read_text())
+            data = json.loads(self.path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             raise ValueError('GitHub configuration is unreadable.') from None
         if not isinstance(data, dict):
@@ -166,25 +172,112 @@ class GitHub:
                     or not isinstance(data.get('pr_login'), str)
                     or not re.fullmatch(r'[A-Za-z0-9-]{1,39}', data['pr_login'])):
                 raise ValueError('Invalid GitHub pull request credential file.')
+        if validate:
+            self._validate_protected(data)
         return data
 
-    def pr_credential(self):
+    def validate_policy(self):
+        from publication_policy import load
+        with self.lock:
+            policies = load(self.policy_path, self.require_root_policy)
+            if self._policy_was_protected and not policies:
+                raise ValueError('Previously enabled publishing protection is missing or empty. Restore the operator policy and restart after any deliberate policy reset.')
+            self._policy_was_protected = bool(policies) or self._policy_was_protected
+            return policies
+
+    def protected_policy(self, upstream):
+        return self.validate_policy().get(str(upstream).lower())
+
+    def _validate_protected(self, data, *, only_upstream=None, policies=None):
+        from publication_policy import fine_pair
+        if policies is None:
+            policies = self.validate_policy()
+        entries = data.get('publication', {})
+        if not isinstance(entries, dict):
+            raise ValueError('Invalid publication settings.')
+        for name, entry in entries.items():
+            destination = entry.get('publishing_repository', name) if isinstance(entry, dict) else name
+            if str(destination).lower() in policies:
+                raise ValueError('A protected upstream is never a branch destination.')
+            if any(str(destination).lower() == policy['fork'].lower() and str(name).lower() != policy['upstream'].lower()
+                   for policy in policies.values()):
+                raise ValueError('A protected fork may only serve its configured upstream.')
+        for name in data.get('repositories', []):
+            if only_upstream is not None and str(name).lower() != str(only_upstream).lower():
+                continue
+            policy = policies.get(str(name).lower())
+            if policy:
+                fine_pair(data.get('token'), data.get('pr_token'))
+                entry = entries.get(name) or {}
+                if entry.get('mode') != 'fork' or str(entry.get('publishing_repository', '')).lower() != policy['fork'].lower():
+                    raise ValueError('Protected publication must use the operator-configured fork: ' + policy['fork'])
+
+    def publication_mode(self, upstream):
+        policy = self.protected_policy(upstream)
+        return policy['arrangement'] if policy else 'automatic'
+
+    def manual_pull(self, upstream, destination, branch, base):
+        self.allow_publishing(upstream, destination)
+        compare = f'https://github.com/{upstream}/compare/{quote(base, safe="")}...{quote(destination.split("/")[0], safe="")}:{quote(destination.split("/")[1], safe="")}:{quote(branch, safe="")}?' + urlencode({'expand': '1'})
+        return dict(state='awaiting_manual_pr', compare_url=compare,
+                    message='The fork branch is published. Open its draft PR on GitHub, then check here to adopt it. The upstream credential cannot combine access from a second fine-grained token.')
+
+    def probe_published_head(self, upstream, destination, branch, sha):
+        self.allow_publishing(upstream, destination)
+        credential = self.pr_credential(upstream)
+        try:
+            data = self.request('/repos/' + destination + '/branches/' + quote(branch, safe=''),
+                                token=credential.token, credential_role=credential.role)
+        except GitHubError as error:
+            if error.status in (403, 404):
+                return dict(state='unavailable', github_status=error.status,
+                            message='The upstream credential cannot read this private fork branch. Open the draft PR on GitHub; adoption still requires verifiable PR metadata.')
+            raise
+        if not isinstance(data, dict) or not isinstance(data.get('commit'), dict) or data['commit'].get('sha') != sha:
+            raise ValueError('The fork head visible to the PR credential differs from the approved commit.')
+        return dict(state='verified', head_sha=sha)
+
+    def fork_client(self, upstream, destination):
+        return ForkPublisher(self, upstream, destination)
+
+    def upstream_client(self, upstream):
+        return UpstreamPullRequests(self, upstream)
+
+    def pr_credential(self, upstream=None):
         """The credential used for upstream pull request operations.
 
         Falls back to the push credential, so a configuration without the split
         behaves exactly as it did before one existed.
         """
         data = self.configuration()
+        if upstream and self.protected_policy(upstream):
+            from publication_policy import fine_pair
+            fine_pair(data.get('token'), data.get('pr_token'))
         return GitHubCredential(data.get('pr_token') or data.get('token'),
                                 data.get('pr_login') or data.get('login'),
                                 'pull request token' if data.get('pr_token') else 'push token')
 
     def snapshot(self):
-        data = self.configuration()
+        try:
+            policies = self.validate_policy()
+        except ValueError as error:
+            return dict(configured=False, error=str(error), protected_publication_error=str(error),
+                        protected_publication={}, publication_disabled=True, credential_isolation='shared_unix_user')
+        try:
+            data = self.configuration()
+            self._validate_protected(data, policies=policies)
+        except ValueError as error:
+            # Keep operator-owned choices visible while an administrator rotates
+            # legacy credentials. Invalid credentials never enable publication.
+            return dict(configured=False, error=str(error), protected_publication=policies,
+                        credential_isolation='shared_unix_user')
         return dict(configured=bool(data.get('token')), login=data.get('login'),
                     pr_configured=bool(data.get('pr_token')), pr_login=data.get('pr_login'),
                     repositories=data.get('repositories', []),
-                    publication=data.get('publication', {}),
+                    publication={name: dict(entry, **({'arrangement': policies[name.lower()]['arrangement'], 'allow_direct': False} if name.lower() in policies else {}))
+                                 for name, entry in data.get('publication', {}).items()},
+                    protected_publication=policies,
+                    protected_publication_state='enabled' if policies else 'empty' if self.policy_path.exists() else 'absent',
                     credential_isolation='shared_unix_user')
 
     def publication_settings(self):
@@ -195,8 +288,9 @@ class GitHub:
         """Destinations an operator may select for each configured upstream."""
         options = {}
         for upstream, entry in self.publication_settings().items():
-            values = [upstream]
-            if entry.get('mode') == 'fork' and isinstance(entry.get('publishing_repository'), str):
+            policy = self.protected_policy(upstream)
+            values = [policy['fork']] if policy else [upstream]
+            if not policy and entry.get('mode') == 'fork' and isinstance(entry.get('publishing_repository'), str):
                 values.append(entry['publishing_repository'])
             options[upstream] = values
         return options
@@ -207,7 +301,18 @@ class GitHub:
         A task records its destination, so without this check a modified task
         record could publish to an unrelated repository.
         """
+        policies = self.validate_policy()
+        if str(publishing).lower() in policies:
+            raise ValueError('A protected upstream is never a push destination.')
+        if any(str(publishing).lower() == item['fork'].lower() and str(upstream).lower() != item['upstream'].lower() for item in policies.values()):
+            raise ValueError('Protected fork may only serve its configured upstream.')
         self.allow(upstream)
+        self._validate_protected(self.configuration(), only_upstream=upstream, policies=policies)
+        policy = policies.get(str(upstream).lower())
+        if policy:
+            if str(publishing).lower() != policy['fork'].lower():
+                raise ValueError('Protected publication permits only fork ' + policy['fork'])
+            return
         if publishing == upstream:
             return
         entry = self.publication_settings().get(upstream) or {}
@@ -225,7 +330,9 @@ class GitHub:
         """
         if page_result and (method != 'GET' or token is None):
             raise ValueError('Paged GitHub requests require an explicit credential and GET.')
-        if not path.startswith('/') or '\\' in path or '..' in path:
+        if (not path.startswith('/') or path.startswith('//') or '#' in path or '\\' in path or '..' in path
+                or '%' in path.split('/', 2)[1]
+                or path.startswith('/repos/') and not re.match(r'^/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:[/?]|$)', path)):
             raise ValueError('Invalid GitHub API path.')
         # Explicit credentials carry provenance from the same configuration
         # snapshot that selected the secret; the endpoint cannot identify it.
@@ -253,6 +360,36 @@ class GitHub:
                 credential_role = 'push token'
         if not token:
             raise ValueError('Configure GitHub publishing credentials first.')
+        try:
+            policies = self.validate_policy()
+        except ValueError:
+            # Reads remain available after a live policy failure. All writes
+            # fail closed because the protected set cannot be identified safely.
+            if method != 'GET':
+                raise
+            policies = {}
+        for policy in policies.values():
+            match = re.match(r'^/repos/([^/]+/[^/?]+)(/[^?]*)?(?:[?]|$)', path)
+            if not match:
+                continue
+            name, suffix = match[1].lower(), match[2] or ''
+            if name not in (policy['upstream'].lower(), policy['fork'].lower()):
+                continue
+            expected = getattr(self._candidate_credentials, 'value', None)
+            if expected is None:
+                data = self.configuration()
+                expected = {'push token': data.get('token'), 'pull request token': data.get('pr_token')}
+            from publication_policy import fine_pair
+            fine_pair(expected.get('push token'), expected.get('pull request token'))
+            if token != expected.get(credential_role):
+                raise ValueError('Protected request credential does not match its selected source.')
+            if name == policy['upstream'].lower():
+                if (credential_role != 'pull request token' or not upstream_route(suffix, method)
+                        or method == 'PATCH' and (not isinstance(body, dict) or set(body) - {'title', 'body', 'state'} or 'state' in body and body['state'] not in ('open', 'closed'))):
+                    raise ValueError('Protected upstream permits only upstream-credential reads and limited PR management; creation, merge and repository writes are forbidden.')
+            elif name == policy['fork'].lower():
+                if method != 'GET' or credential_role not in ('push token', 'pull request token'):
+                    raise ValueError('Protected fork API access is read-only; Git publication uses the isolated fork publisher.')
         headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json',
                    'User-Agent': 'herdr-dashboard', 'X-GitHub-Api-Version': '2022-11-28'}
         with self.lock:
@@ -330,7 +467,10 @@ class GitHub:
 
     def repository_info(self, repository, token, *, credential_role='push token', operation='Read repository metadata'):
         try:
-            info = self.request('/repos/' + repository, token=token)
+            from publication_policy import load
+            protected = any(repository.lower() in (p['upstream'].lower(), p['fork'].lower())
+                            for p in load(self.policy_path, self.require_root_policy).values())
+            info = self.request('/repos/' + repository, token=token, **({'credential_role': credential_role} if protected else {}))
         except GitHubError as error:
             raise GitHubError(error.status, repository=repository, operation=operation,
                               credential_role=credential_role, validation=error.validation, request_id=error.request_id) from None
@@ -343,7 +483,8 @@ class GitHub:
         role = 'pull request token' if config.get('pr_token') else 'push token'
         target = self.repository_info(upstream, upstream_token, credential_role=role,
                                       operation='Read upstream repository')
-        destination = self.repository_info(publishing, config.get('token'), operation='Read fork destination')
+        destination = self.fork_client(upstream, publishing).request('/repos/' + publishing)
+        destination = destination if isinstance(destination, dict) else {}
         return target, destination
 
     def verify_fork(self, upstream, publishing):
@@ -396,8 +537,17 @@ class GitHub:
         return login
 
     def configure(self, body):
+        previous = getattr(self._candidate_credentials, 'value', None)
+        try:
+            return self._configure(body)
+        finally:
+            self._candidate_credentials.value = previous
+
+    def _configure(self, body):
         if not isinstance(body, dict):
             raise ValueError('Expected GitHub configuration fields.')
+        if set(body) - {'token', 'repositories', 'publication', 'pr_token', 'pr_login', 'clear_pr_credential'}:
+            raise ValueError('Only credentials and publication selections may be configured. Protected policy is operator-owned.')
         token, repositories = body.get('token'), body.get('repositories')
         if not isinstance(token, str) or not re.fullmatch(r'[A-Za-z0-9_]{20,255}', token):
             raise ValueError('Enter a GitHub personal access token.')
@@ -420,12 +570,15 @@ class GitHub:
             raise ValueError('Remove or replace the pull request credential, not both.')
         if pr_token and not re.fullmatch(r'[A-Za-z0-9_]{20,255}', pr_token):
             raise ValueError('Enter a valid pull request personal access token.')
-        previous = self.configuration()
+        previous = self.configuration(validate=False)
         if not pr_token and not clear_pr:
             pr_token = previous.get('pr_token')
             pr_login = pr_login or previous.get('pr_login')
             if pr_login and not pr_token:
                 raise ValueError('Provide a pull request token to verify its account.')
+        if any(self.protected_policy(name) for name in repositories):
+            from publication_policy import fine_pair
+            fine_pair(token, pr_token)
         if pr_token:
             if pr_token == previous.get('pr_token') and (not pr_login or pr_login.lower() == str(previous.get('pr_login') or '').lower()):
                 pr_login = previous['pr_login']
@@ -450,6 +603,8 @@ class GitHub:
             if publishing == upstream:
                 raise ValueError('A fork destination must differ from the upstream repository.')
             publication[upstream] = dict(mode='fork', publishing_repository=publishing)
+        self._validate_protected(dict(token=token, pr_token=pr_token, repositories=repositories, publication=publication))
+        self._candidate_credentials.value = {'push token': token, 'pull request token': pr_token}
         user = self.request('/user', token=token)
         if not isinstance(user, dict) or not re.fullmatch(r'[A-Za-z0-9-]{1,39}', str(user.get('login', ''))):
             raise ValueError('GitHub returned an invalid account identity.')
@@ -462,12 +617,18 @@ class GitHub:
                   for name in repositories}
         needed.update((entry['publishing_repository'], 'destination') for entry in publication.values() if entry['mode'] == 'fork')
         needed = sorted(needed)
+        candidate_credentials = self._candidate_credentials.value
         def resolve(item):
-            name, purpose = item
-            separate = purpose == 'upstream' and pr_token is not None
-            return self.repository_info(name, pr_token if separate else token,
-                                        credential_role='pull request token' if separate else 'push token',
-                                        operation='Read upstream repository' if purpose == 'upstream' else 'Read branch destination')
+            previous_candidate = getattr(self._candidate_credentials, 'value', None)
+            self._candidate_credentials.value = candidate_credentials
+            try:
+                name, purpose = item
+                separate = purpose == 'upstream' and pr_token is not None
+                return self.repository_info(name, pr_token if separate else token,
+                                            credential_role='pull request token' if separate else 'push token',
+                                            operation='Read upstream repository' if purpose == 'upstream' else 'Read branch destination')
+            finally:
+                self._candidate_credentials.value = previous_candidate
         with ThreadPoolExecutor(max_workers=5) as pool:
             resolved = dict(zip(needed, pool.map(resolve, needed)))
         # A fork-mode upstream is read-only here. Requiring push on it would
@@ -491,6 +652,25 @@ class GitHub:
             if not self.same_fork_network(resolved[(upstream, 'upstream')], resolved[(publishing, 'destination')]):
                 raise ValueError(publishing + ' is not a fork of ' + upstream + '.')
             # Setup never creates a branch or pull request to prove write access.
+            policy = self.protected_policy(upstream)
+            if policy:
+                # Probe only branches that already exist. Inaccessible fork refs
+                # are expected for arrangement B and do not block fork publication.
+                self.credential_login(pr_token, pr_login)
+                entry.update(arrangement='manual_adoption', allow_direct=False)
+                entry['capabilities'] = {}
+                for name, info in ((upstream, resolved[(upstream, 'upstream')]), (publishing, resolved[(publishing, 'destination')])):
+                    if not info.get('default_branch'):
+                        entry['capabilities'][name] = 'no_existing_branch_to_probe'
+                        continue
+                    try:
+                        self.request('/repos/' + name + '/branches/' + quote(info['default_branch'], safe=''), token=pr_token, credential_role='pull request token')
+                        entry['capabilities'][name] = 'branch_read_verified'
+                    except GitHubError as error:
+                        if error.status not in (403, 404):
+                            raise
+                        entry['capabilities'][name] = 'branch_unavailable'
+                entry['manual_pr_required'] = True
             entry['verification'] = dict(
                 fork_access='verified', account_write_to_publishing='verified',
                 token_write_capability='not_exercised',
@@ -530,4 +710,42 @@ class GitHub:
         query = dict(head=owner + ':' + branch, state='all', per_page=100)
         if base:
             query['base'] = base
-        return self.request('/repos/' + repository + '/pulls?' + urlencode(query))
+        path = '/repos/' + repository + '/pulls?' + urlencode(query)
+        return self.upstream_client(repository).request(path) if self.protected_policy(repository) else self.request(path)
+
+
+def upstream_route(suffix, method):
+    if method == 'GET':
+        return (suffix in ('', '/') or re.fullmatch(r'/branches/[^?]+', suffix) is not None
+                or re.fullmatch(r'/pulls(?:/[0-9]+(?:/reviews|/comments)?)?', suffix) is not None
+                or re.fullmatch(r'/commits/[A-Za-z0-9]+/(?:check-runs|status)', suffix) is not None)
+    return method == 'PATCH' and re.fullmatch(r'/pulls/[0-9]+', suffix) is not None
+
+
+class ForkPublisher:
+    def __init__(self, github, upstream, destination):
+        github.allow_publishing(upstream, destination)
+        self.github, self.upstream, self.destination = github, upstream, destination
+
+    def request(self, path, method='GET', body=None):
+        prefix = '/repos/' + self.destination
+        if method != 'GET' or not (path == prefix or path.startswith(prefix + '/')):
+            raise ValueError('Fork publisher may only read its configured destination.')
+        credential = self.github.configuration().get('token')
+        return self.github.request(path, method, body, token=credential, credential_role='push token')
+
+
+class UpstreamPullRequests:
+    def __init__(self, github, upstream):
+        github.allow(upstream)
+        self.github, self.upstream = github, upstream
+
+    def request(self, path, method='GET', body=None):
+        prefix = '/repos/' + self.upstream
+        suffix = path[len(prefix):].split('?', 1)[0] if path.startswith(prefix) else None
+        if suffix is None or not upstream_route(suffix, method):
+            raise ValueError('Upstream client forbids this endpoint or method.')
+        if method == 'PATCH' and (not isinstance(body, dict) or set(body) - {'title', 'body', 'state'}):
+            raise ValueError('Only PR title, description and open/closed state may be managed.')
+        credential = self.github.pr_credential(self.upstream)
+        return self.github.request(path, method, body, token=credential.token, credential_role=credential.role)

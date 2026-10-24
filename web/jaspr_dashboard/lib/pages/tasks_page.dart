@@ -493,6 +493,14 @@ class _TasksPageState extends State<TasksPage> {
         .map((line) => line.trim())
         .where((line) => line.isNotEmpty)
         .toList();
+    TextEditingController forkController(String name) {
+      final controller = forks.putIfAbsent(name, () => TextEditingController());
+      final requiredFork = protectedPublishingPolicy(github, name)?['fork'];
+      if (requiredFork is String && controller.text != requiredFork)
+        controller.text = requiredFork;
+      return controller;
+    }
+
     final epoch = connection.generation;
     try {
       setState(() {
@@ -571,17 +579,31 @@ class _TasksPageState extends State<TasksPage> {
                       obscureText: true,
                       enableSuggestions: false,
                       autocorrect: false,
-                      decoration: const InputDecoration(
-                        labelText: 'Pull request token (optional)',
+                      decoration: InputDecoration(
+                        labelText:
+                            listed().any(
+                              (name) =>
+                                  protectedPublishingPolicy(github, name) !=
+                                  null,
+                            )
+                            ? 'Upstream fine-grained PAT (required)'
+                            : 'Pull request token (optional)',
                       ),
                       maxLength: 255,
                     ),
                     if (github['pr_configured'] == true)
                       CheckboxListTile(
                         value: clearPrCredential,
-                        onChanged: (value) => setDialogState(
-                          () => clearPrCredential = value == true,
-                        ),
+                        onChanged:
+                            listed().any(
+                              (name) =>
+                                  protectedPublishingPolicy(github, name) !=
+                                  null,
+                            )
+                            ? null
+                            : (value) => setDialogState(
+                                () => clearPrCredential = value == true,
+                              ),
                         title: const Text(
                           'Remove separate PR credential and use the push token',
                         ),
@@ -602,12 +624,17 @@ class _TasksPageState extends State<TasksPage> {
                         children: [
                           Expanded(child: Text(name)),
                           DropdownButton<String>(
-                            value: modes[name] ?? 'direct',
-                            items: const [
-                              DropdownMenuItem(
-                                value: 'direct',
-                                child: Text('Direct'),
-                              ),
+                            value:
+                                protectedPublishingPolicy(github, name) != null
+                                ? 'fork'
+                                : modes[name] ?? 'direct',
+                            items: [
+                              if (protectedPublishingPolicy(github, name) ==
+                                  null)
+                                const DropdownMenuItem(
+                                  value: 'direct',
+                                  child: Text('Direct'),
+                                ),
                               DropdownMenuItem(
                                 value: 'fork',
                                 child: Text('Through a fork'),
@@ -625,9 +652,12 @@ class _TasksPageState extends State<TasksPage> {
                           ),
                         ],
                       ),
-                      if (modes[name] == 'fork')
+                      if (modes[name] == 'fork' ||
+                          protectedPublishingPolicy(github, name) != null)
                         TextField(
-                          controller: forks[name],
+                          readOnly:
+                              protectedPublishingPolicy(github, name) != null,
+                          controller: forkController(name),
                           decoration: InputDecoration(
                             labelText: 'Fork for $name (owner/repository)',
                           ),
@@ -665,10 +695,13 @@ class _TasksPageState extends State<TasksPage> {
       });
       final publication = <String, dynamic>{};
       for (final name in listed()) {
-        publication[name] = modes[name] == 'fork'
+        publication[name] =
+            modes[name] == 'fork' ||
+                protectedPublishingPolicy(github, name) != null
             ? {
                 'mode': 'fork',
-                'publishing_repository': '${forks[name]?.text.trim() ?? ''}',
+                'publishing_repository':
+                    '${protectedPublishingPolicy(github, name)?['fork'] ?? forks[name]?.text.trim() ?? ''}',
               }
             : {'mode': 'direct'};
       }
@@ -1002,8 +1035,10 @@ class _TasksPageState extends State<TasksPage> {
                         'Target branch: ${preview['base']}\n\n'
                         'Exact candidate: ${preview['head_sha']}',
                       ),
-                      const Text(
-                        'This title and Markdown description will be public on the selected repository. The branch is already published. Creating a draft PR does not merge or deploy it.',
+                      Text(
+                        manualPrRequired(github, '${task['github_repository']}')
+                            ? 'Copy this title and description into your draft PR on GitHub. Checking for adoption preserves the PR’s existing text. The branch is already published; merging and deployment remain separate.'
+                            : 'This title and Markdown description will be public on the selected repository. The branch is already published. Creating a draft PR does not merge or deploy it.',
                       ),
                       TextFormField(
                         controller: title,
@@ -1077,7 +1112,11 @@ class _TasksPageState extends State<TasksPage> {
                   if (form.currentState!.validate())
                     Navigator.pop(context, true);
                 },
-                child: const Text('Create draft PR'),
+                child: Text(
+                  manualPrRequired(github, '${task['github_repository']}')
+                      ? 'Check for operator-created PR'
+                      : 'Create draft PR',
+                ),
               ),
             ],
           ),
@@ -1118,7 +1157,11 @@ class _TasksPageState extends State<TasksPage> {
       return;
     }
     final current = '${task['publishing_repository'] ?? upstream}';
-    var mode = current == upstream ? 'direct' : 'fork';
+    var mode = protectedPublishingPolicy(github, upstream) != null
+        ? 'fork'
+        : current == upstream
+        ? 'direct'
+        : 'fork';
     try {
       final route = DialogRoute<bool>(
         context: context,
@@ -1141,10 +1184,11 @@ class _TasksPageState extends State<TasksPage> {
                   DropdownButton<String>(
                     value: mode,
                     items: [
-                      DropdownMenuItem(
-                        value: 'direct',
-                        child: Text('Direct \u00b7 $upstream'),
-                      ),
+                      if (protectedPublishingPolicy(github, upstream) == null)
+                        DropdownMenuItem(
+                          value: 'direct',
+                          child: Text('Direct \u00b7 $upstream'),
+                        ),
                       DropdownMenuItem(
                         value: 'fork',
                         child: Text('Through a fork \u00b7 $fork'),
@@ -1339,6 +1383,8 @@ class _TasksPageState extends State<TasksPage> {
                 : 'info',
           },
         ),
+        if (admin && publishingPolicyNotice(github) != null)
+          ui.notice(publishingPolicyNotice(github)!),
         if (admin && github['publication'] is Map)
           for (final entry in (github['publication'] as Map).entries)
             if (entry.value is Map && entry.value['mode'] == 'fork')
@@ -2744,6 +2790,24 @@ class _TasksPageState extends State<TasksPage> {
             classes: 'task-page__status',
             attributes: {'data-tone': 'warning'},
           ),
+        if (task['manual_pr'] is Map) ...[
+          ui.notice(task['manual_pr']['message']),
+          if (githubCompareUri(task['manual_pr']['compare_url']) != null)
+            ui.el(
+              'a',
+              [ui.text('Open GitHub comparison and create draft PR')],
+              attributes: {
+                'href': '${task['manual_pr']['compare_url']}',
+                'target': '_blank',
+                'rel': 'noopener noreferrer',
+              },
+            ),
+        ],
+        if (task['checks_unavailable'] is Map &&
+            (task['checks_unavailable'] as Map).isNotEmpty)
+          ui.notice(
+            'Some GitHub check evidence is unavailable. Delivery remains pending; unavailable checks are not passing checks.',
+          ),
         if (task['pull_notice'] != null)
           ui.el(
             'p',
@@ -2970,7 +3034,7 @@ class _TasksPageState extends State<TasksPage> {
                   ),
                   SwitchListTile(
                     title: const Text(
-                      'Automatically publish a validated draft PR',
+                      'Publish verified branch and follow the configured PR/adoption workflow',
                     ),
                     subtitle: const Text(
                       'Checks current GitHub account access and the direct/fork destination before enabling. Authorizes pushing verified commits and publishing generated task/check details. Token write access is only proven by successful writes. The agent stays reserved until it reviews the results. Merge and deployment remain manual.',
@@ -3588,6 +3652,8 @@ class _TasksPageState extends State<TasksPage> {
           child: Text(
             needsPrAuthentication(github, task['github_repository'] as String?)
                 ? 'Configure authentication for upstream PR'
+                : manualPrRequired(github, '${task['github_repository']}')
+                ? 'Check for operator-created PR'
                 : 'Open draft PR',
           ),
         ),

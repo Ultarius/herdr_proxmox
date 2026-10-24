@@ -27,6 +27,7 @@ ROOT = Path('/opt/herdr-web')
 STATE = Path('/var/lib/herdr-updater')
 REQUEST = Path('/var/lib/herdr-update-requests/request.json')
 CONFIG = Path('/home/herdr/.config/herdr-web')
+PUBLISHING_POLICY = Path('/etc/herdr/publishing-policy.json')
 LOCAL_ARTIFACTS = Path('/home/herdr/herdr-validation')
 REPOSITORY = 'Ultarius/herdr_proxmox'
 REQUIRED = ('web/gateway/server.py', 'web/public/index.html',
@@ -479,11 +480,67 @@ def wait_for_ready(expected=None):
     raise ValueError('Updated gateway failed its startup check.')
 
 
+def guard_publishing_policy_migration(legacy_root=None, *, require_root=True):
+    """Never erase legacy protection before root migrates and enables it.
+
+    Inspect bounded JSON only: the updater does not import or execute gateway
+    code from an installed tree, backup or incoming archive.
+    """
+    def read(path):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 16384:
+            raise ValueError('Publishing policy migration requires a plain, bounded policy file.')
+        if require_root:
+            if info.st_uid != 0 or stat.S_IMODE(info.st_mode) not in (0o444, 0o644):
+                raise ValueError('Publishing policy migration requires root-owned policy files with mode 0444 or 0644.')
+            for parent in path.absolute().parents:
+                ancestor = parent.lstat()
+                if not stat.S_ISDIR(ancestor.st_mode) or ancestor.st_uid != 0 or ancestor.st_mode & 0o022:
+                    raise ValueError('Publishing policy migration requires trusted root-owned parent directories.')
+        return path.read_text(encoding='utf-8')
+    def mappings(path):
+        content = read(path)
+        if content is None:
+            return set()
+        try:
+            data = json.loads(content)
+            if type(data.get('version')) is not int or data['version'] != 1 or not isinstance(data.get('protected'), list):
+                raise ValueError()
+            values = set()
+            for record in data['protected']:
+                if (not isinstance(record, dict) or set(record) != {'upstream', 'fork', 'mode', 'arrangement'}
+                        or any(not isinstance(record.get(key), str) or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', record[key])
+                               or any(part in ('.', '..') for part in record[key].split('/')) for key in ('upstream', 'fork'))
+                        or record['mode'] != 'fork_only' or record['arrangement'] != 'manual_adoption'):
+                    raise ValueError()
+                values.add((record['upstream'].lower(), record['fork'].lower(), record['mode'], record['arrangement']))
+            return values
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError('Publishing policy migration requires readable version-1 fork-only policy data.') from None
+    legacy = mappings((legacy_root or ROOT) / 'web/gateway/publishing-policy.json')
+    external = mappings(PUBLISHING_POLICY)
+    required = read(PUBLISHING_POLICY.with_suffix('.required'))
+    if legacy - external:
+        raise ValueError('Existing release-tree publishing protection must be migrated to /etc/herdr/publishing-policy.json before updating. Root must preserve every protected upstream/fork mapping and enable the external policy; the live installation was not replaced.')
+    if (external and required != 'required\n') or (required is not None and not external):
+        raise ValueError('Publishing protection requires root provisioning before updating. Restore the external policy and run publication_policy.py --arm /etc/herdr/publishing-policy.json.')
+
+
 def replace_install(source, build_identity):
     """Replace gateway and UI together, preserving installers and provenance."""
+    guard_publishing_policy_migration()
+    if os.name != 'nt':
+        for directory in (ROOT, ROOT / 'web'):
+            os.chown(directory, 0, 0)
+            directory.chmod(0o755)
     for part in ('gateway', 'public'):
         shutil.rmtree(ROOT / 'web' / part)
         shutil.copytree(source / 'web' / part, ROOT / 'web' / part)
+        # Resetting every mode to 0644/0755 also strips group/other write,
+        # matching the initial installer's chmod -R go-w guarantee.
         for installed in (ROOT / 'web' / part).rglob('*'):
             installed.chmod(0o755 if installed.is_dir() else 0o644)
         (ROOT / 'web' / part).chmod(0o755)
@@ -572,6 +629,7 @@ def restore(backup, *, recovery=False):
     # backups retain the stricter compatibility guard.
     evidence = verify_backup(backup, allow_added_parts=True) if recovery else verify_backup(backup)
     record_backup_verification(backup, evidence)
+    guard_publishing_policy_migration(backup)
     service('stop')
     try:
         # Build the complete replacement beside CONFIG. Every fallible copy
@@ -648,6 +706,7 @@ def rollback(actor=''):
         expected = json.loads((backup / 'BUILD.json').read_text()).get('build_id')
     except (OSError, ValueError, AttributeError):
         expected = None
+    guard_publishing_policy_migration(backup)
     # Stop writers before copying SQLite files. Preserve the current state too:
     # an unsuccessful rollback must restore it rather than strand the operator.
     service('stop')
@@ -725,6 +784,8 @@ def main():
                     raise ValueError('Deployment identity is unreadable; refusing a release update.') from error
                 if not isinstance(identity, dict) or identity.get('deployment_mode') == 'local':
                     raise ValueError('Release installation is disabled for a local deployment.')
+        if request['mode'] != 'provenance':
+            guard_publishing_policy_migration()
         REQUEST.unlink()
         status('running', mode=request['mode'],
                backup=previous_backup,

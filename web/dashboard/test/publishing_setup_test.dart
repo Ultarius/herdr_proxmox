@@ -14,6 +14,7 @@ void main() {
     Future<void> Function(DashboardBloc, List<Map<String, dynamic>>) body, {
     bool listingFails = false,
     bool prConfigured = false,
+    Map<String, dynamic>? github,
   }) async {
     tester.view.physicalSize = const Size(1280, 2400);
     tester.view.devicePixelRatio = 1;
@@ -63,6 +64,7 @@ void main() {
                 'configured': false,
                 'pr_configured': prConfigured,
                 'pr_login': 'owner',
+                ...?github,
               },
             }),
             200,
@@ -112,6 +114,82 @@ void main() {
     await pumpUntil(tester, () => find.byType(AlertDialog).evaluate().isEmpty);
     await tester.pump(const Duration(milliseconds: 300));
   }
+
+  for (final state in ['absent', 'empty']) {
+    testWidgets('administrator sees never-enabled policy state: $state', (
+      tester,
+    ) async {
+      final github = {'protected_publication_state': state};
+      await withPublishing(tester, (_, posts) async {
+        expect(find.text(publishingPolicyNotice(github)!), findsOneWidget);
+        await cancel(tester);
+        expect(posts, isEmpty);
+      }, github: github);
+    });
+  }
+
+  testWidgets(
+    'protected setup locks the fork and retains the upstream credential',
+    (tester) async {
+      await withPublishing(
+        tester,
+        (_, posts) async {
+          await tester.enterText(
+            field('Allowed owner/repository (one per line)'),
+            'SourceOwner/project',
+          );
+          await tester.pump();
+          expect(find.text('Direct'), findsNothing);
+          expect(field('Upstream fine-grained PAT (required)'), findsOneWidget);
+          final fork = tester.widget<TextField>(
+            field('Fork for SourceOwner/project (owner/repository)'),
+          );
+          expect(fork.readOnly, isTrue);
+          expect(fork.controller!.text, 'ForkOwner/project');
+          final remove = tester.widget<CheckboxListTile>(
+            find.widgetWithText(
+              CheckboxListTile,
+              'Remove saved pull request credential',
+            ),
+          );
+          expect(remove.onChanged, isNull);
+          await tester.enterText(
+            field('Personal access token'),
+            'github_pat_push',
+          );
+          await tester.enterText(
+            field('Upstream fine-grained PAT (required)'),
+            'github_pat_upstream',
+          );
+          await clickText(tester, 'Validate and save');
+          await pumpUntil(tester, () => posts.isNotEmpty);
+          expect(posts.single['publication'], {
+            'SourceOwner/project': {
+              'mode': 'fork',
+              'publishing_repository': 'ForkOwner/project',
+            },
+          });
+          expect(posts.single['pr_token'], 'github_pat_upstream');
+          expect(posts.single['clear_pr_credential'], isNull);
+        },
+        prConfigured: true,
+        github: {
+          'publication': {
+            'SourceOwner/project': {
+              'mode': 'fork',
+              'publishing_repository': 'stale/fork',
+            },
+          },
+          'protected_publication': {
+            'sourceowner/project': {
+              'fork': 'ForkOwner/project',
+              'arrangement': 'manual_adoption',
+            },
+          },
+        },
+      );
+    },
+  );
 
   testWidgets('fork setup submits separate push and upstream tokens', (
     tester,

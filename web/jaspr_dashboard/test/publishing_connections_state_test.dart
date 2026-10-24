@@ -22,6 +22,56 @@ class MetadataConnection extends DashboardBloc {
 }
 
 void main() {
+  test(
+    'policy notices distinguish never-enabled absent and empty deployments',
+    () {
+      expect(
+        publishingPolicyNotice({'protected_publication_state': 'absent'}),
+        contains('file is absent'),
+      );
+      expect(
+        publishingPolicyNotice({'protected_publication_state': 'empty'}),
+        contains('no protected repositories'),
+      );
+      expect(
+        publishingPolicyNotice({'protected_publication_state': 'enabled'}),
+        isNull,
+      );
+      expect(publishingPolicyNotice({}), isNull);
+    },
+  );
+
+  test(
+    'protected manual mode and compare links tolerate malformed snapshot fields',
+    () {
+      expect(manualPrRequired({'publication': []}, 'owner/repo'), isFalse);
+      expect(
+        manualPrRequired({
+          'protected_publication': {
+            'owner/repo': {'arrangement': 'manual_adoption'},
+          },
+        }, 'OWNER/REPO'),
+        isTrue,
+      );
+      expect(
+        githubCompareUri(
+          'https://github.com/owner/repo/compare/main...fork:branch?expand=1',
+        ),
+        isNotNull,
+      );
+      for (final value in [
+        null,
+        {},
+        'https://evil.example/owner/repo/compare/a',
+        'javascript:alert(1)',
+        'https://user@github.com/owner/repo/compare/a',
+        'https://github.com/owner/repo/compare/a#fragment',
+      ]) {
+        expect(githubCompareUri(value), isNull, reason: '$value');
+      }
+    },
+  );
+
   late DashboardBloc connection;
   late Completer<http.Response> sources;
   var reads = 0;

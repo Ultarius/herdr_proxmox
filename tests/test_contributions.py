@@ -840,6 +840,7 @@ class ContributionTests(unittest.TestCase):
         self.api.pr_credential.return_value = GitHubCredential('pr-token', 'upstream-owner', 'pull request token')
         self.api.path = self.root / 'github.json'
         self.api.snapshot.return_value = dict(configured=True)
+        self.api.configuration.return_value = dict(token='p' * 40, pr_token='r' * 40)
         self.api.publication_settings.return_value = {}
         self.api.publication_options.return_value = {}
         self.profile = dict(id='worker', organization_id='org', project=str(self.repo), use_worktree=True)
@@ -995,7 +996,7 @@ class ContributionTests(unittest.TestCase):
         entered, release = threading.Event(), threading.Event()
         remote, errors = [None], []
 
-        def blocked_push(*args):
+        def blocked_push(*args, **kwargs):
             entered.set()
             if not release.wait(timeout=5):
                 raise AssertionError('Publication was not released by the test.')
@@ -1043,7 +1044,8 @@ class ContributionTests(unittest.TestCase):
         self.assertEqual((authorization['repository'], authorization['branch']), (destination, task['branch']))
         self.assertEqual(authorization['organization_policy']['updated_by'], 'policy-admin')
         remote = [None]
-        def pushed(*args):
+        def pushed(*args, upstream):
+            self.assertEqual(upstream, task['github_repository'])
             remote[0] = task['head_sha']
         with patch('collaboration.current_run'), patch.object(self.service, 'remote_head', side_effect=lambda t: remote[0]), \
                 patch('contributions.push', side_effect=pushed) as push:
@@ -1121,7 +1123,8 @@ class ContributionTests(unittest.TestCase):
         import task_delivery
         task, run, pull = self._delivery_task()
         remote = [None]
-        def pushed(*args):
+        def pushed(*args, upstream):
+            self.assertEqual(upstream, task['github_repository'])
             remote[0] = task['head_sha']
         with patch('collaboration.current_run'), patch.object(self.service, 'remote_head', side_effect=lambda t: remote[0]), \
                 patch('contributions.push', side_effect=pushed) as push:
@@ -1220,7 +1223,7 @@ class ContributionTests(unittest.TestCase):
         self.api.request.side_effect = fail
         remote = [None]
         with patch('collaboration.current_run'), patch.object(self.service, 'remote_head', side_effect=lambda t: remote[0]), \
-                patch('contributions.push', side_effect=lambda *args: remote.__setitem__(0, task['head_sha'])) as push:
+                patch('contributions.push', side_effect=lambda *args, **kwargs: remote.__setitem__(0, task['head_sha'])) as push:
             task_delivery.advance(self.service)
             waiting = self.service.get(task['id'])
             self.assertEqual(waiting['publish']['head_sha'], task['head_sha'])
@@ -2748,7 +2751,7 @@ class ContributionTests(unittest.TestCase):
         for branch, sha in [('main', task['head_sha']), (task['branch'], task['head_sha'][:12]),
                             ('herdr/task-abcdefabcdef', task['head_sha'] + '0')]:
             with self.assertRaisesRegex(ValueError, 'task branch and full reviewed commit'):
-                contributions.push(Path(task['worktree']), branch, sha, self.api, task['github_repository'])
+                contributions.push(Path(task['worktree']), branch, sha, self.api, task['github_repository'], upstream=task['github_repository'])
         self.api.allow.assert_not_called()
 
     def test_push_releases_the_repository_lock_before_the_network_call(self):
@@ -2775,7 +2778,7 @@ class ContributionTests(unittest.TestCase):
 
         with patch.object(contributions.sys, 'platform', 'linux'), patch.object(contributions, 'repository_lock', tracked_lock), \
                 patch.object(contributions.subprocess, 'run', side_effect=run):
-            contributions.push(Path(task['worktree']), task['branch'], task['head_sha'], self.api, task['github_repository'])
+            contributions.push(Path(task['worktree']), task['branch'], task['head_sha'], self.api, task['github_repository'], upstream=task['github_repository'])
         self.assertEqual(held.count('held'), held.count('released'))
 
 
@@ -2784,13 +2787,12 @@ class ContributionTests(unittest.TestCase):
         self.service.record_pull(task, self.pull_data(task))
         self.service.save(task, 'pull', 'admin')
         merged = self.pull_data(task, merged=True, merge_commit_sha=self.base, state='closed')
-        self.api.request.side_effect = [merged, GitHubError(403)]
-        with self.assertRaises(GitHubError):
-            self.service.action('refresh', dict(request_id='refresh', task_id=task['id']), 'admin', 'admin')
+        self.api.request.side_effect = [merged, GitHubError(403), dict(statuses=[]), []]
+        self.service.action('refresh', dict(request_id='refresh', task_id=task['id']), 'admin', 'admin')
         saved = self.service.get(task['id'])
         self.assertEqual(saved['merge_sha'], self.base)
         self.assertEqual(saved['state'], 'merged')
-        self.assertIn('denied', saved['error'])
+        self.assertEqual(saved['checks_unavailable']['check_runs']['github_status'], 403)
 
     def test_gateway_routes_authenticate_and_enforce_administrator(self):
         task = self.candidate()
@@ -2892,10 +2894,10 @@ class ContributionTests(unittest.TestCase):
             result = real_run(arguments, **kwargs)
             return result
         with patch.object(contributions.sys, 'platform', 'linux'), patch.object(contributions.subprocess, 'run', side_effect=run):
-            contributions.push(Path(task['worktree']), task['branch'], task['head_sha'], self.api, task['github_repository'])
+            contributions.push(Path(task['worktree']), task['branch'], task['head_sha'], self.api, task['github_repository'], upstream=task['github_repository'])
             # A rewind to the original base is non-fast-forward and rejected.
             with self.assertRaisesRegex(ValueError, 'rejected'):
-                contributions.push(Path(task['worktree']), task['branch'], self.base, self.api, task['github_repository'])
+                contributions.push(Path(task['worktree']), task['branch'], self.base, self.api, task['github_repository'], upstream=task['github_repository'])
         pushed = [args for args, _ in calls if 'push' in args]
         self.assertEqual(len(pushed), 2)
         self.assertIn('--no-force', pushed[0])

@@ -6,6 +6,7 @@ import shutil
 import stat
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import threading
 import unittest
@@ -933,6 +934,38 @@ class UpdateTests(unittest.TestCase):
             service.assert_not_called()
             self.assertEqual(json.loads((base / 'state/status.json').read_text())['state'], 'failed')
 
+    def test_replacement_enforces_root_ownership_on_the_posix_branch(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            root, source = base / 'installed', base / 'source'
+            for directory in (root, source):
+                (directory / 'web/gateway').mkdir(parents=True)
+                (directory / 'web/public').mkdir()
+            (root / 'web/gateway/server.py').write_text('old gateway', encoding='utf-8')
+            (source / 'web/gateway/server.py').write_text('new gateway', encoding='utf-8')
+            (source / 'web/public/index.html').write_text('new dashboard', encoding='utf-8')
+            (source / 'VERSION').write_text('v0.2.0', encoding='utf-8')
+            ownership = MagicMock()
+            # Select only the updater's POSIX branch. pathlib/shutil keep the
+            # host filesystem; the privileged chown operation is intercepted.
+            posix = SimpleNamespace(name='posix', chown=ownership)
+            original_chmod = Path.chmod
+            with patch.object(worker, 'ROOT', root), patch.object(worker, 'PUBLISHING_POLICY', base / 'policy.json'), \
+                    patch.object(worker, 'os', posix), \
+                    patch.object(Path, 'chmod', autospec=True, side_effect=original_chmod) as chmod:
+                worker.replace_install(source, {'build_id':'v0.2.0'})
+                self.assertEqual(ownership.call_args_list, [call(root, 0, 0), call(root / 'web', 0, 0)])
+                self.assertIn(call(root, 0o755), chmod.call_args_list)
+                self.assertIn(call(root / 'web', 0o755), chmod.call_args_list)
+                self.assertIn(call(root / 'web/gateway/server.py', 0o644), chmod.call_args_list)
+                self.assertEqual((root / 'web/gateway/server.py').read_text(encoding='utf-8'), 'new gateway')
+                # Production must still fail if ownership cannot be established.
+                ownership.side_effect = PermissionError('root required')
+                (source / 'web/gateway/server.py').write_text('must not replace', encoding='utf-8')
+                with self.assertRaisesRegex(PermissionError, 'root required'):
+                    worker.replace_install(source, {'build_id':'v0.3.0'})
+                self.assertEqual((root / 'web/gateway/server.py').read_text(encoding='utf-8'), 'new gateway')
+
     def test_failed_startup_restores_files_and_database(self):
         with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
             base = Path(folder)
@@ -976,6 +1009,9 @@ class UpdateTests(unittest.TestCase):
                 mocks.enter_context(patch.object(worker, name, value))
             mocks.enter_context(patch.object(worker.os, 'geteuid', return_value=0, create=True))
             mocks.enter_context(patch.object(tarfile.TarFile, 'chown'))
+            # The fixture simulates root; do not attempt a real ownership change
+            # on the unprivileged CI runner's temporary installation.
+            ownership = mocks.enter_context(patch.object(worker.os, 'chown', create=True))
             mocks.enter_context(patch.object(worker, 'download', side_effect=download))
             mocks.enter_context(patch.object(worker.subprocess, 'run'))
             def inspect_service(action):
@@ -996,6 +1032,8 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual((config / 'organizations.sqlite3').read_bytes(), original_database)
             self.assertTrue(json.loads((state / 'status.json').read_text())['rolled_back'])
             self.assertEqual([call.args[0] for call in service.call_args_list], ['stop', 'start', 'stop', 'start'])
+            if worker.os.name != 'nt':
+                ownership.assert_has_calls([call(root, 0, 0), call(root / 'web', 0, 0)])
 
     def test_version_check_request_and_duplicate(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1153,11 +1191,16 @@ class UpdateTests(unittest.TestCase):
                 mocks.enter_context(patch.object(worker, name, value))
             mocks.enter_context(patch.object(worker.os, 'geteuid', return_value=0, create=True))
             mocks.enter_context(patch.object(tarfile.TarFile, 'chown'))
+            # The fixture simulates root; do not attempt a real ownership change
+            # on the unprivileged CI runner's temporary installation.
+            ownership = mocks.enter_context(patch.object(worker.os, 'chown', create=True))
             mocks.enter_context(patch.object(worker.subprocess, 'run'))
             mocks.enter_context(patch.object(worker, 'service'))
             ready = mocks.enter_context(patch.object(worker, 'wait_for_ready'))
             worker.main()
             ready.assert_called_once_with(run_id)
+            if worker.os.name != 'nt':
+                ownership.assert_has_calls([call(root, 0, 0), call(root / 'web', 0, 0)])
             self.assertEqual((root / 'web/gateway/server.py').read_text(), 'new web/gateway/server.py')
             self.assertEqual(json.loads((root / 'BUILD.json').read_text())['build_id'], run_id)
             self.assertFalse(request.exists())
