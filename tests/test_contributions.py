@@ -1,4 +1,5 @@
 import json
+import io
 from contextlib import closing, contextmanager
 import hashlib
 import os
@@ -213,13 +214,42 @@ class GitHubTests(unittest.TestCase):
                 self.assertNotIn(secret, json.dumps(result))
                 self.assertNotIn(secret, str(log.call_args_list))
 
+    def test_http_exposes_only_safe_pr_validation_summaries(self):
+        reasons = ('GitHub could not accept the head branch or fork. Check the PR credential can access the published fork branch.',
+                   'GitHub could not accept the base branch. Check it exists in the upstream repository.',
+                   'GitHub reports an existing pull request for this branch. Reconcile it before retrying.')
+        failure = GitHubError(422, repository='owner/' + 'r' * 100, operation='Create draft pull request with reviewed release details',
+                              credential_role='pull request token', validation=reasons)
+        self.assertGreater(len(str(failure)), 500)
+        listener = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        listener.token = 'admin'
+        listener.operators = SimpleNamespace(identify=lambda _: None)
+        listener.github = self.api
+        worker = threading.Thread(target=listener.serve_forever, daemon=True)
+        worker.start()
+        self.addCleanup(listener.server_close)
+        self.addCleanup(worker.join, 3)
+        self.addCleanup(listener.shutdown)
+        endpoint = f'http://127.0.0.1:{listener.server_port}/api/github/configure'
+        with patch.object(self.api, 'configure', side_effect=failure), patch.object(server.Handler, 'log_message') as log:
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(Request(endpoint, data=json.dumps(self.split_body()).encode(), headers={'Authorization': 'Bearer admin'}))
+            self.assertEqual(caught.exception.code, 502)
+            result = json.load(caught.exception)
+            self.assertEqual(result['github_validation'], list(reasons))
+            self.assertEqual(result['error'], str(failure))
+            for reason in reasons:
+                self.assertIn(reason, result['error'])
+            self.assertEqual(result['github_credential_role'], 'pull request token')
+            log.assert_any_call('GitHub validation: %s', ' '.join(reasons))
+
     def test_split_credential_verifies_identity_and_never_exposes_secrets(self):
         body = self.split_body()
         with patch.object(self.api, 'request', side_effect=self.split_response) as request:
             snapshot = self.api.configure(body)
         self.assertEqual(snapshot['pr_login'], 'owner')
         self.assertTrue(snapshot['pr_configured'])
-        self.assertEqual(self.api.pr_credential(), GitHubCredential(body['pr_token'], 'owner'))
+        self.assertEqual(self.api.pr_credential(), GitHubCredential(body['pr_token'], 'owner', 'pull request token'))
         self.assertEqual(self.api.configuration()['pr_login'], 'owner')
         request.assert_any_call('/user', token=body['pr_token'])
         self.assertEqual(snapshot['publication']['owner/repo']['verification']['upstream_pr_creation'], 'not_exercised')
@@ -242,7 +272,7 @@ class GitHubTests(unittest.TestCase):
         self.assertFalse(removed['pr_configured'])
         self.assertNotIn('pr_token', self.api.configuration())
         self.assertNotIn('pr_login', self.api.configuration())
-        self.assertEqual(self.api.pr_credential(), GitHubCredential(body['token'], 'contributor'))
+        self.assertEqual(self.api.pr_credential(), GitHubCredential(body['token'], 'contributor', 'push token'))
 
     def test_split_credential_rejects_malformed_fields_before_network_calls(self):
         for changes in (dict(pr_token=0), dict(pr_token=False), dict(pr_token=[]), dict(pr_token={}),
@@ -486,6 +516,98 @@ class GitHubTests(unittest.TestCase):
             calls[-1],
             '/repos/owner/repo/pulls?head=contributor%3Aherdr%2Ftask-abcdefabcdef&state=all&per_page=100')
 
+    def test_explicit_credential_provenance_survives_single_split_and_non_pr_operations(self):
+        for split in (False, True):
+            body = self.split_body()
+            if not split:
+                body.pop('pr_token')
+            with patch.object(self.api, 'request', side_effect=self.split_response):
+                self.api.configure(body)
+            credential = self.api.pr_credential()
+            expected_role = 'pull request token' if split else 'push token'
+            self.assertEqual(credential.role, expected_role)
+            for path, method in (('/repos/owner/repo/pulls', 'POST'),
+                                 ('/repos/owner/repo/pulls/7/reviews', 'POST'),
+                                 ('/repos/owner/repo/pulls/7/merge', 'PUT'),
+                                 ('/repos/owner/repo/issues/7/comments', 'POST')):
+                with self.subTest(split=split, path=path):
+                    opener = MagicMock()
+                    opener.open.side_effect = HTTPError('https://api.github.com' + path, 403, 'denied', {}, None)
+                    # An explicit credential must not be relabelled by re-reading
+                    # configuration that may have changed since it was selected.
+                    with patch('github_api.build_opener', return_value=opener), \
+                            patch.object(self.api, 'configuration', side_effect=AssertionError('Do not re-read credential source')), \
+                            self.assertRaises(GitHubError) as caught:
+                        self.api.request(path, method, {}, token=credential.token, credential_role=credential.role)
+                    self.assertEqual(caught.exception.credential_role, expected_role)
+                    self.assertIn('using ' + expected_role, str(caught.exception))
+                    self.assertEqual(opener.open.call_args.args[0].get_header('Authorization'), 'Bearer ' + credential.token)
+
+    def test_validation_conflict_does_not_claim_head_or_base_failure(self):
+        from github_api import pull_validation
+        response = io.BytesIO(json.dumps({'errors': [{'field': 'head', 'code': 'missing', 'message': 'Body is missing'}]}).encode())
+        reasons = pull_validation(response)
+        self.assertEqual(reasons, ('GitHub returned conflicting validation details. Inspect the submitted PR fields.',))
+        self.assertNotIn('head branch', reasons[0])
+
+    def test_validation_summaries_are_typed_and_bounded(self):
+        for invalid in ('a string', {'head': 'invalid'}, (None,), ('',), ('x' * 241,), ('a',) * 4):
+            with self.subTest(invalid=invalid), self.assertRaises(TypeError):
+                GitHubError(422, validation=invalid)
+        error = GitHubError(422, validation=['One safe summary.'])
+        self.assertEqual(error.validation, ('One safe summary.',))
+        with self.assertRaisesRegex(ValueError, 'known role'):
+            self.api.request('/user', token='not-a-secret', credential_role='unrecognized')
+
+    def test_pull_validation_reports_safe_reasons_and_uses_pr_identity(self):
+        from discovery import redact
+        body = self.split_body()
+        with patch.object(self.api, 'request', side_effect=self.split_response):
+            self.api.configure(body)
+        cases = [({'message': 'Validation Failed', 'errors': [{'resource': 'PullRequest', 'field': 'head', 'code': 'invalid'}]}, 'head branch or fork'),
+                 ({'message': 'Validation Failed', 'errors': ["Head sha cannot be blank"]}, 'head branch or fork'),
+                 ({'errors': [{'field': 'base', 'code': 'invalid'}]}, 'base branch'),
+                 ({'errors': [{'message': 'No commits between private-base and private-head'}]}, 'no commits between'),
+                 ({'errors': [{'message': 'A pull request already exists for private-branch'}]}, 'existing pull request'),
+                 ({'message': 'Draft pull requests are not supported in this repository'}, 'does not allow draft'),
+                 ({'errors': [{'field': 'title', 'code': 'missing_field'}]}, 'title (missing_field)')]
+        for data, expected in cases:
+            with self.subTest(data=data):
+                failure = HTTPError('https://api.github.com/repos/owner/repo/pulls', 422, 'private text', {}, io.BytesIO(json.dumps(data).encode()))
+                opener = MagicMock()
+                opener.open.side_effect = failure
+                with patch('github_api.build_opener', return_value=opener):
+                    with self.assertRaises(GitHubError) as caught:
+                        self.api.request('/repos/owner/repo/pulls', 'POST', dict(draft=True, head='contributor:branch', base='main'))
+                error = caught.exception
+                self.assertIn(expected, str(error))
+                self.assertEqual(error.credential_role, 'pull request token')
+                self.assertEqual(error.operation, 'Create draft pull request')
+                self.assertIn('GitHub rejected', redact(error))
+                self.assertTrue(error.validation)
+                self.assertEqual(opener.open.call_args.args[0].get_header('Authorization'), 'Bearer ' + body['pr_token'])
+                self.assertNotIn('private-base', str(error))
+                self.assertNotIn('private-head', str(error))
+
+    def test_pull_validation_never_echoes_raw_messages_values_or_secrets(self):
+        secret = 'github_pat_' + 's' * 40
+        payloads = [b'not JSON ' + secret.encode(), b'x' * 16385,
+                    json.dumps({'message': secret, 'errors': [{'field': 'head', 'code': 'invalid', 'value': secret, 'message': secret}]}).encode(),
+                    json.dumps({'message': secret, 'errors': [{'field': [secret], 'code': {'secret': secret}}]}).encode(),
+                    json.dumps({'errors': [{'field': 'title', 'code': secret, 'message': secret}]}).encode()]
+        for payload in payloads:
+            with self.subTest(payload=payload[:40]):
+                failure = HTTPError('https://api.github.com/repos/owner/repo/pulls', 422, secret, {}, io.BytesIO(payload))
+                opener = MagicMock()
+                opener.open.side_effect = failure
+                with patch('github_api.build_opener', return_value=opener), self.assertRaises(GitHubError) as caught:
+                    self.api.request('/repos/owner/repo/pulls', 'POST', dict(draft=True), token=secret)
+                self.assertNotIn(secret, str(caught.exception))
+                self.assertNotIn(secret, str(caught.exception.validation))
+                self.assertEqual(caught.exception.status, 422)
+                self.assertEqual(caught.exception.credential_role, 'provided token')
+                self.assertNotIn('refresh before retrying', str(caught.exception))
+
     def test_errors_and_oversized_responses_never_expose_credentials(self):
         secret = 'github_pat_' + 's' * 40
         opener = MagicMock()
@@ -672,7 +794,7 @@ class ContributionTests(unittest.TestCase):
         self.git('update-ref', 'refs/remotes/origin/main', self.base)
         self.api = MagicMock()
         self.api.publication_preflight.return_value = dict(login='owner', account_write='verified', token_write='not_exercised')
-        self.api.pr_credential.return_value = GitHubCredential('pr-token', 'upstream-owner')
+        self.api.pr_credential.return_value = GitHubCredential('pr-token', 'upstream-owner', 'pull request token')
         self.api.path = self.root / 'github.json'
         self.api.snapshot.return_value = dict(configured=True)
         self.api.publication_settings.return_value = {}
@@ -737,8 +859,11 @@ class ContributionTests(unittest.TestCase):
         self.service.save(task, 'build_result', 'tests')
         pull = self.pull_data(task, mergeable=True)
         self.api.find_pull.return_value = []
-        def response(path, method='GET', body=None, token=None):
+        def response(path, method='GET', body=None, token=None, *, credential_role=None):
             if path.endswith('/pulls') and method == 'POST':
+                credential = self.api.pr_credential.return_value
+                self.assertEqual(token, credential.token)
+                self.assertEqual(credential_role, credential.role)
                 return pull
             if '/pulls/' in path:
                 return pull
@@ -1018,7 +1143,7 @@ class ContributionTests(unittest.TestCase):
         task, run, pull = self._delivery_task()
         checks = [dict(name='CI', status='in_progress', conclusion=None)]
         original = self.api.request.side_effect
-        self.api.request.side_effect = lambda path, *args, **kwargs: dict(check_runs=checks) if path.endswith('/check-runs') else original(path, *args)
+        self.api.request.side_effect = lambda path, *args, **kwargs: dict(check_runs=checks) if path.endswith('/check-runs') else original(path, *args, **kwargs)
         with patch('collaboration.current_run'), patch.object(self.service, 'remote_head', return_value=task['head_sha']), \
                 patch('task_delivery.time.time', return_value=100):
             task_delivery.advance(self.service)
@@ -1042,10 +1167,13 @@ class ContributionTests(unittest.TestCase):
         import task_delivery
         task, run, pull = self._delivery_task()
         original = self.api.request.side_effect
-        def fail(path, method='GET', body=None, token=None):
+        def fail(path, method='GET', body=None, token=None, *, credential_role=None):
             if path.endswith('/pulls') and method == 'POST':
+                credential = self.api.pr_credential.return_value
+                self.assertEqual(token, credential.token)
+                self.assertEqual(credential_role, credential.role)
                 raise GitHubError(403)
-            return original(path, method, body)
+            return original(path, method, body, token=token, credential_role=credential_role)
         self.api.request.side_effect = fail
         remote = [None]
         with patch('collaboration.current_run'), patch.object(self.service, 'remote_head', side_effect=lambda t: remote[0]), \
@@ -2168,10 +2296,23 @@ class ContributionTests(unittest.TestCase):
                          (task['github_repository'], task['branch'], 'contributor', 'main'))
         self.assertEqual(self.api.request.call_args.args[0], '/repos/owner/repo/pulls')
         self.assertEqual(self.api.request.call_args.kwargs['token'], 'pr-token')
+        self.assertEqual(self.api.request.call_args.kwargs['credential_role'], 'pull request token')
         payload = self.api.request.call_args.args[2]
         self.assertEqual(payload['head'], 'contributor:' + task['branch'])
         self.assertEqual(payload['base'], 'main')
         self.assertTrue(payload['draft'])
+
+    def test_single_token_task_pr_reports_the_push_credential_source(self):
+        task = self.fork(self.candidate())
+        task['publish'] = dict(head_sha=task['head_sha'])
+        self.service.save(task, 'publish', 'admin')
+        self.api.find_pull.return_value = []
+        self.api.request.return_value = self.pull_data(task)
+        self.api.pr_credential.return_value = GitHubCredential('push-token', 'contributor', 'push token')
+        with patch.object(self.service, 'remote_head', return_value=task['head_sha']):
+            self.service.action('pull', dict(request_id='single-token-pr', task_id=task['id'], head_sha=task['head_sha'],
+                                            title='Title', body='Body', reviewed=True), 'admin', 'admin')
+        self.assertEqual(self.api.request.call_args.kwargs, {'token': 'push-token', 'credential_role': 'push token'})
 
     def test_pull_head_and_base_repositories_are_both_checked(self):
         task = self.fork(self.candidate())

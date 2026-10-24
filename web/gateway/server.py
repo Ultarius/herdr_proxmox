@@ -984,9 +984,14 @@ class Handler(BaseHTTPRequestHandler):
             details = {key: value for key, value in {
                 'github_repository': exc.repository, 'github_operation': exc.operation,
                 'github_credential_role': exc.credential_role}.items() if value is not None}
+            if exc.validation:
+                details['github_validation'] = list(exc.validation)
+                self.log_message('GitHub validation: %s', ' '.join(exc.validation))
             self.log_message('GitHub failure: status=%s repository=%s operation=%s credential=%s',
                              exc.status, exc.repository or '-', exc.operation or '-', exc.credential_role or '-')
-            self.reply(502, {'error': str(exc)[:500], 'source': 'github', 'github_status': exc.status, **details})
+            # GitHubError bounds its context and three summaries below this limit,
+            # so complete validation reasons reach both dashboards.
+            self.reply(502, {'error': str(exc)[:2000], 'source': 'github', 'github_status': exc.status, **details})
         except FieldValidationError as exc:
             self.reply(400, {'error': str(exc)[:500], 'field_errors': exc.field_errors})
         except StorageBusy as exc:

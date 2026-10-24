@@ -6,26 +6,29 @@ administrator operation; a separate identity/broker is needed for OS isolation.
 """
 import json
 import os
-from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from http.client import HTTPException
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen, HTTPRedirectHandler, build_opener
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 REPOSITORY = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
 MODES = ('direct', 'fork')
 # A single fine-grained token is limited to one resource owner. Separate push
 # and upstream PR tokens support repositories under different owners.
 FINE_GRAINED = 'github_pat_'
+CREDENTIAL_ROLES = ('push token', 'pull request token', 'provided token')
 
 
 @dataclass(frozen=True)
 class GitHubCredential:
     token: str | None = field(repr=False)
     login: str | None
+    role: str = 'provided token'
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -33,20 +36,76 @@ class NoRedirect(HTTPRedirectHandler):
         return None  # Never forward Authorization to another origin.
 
 
+def pull_validation(error):
+    """Classify a bounded GitHub response; never echo arbitrary response text."""
+    try:
+        raw = error.read(16385)
+        if len(raw) > 16384:
+            return ()
+        data = json.loads(raw)
+    except (OSError, ValueError, TypeError, RecursionError, HTTPException):
+        return ()
+    if not isinstance(data, dict):
+        return ()
+    errors = data.get('errors')
+    entries = errors[:10] if isinstance(errors, list) else []
+    # Some GitHub validations supply only a top-level message.
+    entries = entries + [data.get('message')]
+    reasons = []
+    fields = {'head', 'base', 'head_sha', 'base_sha', 'head_repo', 'title', 'body', 'draft'}
+    codes = {'missing', 'missing_field', 'invalid', 'already_exists', 'unprocessable', 'custom'}
+    for item in entries:
+        message = item.get('message') if isinstance(item, dict) else item
+        message = message.lower() if isinstance(message, str) else ''
+        field = item.get('field') if isinstance(item, dict) else None
+        code = item.get('code') if isinstance(item, dict) else None
+        field = field if isinstance(field, str) else None
+        code = code if isinstance(code, str) else None
+        message_fields = set(re.findall(r'\b(head|base|title|body|draft)(?:[_ ](?:sha|repo))?\b', message))
+        normalized_field = 'head' if field in ('head', 'head_sha', 'head_repo') else 'base' if field in ('base', 'base_sha') else field
+        if field in fields and message_fields and normalized_field not in message_fields:
+            reason = 'GitHub returned conflicting validation details. Inspect the submitted PR fields.'
+        elif 'no commits between' in message:
+            reason = 'GitHub reports no commits between the requested base and head branches.'
+        elif 'pull request already exists' in message:
+            reason = 'GitHub reports an existing pull request for this branch. Reconcile it before retrying.'
+        elif 'draft' in message and any(word in message for word in ('not supported', 'not enabled', 'not allowed', 'not permitted')):
+            reason = 'GitHub does not allow draft pull requests for this repository or plan.'
+        elif field in ('head', 'head_sha', 'head_repo') or 'head sha' in message or 'head_sha' in message:
+            reason = 'GitHub could not accept the head branch or fork. Check the PR credential can access the published fork branch.'
+        elif field in ('base', 'base_sha') or 'base sha' in message or 'base_sha' in message:
+            reason = 'GitHub could not accept the base branch. Check it exists in the upstream repository.'
+        elif field in fields and code in codes:
+            reason = f'GitHub validation rejected {field} ({code}).'
+        else:
+            continue
+        if reason not in reasons:
+            reasons.append(reason)
+    return tuple(reasons[:3])
+
+
 class GitHubError(ValueError):
-    def __init__(self, status, *, repository=None, operation=None, credential_role=None):
+    def __init__(self, status, *, repository=None, operation=None, credential_role=None, validation=()):
+        if (not isinstance(validation, (tuple, list)) or len(validation) > 3
+                or any(not isinstance(item, str) or not item or len(item) > 240 for item in validation)):
+            raise TypeError('GitHub validation must contain at most three short summary strings.')
         self.status = status
-        self.repository = repository if isinstance(repository, str) and REPOSITORY.fullmatch(repository) else None
-        self.operation = operation
-        self.credential_role = credential_role
+        self.validation = validation = tuple(validation)
+        self.repository = repository if isinstance(repository, str) and len(repository) <= 200 and REPOSITORY.fullmatch(repository) else None
+        self.operation = operation = operation[:80] if isinstance(operation, str) else None
+        self.credential_role = credential_role = credential_role if credential_role in CREDENTIAL_ROLES else None
         message = {401: 'GitHub credentials are invalid or expired.',
                           403: 'GitHub access was denied or rate limited.',
                           404: 'GitHub repository or pull request is unavailable.',
                           409: 'GitHub head changed; refresh before continuing.',
-                          422: 'GitHub rejected the pull request; refresh before retrying.'}.get(
+                          422: 'GitHub rejected the pull request (HTTP 422).'}.get(
                               status, 'GitHub request failed.')
+        if validation:
+            message += ' ' + ' '.join(validation)
+        elif status == 422:
+            message += ' GitHub did not provide a recognized validation reason; check the head/base branches and PR credential access.'
         if self.repository:
-            message = f'{operation or "Repository access"} for {self.repository} using {credential_role or "the selected token"}: {message}'
+            message = f'{operation or "Repository access"} for {self.repository} using {credential_role or "the selected token"}. {message}'
             if status == 404:
                 message += ' Check the repository name, token repository selection, resource owner, and organization approval.'
         super().__init__(message)
@@ -92,7 +151,8 @@ class GitHub:
         """
         data = self.configuration()
         return GitHubCredential(data.get('pr_token') or data.get('token'),
-                                data.get('pr_login') or data.get('login'))
+                                data.get('pr_login') or data.get('login'),
+                                'pull request token' if data.get('pr_token') else 'push token')
 
     def snapshot(self):
         data = self.configuration()
@@ -129,18 +189,24 @@ class GitHub:
         if entry.get('mode') != 'fork' or entry.get('publishing_repository') != publishing:
             raise ValueError('Repository is not the configured fork for this project.')
 
-    def request(self, path, method='GET', body=None, token=None, page_result=False):
+    def request(self, path, method='GET', body=None, token=None, page_result=False, *, credential_role=None):
         """Return JSON, refusing partial lists unless the caller consumes page metadata.
 
         page_result requires an explicit token and returns {items, has_next}.
-        Such results bypass the shared cache. Callers construct subsequent URLs
+        Such results bypass the shared cache. Explicit tokens may carry a diagnostic
+        credential_role; this labels their source without changing authentication.
+        Callers construct subsequent URLs
         themselves; response Link URLs are never followed with credentials.
         """
         if page_result and (method != 'GET' or token is None):
             raise ValueError('Paged GitHub requests require an explicit credential and GET.')
         if not path.startswith('/') or '\\' in path or '..' in path:
             raise ValueError('Invalid GitHub API path.')
-        credential_role = 'provided token'
+        # Explicit credentials carry provenance from the same configuration
+        # snapshot that selected the secret; the endpoint cannot identify it.
+        if credential_role is not None and (token is None or credential_role not in CREDENTIAL_ROLES):
+            raise ValueError('An explicit credential role requires a token and a known role.')
+        credential_role = credential_role or 'provided token'
         supplied_token = token is not None
         if token is None:
             config = self.configuration()
@@ -194,7 +260,11 @@ class GitHub:
                 return result
         except HTTPError as error:
             status = error.code
-            error.close()
+            is_pull = method == 'POST' and re.fullmatch(r'/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls', path)
+            try:
+                validation = pull_validation(error) if status == 422 and is_pull else ()
+            finally:
+                error.close()
             if status == 304:
                 # Re-read under the lock: a credential change may have cleared it.
                 with self.lock:
@@ -204,7 +274,8 @@ class GitHub:
                 raise GitHubError(status) from None
             match = re.match(r'^/repos/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:[/?]|$)', path)
             raise GitHubError(status, repository=match[1] if match else None,
-                              operation=method + ' repository API request', credential_role=credential_role) from None
+                              operation='Create draft pull request' if is_pull and isinstance(body, dict) and body.get('draft') else method + ' repository API request',
+                              credential_role=credential_role, validation=validation) from None
         except (OSError, ValueError) as error:
             if isinstance(error, GitHubError):
                 raise

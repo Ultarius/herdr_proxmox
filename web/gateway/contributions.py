@@ -3380,8 +3380,9 @@ class Contributions:
                 try:
                     # The optional PR credential is separate from the credential
                     # used to push the branch. Existing single-token setups fall back.
+                    credential = self.github.pr_credential()
                     pull = self.github.request('/repos/' + upstream + '/pulls', 'POST', payload,
-                                               token=self.github.pr_credential().token)
+                                               token=credential.token, credential_role=credential.role)
                 except GitHubError as error:
                     if error.status != 422:
                         raise ValueError('The branch is already published, but PR creation failed. ' + str(error)) from None

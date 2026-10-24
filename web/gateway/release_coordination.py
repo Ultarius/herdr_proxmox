@@ -320,7 +320,9 @@ def advance_pull(manager, release, repository):
         if destination.lower() != upstream.lower() and owner.lower() == upstream.split('/')[0].lower():
             payload['head_repo'] = destination.split('/')[1]
         try:
-            pull = github.request('/repos/' + upstream + '/pulls', 'POST', payload, token=github.pr_credential().token)
+            credential = github.pr_credential()
+            pull = github.request('/repos/' + upstream + '/pulls', 'POST', payload,
+                                  token=credential.token, credential_role=credential.role)
         except GitHubError as error:
             if error.status != 422:
                 raise
