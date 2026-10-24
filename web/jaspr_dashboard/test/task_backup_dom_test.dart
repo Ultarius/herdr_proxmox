@@ -61,7 +61,10 @@ void main() {
       final target = event.target;
       if (target is web.HTMLAnchorElement &&
           (target.download.startsWith('herdr-tasks-') ||
-              Uri.parse(target.href).path == '/api/tasks/export')) {
+              const {
+                '/api/tasks/export',
+                '/api/tasks/export/json',
+              }.contains(Uri.parse(target.href).path))) {
         event.preventDefault();
         downloads.add(target);
       }
@@ -69,12 +72,18 @@ void main() {
     web.document.body!.addEventListener('click', capture);
     connection = DashboardBloc(
       client: MockClient((request) async {
-        if (request.url.path == '/api/tasks/export/info')
+        if (const {
+          '/api/tasks/export/info',
+          '/api/tasks/export/json/info',
+        }.contains(request.url.path))
           return http.Response(
             jsonEncode({'estimated_bytes': estimatedBytes}),
             200,
           );
-        if (request.url.path == '/api/tasks/export') {
+        if (const {
+          '/api/tasks/export',
+          '/api/tasks/export/json',
+        }.contains(request.url.path)) {
           exports++;
           expect(request.url.query, isEmpty);
           return response.future;
@@ -106,6 +115,42 @@ void main() {
     await BlocScope.reset();
     root.remove();
   });
+
+  test(
+    'JSON toolbar action downloads readable JSON beside database backup',
+    () async {
+      final buttons = root.querySelectorAll('button');
+      final button = List.generate(
+        buttons.length,
+        (i) => buttons.item(i) as web.HTMLButtonElement,
+      ).firstWhere((button) => button.textContent!.contains(taskJsonLabel));
+      button.click();
+      await until(() => exports == 1);
+      expect(exportButton().disabled, isTrue);
+      response.complete(
+        http.Response(
+          '{"tables":{"tasks":{"rows":[]}}}',
+          200,
+          headers: {
+            'content-disposition':
+                'attachment; filename="herdr-tasks-20261024T120000Z.json"',
+          },
+        ),
+      );
+      await until(() => downloads.isNotEmpty);
+      expect(downloads.single.download, 'herdr-tasks-20261024T120000Z.json');
+      await until(() => root.textContent!.contains(taskJsonNotice));
+      final blobResponse = await web.window
+          .fetch(downloads.single.href.toJS)
+          .toDart;
+      expect(blobResponse.headers.get('content-type'), 'application/json');
+      expect(jsonDecode((await blobResponse.text().toDart).toDart), {
+        'tables': {
+          'tasks': {'rows': []},
+        },
+      });
+    },
+  );
 
   test('export downloads complete response bytes as a SQLite backup', () async {
     exportButton().click();
@@ -170,32 +215,48 @@ void main() {
       expect(downloads, isEmpty);
     },
   );
-  test(
-    'large cookie-session backups use a same-origin native download link',
-    () async {
-      estimatedBytes = taskBackupBrowserLimit + 1;
-      connection.connect('');
-      await connection.stream.firstWhere(
-        (_) => connection.state.refreshed != null,
-      );
-      await until(() => !exportButton().disabled);
-      exportButton().click();
-      await until(() => downloads.isNotEmpty);
-      expect(
-        Uri.parse(downloads.single.href),
-        Uri.base.resolve('/api/tasks/export'),
-      );
-      expect(
-        downloads.single.download,
-        isEmpty,
-        reason: 'Native downloads use Content-Disposition',
-      );
-      expect(
-        exports,
-        0,
-        reason: 'Database bytes must not be read into JavaScript',
-      );
-      expect(root.textContent, contains(taskBackupStartedNotice));
-    },
-  );
+  for (final asJson in [false, true]) {
+    test(
+      'large cookie-session ${asJson ? 'JSON exports' : 'backups'} use a same-origin native download link',
+      () async {
+        estimatedBytes = taskBackupBrowserLimit + 1;
+        connection.connect('');
+        await connection.stream.firstWhere(
+          (_) => connection.state.refreshed != null,
+        );
+        await until(() => !exportButton().disabled);
+        if (asJson) {
+          final buttons = root.querySelectorAll('button');
+          List.generate(
+                buttons.length,
+                (i) => buttons.item(i) as web.HTMLButtonElement,
+              )
+              .firstWhere(
+                (button) => button.textContent!.contains(taskJsonLabel),
+              )
+              .click();
+        } else {
+          exportButton().click();
+        }
+        await until(() => downloads.isNotEmpty);
+        expect(
+          Uri.parse(downloads.single.href),
+          Uri.base.resolve(
+            asJson ? '/api/tasks/export/json' : '/api/tasks/export',
+          ),
+        );
+        expect(
+          downloads.single.download,
+          isEmpty,
+          reason: 'Native downloads use Content-Disposition',
+        );
+        expect(
+          exports,
+          0,
+          reason: 'Database bytes must not be read into JavaScript',
+        );
+        expect(root.textContent, contains(taskBackupStartedNotice));
+      },
+    );
+  }
 }

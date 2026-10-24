@@ -184,7 +184,7 @@ class _TasksPageState extends State<TasksPage> {
               : downloadBinaryArtifact(
                   file.bytes,
                   file.filename,
-                  contentType: 'application/vnd.sqlite3',
+                  contentType: file.contentType,
                 ),
     );
     backup.addListener(backupChanged);
@@ -438,6 +438,9 @@ class _TasksPageState extends State<TasksPage> {
   Future<void> exportTasks() =>
       backup.export(blocked: busy || configuringPublishing);
 
+  Future<void> exportJson() =>
+      backup.export(blocked: busy || configuringPublishing, asJson: true);
+
   Future<void> configure() async {
     if (!admin) {
       setState(
@@ -451,6 +454,8 @@ class _TasksPageState extends State<TasksPage> {
         !connection.state.connected)
       return;
     final token = TextEditingController();
+    final prToken = TextEditingController();
+    var clearPrCredential = false;
     final repos = TextEditingController(
       text: (github['repositories'] as List? ?? []).join('\n'),
     );
@@ -505,9 +510,7 @@ class _TasksPageState extends State<TasksPage> {
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      'Use a fine-grained token for selected repositories: Contents write, Pull requests write, Checks read, and Commit statuses read. Workflow changes may also require Workflows write. Setup verifies account access; it cannot prove the token has these write permissions. Keep branch protection enabled.\n\nAgents and gateway share a Linux user; this credential is not isolated from same-user agents. Use only trusted agents and repositories.',
-                    ),
+                    const Text(publishingPushTokenNotice),
                     DropdownButtonFormField<String>(
                       key: const ValueKey('publishing-token-source'),
                       initialValue: selection.selectedId,
@@ -541,6 +544,27 @@ class _TasksPageState extends State<TasksPage> {
                         ),
                         maxLength: 255,
                       ),
+                    const Text(publishingPrTokenNotice),
+                    TextField(
+                      controller: prToken,
+                      obscureText: true,
+                      enableSuggestions: false,
+                      autocorrect: false,
+                      decoration: const InputDecoration(
+                        labelText: 'Pull request token (optional)',
+                      ),
+                      maxLength: 255,
+                    ),
+                    if (github['pr_configured'] == true)
+                      CheckboxListTile(
+                        value: clearPrCredential,
+                        onChanged: (value) => setDialogState(
+                          () => clearPrCredential = value ?? false,
+                        ),
+                        title: const Text(
+                          'Remove saved pull request credential',
+                        ),
+                      ),
                     TextField(
                       controller: repos,
                       minLines: 2,
@@ -551,9 +575,7 @@ class _TasksPageState extends State<TasksPage> {
                       ),
                     ),
                     const SizedBox(height: 12),
-                    const Text(
-                      'Publication mode. Direct pushes the task branch and opens the pull request in the same repository. Through a fork pushes the branch to your fork and opens the pull request upstream, so the upstream repository does not need push access. A fine-grained token for your fork cannot authorize a cross-owner upstream PR. For that workflow, use a classic token with appropriate repository scopes. The dashboard currently stores one credential for both push and PR creation; separate PR credentials are not supported.',
-                    ),
+                    const Text(publishingModeNotice),
                     for (final name in listed()) ...[
                       Row(
                         children: [
@@ -634,6 +656,8 @@ class _TasksPageState extends State<TasksPage> {
         if (!selection.manual) 'connection_id': selection.selectedId,
         'repositories': listed(),
         'publication': publication,
+        if (prToken.text.trim().isNotEmpty) 'pr_token': prToken.text.trim(),
+        if (clearPrCredential) 'clear_pr_credential': true,
       });
       await refresh();
     } catch (e) {
@@ -642,6 +666,8 @@ class _TasksPageState extends State<TasksPage> {
     } finally {
       token.clear();
       token.dispose();
+      prToken.clear();
+      prToken.dispose();
       repos.dispose();
       for (final controller in forks.values) {
         controller.dispose();
@@ -1238,7 +1264,25 @@ class _TasksPageState extends State<TasksPage> {
                         : null,
                     icon: const Icon(Icons.download),
                     label: Text(
-                      exportingTasks ? 'Exporting tasks…' : taskBackupLabel,
+                      exportingTasks && !backup.jsonExport
+                          ? 'Exporting tasks…'
+                          : taskBackupLabel,
+                    ),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed:
+                        admin &&
+                            connection.state.connected &&
+                            !busy &&
+                            !configuringPublishing &&
+                            !exportingTasks
+                        ? exportJson
+                        : null,
+                    icon: const Icon(Icons.data_object),
+                    label: Text(
+                      exportingTasks && backup.jsonExport
+                          ? 'Exporting JSON…'
+                          : taskJsonLabel,
                     ),
                   ),
                   IconButton(

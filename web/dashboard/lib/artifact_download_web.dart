@@ -33,7 +33,10 @@ Future<void> downloadBinaryArtifact(
 /// gateway's Content-Disposition. No database bytes enter JavaScript memory.
 Future<void> downloadTaskBackupLink(Uri uri) async {
   if (uri.origin != Uri.base.origin ||
-      uri.path != '/api/tasks/export' ||
+      !const {
+        '/api/tasks/export',
+        '/api/tasks/export/json',
+      }.contains(uri.path) ||
       uri.hasQuery ||
       uri.hasFragment) {
     throw ArgumentError('Invalid task backup download URL');

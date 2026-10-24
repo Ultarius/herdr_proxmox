@@ -3365,8 +3365,9 @@ class Contributions:
                     self.github.request('/repos/' + upstream + '/branches/' + quote(base, safe=''))
                 except GitHubError as error:
                     if error.status == 404:
-                        raise ValueError('The upstream base branch ' + base + ' does not exist. Refresh the task '
-                                         'base before opening a pull request.') from None
+                        raise ValueError('The upstream base branch ' + base + ' is unavailable to the upstream credential. '
+                                         'Check the branch name, token repository selection, and Contents read permission. '
+                                         'Refresh the task base before opening a pull request.') from None
                     raise
                 payload = dict(title=title.strip(),
                                head=(owner + ':' + task['branch']) if fork else task['branch'],

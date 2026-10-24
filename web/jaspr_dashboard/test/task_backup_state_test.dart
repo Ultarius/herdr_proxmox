@@ -21,12 +21,18 @@ void main() {
     started = Completer<void>();
     connection = DashboardBloc(
       client: MockClient((request) async {
-        if (request.url.path == '/api/tasks/export/info')
+        if (const {
+          '/api/tasks/export/info',
+          '/api/tasks/export/json/info',
+        }.contains(request.url.path))
           return http.Response(
             jsonEncode({'estimated_bytes': estimatedBytes}),
             200,
           );
-        if (request.url.path == '/api/tasks/export') {
+        if (const {
+          '/api/tasks/export',
+          '/api/tasks/export/json',
+        }.contains(request.url.path)) {
           exports++;
           started.complete();
           expect(request.method, 'GET');
@@ -49,6 +55,37 @@ void main() {
     if (!response.isCompleted) response.complete(http.Response('{}', 503));
     await connection.disconnect();
     connection.dispose();
+  });
+
+  test('JSON export keeps server filename, readable bytes and MIME', () async {
+    final future = fetchTaskBackup(connection, asJson: true);
+    final bytes = utf8.encode('{"tables":{"tasks":{"rows":[]}}}');
+    response.complete(
+      http.Response.bytes(
+        bytes,
+        200,
+        headers: {
+          'content-disposition':
+              'attachment; filename="herdr-tasks-20261024T120000Z.json"',
+        },
+      ),
+    );
+    final backup = await future;
+    expect(backup.bytes, bytes);
+    expect(backup.filename, 'herdr-tasks-20261024T120000Z.json');
+    expect(backup.contentType, 'application/json');
+  });
+
+  test('large JSON uses its own native download endpoint', () async {
+    estimatedBytes = taskBackupBrowserLimit + 1;
+    await connection.disconnect();
+    connection.connect('');
+    await connection.stream.firstWhere(
+      (_) => connection.state.refreshed != null,
+    );
+    final backup = await fetchTaskBackup(connection, asJson: true);
+    expect(backup.downloadUri!.path, '/api/tasks/export/json');
+    expect(exports, 0);
   });
 
   test('all task backup bytes are retained in a portable filename', () async {

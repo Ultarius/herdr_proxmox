@@ -2,7 +2,10 @@ import 'dart:typed_data';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 
-const taskBackupLabel = 'Export all tasks';
+const taskBackupLabel = 'Database backup';
+const taskJsonLabel = 'Export JSON';
+const taskJsonNotice =
+    'Readable JSON downloaded. Includes all tasks, full history, and related metadata. Repository files, credentials, and external logs/artifacts need separate backups.';
 const taskBackupNotice =
     'Task database backup downloaded. Includes all tasks, full history, and related metadata. '
     'Repository files, credentials, and external logs/artifacts need separate backups.';
@@ -14,24 +17,34 @@ const taskBackupStartedNotice =
 typedef TaskBackupSaver = Future<void> Function(TaskBackup backup);
 
 class TaskBackup {
-  TaskBackup(this.bytes, this.filename) : downloadUri = null;
+  TaskBackup(
+    this.bytes,
+    this.filename, {
+    this.contentType = 'application/vnd.sqlite3',
+  }) : downloadUri = null;
   TaskBackup.streamed(Uri uri)
     : downloadUri = uri,
       bytes = Uint8List(0),
-      filename = '';
+      filename = '',
+      contentType = '';
   final Uint8List bytes;
   final String filename;
+  final String contentType;
   final Uri? downloadUri;
 }
 
-Future<TaskBackup> fetchTaskBackup(DashboardBloc connection) async {
+Future<TaskBackup> fetchTaskBackup(
+  DashboardBloc connection, {
+  bool asJson = false,
+}) async {
   bool allowed() =>
       connection.state.connected &&
       connection.operator.value['role'] == 'admin';
   if (!allowed())
     throw StateError('Only an administrator can export all tasks.');
   final generation = connection.generation;
-  final info = await connection.request('tasks/export/info');
+  final path = asJson ? 'tasks/export/json' : 'tasks/export';
+  final info = await connection.request('$path/info');
   if (!allowed() || generation != connection.generation)
     throw StateError('Connection changed. Export the backup again.');
   if (info is! Map || info['estimated_bytes'] is! num)
@@ -40,11 +53,11 @@ Future<TaskBackup> fetchTaskBackup(DashboardBloc connection) async {
     );
   if ((info['estimated_bytes'] as num) > taskBackupBrowserLimit) {
     if (connection.browserSession)
-      return TaskBackup.streamed(Uri.base.resolve('/api/tasks/export'));
+      return TaskBackup.streamed(Uri.base.resolve('/api/$path'));
     throw StateError(taskBackupLimitNotice);
   }
   final response = await connection.download(
-    'tasks/export',
+    path,
     maximumBytes: taskBackupBrowserLimit,
   );
   if (!allowed() || generation != connection.generation) {
@@ -52,13 +65,19 @@ Future<TaskBackup> fetchTaskBackup(DashboardBloc connection) async {
   }
   final disposition = response.headers['content-disposition'] ?? '';
   final filename = RegExp(
-    r'filename="(herdr-tasks-[0-9]{8}T[0-9]{6}Z\.sqlite3)"',
+    asJson
+        ? r'filename="(herdr-tasks-[0-9]{8}T[0-9]{6}Z\.json)"'
+        : r'filename="(herdr-tasks-[0-9]{8}T[0-9]{6}Z\.sqlite3)"',
   ).firstMatch(disposition)?[1];
   if (filename == null)
     throw StateError(
       'Task backup filename was not supplied by the gateway. Refresh the dashboard and retry.',
     );
-  return TaskBackup(response.bodyBytes, filename);
+  return TaskBackup(
+    response.bodyBytes,
+    filename,
+    contentType: asJson ? 'application/json' : 'application/vnd.sqlite3',
+  );
 }
 
 /// Both dashboards share the complete operation lifecycle and download guard.
@@ -74,7 +93,7 @@ class TaskBackupController extends ValueNotifier<int> {
   StreamSubscription? _subscription;
   int _generation, _operation = 0;
   bool _disposed = false;
-  bool busy = false, failed = false;
+  bool busy = false, failed = false, jsonExport = false;
   String? message;
   bool get _allowed =>
       connection.state.connected &&
@@ -99,7 +118,7 @@ class TaskBackupController extends ValueNotifier<int> {
     notifyListeners();
   }
 
-  Future<void> export({bool blocked = false}) async {
+  Future<void> export({bool blocked = false, bool asJson = false}) async {
     if (_disposed || busy || blocked || !_allowed) return;
     final epoch = connection.generation, operation = ++_operation;
     bool current() =>
@@ -107,12 +126,13 @@ class TaskBackupController extends ValueNotifier<int> {
         operation == _operation &&
         epoch == connection.generation &&
         _allowed;
+    jsonExport = asJson;
     busy = true;
     message = null;
     failed = false;
     notifyListeners();
     try {
-      final backup = await fetchTaskBackup(connection);
+      final backup = await fetchTaskBackup(connection, asJson: asJson);
       if (!current()) return;
       try {
         await save(backup);
@@ -123,7 +143,7 @@ class TaskBackupController extends ValueNotifier<int> {
       }
       if (current())
         message = backup.downloadUri == null
-            ? taskBackupNotice
+            ? (asJson ? taskJsonNotice : taskBackupNotice)
             : taskBackupStartedNotice;
     } catch (error) {
       if (current()) {

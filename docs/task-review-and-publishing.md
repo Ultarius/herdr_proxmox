@@ -14,7 +14,7 @@ actions are under Activity & agents.
 
 ## Back up all tasks
 
-As an administrator, choose **Tasks → Export all tasks** in either dashboard.
+As an administrator, choose **Tasks → Database backup** in either dashboard.
 The download is a timestamped `herdr-tasks-….sqlite3` file: a consistent SQLite
 backup of the complete task database, including tasks outside the latest-100
 dashboard listing and any active view filters. It preserves all stored task
@@ -111,7 +111,7 @@ existing behavior.
 For either a saved connection or a manually entered token, supply:
 
 - A fine-grained personal access token belonging to an account with push access
-  to the selected repositories. Select the repository owner as resource owner,
+  to each branch destination. Select its owner as resource owner,
   choose the repositories, set an expiry, and obtain organization approval if
   the organization requires it.
 - Repository permissions: Contents write, Pull requests write, Checks read and
@@ -135,6 +135,26 @@ Each allowlisted repository also chooses a publication mode:
 The upstream repository always remains the source of the base branch and the
 pull request target. Only the branch destination moves to the fork.
 
+For private repositories under different owners, use two fine-grained tokens:
+the push token selects the fork and grants Contents write (plus Workflows write
+when needed). The separate PR token selects the upstream and grants Pull requests
+write, Contents read for base-branch checks, Checks read, and Commit statuses
+read for monitoring. Metadata read is included by GitHub. The PR account must
+have the fork access required by GitHub for cross-account PR creation; Herdr
+does not require its token to select the fork during setup.
+
+Setup and publication preflight inspect the upstream with the PR token and the
+fork with the push token. Subsequent upstream branch/check/review reads use the
+PR token as well. Omitting a separate PR token keeps the single-token behavior,
+which requires that credential to access both repositories. A missing permission
+is never fixed by automatically retrying with the other token.
+
+GitHub failures identify the repository, operation, and credential role in the
+UI and gateway journal (`journalctl -u herdr-web.service`). API error responses
+retain `source` and `github_status` and add `github_repository`,
+`github_operation`, and `github_credential_role` when known. Tokens and raw
+GitHub response bodies are not included in these diagnostics.
+
 Validate and save reports capability rather than asserting it. Account access
 and token permission are separate, and setup is read-only:
 
@@ -142,16 +162,15 @@ and token permission are separate, and setup is read-only:
 Fork access: verified
 Account write access to the fork: verified
 Token write capability: not yet exercised
-Upstream PR creation: supported | needs different authentication
+Upstream PR creation: supported | not_exercised
 ```
 
-Setup never creates a branch or pull request to prove write access. A
-fine-grained token is limited to its resource owner's repositories, so it
-generally cannot open a pull request on another account's repository; in that
-case Herdr reports that upstream PR creation needs different authentication, and
-a classic token with `public_repo` (plus `workflow` when publishing workflow
-changes) is the narrower supported option. A classic token cannot grant
-repository privileges the account itself lacks.
+Setup never creates a branch or pull request to prove write access. Fine-grained
+PR write permission is reported as `not_exercised` until a real operation succeeds.
+One fine-grained token is limited to a single resource owner; separate fork and
+upstream tokens allow this private cross-owner setup without granting either
+token access to both repositories. Account access and GitHub's fork/PR rules
+still apply.
 
 The gateway needs working Internet routing and DNS. Publishing uploads the exact
 reviewed commit; it does not merge or deploy it. Pull request creation and
@@ -274,3 +293,27 @@ starting the next task. Failed checks retain ownership and require inspection.
 A group proposal alone cannot replace these checks. It can discuss work that
 is still running, recommend optional improvements, or refer to an earlier
 candidate. Likewise, an idle pane by itself is not proof of completed work.
+
+### Readable task export
+
+The Tasks toolbar offers **Export JSON** beside **Database backup**. Both export
+all stored tasks, complete history, and related metadata, including records beyond
+the dashboard list limits. JSON is pretty-printed UTF-8 and can be opened in a
+text editor. Repository files, credentials, and external logs/artifacts require
+separate backups.
+
+The JSON document has format `herdr-task-export`, version `1`, an export timestamp,
+database version metadata, the SQLite schema, and every table with column
+information and all rows. Stored JSON objects and arrays are expanded into nested
+values; `json_text_columns` identifies them. Each row includes its SQLite storage
+types and rowid when available. BLOBs are base64 strings, non-finite real values
+are tagged with `sqlite_real`, and invalid or duplicate-key JSON remains text.
+Use the SQLite backup for exact database restoration; JSON is a readable data
+export, and there is currently no JSON import action.
+
+Administrator-only endpoints are `GET /api/tasks/export/json` and
+`GET /api/tasks/export/json/info`. They share the database export's single-flight
+lock, snapshot consistency, private scratch storage, cleanup, and download limits.
+JSON generation measures additional disk requirements before writing and has a
+five-minute deadline. Its transfer preflight conservatively estimates expansion;
+large exports use native browser streaming with a browser session.

@@ -17,8 +17,8 @@ from urllib.request import Request, urlopen, HTTPRedirectHandler, build_opener
 
 REPOSITORY = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
 MODES = ('direct', 'fork')
-# Fine-grained tokens are limited to their resource owner's repositories, so
-# they generally cannot open a pull request on another account's repository.
+# A single fine-grained token is limited to one resource owner. Separate push
+# and upstream PR tokens support repositories under different owners.
 FINE_GRAINED = 'github_pat_'
 
 
@@ -34,14 +34,22 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 class GitHubError(ValueError):
-    def __init__(self, status):
+    def __init__(self, status, *, repository=None, operation=None, credential_role=None):
         self.status = status
-        super().__init__({401: 'GitHub credentials are invalid or expired.',
+        self.repository = repository if isinstance(repository, str) and REPOSITORY.fullmatch(repository) else None
+        self.operation = operation
+        self.credential_role = credential_role
+        message = {401: 'GitHub credentials are invalid or expired.',
                           403: 'GitHub access was denied or rate limited.',
                           404: 'GitHub repository or pull request is unavailable.',
                           409: 'GitHub head changed; refresh before continuing.',
                           422: 'GitHub rejected the pull request; refresh before retrying.'}.get(
-                              status, 'GitHub request failed.'))
+                              status, 'GitHub request failed.')
+        if self.repository:
+            message = f'{operation or "Repository access"} for {self.repository} using {credential_role or "the selected token"}: {message}'
+            if status == 404:
+                message += ' Check the repository name, token repository selection, resource owner, and organization approval.'
+        super().__init__(message)
 
 
 class GitHub:
@@ -132,17 +140,26 @@ class GitHub:
             raise ValueError('Paged GitHub requests require an explicit credential and GET.')
         if not path.startswith('/') or '\\' in path or '..' in path:
             raise ValueError('Invalid GitHub API path.')
+        credential_role = 'provided token'
         supplied_token = token is not None
         if token is None:
             config = self.configuration()
             # Keep creation, lookup, reviews and lost-response recovery on the
             # same credential. Explicit tokens still override this selection.
-            match = re.match(r'^/repos/([^/]+/[^/]+)/pulls(?:[/?]|$)', path)
-            if config.get('pr_token') and match and match[1] in config.get('repositories', []):
+            match = re.match(r'^/repos/([^/]+/[^/?]+)(/[^?]*)?(?:[?]|$)', path)
+            repository = match[1] if match else None
+            suffix = (match[2] or '') if match else ''
+            entry = config.get('publication', {}).get(repository, {})
+            upstream_read = method == 'GET' and entry.get('mode') == 'fork' and entry.get('publishing_repository') != repository
+            pr_operation = suffix == '/pulls' or suffix.startswith('/pulls/')
+            if (config.get('pr_token') and repository in config.get('repositories', [])
+                    and (pr_operation or upstream_read)):
                 token = config['pr_token']
                 supplied_token = True  # Do not mix identities in the GET cache.
+                credential_role = 'pull request token'
             else:
                 token = config.get('token')
+                credential_role = 'push token'
         if not token:
             raise ValueError('Configure GitHub publishing credentials first.')
         headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json',
@@ -185,7 +202,9 @@ class GitHub:
                 if current:
                     return current[1]
                 raise GitHubError(status) from None
-            raise GitHubError(status) from None
+            match = re.match(r'^/repos/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:[/?]|$)', path)
+            raise GitHubError(status, repository=match[1] if match else None,
+                              operation=method + ' repository API request', credential_role=credential_role) from None
         except (OSError, ValueError) as error:
             if isinstance(error, GitHubError):
                 raise
@@ -212,16 +231,30 @@ class GitHub:
         """
         return 'not_exercised' if token.startswith(FINE_GRAINED) else 'supported'
 
-    def repository_info(self, repository, token):
-        info = self.request('/repos/' + repository, token=token)
+    def repository_info(self, repository, token, *, credential_role='push token', operation='Read repository metadata'):
+        try:
+            info = self.request('/repos/' + repository, token=token)
+        except GitHubError as error:
+            raise GitHubError(error.status, repository=repository, operation=operation,
+                              credential_role=credential_role) from None
         return info if isinstance(info, dict) else {}
+
+    def fork_repositories(self, upstream, publishing, config):
+        # An upstream-scoped fine-grained PAT need not see the private fork,
+        # and a fork-scoped push PAT need not see the private upstream.
+        upstream_token = config.get('pr_token') or config.get('token')
+        role = 'pull request token' if config.get('pr_token') else 'push token'
+        target = self.repository_info(upstream, upstream_token, credential_role=role,
+                                      operation='Read upstream repository')
+        destination = self.repository_info(publishing, config.get('token'), operation='Read fork destination')
+        return target, destination
 
     def verify_fork(self, upstream, publishing):
         """Re-check a fork destination against the live API, for task overrides."""
         if not REPOSITORY.fullmatch(str(publishing)) or publishing == upstream:
             raise ValueError('Enter the fork as owner/repository.')
-        self.allow(upstream)
-        if not self.same_fork_network(self.repository_info(upstream, None), self.repository_info(publishing, None)):
+        self.allow_publishing(upstream, publishing)
+        if not self.same_fork_network(*self.fork_repositories(upstream, publishing, self.configuration())):
             raise ValueError(publishing + ' is not a fork of ' + upstream + '.')
         return True
 
@@ -236,8 +269,12 @@ class GitHub:
             raise ValueError('GitHub returned an invalid publishing identity.')
         if login.lower() != str(config.get('login', '')).lower():
             raise ValueError('GitHub publishing account changed; configure credentials again.')
-        target = self.repository_info(upstream, token)
-        destination = target if upstream == publishing else self.repository_info(publishing, token)
+        if config.get('pr_token'):
+            self.credential_login(config['pr_token'], config['pr_login'])
+        if upstream == publishing:
+            target = destination = self.repository_info(upstream, token)
+        else:
+            target, destination = self.fork_repositories(upstream, publishing, config)
         if (str(target.get('full_name', '')).lower() != upstream.lower()
                 or str(destination.get('full_name', '')).lower() != publishing.lower()):
             raise ValueError('GitHub repository moved or is unavailable; inspect the publishing destination.')
@@ -247,8 +284,6 @@ class GitHub:
         if upstream != publishing:
             if not self.same_fork_network(target, destination):
                 raise ValueError(publishing + ' is no longer a fork of ' + upstream + '.')
-        if config.get('pr_token'):
-            self.credential_login(config['pr_token'], config['pr_login'])
         return dict(login=login, repository=publishing, upstream=upstream,
                     mode='direct' if upstream == publishing else 'fork',
                     account_write='verified', token_write='not_exercised',
@@ -324,18 +359,27 @@ class GitHub:
         login = user['login']
         # Resolve every repository once, concurrently: the dashboard gives this
         # call a bounded timeout, and twenty sequential checks could exceed it.
-        needed = list(repositories)
-        needed += sorted({entry['publishing_repository'] for entry in publication.values()
-                          if entry['mode'] == 'fork'} - set(repositories))
+        # Keep upstream and destination evidence separate even when a repository
+        # is a destination for one entry and the upstream for another.
+        needed = {(name, 'upstream' if publication.get(name, {}).get('mode') == 'fork' else 'destination')
+                  for name in repositories}
+        needed.update((entry['publishing_repository'], 'destination') for entry in publication.values() if entry['mode'] == 'fork')
+        needed = sorted(needed)
+        def resolve(item):
+            name, purpose = item
+            separate = purpose == 'upstream' and pr_token is not None
+            return self.repository_info(name, pr_token if separate else token,
+                                        credential_role='pull request token' if separate else 'push token',
+                                        operation='Read upstream repository' if purpose == 'upstream' else 'Read branch destination')
         with ThreadPoolExecutor(max_workers=5) as pool:
-            resolved = dict(zip(needed, pool.map(lambda name: self.repository_info(name, token), needed)))
+            resolved = dict(zip(needed, pool.map(resolve, needed)))
         # A fork-mode upstream is read-only here. Requiring push on it would
         # contradict the purpose of contributing through a fork, and the account
         # permission GitHub reports does not prove the token may write anyway.
         upstreams = {name for name, entry in publication.items() if entry['mode'] == 'fork'}
         writers = [name for name in repositories if name not in upstreams]
         writers += [entry['publishing_repository'] for entry in publication.values() if entry['mode'] == 'fork']
-        if not all(isinstance(resolved[name].get('permissions'), dict) and resolved[name]['permissions'].get('push')
+        if not all(isinstance(resolved[(name, 'destination')].get('permissions'), dict) and resolved[(name, 'destination')]['permissions'].get('push')
                    for name in writers):
             raise ValueError('GitHub account needs push access to every repository Herdr publishes to.')
         for upstream in repositories:
@@ -347,7 +391,7 @@ class GitHub:
                     upstream_pr_creation=self.pr_capability(pr_token or token))
                 continue
             publishing = entry['publishing_repository']
-            if not self.same_fork_network(resolved[upstream], resolved[publishing]):
+            if not self.same_fork_network(resolved[(upstream, 'upstream')], resolved[(publishing, 'destination')]):
                 raise ValueError(publishing + ' is not a fork of ' + upstream + '.')
             # Setup never creates a branch or pull request to prove write access.
             entry['verification'] = dict(

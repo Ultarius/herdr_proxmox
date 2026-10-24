@@ -202,12 +202,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def task_backup(self):
+    def task_backup(self, output_format='sqlite'):
         from datetime import datetime, timezone
-        from task_backup import BackupBusy, export_database
+        from task_backup import BackupBusy, export_database, readable_json
         with ExitStack() as stack:
             try:
                 backup = stack.enter_context(export_database(self.server.contributions.connect))
+                if output_format == 'json':
+                    backup = readable_json(backup)
                 stream = stack.enter_context(backup.open('rb'))
                 size = backup.stat().st_size
             except BackupBusy as error:
@@ -219,10 +221,11 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, sqlite3.Error):
                 self.reply(503, {'error': 'Could not export task storage. Check gateway storage and available disk space, then retry.'})
                 return
-            filename = 'herdr-tasks-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '.sqlite3'
+            suffix = '.json' if output_format == 'json' else '.sqlite3'
+            filename = 'herdr-tasks-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + suffix
             try:
                 self.send_response(200)
-                self.send_header('Content-Type', 'application/vnd.sqlite3')
+                self.send_header('Content-Type', 'application/json; charset=utf-8' if output_format == 'json' else 'application/vnd.sqlite3')
                 self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
                 self.send_header('Cache-Control', 'no-store')
                 self.send_header('X-Content-Type-Options', 'nosniff')
@@ -367,14 +370,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith('/api/'):
             if not self.authenticated():
                 return
-            if urlsplit(self.path).path in ('/api/tasks/export', '/api/tasks/export/info'):
+            if urlsplit(self.path).path in ('/api/tasks/export', '/api/tasks/export/info', '/api/tasks/export/json', '/api/tasks/export/json/info'):
                 if self.operator['role'] != 'admin':
-                    self.reply(403, {'error': 'Only an administrator can export the task database.'})
+                    self.reply(403, {'error': 'Only an administrator can export task data.'})
                     return
+                output_format = 'json' if '/json' in urlsplit(self.path).path else 'sqlite'
                 if urlsplit(self.path).path.endswith('/info'):
                     from task_backup import BackupBusy, export_info
                     try:
-                        self.reply(200, export_info(self.server.contributions.connect))
+                        self.reply(200, export_info(self.server.contributions.connect, output_format))
                     except BackupBusy as error:
                         self.reply(409, {'error': str(error)}, retry_after=2)
                     except ValueError as error:
@@ -382,7 +386,7 @@ class Handler(BaseHTTPRequestHandler):
                     except (OSError, sqlite3.Error):
                         self.reply(503, {'error': 'Could not inspect task backup storage. Check storage and permissions, then retry.'})
                 else:
-                    self.task_backup()
+                    self.task_backup(output_format)
                 return
             if urlsplit(self.path).path == '/api/organizations/automation':
                 org_id = (parse_qs(urlsplit(self.path).query).get('organization_id') or [''])[0]
@@ -977,7 +981,12 @@ class Handler(BaseHTTPRequestHandler):
         except GitHubError as exc:
             # HTTP 401 is reserved for dashboard authentication. An upstream
             # 401 must not revoke a valid browser session or erase task state.
-            self.reply(502, {'error': str(exc)[:500], 'source': 'github', 'github_status': exc.status})
+            details = {key: value for key, value in {
+                'github_repository': exc.repository, 'github_operation': exc.operation,
+                'github_credential_role': exc.credential_role}.items() if value is not None}
+            self.log_message('GitHub failure: status=%s repository=%s operation=%s credential=%s',
+                             exc.status, exc.repository or '-', exc.operation or '-', exc.credential_role or '-')
+            self.reply(502, {'error': str(exc)[:500], 'source': 'github', 'github_status': exc.status, **details})
         except FieldValidationError as exc:
             self.reply(400, {'error': str(exc)[:500], 'field_errors': exc.field_errors})
         except StorageBusy as exc:

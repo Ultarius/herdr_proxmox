@@ -166,7 +166,7 @@ class _TasksPageState extends State<TasksPage> {
               : downloadBytes(
                   file.bytes,
                   file.filename,
-                  contentType: 'application/vnd.sqlite3',
+                  contentType: file.contentType,
                 ),
     );
     backup.addListener(backupChanged);
@@ -455,6 +455,9 @@ class _TasksPageState extends State<TasksPage> {
   Future<void> exportTasks() =>
       backup.export(blocked: busy || configuringPublishing);
 
+  Future<void> exportJson() =>
+      backup.export(blocked: busy || configuringPublishing, asJson: true);
+
   Future<void> configure() async {
     if (!admin) {
       setState(
@@ -524,9 +527,7 @@ class _TasksPageState extends State<TasksPage> {
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      'The push token needs Contents write on the branch destination. Workflow changes may require Workflows write. If this token also handles upstream PRs, it needs Pull requests write there. Setup verifies identity and account access; actual publishing verifies token permissions. Keep branch protection enabled.\n\nAgents and gateway share a Linux user; credentials are not isolated from same-user agents. Use only trusted agents and repositories.',
-                    ),
+                    const Text(publishingPushTokenNotice),
                     DropdownButtonFormField<String>(
                       key: const ValueKey('publishing-token-source'),
                       initialValue: selection.selectedId,
@@ -560,12 +561,7 @@ class _TasksPageState extends State<TasksPage> {
                         ),
                         maxLength: 255,
                       ),
-                    const Text(
-                      'An optional separate token handles upstream PR operations while the token above pushes the branch. '
-                      'For a split between personal accounts, the upstream account needs write access to the fork, '
-                      'and its token needs Pull requests write on the upstream. GitHub verifies the account name. '
-                      'Leave blank to preserve an existing PR credential; without one, the push token is used.',
-                    ),
+                    const Text(publishingPrTokenNotice),
                     if (github['pr_configured'] == true)
                       Text(
                         'Separate PR credential configured for ${github['pr_login'] ?? 'a verified account'}.',
@@ -600,9 +596,7 @@ class _TasksPageState extends State<TasksPage> {
                       ),
                     ),
                     const SizedBox(height: 12),
-                    const Text(
-                      'Direct publishes the branch and PR in the same repository. Through a fork publishes the branch to the fork and opens the PR upstream. Separate credentials narrow GitHub permissions; both are stored under the same gateway user. Setup verifies identity and account access; actual PR creation verifies token permission.',
-                    ),
+                    const Text(publishingModeNotice),
                     for (final name in listed()) ...[
                       Row(
                         children: [
@@ -1279,11 +1273,30 @@ class _TasksPageState extends State<TasksPage> {
             iconName: 'key-round',
           ),
           ui.button(
-            exportingTasks ? 'Exporting tasks…' : taskBackupLabel,
-            admin && connection.state.connected && !busy && !exportingTasks
+            exportingTasks && !backup.jsonExport
+                ? 'Exporting tasks…'
+                : taskBackupLabel,
+            admin &&
+                    connection.state.connected &&
+                    !busy &&
+                    !configuringPublishing &&
+                    !exportingTasks
                 ? exportTasks
                 : null,
             iconName: 'download',
+          ),
+          ui.button(
+            exportingTasks && backup.jsonExport
+                ? 'Exporting JSON…'
+                : taskJsonLabel,
+            admin &&
+                    connection.state.connected &&
+                    !busy &&
+                    !configuringPublishing &&
+                    !exportingTasks
+                ? exportJson
+                : null,
+            iconName: 'file-text',
           ),
           ui.button(
             'Refresh tasks',

@@ -15,12 +15,18 @@ class BackupFixture {
   final saved = <TaskBackup>[];
   late final DashboardBloc connection = DashboardBloc(
     client: MockClient((request) async {
-      if (request.url.path == '/api/tasks/export/info')
+      if (const {
+        '/api/tasks/export/info',
+        '/api/tasks/export/json/info',
+      }.contains(request.url.path))
         return http.Response(
           jsonEncode({'estimated_bytes': estimatedBytes}),
           200,
         );
-      if (request.url.path == '/api/tasks/export') {
+      if (const {
+        '/api/tasks/export',
+        '/api/tasks/export/json',
+      }.contains(request.url.path)) {
         exports++;
         return pending.future;
       }
@@ -79,6 +85,35 @@ void main() {
     await clickText(tester, taskBackupLabel);
     await pumpUntil(tester, () => fixture.exports == 1);
   }
+
+  testWidgets('JSON action saves readable data with JSON filename and MIME', (
+    tester,
+  ) async {
+    await withBackup(tester, (f) async {
+      await clickText(tester, taskJsonLabel);
+      await pumpUntil(tester, () => f.exports == 1);
+      expect(action(tester, taskBackupLabel).onPressed, isNull);
+      expect(action(tester, 'Exporting JSON…').onPressed, isNull);
+      final bytes = utf8.encode('{"tables":{"tasks":{"rows":[{"id":"all"}]}}}');
+      f.pending.complete(
+        http.Response.bytes(
+          bytes,
+          200,
+          headers: {
+            'content-disposition':
+                'attachment; filename="herdr-tasks-20261024T120000Z.json"',
+          },
+        ),
+      );
+      await pumpUntil(
+        tester,
+        () => find.text(taskJsonNotice).evaluate().isNotEmpty,
+      );
+      expect(f.saved.single.bytes, bytes);
+      expect(f.saved.single.filename, 'herdr-tasks-20261024T120000Z.json');
+      expect(f.saved.single.contentType, 'application/json');
+    });
+  });
 
   testWidgets(
     'successful export saves exact bytes and server filename and offers dismissal',

@@ -13,6 +13,7 @@ void main() {
     WidgetTester tester,
     Future<void> Function(DashboardBloc, List<Map<String, dynamic>>) body, {
     bool listingFails = false,
+    bool prConfigured = false,
   }) async {
     tester.view.physicalSize = const Size(1280, 2400);
     tester.view.devicePixelRatio = 1;
@@ -56,7 +57,14 @@ void main() {
         }
         if (request.url.path == '/api/tasks')
           return http.Response(
-            '{"tasks":[],"github":{"configured":false}}',
+            jsonEncode({
+              'tasks': [],
+              'github': {
+                'configured': false,
+                'pr_configured': prConfigured,
+                'pr_login': 'owner',
+              },
+            }),
             200,
           );
         return http.Response('{"workspaces":[],"agents":[]}', 200);
@@ -103,6 +111,70 @@ void main() {
     await clickText(tester, 'Cancel');
     await pumpUntil(tester, () => find.byType(AlertDialog).evaluate().isEmpty);
     await tester.pump(const Duration(milliseconds: 300));
+  }
+
+  testWidgets('fork setup submits separate push and upstream tokens', (
+    tester,
+  ) async {
+    await withPublishing(tester, (_, posts) async {
+      await tester.enterText(field('Personal access token'), 'github_pat_push');
+      await tester.enterText(
+        field('Pull request token (optional)'),
+        'github_pat_upstream',
+      );
+      expect(find.text(publishingPrTokenNotice), findsOneWidget);
+      await tester.enterText(
+        field('Allowed owner/repository (one per line)'),
+        'upstream/private',
+      );
+      await tester.pump();
+      await tester.tap(find.text('Direct').last);
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.tap(find.text('Through a fork').last);
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.enterText(
+        field('Fork for upstream/private (owner/repository)'),
+        'contributor/private',
+      );
+      await clickText(tester, 'Validate and save');
+      await pumpUntil(tester, () => posts.isNotEmpty);
+      expect(posts.single['token'], 'github_pat_push');
+      expect(posts.single['pr_token'], 'github_pat_upstream');
+      expect(posts.single['publication'], {
+        'upstream/private': {
+          'mode': 'fork',
+          'publishing_repository': 'contributor/private',
+        },
+      });
+      await tester.pump(const Duration(milliseconds: 300));
+    });
+  });
+
+  for (final remove in [false, true]) {
+    testWidgets(
+      'saved PR credential is ${remove ? 'explicitly removed' : 'preserved when blank'}',
+      (tester) async {
+        await withPublishing(tester, (_, posts) async {
+          await tester.enterText(
+            field('Personal access token'),
+            'github_pat_push',
+          );
+          await tester.enterText(
+            field('Allowed owner/repository (one per line)'),
+            'owner/repo',
+          );
+          if (remove) {
+            await tester.tap(find.text('Remove saved pull request credential'));
+            await tester.pump();
+          }
+          await clickText(tester, 'Validate and save');
+          await pumpUntil(tester, () => posts.isNotEmpty);
+          expect(posts.single.containsKey('pr_token'), false);
+          expect(posts.single['clear_pr_credential'], remove ? true : null);
+          await tester.pump(const Duration(milliseconds: 300));
+        }, prConfigured: true);
+      },
+    );
   }
 
   testWidgets('publishing reuses a saved PAT without receiving its value', (

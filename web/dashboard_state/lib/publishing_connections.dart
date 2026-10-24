@@ -4,6 +4,21 @@ const publishingTokenSourceLabel = 'Publishing token source';
 const manualPublishingTokenLabel = 'Enter a new token';
 const publishingSourcesUnavailable =
     'Saved connections could not be loaded. Enter a token manually, or reopen this dialog to retry.';
+const publishingPushTokenNotice =
+    'The push token needs Contents write on the branch destination. Workflow changes may require Workflows write. '
+    'If this token also handles upstream PRs, it needs Pull requests write there. Setup verifies identity and account access; '
+    'actual publishing verifies token permissions. Keep branch protection enabled.\n\n'
+    'Agents and gateway share a Linux user; credentials are not isolated from same-user agents. Use only trusted agents and repositories.';
+const publishingPrTokenNotice =
+    'An optional separate token handles the private upstream while the token above pushes to the fork. '
+    'Select the upstream repository and grant Pull requests write, Contents read for base-branch checks, '
+    'Checks read, and Commit statuses read for status monitoring. '
+    'The PR account needs access to the fork as required by GitHub, but its token does not need the fork selected for setup. '
+    'Leave blank to preserve an existing PR credential; without one, the push token is used for both repositories.';
+const publishingModeNotice =
+    'Direct publishes the branch and PR in the same repository. Through a fork publishes the branch to the fork '
+    'and opens the PR upstream. With separate tokens, upstream reads and PR operations use the PR token; '
+    'fork access and Git pushes use the push token. Setup is read-only and does not prove write permissions.';
 const savedPublishingTokenNotice =
     'Every branch destination must match this connection’s repository. Direct mode allows '
     'only that one repository; fork mode lists the upstream and must target this connection’s fork. '

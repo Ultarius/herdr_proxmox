@@ -98,7 +98,7 @@ void main() {
         await tester.tap(find.text('Set up GitHub publishing'));
         await tester.pumpAndSettle();
         expect(
-          find.textContaining('Contents write, Pull requests write'),
+          find.textContaining('Contents write on the branch destination'),
           findsOneWidget,
         );
         await tester.enterText(

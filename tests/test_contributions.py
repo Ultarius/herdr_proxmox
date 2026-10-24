@@ -120,6 +120,99 @@ class GitHubTests(unittest.TestCase):
                         permissions=dict(push=True))
         raise AssertionError(path)
 
+    def test_private_scoped_tokens_work_in_setup_preflight_and_fork_validation(self):
+        body = dict(self.split_body(), token='github_pat_' + 'p' * 40)
+        def scoped(path, *args, token=None, **kwargs):
+            expected = body['pr_token'] if path == '/repos/owner/repo' else body['token']
+            if path != '/user' and token != expected:
+                raise GitHubError(404)
+            return self.split_response(path, *args, token=token, **kwargs)
+        with patch.object(self.api, 'request', side_effect=scoped) as request:
+            self.assertTrue(self.api.configure(body)['configured'])
+            request.assert_any_call('/repos/owner/repo', token=body['pr_token'])
+            request.assert_any_call('/repos/contributor/repo', token=body['token'])
+            self.assertEqual(self.api.publication_preflight('owner/repo', 'contributor/repo')['mode'], 'fork')
+            self.assertTrue(self.api.verify_fork('owner/repo', 'contributor/repo'))
+
+    def test_private_upstream_reads_and_pr_writes_use_pr_token_without_push_cache(self):
+        body = self.split_body()
+        with patch.object(self.api, 'request', side_effect=self.split_response):
+            self.api.configure(body)
+        paths = [('/repos/owner/repo', 'GET', body['pr_token']),
+                 ('/repos/owner/repo/branches/main', 'GET', body['pr_token']),
+                 ('/repos/owner/repo/commits/abc/check-runs', 'GET', body['pr_token']),
+                 ('/repos/owner/repo/commits/abc/status', 'GET', body['pr_token']),
+                 ('/repos/owner/repo/pulls', 'POST', body['pr_token']),
+                 ('/repos/contributor/repo', 'GET', body['token']),
+                 ('/repos/contributor/repo/git/ref/heads/task', 'GET', body['token']),
+                 ('/repos/owner/repo/git/refs', 'POST', body['token']),
+                 ('/repos/unlisted/repo/pulls', 'GET', body['token'])]
+        opener = MagicMock()
+        response = opener.open.return_value.__enter__.return_value
+        response.read.return_value = b'{}'
+        response.headers = {}
+        with patch('github_api.build_opener', return_value=opener):
+            for path, method, expected in paths:
+                with self.subTest(path=path, method=method):
+                    self.api.cache[path] = ('old-push-cache', {})
+                    self.api.request(path, method)
+                    request = opener.open.call_args.args[0]
+                    self.assertEqual(request.get_header('Authorization'), 'Bearer ' + expected)
+                    if expected == body['pr_token']:
+                        self.assertIsNone(request.get_header('If-none-match'))
+            self.api.request('/repos/owner/repo/branches/main', token='explicit-override')
+            self.assertEqual(opener.open.call_args.args[0].get_header('Authorization'), 'Bearer explicit-override')
+
+    def test_repository_errors_identify_repository_role_and_stage_without_leaking_response(self):
+        body = self.split_body()
+        for repository, expected_role in [('owner/repo', 'pull request token'), ('contributor/repo', 'push token')]:
+            def unavailable(path, *args, token=None, **kwargs):
+                if path == '/repos/' + repository:
+                    raise GitHubError(404)
+                return self.split_response(path, *args, token=token, **kwargs)
+            with self.subTest(repository=repository), patch.object(self.api, 'request', side_effect=unavailable):
+                with self.assertRaises(GitHubError) as error:
+                    self.api.configure(body)
+                self.assertEqual(error.exception.repository, repository)
+                self.assertEqual(error.exception.credential_role, expected_role)
+                self.assertIn('Read ', error.exception.operation)
+                self.assertIn(repository, str(error.exception))
+                self.assertIn('repository selection', str(error.exception))
+                self.assertFalse(self.path.exists())
+                for secret in (body['token'], body['pr_token']):
+                    self.assertNotIn(secret, str(error.exception))
+
+    def test_configure_http_returns_and_logs_safe_repository_diagnostics(self):
+        body = self.split_body()
+        listener = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        listener.token = 'admin'
+        listener.operators = SimpleNamespace(identify=lambda _: None)
+        listener.github = self.api
+        worker = threading.Thread(target=listener.serve_forever, daemon=True)
+        worker.start()
+        self.addCleanup(listener.server_close)
+        self.addCleanup(worker.join, 3)
+        self.addCleanup(listener.shutdown)
+        def unavailable(path, *args, token=None, **kwargs):
+            if path == '/repos/owner/repo':
+                raise GitHubError(404)
+            return self.split_response(path, *args, token=token, **kwargs)
+        endpoint = f'http://127.0.0.1:{listener.server_port}/api/github/configure'
+        with patch.object(self.api, 'request', side_effect=unavailable), patch.object(server.Handler, 'log_message') as log:
+            with self.assertRaises(HTTPError) as error:
+                urlopen(Request(endpoint, data=json.dumps(body).encode(), headers={'Authorization': 'Bearer admin'}))
+            self.assertEqual(error.exception.code, 502)
+            result = json.load(error.exception)
+            self.assertEqual(result['github_status'], 404)
+            self.assertEqual(result['github_repository'], 'owner/repo')
+            self.assertEqual(result['github_credential_role'], 'pull request token')
+            self.assertEqual(result['github_operation'], 'Read upstream repository')
+            log.assert_any_call('GitHub failure: status=%s repository=%s operation=%s credential=%s',
+                                404, 'owner/repo', 'Read upstream repository', 'pull request token')
+            for secret in (body['token'], body['pr_token']):
+                self.assertNotIn(secret, json.dumps(result))
+                self.assertNotIn(secret, str(log.call_args_list))
+
     def test_split_credential_verifies_identity_and_never_exposes_secrets(self):
         body = self.split_body()
         with patch.object(self.api, 'request', side_effect=self.split_response) as request:
@@ -451,6 +544,27 @@ class ContributionTests(unittest.TestCase):
                     self.assertEqual(list(restored.iterdump()), before)
                     self.assertEqual(restored.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
             self.assertEqual(list(source.iterdump()), before, 'Export must not mutate live task records')
+
+    def test_readable_export_preserves_every_live_table_and_record(self):
+        from task_backup import export_database, readable_json
+        with export_database(self.service.connect) as backup:
+            data = json.loads(readable_json(backup).read_text(encoding='utf-8'))
+            with closing(sqlite3.connect(backup)) as source:
+                tables = [row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+                self.assertEqual(set(data['tables']), set(tables))
+                for name in tables:
+                    cursor = source.execute('SELECT * FROM "' + name.replace('"', '""') + '"')
+                    columns = [item[0] for item in cursor.description]
+                    originals = list(cursor)
+                    exported = data['tables'][name]['rows']
+                    self.assertEqual(len(exported), len(originals), name)
+                    for original, record in zip(originals, exported):
+                        for column, value in zip(columns, original):
+                            expected = json.loads(value) if column in record['json_text_columns'] else value
+                            if record['storage_types'][column] == 'blob':
+                                import base64
+                                expected = base64.b64encode(value).decode('ascii')
+                            self.assertEqual(record['values'][column], expected, (name, column))
 
     def test_release_notifications_skip_noop_and_audit_only_saves_but_keep_progress(self):
         releases = self.service.releases

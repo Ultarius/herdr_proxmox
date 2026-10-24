@@ -2,6 +2,10 @@
 from contextlib import closing, contextmanager
 from pathlib import Path
 import os
+import base64
+from datetime import datetime, timezone
+import json
+import math
 import sqlite3
 import tempfile
 import threading
@@ -55,9 +59,115 @@ def backup_plan(source):
     return directory, dict(estimated_bytes=estimated, required_free_bytes=required, free_bytes=storage['free_bytes'])
 
 
-def export_info(connect):
+def export_info(connect, output_format='sqlite'):
     with export_slot(), closing(connect()) as source:
-        return backup_plan(source)[1]
+        info = backup_plan(source)[1]
+        if output_format == 'json':
+            # A conservative transfer estimate chooses native streaming early.
+            # Actual JSON disk requirements are measured before writing it.
+            info['estimated_bytes'] *= 16
+        return info
+
+
+def _quoted(identifier):
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('Duplicate JSON key')
+        result[key] = value
+    return result
+
+
+def _nonstandard_number(value):
+    raise ValueError('Nonstandard JSON number')
+
+
+def _finite_float(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError('Non-finite JSON number')
+    return number
+
+
+def _readable_row(columns, values, rowid):
+    record, storage_types, json_columns = {}, {}, []
+    for name, value in zip(columns, values):
+        kind = ('null' if value is None else 'blob' if isinstance(value, bytes) else
+                'integer' if isinstance(value, int) else 'real' if isinstance(value, float) else 'text')
+        storage_types[name] = kind
+        if kind == 'blob':
+            value = base64.b64encode(value).decode('ascii')
+        elif kind == 'real' and not math.isfinite(value):
+            value = {'sqlite_real': str(value)}
+        elif kind == 'text' and value.lstrip().startswith(('{', '[')):
+            try:
+                value = json.loads(value, object_pairs_hook=_unique_object, parse_constant=_nonstandard_number, parse_float=_finite_float)
+                json_columns.append(name)
+            except (ValueError, RecursionError):
+                pass  # Preserve non-JSON text, duplicate keys and nonstandard JSON verbatim.
+        record[name] = value
+    return dict(rowid=rowid, values=record, storage_types=storage_types, json_text_columns=json_columns)
+
+
+def _json_chunks(snapshot, exported_at):
+    def encode(value, depth=0):
+        text = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
+        # Keep Unicode readable while escaping unpaired surrogates in stored JSON.
+        return text.encode('utf-8', errors='backslashreplace').decode('utf-8').replace('\n', '\n' + ' ' * depth)
+    with closing(sqlite3.connect(snapshot)) as db:
+        schema = [dict(type=row[0], name=row[1], table=row[2], sql=row[3]) for row in db.execute(
+            'SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name')]
+        yield '{\n  "format": "herdr-task-export",\n  "version": 1,\n  "exported_at": ' + encode(exported_at)
+        yield ',\n  "database": ' + encode(dict(
+            user_version=db.execute('PRAGMA user_version').fetchone()[0],
+            application_id=db.execute('PRAGMA application_id').fetchone()[0]), 2)
+        yield ',\n  "schema": ' + encode(schema, 2) + ',\n  "tables": {'
+        rowid_tables = {row[1] for row in db.execute('PRAGMA table_list') if row[0] == 'main' and not row[4]}
+        for index, table in enumerate(item for item in schema if item['type'] == 'table'):
+            name = table['name']
+            columns = [dict(cid=row[0], name=row[1], type=row[2], not_null=bool(row[3]), default=row[4], primary_key=row[5])
+                       for row in db.execute('PRAGMA table_info(' + _quoted(name) + ')')]
+            names = [column['name'] for column in columns]
+            alias = next((item for item in ('_rowid_', 'rowid', 'oid') if item not in {n.lower() for n in names}), None)
+            has_rowid = alias is not None and name in rowid_tables
+            query = ('SELECT ' + alias + ', * FROM ' + _quoted(name) + ' ORDER BY ' + alias if has_rowid
+                     else 'SELECT * FROM ' + _quoted(name))
+            cursor = db.execute(query)
+            # cursor.description also retains any generated columns in SELECT *.
+            names = [column[0] for column in cursor.description][1 if has_rowid else 0:]
+            yield (',' if index else '') + '\n    ' + encode(name) + ': {\n      "columns": ' + encode(columns, 6) + ',\n      "rows": ['
+            for row_index, row in enumerate(cursor):
+                readable = _readable_row(names, row[1:] if has_rowid else row, row[0] if has_rowid else None)
+                yield (',' if row_index else '') + '\n' + '\n'.join('        ' + line for line in encode(readable).splitlines())
+            yield '\n      ]\n    }'
+        yield '\n  }\n}\n'
+
+
+def readable_json(snapshot):
+    """Pretty-print all records from the immutable backup, without list limits."""
+    exported_at = datetime.now(timezone.utc).isoformat()
+    deadline = time.monotonic() + COPY_TIMEOUT
+
+    def chunks():
+        for chunk in _json_chunks(snapshot, exported_at):
+            if time.monotonic() > deadline:
+                raise ValueError('The readable task export exceeded its time limit. Retry on faster backup storage.')
+            yield chunk
+
+    required = sum(len(chunk.encode('utf-8')) for chunk in chunks())
+    reserve = max(RESERVE_BYTES, required // 10)
+    storage = build_capacity.storage_status(snapshot.parent, minimum_free=required + reserve)
+    if not storage['available'] or storage['free_bytes'] < required + reserve:
+        raise ValueError(f'Readable task export needs {required + reserve} additional bytes free on the backup volume. '
+                         'Free space or configure HERDR_TASK_BACKUP_DIR on a larger volume.')
+    destination = snapshot.with_suffix('.json')
+    with destination.open('w', encoding='utf-8', newline='\n') as output:
+        output.writelines(chunks())
+    return destination
 
 
 @contextmanager

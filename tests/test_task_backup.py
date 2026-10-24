@@ -1,4 +1,5 @@
 from contextlib import closing
+import base64
 import io
 import json
 from pathlib import Path
@@ -15,7 +16,7 @@ from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'web/gateway'))
 import server
-from task_backup import BackupBusy, export_database, export_info
+from task_backup import BackupBusy, export_database, export_info, readable_json
 
 
 class TaskBackupTests(unittest.TestCase):
@@ -60,6 +61,68 @@ class TaskBackupTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT data FROM policies').fetchone()[0], '{"paused":true}')
             self.assertEqual(db.execute('SELECT payload FROM future_metadata').fetchone()[0], b'future\x00metadata')
             self.assertIsNotNone(db.execute('SELECT name FROM sqlite_master WHERE name="task_audit"').fetchone())
+
+    def test_readable_json_retains_all_tables_history_and_nested_metadata(self):
+        with export_database(self.connect) as snapshot:
+            output = readable_json(snapshot)
+            text = output.read_text(encoding='utf-8')
+            data = json.loads(text)
+            self.assertIn('\n', text)
+            self.assertEqual(data['format'], 'herdr-task-export')
+            self.assertEqual(data['version'], 1)
+            tables = data['tables']
+            self.assertEqual(len(tables['tasks']['rows']), 125)
+            self.assertEqual(len(tables['audit']['rows']), 301)
+            record = tables['tasks']['rows'][0]
+            self.assertEqual(record['values']['data']['outcome_request'], {'retained': True})
+            self.assertEqual(record['values']['data']['diff'], 'full diff')
+            self.assertEqual(record['values']['data']['custom_metadata'], {'nested': [0, 'unchanged']})
+            self.assertIn('data', record['json_text_columns'])
+            blob = tables['future_metadata']['rows'][0]
+            self.assertEqual(blob['storage_types']['payload'], 'blob')
+            self.assertEqual(base64.b64decode(blob['values']['payload']), b'future\x00metadata')
+            self.assertTrue(any(item['name'] == 'task_audit' for item in data['schema']))
+            self.assertEqual(set(tables), {r[0] for r in self.writer.execute("SELECT name FROM sqlite_master WHERE type='table'")})
+        self.assertFalse(output.exists())
+
+    def test_json_preserves_unusual_text_and_without_rowid_tables(self):
+        self.writer.execute('CREATE TABLE unusual (id TEXT PRIMARY KEY, data TEXT) WITHOUT ROWID')
+        texts = ['{"duplicate":1,"duplicate":2}', '{"number":NaN}', '{"number":1e400}', '{not JSON', 'plain text', '{"unicode":"caf\u00e9"}']
+        self.writer.executemany('INSERT INTO unusual VALUES (?,?)', [(str(i), value) for i, value in enumerate(texts)])
+        self.writer.commit()
+        with export_database(self.connect) as snapshot:
+            rows = json.loads(readable_json(snapshot).read_text(encoding='utf-8'))['tables']['unusual']['rows']
+            for row, text in zip(rows, texts):
+                self.assertIsNone(row['rowid'])
+                self.assertEqual(row['values']['data'], json.loads(text) if text == texts[-1] else text)
+
+    def test_json_space_preflight_preserves_live_database(self):
+        with export_database(self.connect) as snapshot:
+            with patch('task_backup.build_capacity.storage_status', return_value=dict(available=True, free_bytes=1)):
+                with self.assertRaisesRegex(ValueError, 'additional bytes free'):
+                    readable_json(snapshot)
+            self.assertFalse(snapshot.with_suffix('.json').exists())
+        self.assert_complete(self.path)
+
+    def test_json_http_download_and_info_are_admin_only_and_complete(self):
+        endpoint = self.start_http() + '/json'
+        for route in (endpoint, endpoint + '/info'):
+            with self.assertRaises(HTTPError) as error:
+                urlopen(Request(route, headers={'Authorization': 'Bearer reader'}))
+            self.assertEqual(error.exception.code, 403)
+        with urlopen(Request(endpoint + '/info?cache=1', headers={'Authorization': 'Bearer admin'})) as response:
+            self.assertGreater(json.load(response)['estimated_bytes'], 0)
+        with urlopen(Request(endpoint + '?cache=1', headers={'Authorization': 'Bearer admin'})) as response:
+            content = response.read()
+            self.assertEqual(response.headers['Content-Type'], 'application/json; charset=utf-8')
+            self.assertEqual(response.headers['Cache-Control'], 'no-store')
+            self.assertEqual(int(response.headers['Content-Length']), len(content))
+            self.assertRegex(response.headers['Content-Disposition'], r'filename="herdr-tasks-\d{8}T\d{6}Z\.json"')
+            self.assertEqual(len(json.loads(content)['tables']['tasks']['rows']), 125)
+        deadline = time.monotonic() + 2
+        while list((self.root / 'task-backups').iterdir()) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(list((self.root / 'task-backups').iterdir()), [])
 
     def test_complete_wal_backup_is_restorable_and_temporary_file_is_removed(self):
         self.assertTrue(Path(str(self.path) + '-wal').is_file())
@@ -161,13 +224,14 @@ class TaskBackupTests(unittest.TestCase):
         handler.send_response = Mock()
         handler.send_header = Mock()
         handler.end_headers = Mock()
-        for failure in (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            handler.wfile = Mock(spec=io.BytesIO)
-            handler.wfile.write.side_effect = failure('Browser cancelled')
-            handler.task_backup()
-            self.assertEqual(list((self.root / 'task-backups').iterdir()), [])
-            with export_database(self.connect) as retry:
-                self.assert_complete(retry)
+        for output_format in ('sqlite', 'json'):
+            for failure in (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                handler.wfile = Mock(spec=io.BytesIO)
+                handler.wfile.write.side_effect = failure('Browser cancelled')
+                handler.task_backup(output_format)
+                self.assertEqual(list((self.root / 'task-backups').iterdir()), [])
+                with export_database(self.connect) as retry:
+                    self.assert_complete(retry)
 
     def start_http(self):
         listener = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
