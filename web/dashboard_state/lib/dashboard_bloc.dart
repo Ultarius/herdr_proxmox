@@ -36,10 +36,24 @@ class DashboardState extends BlocState {
 }
 
 class DashboardCommand extends EventBase {
-  DashboardCommand(this.action, [this.body, this.background = false]);
+  factory DashboardCommand(
+    String action, [
+    Map<String, dynamic>? body,
+    bool background = false,
+  ]) => action == 'refresh'
+      ? _DashboardRefresh(body, background)
+      : DashboardCommand._(action, body, background);
+
+  DashboardCommand._(this.action, this.body, this.background);
   final bool background;
   final String action;
   final Map<String, dynamic>? body;
+}
+
+// Separate runtime event types give reads and mutations independent admission.
+class _DashboardRefresh extends DashboardCommand {
+  _DashboardRefresh(Map<String, dynamic>? body, bool background)
+    : super._('refresh', body, background);
 }
 
 class DisconnectDashboard extends EventBase {
@@ -55,12 +69,25 @@ class DisconnectUseCase
   }
 }
 
+typedef DisconnectCleanupRequest =
+    Future<dynamic> Function(String path, [Map<String, dynamic>? body]);
+
+class _DisconnectCleanupPermit {
+  const _DisconnectCleanupPermit(this.connection, this.generation);
+  final DashboardBloc connection;
+  final int generation;
+}
+
 class DashboardBloc extends JuiceBloc<DashboardState> {
   DashboardBloc({http.Client? client})
     : client = client ?? http.Client(),
       super(const DashboardState(), [
         () => UseCaseBuilder.typed(
           () => DashboardUseCase(),
+          concurrency: EventConcurrency.droppable,
+        ),
+        () => UseCaseBuilder.typed(
+          () => _DashboardRefreshUseCase(),
           concurrency: EventConcurrency.droppable,
         ),
         () => UseCaseBuilder.typed(
@@ -74,6 +101,49 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   bool get browserSession => _credential == '' && state.connected;
   Timer? _timer;
   Timer? _notificationTimer;
+  int _mutationRevision = 0;
+  int? _mutationGeneration;
+  final _disconnectCleanups = <Future<void> Function()>{};
+  static final _disconnectCleanupZone = Object();
+  Future<void>? _disconnectFuture;
+  bool get disconnecting => _disconnectFuture != null;
+
+  /// Register owned-resource teardown and capture its session-scoped transport.
+  /// The returned capability also works when teardown began before sign-out.
+  DisconnectCleanupRequest addDisconnectCleanup(
+    Future<void> Function() cleanup,
+  ) {
+    _disconnectCleanups.add(cleanup);
+    final permit = _DisconnectCleanupPermit(this, generation);
+    return (String path, [Map<String, dynamic>? body]) {
+      if (!_disconnectCleanups.contains(cleanup) ||
+          permit.generation != generation) {
+        return Future<dynamic>.error(
+          StateError('Dashboard cleanup registration is no longer current.'),
+        );
+      }
+      return runZoned(
+        () => request(path, body),
+        zoneValues: {_disconnectCleanupZone: permit},
+      );
+    };
+  }
+
+  void removeDisconnectCleanup(Future<void> Function() cleanup) =>
+      _disconnectCleanups.remove(cleanup);
+
+  void _checkRequestAdmission() {
+    if (isClosing) throw StateError('Dashboard connection is closed.');
+    final permit = Zone.current[_disconnectCleanupZone];
+    final cleanup =
+        permit is _DisconnectCleanupPermit &&
+        identical(permit.connection, this);
+    if (cleanup && permit.generation != generation)
+      throw StateError('Dashboard cleanup session is no longer current.');
+    if (disconnecting && !cleanup)
+      throw StateError('Dashboard is signing out.');
+  }
+
   final notificationRevision = ValueNotifier<int>(0);
   final runtimeEvents = ValueNotifier<Map<String, dynamic>>({});
   String _notificationEpoch = '';
@@ -98,6 +168,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   }
 
   Future<void> signIn(String token) async {
+    if (isClosing || disconnecting) return;
     final attempt = ++generation;
     try {
       final response = await client
@@ -120,6 +191,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   }
 
   Future<void> restoreSession() async {
+    if (isClosing || disconnecting) return;
     final attempt = generation;
     try {
       final response = await client
@@ -139,7 +211,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   }
 
   void connect(String token) {
-    if (isClosing) return;
+    if (isClosing || disconnecting) return;
     _credential = token;
     generation++;
     send(DashboardCommand('refresh'));
@@ -159,7 +231,11 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   }
 
   Future<void> _notifications(int attempt) async {
-    if (attempt != generation || _credential == null || isClosing) return;
+    if (attempt != generation ||
+        _credential == null ||
+        isClosing ||
+        disconnecting)
+      return;
     var delay = const Duration(milliseconds: 100);
     try {
       final response = await client
@@ -173,7 +249,11 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
             },
           )
           .timeout(const Duration(seconds: 25));
-      if (attempt != generation || _credential == null || isClosing) return;
+      if (attempt != generation ||
+          _credential == null ||
+          isClosing ||
+          disconnecting)
+        return;
       if (response.statusCode != 200)
         throw StateError('Notification feed unavailable');
       final data = jsonDecode(response.body);
@@ -191,13 +271,56 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
         send(DashboardCommand('refresh', null, true));
       }
     } catch (_) {
-      if (attempt != generation || _credential == null || isClosing) return;
+      if (attempt != generation ||
+          _credential == null ||
+          isClosing ||
+          disconnecting)
+        return;
       delay = const Duration(seconds: 5);
     }
     _notificationTimer = Timer(delay, () => _notifications(attempt));
   }
 
-  Future<void> disconnect() async {
+  Future<void> disconnect() {
+    if (_disconnectFuture case final pending?) return pending;
+    if (isClosing) return Future<void>.value();
+    final completion = Completer<void>();
+    final pending = completion.future;
+    _disconnectFuture = pending;
+    _disconnect().then(
+      (_) {
+        _disconnectFuture = null;
+        completion.complete();
+      },
+      onError: (Object error, StackTrace stack) {
+        _disconnectFuture = null;
+        completion.completeError(error, stack);
+      },
+    );
+    return pending;
+  }
+
+  Future<void> _disconnect() async {
+    // Cleanup still needs the current credential. Bound the combined wait so
+    // a failed remote session cannot indefinitely prevent local sign-out.
+    _notificationTimer?.cancel();
+    _timer?.cancel();
+    final cleanups = List<Future<void> Function()>.of(_disconnectCleanups);
+    try {
+      await Future.wait([
+        for (final cleanup in cleanups)
+          runZoned(
+            () => Future<void>.sync(cleanup),
+            zoneValues: {
+              _disconnectCleanupZone: _DisconnectCleanupPermit(
+                this,
+                generation,
+              ),
+            },
+          ).catchError((Object _) {}),
+      ]).timeout(const Duration(seconds: 20));
+    } catch (_) {}
+    if (isClosing) return;
     final browserSession = _credential == '';
     _notificationTimer?.cancel();
     _timer?.cancel();
@@ -228,7 +351,21 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
     }
   }
 
-  Future<dynamic> request(String path, [Map<String, dynamic>? body]) async {
+  Future<dynamic> request(String path, [Map<String, dynamic>? body]) =>
+      _request(path, body);
+
+  /// Fence an ordered read before it can update shared directory observations.
+  Future<dynamic> requestRead(
+    String path, {
+    required bool Function() isCurrent,
+  }) => _request(path, null, isCurrent: isCurrent);
+
+  Future<dynamic> _request(
+    String path,
+    Map<String, dynamic>? body, {
+    bool Function()? isCurrent,
+  }) async {
+    _checkRequestAdmission();
     final requestGeneration = generation;
     final uri = Uri.base.resolve('/api/$path');
     final headers = {
@@ -263,6 +400,8 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
             );
     if (requestGeneration != generation || _credential == null)
       throw StateError('Dashboard connection changed.');
+    if (isCurrent != null && !isCurrent())
+      throw StateError('Dashboard read was superseded.');
     final data = jsonDecode(response.body);
     if (response.statusCode == 401 && _credential == '') {
       _timer?.cancel();
@@ -314,6 +453,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   }
 
   Future<Uint8List> bytes(String path) async {
+    _checkRequestAdmission();
     final requestGeneration = generation;
     final response = await client
         .get(
@@ -343,6 +483,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
     required int maximumBytes,
     Duration timeout = const Duration(minutes: 10),
   }) async {
+    _checkRequestAdmission();
     final epoch = generation;
     final request = http.Request('GET', Uri.base.resolve('/api/$path'));
     if (_credential?.isNotEmpty == true)
@@ -426,17 +567,34 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
       _timer?.cancel();
       _credential = null;
       generation++;
+      _disconnectCleanups.clear();
       client.close();
     }
     return super.close();
   }
 }
 
-class DashboardUseCase extends BlocUseCase<DashboardBloc, DashboardCommand> {
+class DashboardUseCase extends _DashboardOperation<DashboardCommand> {}
+
+class _DashboardRefreshUseCase extends _DashboardOperation<_DashboardRefresh> {}
+
+abstract class _DashboardOperation<T extends DashboardCommand>
+    extends BlocUseCase<DashboardBloc, T> {
   @override
-  Future<void> execute(DashboardCommand event) async {
-    if (bloc._credential == null) return;
+  Future<void> execute(T event) async {
+    if (bloc._credential == null || bloc.disconnecting) return;
     final generation = bloc.generation;
+    final refresh = event.action == 'refresh';
+    if (refresh && bloc._mutationGeneration == generation) return;
+    final revision = refresh
+        ? bloc._mutationRevision
+        : ++bloc._mutationRevision;
+    if (!refresh) bloc._mutationGeneration = generation;
+    bool current() =>
+        generation == bloc.generation &&
+        revision == bloc._mutationRevision &&
+        !bloc.isClosing &&
+        !bloc.disconnecting;
     final previous = bloc.state;
     if (!event.background)
       emitUpdate(
@@ -452,12 +610,12 @@ class DashboardUseCase extends BlocUseCase<DashboardBloc, DashboardCommand> {
     try {
       if (event.action == 'start-server') {
         await bloc.request('herdr-server/start', {});
-      } else if (event.action != 'refresh') {
+      } else if (!refresh) {
         await bloc.request('workspaces/${event.action}', event.body);
       }
-      if (generation != bloc.generation) return;
-      final data = await bloc.request('snapshot');
-      if (generation != bloc.generation || bloc.isClosing) return;
+      if (!current()) return;
+      final data = await bloc.requestRead('snapshot', isCurrent: current);
+      if (!current()) return;
       if (event.background &&
           previous.error == null &&
           jsonEncode(data['workspaces']) == jsonEncode(previous.workspaces) &&
@@ -474,7 +632,7 @@ class DashboardUseCase extends BlocUseCase<DashboardBloc, DashboardCommand> {
         ),
       );
     } catch (e) {
-      if (generation != bloc.generation || bloc.isClosing) return;
+      if (!current()) return;
       emitUpdate(
         newState: DashboardState(
           connected: true,
@@ -485,6 +643,9 @@ class DashboardUseCase extends BlocUseCase<DashboardBloc, DashboardCommand> {
           serverStatus: previous.serverStatus,
         ),
       );
+    } finally {
+      if (!refresh && revision == bloc._mutationRevision)
+        bloc._mutationGeneration = null;
     }
   }
 }

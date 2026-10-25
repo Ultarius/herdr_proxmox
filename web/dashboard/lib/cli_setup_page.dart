@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/cli_setup_session.dart';
 import 'clipboard_copy.dart';
 import 'setup_links.dart';
 import 'external_link.dart';
@@ -18,6 +19,7 @@ class CliSetupPage extends StatefulWidget {
 class _CliSetupPageState extends State<CliSetupPage> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
   final terminal = Terminal(maxLines: 2000);
+  late final CliSetupSession setupSession;
   final paste = TextEditingController();
   List<Map<String, dynamic>> clis = [];
   Map<String, dynamic>? integrations;
@@ -35,6 +37,7 @@ class _CliSetupPageState extends State<CliSetupPage> {
   @override
   void initState() {
     super.initState();
+    setupSession = CliSetupSession(connection);
     terminal.onOutput = sendInput;
     terminal.onResize = (width, height, pixelWidth, pixelHeight) {
       final id = session;
@@ -78,7 +81,11 @@ class _CliSetupPageState extends State<CliSetupPage> {
   void enqueue(String action, Map<String, dynamic> body) {
     final epoch = generation;
     writes = writes.then((_) async {
-      if (!mounted || epoch != generation || !connection.state.connected)
+      if (!mounted ||
+          epoch != generation ||
+          !connection.state.connected ||
+          connection.disconnecting ||
+          setupSession.closing)
         return;
       try {
         await connection.request('cli-setup/$action', body);
@@ -95,15 +102,21 @@ class _CliSetupPageState extends State<CliSetupPage> {
   }
 
   Future<void> start(String cli) async {
+    if (busy ||
+        session != null ||
+        connection.disconnecting ||
+        setupSession.closing)
+      return;
     setState(() {
       busy = true;
       error = null;
     });
     final epoch = ++generation;
     try {
-      final data = await connection.request('cli-setup/start', {'cli': cli});
+      final data = await setupSession.start(cli);
+      if (data == null) return;
       if (!mounted || epoch != generation || !connection.state.connected) {
-        await connection.request('cli-setup/close', {'id': data['id']});
+        await setupSession.close();
         return;
       }
       clearTerminal();
@@ -134,7 +147,8 @@ class _CliSetupPageState extends State<CliSetupPage> {
     final epoch = ++generation;
     try {
       final data = await connection.request('cli-setup/verify', {'cli': cli});
-      if (!mounted || epoch != generation || !connection.state.connected) return;
+      if (!mounted || epoch != generation || !connection.state.connected)
+        return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('${data['detail'] ?? 'Account verified.'}')),
       );
@@ -153,13 +167,15 @@ class _CliSetupPageState extends State<CliSetupPage> {
     });
     final epoch = ++generation;
     try {
-      final data = await connection.request(
-        'cli-setup/install_integration',
-        {'cli': cli},
-      );
-      if (!mounted || epoch != generation || !connection.state.connected) return;
+      final data = await connection.request('cli-setup/install_integration', {
+        'cli': cli,
+      });
+      if (!mounted || epoch != generation || !connection.state.connected)
+        return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${data['detail'] ?? 'Herdr integration installed.'}')),
+        SnackBar(
+          content: Text('${data['detail'] ?? 'Herdr integration installed.'}'),
+        ),
       );
       await refresh();
     } catch (e) {
@@ -171,7 +187,12 @@ class _CliSetupPageState extends State<CliSetupPage> {
 
   Future<void> poll() async {
     final id = session;
-    if (id == null || polling || !running) return;
+    if (id == null ||
+        polling ||
+        !running ||
+        connection.disconnecting ||
+        setupSession.closing)
+      return;
     if (!connection.state.connected) {
       await stop();
       return;
@@ -218,7 +239,7 @@ class _CliSetupPageState extends State<CliSetupPage> {
       });
     if (id != null) {
       try {
-        await connection.request('cli-setup/close', {'id': id});
+        await setupSession.close();
       } catch (e) {
         showError(e);
       }
@@ -236,14 +257,7 @@ class _CliSetupPageState extends State<CliSetupPage> {
   void dispose() {
     timer?.cancel();
     generation++;
-    final id = session;
-    if (id != null) {
-      unawaited(
-        connection
-            .request('cli-setup/close', {'id': id})
-            .catchError((_) => null),
-      );
-    }
+    setupSession.dispose();
     terminal.onOutput = null;
     terminal.onResize = null;
     clearTerminal();
@@ -347,12 +361,12 @@ class _CliSetupPageState extends State<CliSetupPage> {
                     Text(
                       (cli['integration'] as Map?)?['installed'] == true
                           ? 'Herdr integration is outdated, needs repair or could '
-                              'not be verified. Until it is current this agent cannot '
-                              'report working or blocked state, and finished sessions '
-                              'cannot be resumed.'
+                                'not be verified. Until it is current this agent cannot '
+                                'report working or blocked state, and finished sessions '
+                                'cannot be resumed.'
                           : 'Herdr integration missing. Without it this agent cannot '
-                              'report working or blocked state, and finished sessions '
-                              'cannot be resumed.',
+                                'report working or blocked state, and finished sessions '
+                                'cannot be resumed.',
                       style: const TextStyle(
                         fontSize: 12,
                         color: Color(0xffaaaaaa),
@@ -426,9 +440,8 @@ class _CliSetupPageState extends State<CliSetupPage> {
       return 'Herdr integration: all $tracked installed agents are connected. '
           'They report working/blocked state and resume finished sessions.';
     }
-    String names(String key) => ((summary[key] as List?) ?? const [])
-        .map((name) => '$name')
-        .join(', ');
+    String names(String key) =>
+        ((summary[key] as List?) ?? const []).map((name) => '$name').join(', ');
     final stale = names('outdated_names');
     final absent = names('missing_names');
     final parts = <String>[];
@@ -480,13 +493,15 @@ class _CliSetupPageState extends State<CliSetupPage> {
                 const Text(
                   'Connect your coding agents to their providers. Choose an account below to open its sign-in terminal.',
                 ),
-                if (integrations != null && (integrations!['total'] ?? 0) > 0) ...[
+                if (integrations != null &&
+                    (integrations!['total'] ?? 0) > 0) ...[
                   const SizedBox(height: 12),
                   Text(
                     integrationSummary(integrations!),
                     style: TextStyle(
                       fontSize: 12,
-                      color: integrations!['connected'] == integrations!['total']
+                      color:
+                          integrations!['connected'] == integrations!['total']
                           ? const Color(0xff9fd39f)
                           : const Color(0xffd8b06a),
                     ),

@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/cli_setup_session.dart';
 import 'operations_support.dart';
 import 'ops_ui.dart';
 import '../terminal.dart';
@@ -13,6 +14,7 @@ class CliSetupPage extends StatefulComponent {
 
 class _CliState extends OperationsState<CliSetupPage> {
   late final BrowserTerminal terminal;
+  late final CliSetupSession setupSession;
   List<Map<String, dynamic>> clis = [];
   Map<String, dynamic>? integrations;
   String? session, selected;
@@ -24,6 +26,7 @@ class _CliState extends OperationsState<CliSetupPage> {
   @override
   void initState() {
     super.initState();
+    setupSession = CliSetupSession(connection);
     terminal = BrowserTerminal(maxLines: 2000);
     terminal.onOutput = sendInput;
     terminal.onChange = () {
@@ -45,13 +48,7 @@ class _CliState extends OperationsState<CliSetupPage> {
   void dispose() {
     timer?.cancel();
     generation++;
-    final id = session;
-    if (id != null && connection.state.connected)
-      unawaited(
-        connection
-            .request('cli-setup/close', {'id': id})
-            .catchError((_) => <String, dynamic>{}),
-      );
+    setupSession.dispose();
     terminal.dispose();
     paste = '';
     super.dispose();
@@ -84,7 +81,11 @@ class _CliState extends OperationsState<CliSetupPage> {
   void enqueue(String action, Map<String, dynamic> body) {
     final epoch = generation, connectionEpoch = connection.generation;
     writes = writes.then((_) async {
-      if (!valid(connectionEpoch) || epoch != generation) return;
+      if (!valid(connectionEpoch) ||
+          epoch != generation ||
+          connection.disconnecting ||
+          setupSession.closing)
+        return;
       try {
         await connection.request('cli-setup/$action', body);
       } catch (e) {
@@ -100,13 +101,18 @@ class _CliState extends OperationsState<CliSetupPage> {
   }
 
   Future<void> start(String cli) async {
-    if (busy || session != null) return;
+    if (busy ||
+        session != null ||
+        connection.disconnecting ||
+        setupSession.closing)
+      return;
     final operation = ++generation;
     await perform((epoch) async {
-      final data = await connection.request('cli-setup/start', {'cli': cli});
+      final data = await setupSession.start(cli);
+      if (data == null) return;
       if (!valid(epoch) || operation != generation) {
         if (connection.state.connected && epoch == connection.generation)
-          await connection.request('cli-setup/close', {'id': data['id']});
+          await setupSession.close();
         return;
       }
       terminal.clear();
@@ -141,7 +147,12 @@ class _CliState extends OperationsState<CliSetupPage> {
 
   Future<void> poll() async {
     final id = session;
-    if (id == null || polling || !running) return;
+    if (id == null ||
+        polling ||
+        !running ||
+        connection.disconnecting ||
+        setupSession.closing)
+      return;
     if (!connection.state.connected) {
       await stop();
       return;
@@ -187,7 +198,7 @@ class _CliState extends OperationsState<CliSetupPage> {
       });
     if (id != null && valid(epoch)) {
       try {
-        await connection.request('cli-setup/close', {'id': id});
+        await setupSession.close();
       } catch (e) {
         if (valid(epoch)) setState(() => error = '$e');
       }

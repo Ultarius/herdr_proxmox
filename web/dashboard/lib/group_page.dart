@@ -48,6 +48,7 @@ class _GroupPageState extends State<GroupPage> {
   String tab = 'posts';
   String? artifact;
   String? error;
+  String? readError;
   OrganizationCommand? pending;
 
   @override
@@ -90,9 +91,10 @@ class _GroupPageState extends State<GroupPage> {
           ).where((g) => g['id'] == widget.id).firstOrNull ??
           data['group'] as Map<String, dynamic>?;
       final signature = jsonEncode(data);
-      if (signature != snapshotSignature)
+      if (signature != snapshotSignature || readError != null)
         setState(() {
           snapshotSignature = signature;
+          readError = null;
           group = current;
           if (jobs.length <= historyLimit)
             nextBefore = data['next_before'] as int?;
@@ -115,7 +117,6 @@ class _GroupPageState extends State<GroupPage> {
               .toList();
           jobs.addAll(older);
           loaded = true;
-          if (pending == null) error = null;
         });
       if (current != null)
         connection.selectedOrganization.value =
@@ -159,7 +160,7 @@ class _GroupPageState extends State<GroupPage> {
       }
     } catch (exception) {
       if (mounted && epoch == connection.generation)
-        setState(() => error = exception.toString());
+        setState(() => readError = exception.toString());
     } finally {
       loading = false;
     }
@@ -184,9 +185,10 @@ class _GroupPageState extends State<GroupPage> {
               .reversed,
         );
         nextBefore = data['next_before'] as int?;
+        readError = null;
       });
     } catch (exception) {
-      if (mounted) setState(() => error = exception.toString());
+      if (mounted) setState(() => readError = exception.toString());
     } finally {
       loading = false;
     }
@@ -611,7 +613,11 @@ class _GroupPageState extends State<GroupPage> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text(error ?? (loaded ? 'Group not found.' : 'Loading group…')),
+            Text(
+              error ??
+                  readError ??
+                  (loaded ? 'Group not found.' : 'Loading group…'),
+            ),
             TextButton(onPressed: refresh, child: const Text('Refresh')),
           ],
         ),
@@ -812,6 +818,7 @@ class _GroupPageState extends State<GroupPage> {
               const SizedBox(height: 20),
             ],
             if (error != null) Text(error!),
+            if (readError != null) Text(readError!),
             if (pending != null && !busy)
               Wrap(
                 children: [

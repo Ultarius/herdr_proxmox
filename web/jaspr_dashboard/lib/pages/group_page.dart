@@ -79,6 +79,7 @@ class _GroupPageState extends State<GroupPage> {
   String? artifact;
 
   String? error;
+  String? readError;
 
   OrganizationCommand? pending;
   final proposalRequests = <String, String>{};
@@ -102,6 +103,7 @@ class _GroupPageState extends State<GroupPage> {
           live.clear();
           loaded = false;
           snapshotSignature = null;
+          readError = null;
           pending = null;
           proposalRequests.clear();
           busy = false;
@@ -164,9 +166,10 @@ class _GroupPageState extends State<GroupPage> {
 
       final signature = jsonEncode(data);
 
-      if (signature != snapshotSignature)
+      if (signature != snapshotSignature || readError != null)
         setState(() {
           snapshotSignature = signature;
+          readError = null;
 
           group = current;
 
@@ -199,8 +202,6 @@ class _GroupPageState extends State<GroupPage> {
           jobs.addAll(older);
 
           loaded = true;
-
-          if (pending == null) error = null;
         });
 
       if (current != null)
@@ -256,7 +257,7 @@ class _GroupPageState extends State<GroupPage> {
       }
     } catch (exception) {
       if (mounted && epoch == connection.generation)
-        setState(() => error = exception.toString());
+        setState(() => readError = exception.toString());
     } finally {
       loading = false;
     }
@@ -289,9 +290,10 @@ class _GroupPageState extends State<GroupPage> {
         );
 
         nextBefore = data['next_before'] as int?;
+        readError = null;
       });
     } catch (exception) {
-      if (mounted) setState(() => error = exception.toString());
+      if (mounted) setState(() => readError = exception.toString());
     } finally {
       loading = false;
     }
@@ -1196,7 +1198,8 @@ class _GroupPageState extends State<GroupPage> {
           ),
         ], iconName: 'message-square'),
         if (error != null) errorLine(error),
-        if (!loaded && error == null)
+        if (readError != null) errorLine(readError),
+        if (!loaded && error == null && readError == null)
           el('p', [text('Loading group…')], attributes: {'role': 'status'}),
       ], classes: 'group-page');
 
@@ -1302,6 +1305,7 @@ class _GroupPageState extends State<GroupPage> {
       ], classes: 'org-tabsrow'),
 
       if (error != null) errorLine(error),
+      if (readError != null) errorLine(readError),
       if (pending != null && !busy)
         el('div', [
           icon('history', classes: 'icon--sm'),

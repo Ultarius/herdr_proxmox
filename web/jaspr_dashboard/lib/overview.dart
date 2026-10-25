@@ -263,14 +263,6 @@ class _OverviewPageState extends State<OverviewPage> {
             disabled: state.busy,
             primary: true,
             iconName: 'play',
-          )
-        else if (admin)
-          button(
-            'Stop',
-            () => dashboardConnection.send(DashboardCommand('stop-server')),
-            disabled: state.busy,
-            variant: 'danger',
-            iconName: 'square',
           ),
       ],
       classes: 'runtime',

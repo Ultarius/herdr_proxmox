@@ -293,6 +293,72 @@ void main() {
   );
 
   test(
+    'unchanged group history clears read errors and preserves failed commands',
+    () async {
+      var failRead = false;
+      var reads = 0;
+      await mount(
+        const GroupPage(id: 'group'),
+        failAction: 'discuss',
+        response: (request) {
+          if (request.url.path.endsWith('/organizations/history')) {
+            reads++;
+            if (failRead)
+              return http.Response(
+                '{"error":"History temporarily unavailable"}',
+                503,
+              );
+          }
+          return null;
+        },
+      );
+      expect(nodes('h1').single.textContent, contains('Architecture'));
+      failRead = true;
+      connection!.notificationRevision.value++;
+      final failedDeadline = DateTime.now().add(const Duration(seconds: 3));
+      while (!nodes('[role=alert]').any(
+            (node) =>
+                node.textContent!.contains('History temporarily unavailable'),
+          ) &&
+          DateTime.now().isBefore(failedDeadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(
+        nodes('[role=alert]').any(
+          (node) =>
+              node.textContent!.contains('History temporarily unavailable'),
+        ),
+        isTrue,
+      );
+      failRead = false;
+      connection!.notificationRevision.value++;
+      final recoveryDeadline = DateTime.now().add(const Duration(seconds: 3));
+      while (nodes('[role=alert]').isNotEmpty &&
+          DateTime.now().isBefore(recoveryDeadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(reads, 3);
+      expect(nodes('[role=alert]'), isEmpty);
+      await click('Start discussion');
+      expect(
+        nodes('[role=alert]').single.textContent,
+        contains('response lost'),
+      );
+      connection!.notificationRevision.value++;
+      final actionDeadline = DateTime.now().add(const Duration(seconds: 3));
+      while (reads < 4 && DateTime.now().isBefore(actionDeadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      await settle();
+      expect(
+        nodes('[role=alert]').single.textContent,
+        contains('response lost'),
+      );
+      expect(btn('Retry same request').disabled, isFalse);
+    },
+  );
+
+  test(
     'organization and group tabs retain keyboard access to scrollable tables',
     () async {
       await mount(const OrganizationPage(initialView: 'chart'));

@@ -32,7 +32,9 @@ class _KnowledgePageState extends State<KnowledgePage> {
   String? error;
   int? before;
   int request = 0;
-  bool busy = false;
+  bool loading = false, mutating = false;
+  // Filter reads may finish while a write still owns the mutation guard.
+  bool get busy => loading || mutating;
   Timer? debounce;
   bool get admin => connection.operator.value['role'] == 'admin';
 
@@ -74,7 +76,7 @@ class _KnowledgePageState extends State<KnowledgePage> {
     if (org.isEmpty) return;
     final current = ++request, epoch = connection.generation;
     setState(() {
-      busy = true;
+      loading = true;
       error = null;
     });
     try {
@@ -96,16 +98,20 @@ class _KnowledgePageState extends State<KnowledgePage> {
         before = result['next_before'] as int?;
       });
     } catch (e) {
-      if (mounted && current == request) setState(() => error = '$e');
+      if (mounted && current == request && epoch == connection.generation)
+        setState(() => error = '$e');
     } finally {
-      if (mounted && current == request) setState(() => busy = false);
+      if (mounted && current == request && epoch == connection.generation)
+        setState(() => loading = false);
     }
   }
 
   Future<void> mutate(Map<String, dynamic> body) async {
+    if (mutating || !connection.state.connected || org.isEmpty || !admin)
+      return;
     final selectedOrg = org, epoch = connection.generation;
     setState(() {
-      busy = true;
+      mutating = true;
       error = null;
     });
     try {
@@ -116,13 +122,16 @@ class _KnowledgePageState extends State<KnowledgePage> {
       if (mounted && org == selectedOrg && epoch == connection.generation)
         await load();
     } catch (e) {
-      if (mounted) setState(() => error = '$e');
+      if (mounted && epoch == connection.generation)
+        setState(() => error = '$e');
     } finally {
-      if (mounted) setState(() => busy = false);
+      if (mounted && epoch == connection.generation)
+        setState(() => mutating = false);
     }
   }
 
   Future<void> create() async {
+    if (busy || org.isEmpty || !admin) return;
     final title = TextEditingController(), body = TextEditingController();
     var selectedKind = 'finding', selectedRepo = repository;
     final form = GlobalKey<FormState>();
@@ -230,6 +239,7 @@ class _KnowledgePageState extends State<KnowledgePage> {
     Map<String, dynamic> record, {
     bool supersede = false,
   }) async {
+    if (busy || !admin) return;
     final reason = TextEditingController();
     String? replacement;
     final candidates = records

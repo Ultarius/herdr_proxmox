@@ -28,10 +28,13 @@ widget APIs and tests are outside this adapter's scope.
 
 Juice 2.0 requires an explicit `EventConcurrency` on each use-case builder.
 Shared dashboard registrations use `UseCaseBuilder.typed` for checked event and
-use-case pairing. Dashboard and organization commands remain `droppable` so a
-duplicate request cannot repeat an in-flight write; disconnect is `concurrent`
-so it can reset the session immediately. `DashboardBloc.close()` owns timer and
-HTTP-client cleanup, including scope teardown and calls through `dispose()`.
+use-case pairing. Refreshes and mutations have separate `droppable` handlers:
+polling cannot discard an operator's write, while duplicate writes are still
+suppressed. Mutation revisions prevent older reads from replacing a write's
+state or shared directory observations. Disconnect remains `concurrent`; remote
+CLI setup cleanup runs before credentials are removed, with a bounded wait.
+`DashboardBloc.close()` owns timer and HTTP-client cleanup, including scope
+teardown and calls through `dispose()`.
 The new runtime exposes typed `JuiceTelemetry` records; the obsolete 1.x vendored
 `Bloc`/`BlocBase`/`Emitter`, event-transformer and global resolver APIs are no
 longer included. Keeping upstream implementations does not imply unchanged
@@ -48,6 +51,10 @@ Handlers previously embedded in widget state were mechanically ported with their
 API payloads, admin gates, polling, generation guards, idempotency keys, inspection
 steps, retry references and confirmation requirements. UI state is disposed on
 route/account changes; pending dialogs close when the session generation changes.
+The Flutter reference shell also waits for a connected session before mounting
+its route content, and keys that content by connection generation. Restoring a
+session therefore starts each page's initial read with current credentials;
+sign-out disposes its displayed data and owned resources.
 
 ## Completed surfaces
 

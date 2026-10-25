@@ -5,6 +5,7 @@ import 'integration.dart';
 import 'routes.dart';
 import 'app_theme.dart';
 import 'agent_status_indicator.dart';
+import 'main.dart' show Dashboard;
 
 class AppShell extends StatefulWidget {
   const AppShell({
@@ -31,11 +32,25 @@ class _AppShellState extends State<AppShell> {
   final Set<String> asking = {};
   String? noticesChecked;
   Timer? noticeTimer;
+  int sessionGeneration = -1;
 
   @override
   void initState() {
     super.initState();
+    sessionGeneration = connection.generation;
     subscription = connection.stream.listen((_) {
+      if (sessionGeneration != connection.generation) {
+        sessionGeneration = connection.generation;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          // Dialogs live above the page subtree in the root Navigator. Remove
+          // old-session overlays without changing the selected page route.
+          Navigator.of(
+            context,
+            rootNavigator: true,
+          ).popUntil((route) => route is! PopupRoute);
+        });
+      }
       if (mounted) setState(() {});
       load();
       if (noticeGeneration != connection.generation)
@@ -758,7 +773,14 @@ class _AppShellState extends State<AppShell> {
                             ],
                           ),
                         ),
-                        Expanded(child: widget.child),
+                        Expanded(
+                          child: connection.state.connected
+                              ? KeyedSubtree(
+                                  key: ValueKey(connection.generation),
+                                  child: widget.child,
+                                )
+                              : Dashboard(coordinator: widget.coordinator),
+                        ),
                       ],
                     ),
                   ),

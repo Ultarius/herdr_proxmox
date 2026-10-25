@@ -1715,6 +1715,66 @@ void main() {
     },
   );
   test(
+    'CLI logout closes its terminal before disconnect and allows a fresh setup',
+    () async {
+      var starts = 0;
+      var closedWhileConnected = false;
+      await mount(const CliSetupPage(), (request) {
+        final path = request.url.path;
+        if (path == '/api/cli-setup')
+          return {
+            'clis': [
+              {
+                'id': 'codex',
+                'name': 'Codex',
+                'installed': true,
+                'status': 'not_configured',
+                'detail': 'Demo',
+              },
+            ],
+          };
+        if (path == '/api/cli-setup/start') return {'id': 'setup-${++starts}'};
+        if (path == '/api/cli-setup/poll')
+          return {'output': 'setup session\r\n', 'cursor': 1, 'running': true};
+        if (path == '/api/cli-setup/close')
+          closedWhileConnected = connection!.state.connected;
+        if (path == '/api/sdk') return {'supported': false};
+        if (path == '/api/ssh-access') return {'key_count': 0};
+        return {'workspaces': [], 'agents': []};
+      });
+      await click('Connect account');
+      await until(
+        () =>
+            posts('cli-setup/start').length == 1 &&
+            elements(
+              '.xterm-rows',
+            ).any((node) => node.textContent!.contains('session')),
+      );
+      await connection!.disconnect();
+      expect(closedWhileConnected, isTrue);
+      expect(posts('cli-setup/close').single['id'], 'setup-1');
+      binding.detachRootComponent();
+      final ready = connection!.stream.firstWhere(
+        (_) => connection!.state.refreshed != null,
+      );
+      connection!.connect('token');
+      await ready;
+      binding.attachRootComponent(
+        const _Host(CliSetupPage()),
+        attachTo: '#operations-test',
+      );
+      await until(
+        () => elements(
+          'button',
+        ).any((node) => node.textContent == 'Connect account'),
+      );
+      await click('Connect account');
+      await until(() => posts('cli-setup/start').length == 2);
+      expect(posts('cli-setup/close'), hasLength(1));
+    },
+  );
+
+  test(
     'closing CLI invalidates queued inputs and its terminal can reopen safely',
     () async {
       final firstInput = Completer<http.Response>();

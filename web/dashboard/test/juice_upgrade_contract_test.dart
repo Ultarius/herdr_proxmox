@@ -55,6 +55,320 @@ class RecordedTimer implements Timer {
 }
 
 void main() {
+  for (final finishPollFirst in [true, false]) {
+    test(
+      'workspace write is admitted during polling; stale poll finishes ${finishPollFirst ? 'during' : 'after'} write',
+      () async {
+        final pollStarted = Completer<void>();
+        final writeStarted = Completer<void>();
+        final pollReply = Completer<http.Response>();
+        final writeReply = Completer<http.Response>();
+        var snapshots = 0, writes = 0;
+        final bloc = DashboardBloc(
+          client: MockClient((request) async {
+            if (request.url.path == '/api/workspaces/create') {
+              writes++;
+              writeStarted.complete();
+              return writeReply.future;
+            }
+            if (request.url.path == '/api/snapshot') {
+              snapshots++;
+              if (snapshots == 2) {
+                pollStarted.complete();
+                return pollReply.future;
+              }
+              return snapshot(snapshots == 1 ? 'initial' : 'saved');
+            }
+            return http.Response('{}', 200);
+          }),
+        );
+        try {
+          await connect(bloc, 'account-a');
+          final poll = bloc.send(DashboardCommand('refresh', null, true));
+          await pollStarted.future;
+          expect(bloc.state.busy, isFalse);
+          final write = bloc.send(
+            DashboardCommand('create', {'name': 'saved'}),
+          );
+          await writeStarted.future;
+          expect(writes, 1);
+          expect(bloc.state.busy, isTrue);
+          if (finishPollFirst) {
+            pollReply.complete(snapshot('stale'));
+            await poll;
+            expect(bloc.state.busy, isTrue);
+            expect(bloc.state.workspaces.single['name'], 'initial');
+          }
+          final beforePoll = snapshots;
+          await bloc.send(DashboardCommand('refresh', null, true));
+          expect(
+            snapshots,
+            beforePoll,
+            reason: 'Polling must not read during a write.',
+          );
+          writeReply.complete(http.Response('{}', 200));
+          await write;
+          expect(bloc.state.workspaces.single['name'], 'saved');
+          expect(bloc.state.busy, isFalse);
+          final saved = bloc.state;
+          if (!finishPollFirst) {
+            pollReply.complete(snapshot('stale'));
+            await poll;
+          }
+          expect(identical(bloc.state, saved), isTrue);
+          expect(bloc.state.error, isNull);
+        } finally {
+          if (!pollReply.isCompleted) pollReply.complete(snapshot());
+          if (!writeReply.isCompleted)
+            writeReply.complete(http.Response('{}', 200));
+          await bloc.close();
+        }
+      },
+    );
+
+    test(
+      'organization write is admitted during polling; stale poll finishes ${finishPollFirst ? 'during' : 'after'} write',
+      () async {
+        final pollStarted = Completer<void>();
+        final writeStarted = Completer<void>();
+        final pollReply = Completer<http.Response>();
+        final writeReply = Completer<http.Response>();
+        var reads = 0, writes = 0;
+        http.Response organizations(String name) => http.Response(
+          jsonEncode({
+            'organizations': [
+              {'name': name},
+            ],
+            'profiles': [],
+            'jobs': [],
+            'groups': [],
+          }),
+          200,
+        );
+        final connection = DashboardBloc(
+          client: MockClient((request) async {
+            if (request.url.path == '/api/organizations/save') {
+              writes++;
+              writeStarted.complete();
+              return writeReply.future;
+            }
+            if (request.url.path == '/api/organizations/state') {
+              reads++;
+              if (reads == 2) {
+                pollStarted.complete();
+                return pollReply.future;
+              }
+              return organizations(reads == 1 ? 'initial' : 'saved');
+            }
+            return snapshot();
+          }),
+        );
+        final org = OrganizationBloc(connection);
+        try {
+          await connect(connection, 'account-a');
+          await org.send(OrganizationCommand('refresh'));
+          final poll = org.send(OrganizationCommand('refresh'));
+          await pollStarted.future;
+          expect(org.state.busy, isFalse);
+          final write = org.send(
+            OrganizationCommand('save', {'name': 'saved'}),
+          );
+          await writeStarted.future;
+          expect(writes, 1);
+          expect(org.state.busy, isTrue);
+          if (finishPollFirst) {
+            pollReply.complete(organizations('stale'));
+            await poll;
+            expect(org.state.busy, isTrue);
+            expect(org.state.organizations.single['name'], 'initial');
+            expect(
+              (connection.organizationDirectory.value['organizations'] as List)
+                  .single['name'],
+              'initial',
+            );
+          }
+          final beforePoll = reads;
+          await org.send(OrganizationCommand('refresh'));
+          expect(
+            reads,
+            beforePoll,
+            reason: 'Polling must not read during a write.',
+          );
+          writeReply.complete(http.Response('{}', 200));
+          await write;
+          expect(org.state.organizations.single['name'], 'saved');
+          expect(org.state.busy, isFalse);
+          final saved = org.state;
+          if (!finishPollFirst) {
+            pollReply.complete(organizations('stale'));
+            await poll;
+          }
+          expect(identical(org.state, saved), isTrue);
+          expect(org.state.error, isNull);
+          expect(
+            (connection.organizationDirectory.value['organizations'] as List)
+                .single['name'],
+            'saved',
+          );
+        } finally {
+          if (!pollReply.isCompleted)
+            pollReply.complete(organizations('initial'));
+          if (!writeReply.isCompleted)
+            writeReply.complete(http.Response('{}', 200));
+          await org.close();
+          await connection.close();
+        }
+      },
+    );
+  }
+
+  test(
+    'disconnect joins cleanup before revoking credentials and coalesces callers',
+    () async {
+      final release = Completer<void>();
+      final started = Completer<void>();
+      final calls = <String>[];
+      var cleanups = 0, removedCalled = false;
+      final bloc = DashboardBloc(
+        client: MockClient((request) async {
+          calls.add(request.url.path);
+          return request.url.path == '/api/snapshot'
+              ? snapshot()
+              : http.Response('{}', 200);
+        }),
+      );
+      Future<void>? closing;
+      late final DisconnectCleanupRequest cleanupRequest;
+      Future<void> closeResource() async {
+        cleanups++;
+        started.complete();
+        await release.future;
+        await cleanupRequest('cli-setup/close', {'id': 'setup'});
+      }
+
+      Future<void> cleanup() => closing ??= closeResource();
+
+      Future<void> removed() async {
+        removedCalled = true;
+      }
+
+      try {
+        await connect(bloc, '');
+        cleanupRequest = bloc.addDisconnectCleanup(cleanup);
+        // Disposal can begin in the page's zone before sign-out starts.
+        final disposing = cleanup();
+        await started.future;
+        bloc.addDisconnectCleanup(removed);
+        bloc.removeDisconnectCleanup(removed);
+        final epoch = bloc.generation;
+        final first = bloc.disconnect();
+        await started.future;
+        expect(bloc.disconnecting, isTrue);
+        expect(identical(first, bloc.disconnect()), isTrue);
+        expect(bloc.generation, epoch);
+        expect(bloc.state.connected, isTrue);
+        await bloc.send(DashboardCommand('create', {'name': 'too late'}));
+        expect(calls, isNot(contains('/api/workspaces/create')));
+        final refused = throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            'Dashboard is signing out.',
+          ),
+        );
+        await expectLater(
+          bloc.request('tasks/create', {'title': 'too late'}),
+          refused,
+        );
+        await expectLater(bloc.bytes('tasks/export'), refused);
+        await expectLater(
+          bloc.download('tasks/export', maximumBytes: 1024),
+          refused,
+        );
+        expect(calls, isNot(contains('/api/tasks/create')));
+        expect(calls, isNot(contains('/api/tasks/export')));
+        release.complete();
+        await Future.wait([first, disposing]);
+        expect(cleanups, 1);
+        expect(removedCalled, isFalse);
+        expect(
+          calls.where((path) => path == '/api/session/logout'),
+          hasLength(1),
+        );
+        expect(
+          calls.indexOf('/api/cli-setup/close'),
+          lessThan(calls.indexOf('/api/session/logout')),
+        );
+        expect(bloc.state.connected, isFalse);
+        expect(bloc.disconnecting, isFalse);
+        expect(bloc.generation, epoch + 1);
+        bloc.connect('next-account');
+        await expectLater(
+          cleanupRequest('cli-setup/close', {'id': 'old-setup'}),
+          throwsA(isA<StateError>()),
+        );
+        expect(
+          calls.where((path) => path == '/api/cli-setup/close'),
+          hasLength(1),
+        );
+      } finally {
+        if (!release.isCompleted) release.complete();
+        await bloc.close();
+      }
+    },
+  );
+
+  test('failed cleanup cannot prevent sign-out', () async {
+    var logout = false;
+    final bloc = DashboardBloc(
+      client: MockClient((request) async {
+        if (request.url.path == '/api/session/logout') logout = true;
+        return request.url.path == '/api/snapshot'
+            ? snapshot()
+            : http.Response('{}', 200);
+      }),
+    );
+    try {
+      await connect(bloc, '');
+      bloc.addDisconnectCleanup(
+        () async => throw StateError('setup unreachable'),
+      );
+      await bloc.disconnect();
+      expect(logout, isTrue);
+      expect(bloc.state.connected, isFalse);
+      expect(bloc.disconnecting, isFalse);
+    } finally {
+      await bloc.close();
+    }
+  });
+
+  test('disconnect bounds cleanup that never finishes', () async {
+    var bounded = false;
+    final bloc = DashboardBloc(client: MockClient((_) async => snapshot()));
+    try {
+      await connect(bloc, 'account-a');
+      bloc.addDisconnectCleanup(() => Completer<void>().future);
+      await runZoned(
+        () => bloc.disconnect(),
+        zoneSpecification: ZoneSpecification(
+          createTimer: (self, parent, zone, duration, callback) {
+            if (duration == const Duration(seconds: 20)) {
+              bounded = true;
+              scheduleMicrotask(callback);
+              return RecordedTimer(duration);
+            }
+            return parent.createTimer(zone, duration, callback);
+          },
+        ),
+      );
+      expect(bounded, isTrue);
+      expect(bloc.state.connected, isFalse);
+      expect(bloc.disconnecting, isFalse);
+    } finally {
+      await bloc.close();
+    }
+  });
+
   test(
     'workspace writes remain droppable while a request is in flight',
     () async {

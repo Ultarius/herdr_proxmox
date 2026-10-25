@@ -155,6 +155,12 @@ void main() {
     await settle();
   }
 
+  test('running runtime offers no unsupported stop command', () async {
+    await mount();
+    expect(node('#runtime').textContent, contains('Herdr is running'));
+    expect(root.querySelector('#runtime button'), isNull);
+  });
+
   test(
     'clone deletion confirmation fits a phone-width workspace with real styles',
     () async {

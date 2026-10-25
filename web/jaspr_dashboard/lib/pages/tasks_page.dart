@@ -146,6 +146,8 @@ class _TasksPageState extends State<TasksPage> {
   bool refreshing = false;
   bool connected = true;
   Future<void>? pending;
+  // Forced notification reads can overlap; only the newest may publish.
+  int readRevision = 0;
   Timer? timer;
   StreamSubscription? subscription;
   int generation = -1;
@@ -227,6 +229,7 @@ class _TasksPageState extends State<TasksPage> {
 
   @override
   void dispose() {
+    readRevision++;
     backup.removeListener(backupChanged);
     backup.dispose();
     connection.notificationRevision.removeListener(notificationRefresh);
@@ -245,7 +248,7 @@ class _TasksPageState extends State<TasksPage> {
     }
     if (!force && pending != null) return pending;
     final epoch = connection.generation;
-    final read = _read(epoch);
+    final read = _read(epoch, ++readRevision);
     pending = read;
     refreshing = true;
     try {
@@ -258,11 +261,16 @@ class _TasksPageState extends State<TasksPage> {
     }
   }
 
-  Future<void> _read(int epoch) async {
+  Future<void> _read(int epoch, int revision) async {
     final id = selectedId;
+    bool current() =>
+        mounted &&
+        revision == readRevision &&
+        epoch == connection.generation &&
+        id == selectedId;
     try {
       final data = await connection.request('tasks');
-      if (id != selectedId) return;
+      if (!current()) return;
       Map<String, dynamic>? detail;
       String? detailError;
       if (id != null) {
@@ -274,8 +282,7 @@ class _TasksPageState extends State<TasksPage> {
           detailError = '$e';
         }
       }
-      if (id != selectedId) return;
-      if (mounted && epoch == connection.generation) {
+      if (current()) {
         setState(() {
           if (id == null) {
             tasks = List<Map<String, dynamic>>.from(data['tasks'] ?? []);
@@ -296,8 +303,7 @@ class _TasksPageState extends State<TasksPage> {
         });
       }
     } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => readError = '$e');
+      if (current()) setState(() => readError = '$e');
     }
   }
 

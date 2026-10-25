@@ -309,7 +309,8 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(find.text('Sign out'));
       await tester.pumpAndSettle();
-      expect(find.text('Connect on the dashboard'), findsOneWidget);
+      expect(find.text('Dashboard access token'), findsOneWidget);
+      expect(find.byType(OrganizationPage), findsNothing);
       expect(find.text('Maya · Lead'), findsNothing);
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox());
