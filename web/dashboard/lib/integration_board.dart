@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/workspace_blocs.dart';
 import 'dart:math';
 import 'package:juice/juice.dart';
 import 'artifact_download.dart';
@@ -14,14 +15,18 @@ class IntegrationBoard extends StatefulWidget {
 
 class _IntegrationBoardState extends State<IntegrationBoard> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
-  Map<String, dynamic> data = const {};
-  Map<String, dynamic> validation = const {};
-  String? error;
-  String? actionFailure;
-  bool busy = false;
-  bool refreshing = false;
-  String? checked;
-
+  late final IntegrationBloc feature;
+  StreamSubscription? featureSubscription;
+  Map<String, dynamic> get data =>
+      feature.state.value<Map<String, dynamic>>('data') ?? const {};
+  Map<String, dynamic> get validation =>
+      feature.state.value<Map<String, dynamic>>('validation') ?? const {};
+  String? get error =>
+      feature.state.errors['refresh'] ?? feature.state.errors['log'];
+  String? get actionFailure => feature.state.errors['action'];
+  bool get busy => feature.state.busy || feature.state.reading.contains('log');
+  bool get refreshing => feature.state.reading.contains('refresh');
+  String? get checked => feature.state.value<String>('checked');
   String displayTime(dynamic value) {
     final date = DateTime.tryParse('$value')?.toLocal();
     if (date == null) return value == null ? 'Not checked yet' : '$value';
@@ -107,21 +112,17 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
 
   Future<void> downloadValidationLog(Map run) async {
     final epoch = connection.generation;
-    setState(() => busy = true);
+    final content = await feature.log(run);
+    if (content == null || !(mounted && epoch == connection.generation)) return;
     try {
-      final content = await connection.text(
-        'validation/log?id=${run['run_id']}',
-      );
-      if (!mounted || epoch != connection.generation) return;
       await downloadArtifact(content, 'validation-${run['run_id']}.log');
       if (mounted && epoch == connection.generation)
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Validation log download started.')),
         );
-    } catch (e) {
-      if (mounted) setState(() => error = e.toString());
-    } finally {
-      if (mounted) setState(() => busy = false);
+    } catch (error) {
+      if (mounted && epoch == connection.generation)
+        await feature.reportError('log', error);
     }
   }
 
@@ -345,71 +346,26 @@ class _IntegrationBoardState extends State<IntegrationBoard> {
     }
   }
 
-  Timer? timer;
   @override
   void initState() {
     super.initState();
+    feature = IntegrationBloc(connection);
+    featureSubscription = feature.stream.listen((_) {
+      if (mounted) setState(() {});
+    });
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 15), (_) => refresh());
   }
 
   @override
   void dispose() {
-    timer?.cancel();
+    featureSubscription?.cancel();
+    feature.dispose();
     super.dispose();
   }
 
-  Future<void> refresh() async {
-    if (busy || refreshing) return;
-    setState(() => refreshing = true);
-    final epoch = connection.generation;
-    try {
-      final result = await connection.request('integration');
-      var validationData = validation;
-      try {
-        validationData = Map<String, dynamic>.from(
-          await connection.request('validation'),
-        );
-      } catch (e) {
-        validationData = {'error': e.toString()};
-      }
-      if (mounted && epoch == connection.generation)
-        setState(() {
-          data = Map<String, dynamic>.from(result['coordination'] ?? {});
-          validation = validationData;
-          checked = result['checked'];
-          error = null;
-        });
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = e.toString());
-    } finally {
-      if (mounted) setState(() => refreshing = false);
-    }
-  }
-
-  Future<void> action(String endpoint, Map<String, dynamic> body) async {
-    final epoch = connection.generation;
-    setState(() {
-      busy = true;
-      error = null;
-      actionFailure = null;
-    });
-    try {
-      await connection.request(endpoint, body);
-      if (!mounted || epoch != connection.generation) return;
-      await connection.request('organizations/directory');
-    } catch (e) {
-      if (mounted && epoch == connection.generation) {
-        setState(() => actionFailure = e.toString());
-      }
-    } finally {
-      if (mounted) {
-        setState(() => busy = false);
-        await refresh();
-      }
-    }
-  }
+  Future<void> refresh() => feature.refresh();
+  Future<void> action(String endpoint, Map<String, dynamic> body) async =>
+      feature.action(endpoint, body);
 
   @override
   Widget build(BuildContext context) {

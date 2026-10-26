@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/shell_bloc.dart';
 import 'dart:async';
 import 'dart:js_interop';
 import 'package:web/web.dart' as web;
@@ -33,22 +34,22 @@ class _DashboardAppState extends State<DashboardApp> {
   double navigationScroll = 0;
   bool agentsOpen = true;
   bool sidebarCollapsed = themeStorage.readSidebarCollapsed();
-  bool loadingDirectory = false;
-  bool polling = false;
-  int noticeGeneration = -1;
+  late final ShellBloc shell;
+  int observedNoticeRevision = -1;
   int sessionGeneration = -1;
-  Timer? noticeTimer;
   String token = '';
   String theme = 'system';
   String navSearch = '';
-  String? noticesChecked;
-  List<IntegrationNotice> notices = [];
+  String? get noticesChecked => shell.checked;
+  List<IntegrationNotice> get notices => shell.notices;
   final Set<String> seen = {};
-  final Set<String> asking = {};
+  Set<String> get asking => shell.asking;
 
   @override
   void initState() {
     super.initState();
+    shell = ShellBloc(connection);
+    subscriptions.add(shell.stream.listen((_) => shellChanged()));
     final queryTheme = Uri.base.queryParameters['theme'];
     theme = ['light', 'dark'].contains(queryTheme)
         ? queryTheme!
@@ -78,15 +79,10 @@ class _DashboardAppState extends State<DashboardApp> {
           if (drawer) closeDrawer(restoreFocus: false);
           closeDialogs();
           messages.value = null;
-          asking.clear();
-          notices = [];
           seen.clear();
-          noticesChecked = null;
+          observedNoticeRevision = -1;
         }
         setState(() {});
-        loadDirectory();
-        if (noticeGeneration != connection.generation)
-          pollNotices(announce: false);
       }),
     );
     connection.organizationDirectory.addListener(rebuild);
@@ -99,10 +95,6 @@ class _DashboardAppState extends State<DashboardApp> {
     connection.restoreSession().whenComplete(() {
       if (mounted) setState(() => restoring = false);
     });
-    noticeTimer = Timer.periodic(
-      const Duration(seconds: 15),
-      (_) => pollNotices(),
-    );
   }
 
   void rebuild() {
@@ -182,90 +174,36 @@ class _DashboardAppState extends State<DashboardApp> {
     rebuild();
   }
 
-  Future<void> loadDirectory() async {
-    if (loadingDirectory ||
-        !connection.state.connected ||
-        connection.organizationDirectory.value['loaded'] == true)
-      return;
-    loadingDirectory = true;
-    try {
-      await connection.request('organizations/directory');
-    } catch (_) {
-    } finally {
-      loadingDirectory = false;
+  void shellChanged() {
+    if (!mounted) return;
+    final fresh = <IntegrationNotice>[];
+    if (observedNoticeRevision != shell.noticeRevision) {
+      observedNoticeRevision = shell.noticeRevision;
+      seen.removeWhere((key) => !notices.any((notice) => notice.key == key));
+      fresh.addAll(notices.where((notice) => seen.add(notice.key)));
     }
-  }
-
-  Future<void> pollNotices({bool announce = true}) async {
-    if (!connection.state.connected) {
-      if (notices.isNotEmpty || seen.isNotEmpty)
-        setState(() {
-          notices = [];
-          seen.clear();
-          noticesChecked = null;
-        });
-      return;
-    }
-    if (noticeGeneration != connection.generation) {
-      noticeGeneration = connection.generation;
-      setState(() {
-        notices = [];
-        seen.clear();
-        noticesChecked = null;
-      });
-    }
-    if (polling) return;
-    final epoch = connection.generation;
-    polling = true;
-    try {
-      final result = await connection.request('integration');
-      if (!mounted ||
-          epoch != connection.generation ||
-          !connection.state.connected)
-        return;
-      final next = [
-        for (final notice in (result['alerts'] as List? ?? []))
-          if (notice is Map<String, dynamic>)
-            IntegrationNotice.fromJson(notice),
-      ];
-      seen.removeWhere((key) => !next.any((notice) => notice.key == key));
-      final fresh = next.where((notice) => seen.add(notice.key)).toList();
-      setState(() {
-        notices = next;
-        noticesChecked = result['checked'] as String?;
-      });
-      refreshDialogs();
-      if (announce && fresh.isNotEmpty)
-        toast(
-          fresh.length == 1
-              ? 'Integration notice: ${fresh.first.summary}'
-              : '${fresh.length} integration notices need review',
-        );
-    } catch (_) {
-    } finally {
-      polling = false;
-    }
+    setState(() {});
+    refreshDialogs();
+    if (shell.announce && fresh.isNotEmpty)
+      toast(
+        fresh.length == 1
+            ? 'Integration notice: ${fresh.first.summary}'
+            : '${fresh.length} integration notices need review',
+      );
   }
 
   Future<void> askIntegration(IntegrationNotice notice) async {
-    if (asking.contains(notice.profileId)) return;
+    if (shell.state.busy) return;
     final epoch = connection.generation;
-    setState(() => asking.add(notice.profileId));
-    refreshDialogs();
     try {
-      await requestIntegration(connection, notice);
-      if (!mounted || epoch != connection.generation) return;
+      final done = await shell.ask(notice);
+      if (!done || !mounted || epoch != connection.generation) return;
       toast(
         'Asked ${notice.name.isEmpty ? 'the agent' : notice.name} to integrate.',
       );
     } catch (error) {
       if (mounted && epoch == connection.generation)
         toast('Integration request failed: $error');
-    } finally {
-      if (mounted && epoch == connection.generation) {
-        setState(() => asking.remove(notice.profileId));
-        refreshDialogs();
-      }
     }
   }
 
@@ -301,6 +239,7 @@ class _DashboardAppState extends State<DashboardApp> {
                 () => askIntegration(notice),
                 disabled:
                     !agentCanIntegrate(connection, notice.profileId) ||
+                    shell.state.busy ||
                     asking.contains(notice.profileId),
               ),
             button(
@@ -336,7 +275,7 @@ class _DashboardAppState extends State<DashboardApp> {
       if (dialog.open) dialog.close();
     }
     drawerMedia.removeEventListener('change', drawerMediaChanged);
-    noticeTimer?.cancel();
+    shell.dispose();
     for (final sub in subscriptions) unawaited(sub.cancel());
     web.window.removeEventListener('hashchange', hashListener);
     connection.organizationDirectory.removeListener(rebuild);

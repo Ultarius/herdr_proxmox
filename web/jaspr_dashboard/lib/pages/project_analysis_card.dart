@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/workspace_blocs.dart';
 import 'package:herdr_dashboard_state/project_environment.dart';
 import 'package:herdr_dashboard_state/project_analysis.dart';
 import 'operations_support.dart';
@@ -19,11 +20,17 @@ class ProjectAnalysisCard extends StatefulComponent {
 }
 
 class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
-  ProjectAnalysisLoad? loaded;
-  Map<String, dynamic> analysis = const {};
-  String? failure;
-  bool refreshing = false;
-  int requestId = 0;
+  late ProjectAnalysisBloc feature;
+  StreamSubscription? featureSubscription;
+  ProjectAnalysisLoad? get loaded => feature.state.value('loaded');
+  bool editingOverride = false;
+  String? get failure => feature.state.errors['analysis'];
+  bool get refreshing => feature.state.reading.contains('analysis');
+  bool get busy => feature.state.busy;
+  String? get error =>
+      editingOverride ? null : feature.state.errors['override'];
+  String? get message => feature.state.message;
+  Map<String, dynamic> get analysis => loaded?.report ?? const {};
   final expanded = <String, bool>{};
   late final ProjectEnvironmentController environment;
   Map<String, dynamic>? get environmentPlan => environment.plan;
@@ -38,19 +45,26 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
     if (old.path != component.path) {
       environment.reset(component.path);
       expanded.clear();
-      requestId++;
-      busy = refreshing = false;
-      loaded = null;
-      analysis = const {};
-      failure = error = null;
+      featureSubscription?.cancel();
+      feature.dispose();
+      bindFeature();
       refresh();
     }
   }
 
   @override
   void dispose() {
+    featureSubscription?.cancel();
+    feature.dispose();
     environment.dispose();
     super.dispose();
+  }
+
+  void bindFeature() {
+    feature = ProjectAnalysisBloc(connection, component.path);
+    featureSubscription = feature.stream.listen((_) {
+      if (mounted) setState(() {});
+    });
   }
 
   void initializeEnvironment() {
@@ -88,34 +102,16 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
   @override
   void initState() {
     super.initState();
+    bindFeature();
     initializeEnvironment();
     refresh();
   }
 
   Future<void> refresh({bool force = false}) async {
-    if (refreshing || !connection.state.connected) return;
-    refreshing = true;
-    final epoch = connection.generation;
-    final id = ++requestId;
+    final currentFeature = feature;
     final path = component.path;
     unawaited(environment.load(path));
-    try {
-      final result = await loadProjectAnalysis(
-        connection.request,
-        path,
-        force: force,
-      );
-      if (valid(epoch) && id == requestId)
-        setState(() {
-          loaded = result;
-          analysis = result.report;
-          failure = null;
-        });
-    } catch (error) {
-      if (valid(epoch) && id == requestId) setState(() => failure = '$error');
-    } finally {
-      if (valid(epoch) && id == requestId) setState(() => refreshing = false);
-    }
+    await currentFeature.refresh(force: force);
   }
 
   Component statePill(
@@ -285,6 +281,7 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
 
   Future<void> setOverride() async {
     if (!admin || busy) return;
+    setState(() => editingOverride = true);
     final current = Map<String, dynamic>.from(operatorOverride ?? {});
     await editRecord(
       'Project toolchain override',
@@ -312,8 +309,7 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
         },
       },
       submit: (values) async {
-        await connection.request('projects/toolchain', {
-          'repository': component.path,
+        await feature.saveOverride({
           'toolchain': values['toolchain'],
           'constraint': values['constraint'],
           'notation': values['notation'],
@@ -327,19 +323,17 @@ class _ProjectAnalysisState extends OperationsState<ProjectAnalysisCard> {
         ),
       ],
     );
+    await feature.clearError('override');
+    if (mounted) setState(() => editingOverride = false);
     await refresh(force: true);
   }
 
   Future<void> clearOverride() async {
     if (!admin || busy) return;
-    await perform((epoch) async {
-      await connection.request('projects/toolchain', {
-        'repository': component.path,
-        'toolchain': '',
-      });
-      if (valid(epoch)) message = 'Override removed.';
-    });
-    await refresh(force: true);
+    try {
+      if (await feature.saveOverride({'toolchain': ''}) == true)
+        await feature.patch({}, message: 'Override removed.');
+    } catch (_) {} // Failure remains in the feature's operation state.
   }
 
   Component projectEnvironment() {

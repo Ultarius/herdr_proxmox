@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/workspace_blocs.dart';
 import 'operations_support.dart';
 import 'integration_board.dart';
 import 'ops_ui.dart';
@@ -11,50 +12,41 @@ class ProjectGitPanel extends StatefulComponent {
 }
 
 class _GitState extends OperationsState<ProjectGitPanel> {
-  Map<String, dynamic>? data;
-  bool loading = false, showProgress = true, updatingBase = false;
-  String? notifying;
-  Timer? timer;
+  late final GitBloc feature;
+  StreamSubscription? featureSubscription;
+  Map<String, dynamic>? get data => feature.state.value('data');
+  String? get error => feature.state.error;
+  bool get loading =>
+      feature.state.reading.contains('status') ||
+      feature.state.writing.contains('fetch');
+  bool get showProgress => feature.state.values['showProgress'] == true;
+  String? get notifying => feature.state.writing.contains('notify')
+      ? feature.state.value<String>('notifying')
+      : null;
+  bool reviewingBase = false;
+  bool get updatingBase =>
+      reviewingBase || feature.state.writing.contains('baseUpdate');
+  String? get message => feature.state.message;
   @override
   void initState() {
     super.initState();
+    feature = GitBloc(connection, component.path);
+    featureSubscription = feature.stream.listen((_) {
+      if (!mounted) return;
+      setState(() {});
+    });
     load();
-    timer = Timer.periodic(
-      const Duration(seconds: 10),
-      (_) => load(quiet: true),
-    );
   }
 
   @override
   void dispose() {
-    timer?.cancel();
+    featureSubscription?.cancel();
+    feature.dispose();
     super.dispose();
   }
 
-  Future<void> load({bool quiet = false, bool fetch = false}) async {
-    if (loading || !connection.state.connected) return;
-    final epoch = connection.generation;
-    setState(() {
-      loading = true;
-      showProgress = !quiet;
-      if (!quiet) error = null;
-    });
-    try {
-      final result = await connection.request('projects/git', {
-        'path': component.path,
-        'action': fetch ? 'fetch' : 'status',
-      });
-      if (valid(epoch))
-        setState(() {
-          data = Map<String, dynamic>.from(result);
-          error = null;
-        });
-    } catch (e) {
-      if (valid(epoch)) setState(() => error = '$e');
-    } finally {
-      if (valid(epoch)) setState(() => loading = false);
-    }
-  }
+  Future<void> load({bool quiet = false, bool fetch = false}) =>
+      feature.load(quiet: quiet, fetch: fetch);
 
   Future<void> updateBase() async {
     final initial = data?['base_update'];
@@ -79,18 +71,15 @@ class _GitState extends OperationsState<ProjectGitPanel> {
     base = base.trim();
     branch = branch.trim();
     setState(() {
-      updatingBase = true;
-      error = null;
+      reviewingBase = true;
     });
     try {
-      final inspected = await connection.request('projects/git', {
-        'path': initial['path'],
-        'base': base,
-      });
-      if (!valid(epoch)) return;
-      final plan = inspected['base_update'];
-      if (plan is! Map || plan['branch'] != branch)
-        throw Exception('Destination branch changed. Refresh before updating.');
+      final plan = await feature.inspectBase(
+        '${initial['path']}',
+        base,
+        branch,
+      );
+      if (plan == null || !(valid(epoch))) return;
       if (!await confirm(
             'Advance $branch?',
             'Checkout: ${plan['path']}\nCurrent: ${plan['head']}\nTarget: ${plan['target']}\nComparison: $base\n\nThe old HEAD is pinned for recovery and the request audited. This is a fast-forward only.',
@@ -98,33 +87,19 @@ class _GitState extends OperationsState<ProjectGitPanel> {
           ) ||
           !valid(epoch))
         return;
-      final result = await connection.request('projects/git', {
-        ...Map<String, dynamic>.from(plan),
-        'action': 'update_base',
-        'request_id': requestId(),
-      });
-      if (!valid(epoch)) return;
-      if (result['state'] != 'complete')
-        throw Exception(result['reason'] ?? 'Base update requires review.');
-      setState(
-        () => message =
-            'Base checkout updated. Agent worktrees continue independently.',
-      );
-      await load();
+      await feature.updateBase(Map<String, dynamic>.from(plan), requestId());
     } catch (e) {
-      if (valid(epoch)) setState(() => error = '$e');
+      if (valid(epoch)) feature.reportError('git', e);
     } finally {
-      if (valid(epoch)) setState(() => updatingBase = false);
+      if (valid(epoch)) setState(() => reviewingBase = false);
     }
   }
 
   Future<void> diff(Map tree, Map file) async {
     final epoch = connection.generation;
     try {
-      final result = await connection.request('projects/git', {
-        'path': tree['path'],
-        'file': file['path'],
-      });
+      final result = await feature.diff(tree, file);
+      if (result == null) return;
       if (!valid(epoch)) return;
       await showDialog<void>(
         '${file['path']}',
@@ -144,7 +119,7 @@ class _GitState extends OperationsState<ProjectGitPanel> {
         ]),
       );
     } catch (e) {
-      if (valid(epoch)) setState(() => error = '$e');
+      if (valid(epoch)) feature.reportError('git', e);
     }
   }
 
@@ -164,26 +139,8 @@ class _GitState extends OperationsState<ProjectGitPanel> {
         ) !=
         0,
   );
-  Future<void> notify(Map tree, Map agent) async {
-    final epoch = connection.generation;
-    if (!agentCanIntegrate(connection, '${agent['profile_id']}')) return;
-    setState(() {
-      notifying = '${agent['profile_id']}';
-      error = null;
-    });
-    try {
-      await requestIntegration(connection, noticeFor(tree, agent));
-      if (valid(epoch))
-        setState(
-          () => message =
-              'Merge request sent. Follow progress in the organization chat.',
-        );
-    } catch (e) {
-      if (valid(epoch)) setState(() => error = '$e');
-    } finally {
-      if (valid(epoch)) setState(() => notifying = null);
-    }
-  }
+  Future<void> notify(Map tree, Map agent) async =>
+      feature.notify(noticeFor(tree, agent));
 
   Component treeCard(Map tree) {
     if (tree['error'] != null)

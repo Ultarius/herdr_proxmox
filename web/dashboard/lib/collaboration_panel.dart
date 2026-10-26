@@ -1,6 +1,6 @@
+import 'package:herdr_dashboard_state/planning_blocs.dart';
 import 'permission_options.dart';
 import 'remove_entry_dialog.dart';
-import 'dart:convert';
 import 'organization_bloc.dart';
 import 'artifact_export.dart';
 import 'package:juice/juice.dart';
@@ -40,92 +40,44 @@ class CollaborationPanel extends StatefulWidget {
 class _CollaborationPanelState extends State<CollaborationPanel> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
   final prompt = TextEditingController();
-  List<Map<String, dynamic>> groups = [];
-  List<Map<String, dynamic>> jobs = [];
-  String? profile;
-  String? error;
-  String output = '';
-  String status = '';
-  String draft = '';
-  String? draftJob;
-  bool busy = false;
-  bool polling = false;
-  OrganizationCommand? pending;
-  String? snapshotSignature;
-  int pollTick = 0;
-  Timer? timer;
+  late final CollaborationBloc bloc;
+  StreamSubscription? featureSubscription;
+  List<Map<String, dynamic>> get groups => bloc.groups;
+  List<Map<String, dynamic>> get jobs => bloc.jobs;
+  String? get profile => bloc.profile;
+  set profile(String? value) => bloc.select(value);
+  String? _error;
+  String? get error => _error ?? bloc.state.error;
+  set error(String? value) => _error = value;
+  String get output => bloc.output;
+  String get status => bloc.status;
+  String get draft => bloc.draft;
+  String? get draftJob => bloc.draftJob;
+  bool get busy => bloc.state.busy;
+  OrganizationCommand? get pending => bloc.pending;
+  set pending(OrganizationCommand? value) {
+    if (value == null) bloc.abandon();
+  }
 
   @override
   void initState() {
     super.initState();
-    refresh();
-    timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (profile != null || ++pollTick % 10 == 0) refresh();
+    bloc = CollaborationBloc(connection, '${widget.organization['id']}');
+    featureSubscription = bloc.stream.listen((_) {
+      if (mounted) setState(() {});
     });
+    refresh();
   }
 
   @override
   void dispose() {
-    timer?.cancel();
+    featureSubscription?.cancel();
+    bloc.dispose();
     prompt.dispose();
     super.dispose();
   }
 
-  Map<String, dynamic> body(Map<String, dynamic> values) => OrganizationCommand(
-    'inspect',
-    {...values, 'organization_id': widget.organization['id']},
-  ).body!;
-
-  Future<void> refresh() async {
-    if (polling || !connection.state.connected) return;
-    polling = true;
-    final epoch = connection.generation;
-    final selected = profile;
-    try {
-      final data = await connection.request('organizations/activity', {
-        'organization_id': widget.organization['id'],
-      });
-      if (!mounted || epoch != connection.generation) return;
-      final signature = jsonEncode(data);
-      if (snapshotSignature != signature)
-        setState(() {
-          snapshotSignature = signature;
-          groups = List<Map<String, dynamic>>.from(data['groups'] ?? [])
-              .where((g) => g['organization_id'] == widget.organization['id'])
-              .toList();
-          jobs = List<Map<String, dynamic>>.from(data['jobs'])
-              .where((j) => j['organization_id'] == widget.organization['id'])
-              .toList();
-        });
-      if (selected != null) {
-        final result = await connection.request(
-          'organizations/inspect',
-          body({'profile_id': selected}),
-        );
-        if (mounted &&
-            epoch == connection.generation &&
-            selected == profile &&
-            (output != result['output'] ||
-                status != result['status'] ||
-                draft != (result['reply_draft'] ?? '') ||
-                draftJob != result['reply_job_id'] ||
-                (error != null && pending == null))) {
-          setState(() {
-            output = result['output'] as String;
-            status = result['status'] as String;
-            draft = result['reply_draft'] as String? ?? '';
-            draftJob = result['reply_job_id'] as String?;
-            if (pending == null) error = null;
-          });
-        }
-      }
-    } catch (exception) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = exception.toString());
-    } finally {
-      polling = false;
-    }
-  }
+  Future<void> refresh() => bloc.refresh();
 
   Future<void> submit(
     String action,
@@ -134,27 +86,13 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
   }) async {
     if (busy || !connection.state.connected) return;
     final epoch = connection.generation;
-    if (!retry) {
-      pending = OrganizationCommand(action, {
-        ...values,
-        'organization_id': widget.organization['id'],
-      });
-    }
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    try {
-      await pending!.execute(connection);
-      if (!mounted || epoch != connection.generation) return;
-      pending = null;
-      if (action == 'chat') prompt.clear();
-      await refresh();
-    } catch (exception) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = exception.toString());
-    } finally {
-      if (mounted) setState(() => busy = false);
+    _error = null;
+    final saved = await bloc.submit(action, values, retry: retry);
+    if (saved &&
+        mounted &&
+        epoch == connection.generation &&
+        action == 'chat') {
+      prompt.clear();
     }
   }
 
@@ -343,10 +281,6 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
             : (value) {
                 setState(() {
                   profile = value;
-                  output = '';
-                  status = '';
-                  draft = '';
-                  draftJob = null;
                   error = null;
                 });
                 refresh();
@@ -587,6 +521,7 @@ class _DiscussionGroupFormState extends State<DiscussionGroupForm> {
     }
     return projects.length == 1;
   }
+
   late bool readOnly = widget.group?['read_only'] ?? true;
   late bool useWorktree = widget.group?['use_worktree'] ?? true;
   late bool notifyOutcomes = widget.group?['notify_outcomes'] ?? true;

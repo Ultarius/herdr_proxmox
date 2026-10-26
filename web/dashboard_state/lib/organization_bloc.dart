@@ -63,6 +63,27 @@ class OrganizationBloc extends JuiceBloc<OrganizationState> {
   OrganizationCommand? pending;
   int _mutationRevision = 0;
   int? _mutationGeneration;
+  Timer? _polling;
+
+  /// Mounted organization views opt into live observations; the bloc owns
+  /// their cadence and notification subscription until it closes.
+  void startPolling() {
+    if (isClosing || _polling != null) return;
+    connection.notificationRevision.addListener(_refresh);
+    _polling = Timer.periodic(const Duration(seconds: 5), (_) => _refresh());
+  }
+
+  void _refresh() {
+    if (!isClosing && connection.state.connected && pending == null)
+      unawaited(send(OrganizationCommand('refresh')));
+  }
+
+  @override
+  Future<void> close() {
+    _polling?.cancel();
+    connection.notificationRevision.removeListener(_refresh);
+    return super.close();
+  }
 }
 
 class OrganizationUseCase extends _OrganizationOperation<OrganizationCommand> {}

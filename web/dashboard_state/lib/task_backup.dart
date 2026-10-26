@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
+import 'feature_bloc.dart';
 
 const taskBackupLabel = 'Database backup';
 const taskJsonLabel = 'Export JSON';
@@ -80,96 +81,85 @@ Future<TaskBackup> fetchTaskBackup(
   );
 }
 
-/// Both dashboards share the complete operation lifecycle and download guard.
-class TaskBackupController extends ValueNotifier<int> {
-  TaskBackupController(this.connection, this.save)
-    : _generation = connection.generation,
-      super(0) {
-    connection.operator.addListener(_sessionChanged);
-    _subscription = connection.stream.listen((_) => _sessionChanged());
-  }
-  final DashboardBloc connection;
+/// The feature bloc owns export admission, download and save completion. The
+/// legacy notifier below is only a renderer-facing Listenable projection.
+class TaskBackupBloc extends FeatureBloc {
+  TaskBackupBloc(DashboardBloc connection, this.save)
+    : super(connection, initial: const {'failed': false, 'jsonExport': false});
   final TaskBackupSaver save;
-  StreamSubscription? _subscription;
-  int _generation, _operation = 0;
-  bool _disposed = false;
-  bool busy = false, failed = false, jsonExport = false;
-  String? message;
-  bool get _allowed =>
-      connection.state.connected &&
-      connection.operator.value['role'] == 'admin';
-
-  void _sessionChanged() {
-    if (_generation != connection.generation || !_allowed) {
-      _generation = connection.generation;
-      _operation++;
-      if (busy || message != null || failed) {
-        busy = false;
-        message = null;
-        failed = false;
-        if (!_disposed) notifyListeners();
-      }
-    }
-  }
-
+  bool get busy => state.busy;
+  bool get failed => state.values['failed'] == true;
+  bool get jsonExport => state.values['jsonExport'] == true;
+  String? get message => state.values['notice'] as String?;
   void dismiss() {
-    message = null;
-    failed = false;
-    notifyListeners();
+    patch({'notice': null, 'failed': false});
   }
 
   Future<void> export({bool blocked = false, bool asJson = false}) async {
-    if (_disposed || busy || blocked || !_allowed) return;
-    final epoch = connection.generation, operation = ++_operation;
-    bool current() =>
-        !_disposed &&
-        operation == _operation &&
-        epoch == connection.generation &&
-        _allowed;
-    jsonExport = asJson;
-    busy = true;
-    message = null;
-    failed = false;
-    notifyListeners();
-    try {
-      final backup = await fetchTaskBackup(connection, asJson: asJson);
-      if (!current()) return;
-      try {
-        await save(backup);
-      } catch (_) {
-        throw StateError(
-          'Could not save the task backup. Check browser download permissions and retry the export.',
-        );
-      }
-      if (current())
-        message = backup.downloadUri == null
-            ? (asJson ? taskJsonNotice : taskBackupNotice)
-            : taskBackupStartedNotice;
-    } catch (error) {
-      if (current()) {
-        failed = true;
-        message = error is StateError
-            ? '${error.message}'
-            : error is DashboardRequestException
-            ? error.message
-            : error is TimeoutException
-            ? 'Task export timed out. Retry on a faster connection or use the streaming task export API.'
-            : 'Could not export the task backup. Check gateway connectivity and retry.';
-      }
-    } finally {
-      if (current()) {
-        busy = false;
-        notifyListeners();
-      }
-    }
+    if (blocked || !available || !admin || busy) return;
+    final epoch = connection.generation;
+    bool allowed() => current(epoch) && admin;
+    await mutate<void>(
+      'backup',
+      () async {
+        try {
+          final backup = await fetchTaskBackup(connection, asJson: asJson);
+          if (!allowed()) return const FeatureResult();
+          try {
+            await save(backup);
+          } catch (_) {
+            throw StateError(
+              'Could not save the task backup. Check browser download permissions and retry the export.',
+            );
+          }
+          return FeatureResult(
+            patch: {
+              'notice': backup.downloadUri == null
+                  ? (asJson ? taskJsonNotice : taskBackupNotice)
+                  : taskBackupStartedNotice,
+            },
+          );
+        } catch (error) {
+          final notice = error is StateError
+              ? '${error.message}'
+              : error is DashboardRequestException
+              ? error.message
+              : error is TimeoutException
+              ? 'Task export timed out. Retry on a faster connection or use the streaming task export API.'
+              : 'Could not export the task backup. Check gateway connectivity and retry.';
+          return FeatureResult(patch: {'failed': true, 'notice': notice});
+        }
+      },
+      admin: true,
+      start: {'jsonExport': asJson, 'notice': null, 'failed': false},
+    );
   }
+}
 
+class TaskBackupController extends ValueNotifier<int> {
+  TaskBackupController(DashboardBloc connection, TaskBackupSaver save)
+    : bloc = TaskBackupBloc(connection, save),
+      super(0) {
+    _subscription = bloc.stream.listen((_) {
+      if (!_disposed) value++;
+    });
+  }
+  final TaskBackupBloc bloc;
+  late final StreamSubscription _subscription;
+  bool _disposed = false;
+  bool get busy => bloc.busy;
+  bool get failed => bloc.failed;
+  bool get jsonExport => bloc.jsonExport;
+  String? get message => bloc.message;
+  void dismiss() => bloc.dismiss();
+  Future<void> export({bool blocked = false, bool asJson = false}) =>
+      bloc.export(blocked: blocked, asJson: asJson);
   @override
   void dispose() {
+    if (_disposed) return;
     _disposed = true;
-    _operation++;
-    connection.operator.removeListener(_sessionChanged);
-    _subscription?.cancel();
+    _subscription.cancel();
+    bloc.dispose();
     super.dispose();
   }
 }

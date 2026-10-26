@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/planning_blocs.dart';
 import 'dart:async';
 import 'dart:convert';
 
@@ -21,86 +22,31 @@ class OrganizationAutomation extends StatefulComponent {
 class _OrganizationAutomationState extends State<OrganizationAutomation> {
   DashboardBloc get connection => dashboardConnection;
 
-  Map<String, dynamic>? policy;
-
-  Map<String, dynamic>? pending;
-
-  String? error;
-
-  bool busy = false;
-
-  int generation = -1;
-
+  late final OrganizationAutomationBloc bloc;
   StreamSubscription? subscription;
+  Map<String, dynamic>? get policy => bloc.policy;
+  Map<String, dynamic>? get pending => bloc.pending;
+  String? get error => bloc.pageError;
+  bool get busy => bloc.state.busy || bloc.state.loading;
 
   @override
   void initState() {
     super.initState();
-
-    generation = connection.generation;
-
-    subscription = connection.stream.listen((_) {
-      if (!mounted) return;
-
-      if (generation != connection.generation || !connection.state.connected) {
-        generation = connection.generation;
-
-        setState(() {
-          policy = null;
-
-          pending = null;
-
-          error = null;
-        });
-      }
-
-      if (policy == null && connection.state.connected) refresh();
+    bloc = OrganizationAutomationBloc(connection, component.organizationId);
+    subscription = bloc.stream.listen((_) {
+      if (mounted) setState(() {});
     });
-
-    connection.notificationRevision.addListener(refresh);
-
     refresh();
   }
 
   @override
   void dispose() {
     subscription?.cancel();
-
-    connection.notificationRevision.removeListener(refresh);
-
+    bloc.dispose();
     super.dispose();
   }
 
-  Future<void> refresh() async {
-    if (busy || !connection.state.connected) return;
-
-    final epoch = connection.generation;
-
-    setState(() => busy = true);
-
-    try {
-      final result = await connection.request(
-        'organizations/automation?organization_id=${Uri.encodeQueryComponent(component.organizationId)}',
-      );
-
-      if (mounted && epoch == connection.generation)
-        setState(() {
-          policy = Map<String, dynamic>.from(result['policy']);
-
-          error = null;
-        });
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = '$e');
-    } finally {
-      if (mounted) {
-        setState(() => busy = false);
-
-        if (epoch != connection.generation && connection.state.connected)
-          refresh();
-      }
-    }
-  }
+  Future<void> refresh() => bloc.refresh();
 
   Future<void> edit() async {
     final epoch = connection.generation;
@@ -114,74 +60,14 @@ class _OrganizationAutomationState extends State<OrganizationAutomation> {
           throw StateError(
             'The connection changed. Close and reopen the policy editor before saving.',
           );
-        // Preserve the request identity after an uncertain response, but an edited
-        // policy is a new intent and must not reuse that identity. Compare the
-        // whole intent rather than its length, so an extra bookkeeping key can
-        // never silently drop retry idempotency.
-        final intent = {'organization_id': component.organizationId, ...chosen};
-        final previous = pending == null
-            ? null
-            : (Json.from(pending!)..remove('request_id'));
-        if (previous == null || jsonEncode(previous) != jsonEncode(intent))
-          pending = {...intent, 'request_id': requestId()};
+        bloc.prepare(chosen);
         await save(fromDialog: true);
       },
     );
   }
 
-  Future<void> save({bool fromDialog = false}) async {
-    if (busy ||
-        pending == null ||
-        !connection.state.connected ||
-        connection.operator.value['role'] != 'admin') {
-      if (fromDialog)
-        throw StateError(
-          'The policy cannot be saved right now. Check the connection and try again.',
-        );
-      return;
-    }
-
-    final epoch = connection.generation;
-
-    setState(() {
-      busy = true;
-
-      error = null;
-    });
-
-    try {
-      final result = await connection.request('tasks/automation', pending);
-
-      if (mounted && epoch == connection.generation)
-        setState(() {
-          policy = Map<String, dynamic>.from(result['policy']);
-
-          pending = null;
-        });
-      else if (fromDialog)
-        throw StateError(
-          'The connection changed while saving. Close and reopen the policy editor.',
-        );
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() {
-          error = fromDialog ? null : '$e';
-
-          if (e is DashboardRequestException &&
-              e.statusCode >= 400 &&
-              e.statusCode < 500)
-            pending = null;
-        });
-      if (fromDialog) rethrow;
-    } finally {
-      if (mounted) {
-        setState(() => busy = false);
-
-        if (epoch != connection.generation && connection.state.connected)
-          refresh();
-      }
-    }
-  }
+  Future<void> save({bool fromDialog = false}) =>
+      bloc.save(fromDialog: fromDialog);
 
   Component value(Object? v) => v is bool
       ? statePill(v ? 'on' : 'off', label: v ? 'On' : 'Off')

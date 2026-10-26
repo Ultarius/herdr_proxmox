@@ -1,5 +1,6 @@
+import 'package:herdr_dashboard_state/settings_bloc.dart';
+import 'pages/operations_support.dart' show FeatureOperationsState;
 import 'dart:async';
-import 'dart:convert';
 import 'package:jaspr/dom.dart' as dom;
 import 'package:web/web.dart' as web;
 import 'ui.dart';
@@ -1028,48 +1029,23 @@ class SystemHealth extends StatefulComponent {
   State<SystemHealth> createState() => _SystemHealthState();
 }
 
-class _SystemHealthState extends State<SystemHealth> {
-  Timer? timer;
-  Map<String, dynamic>? data;
-  bool loading = false;
-  String? error;
+class _SystemHealthState extends FeatureOperationsState<SystemHealth> {
+  late final ResourcesBloc bloc;
+  Map<String, dynamic>? get data => bloc.data;
+  bool get loading => bloc.state.loading;
   @override
   void initState() {
     super.initState();
+    bindFeature(
+      bloc = ResourcesBloc(dashboardConnection),
+      errorFor: (state) => state.error == null
+          ? null
+          : 'Resource monitor unavailable; displayed values may be stale.',
+    );
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 10), (_) => refresh());
   }
 
-  Future<void> refresh() async {
-    if (loading) return;
-    setState(() => loading = true);
-    final epoch = dashboardConnection.generation;
-    try {
-      final result = await dashboardConnection.request('resources');
-      if (mounted && epoch == dashboardConnection.generation)
-        setState(() {
-          data = Map<String, dynamic>.from(result);
-          error = null;
-        });
-      if (mounted && !(timer?.isActive ?? false))
-        timer = Timer.periodic(const Duration(seconds: 10), (_) => refresh());
-    } catch (_) {
-      timer?.cancel();
-      if (mounted && epoch == dashboardConnection.generation)
-        setState(
-          () => error =
-              'Resource monitor unavailable; displayed values may be stale.',
-        );
-    } finally {
-      if (mounted) setState(() => loading = false);
-    }
-  }
-
-  @override
-  void dispose() {
-    timer?.cancel();
-    super.dispose();
-  }
+  Future<void> refresh() => bloc.refresh();
 
   String mib(dynamic value) => _grouped((value as num? ?? 0) / 1048576);
   String bytes(dynamic value) => '${mib(value)} MiB';
@@ -1284,17 +1260,18 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
   String connectionId = '';
   String? unavailableConnection;
   List<Map<String, dynamic>> connections = [];
-  bool busy = false;
-  Timer? timer;
-  List<Map<String, dynamic>> jobs = [];
-  String? completed;
-  bool polling = false;
-  String? result;
-  String? pendingRemoval, removing;
+  late final CloneJobsBloc bloc;
+  StreamSubscription? jobsSubscription;
+  int completionRevision = 0;
+  bool get busy => bloc.state.busy;
+  List<Map<String, dynamic>> get jobs => bloc.jobs;
+  String? get removing => bloc.removing;
+  String? inputError;
+  String? get result => inputError ?? bloc.result;
+  set result(String? value) => inputError = value;
+  String? pendingRemoval;
   bool deleteCloneFolder = false;
   String removalConfirmation = '';
-  int jobsRevision = 0;
-  bool jobsLoaded = false;
   int? removalGeneration;
   late final DashboardBloc cloneConnection;
   StreamSubscription? cloneSubscription;
@@ -1304,6 +1281,15 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
   void initState() {
     super.initState();
     cloneConnection = dashboardConnection;
+    bloc = CloneJobsBloc(cloneConnection);
+    jobsSubscription = bloc.stream.listen((_) {
+      if (!mounted) return;
+      if (completionRevision != bloc.completionRevision) {
+        completionRevision = bloc.completionRevision;
+        if (bloc.clonedFolder != null) component.onCloned(bloc.clonedFolder!);
+      }
+      setState(() {});
+    });
     cloneGeneration = cloneConnection.generation;
     cloneCanRemove = canRemove;
     cloneConnection.operator.addListener(cloneSessionChanged);
@@ -1311,7 +1297,6 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       (_) => cloneSessionChanged(),
     );
     refreshJobs();
-    timer = Timer.periodic(const Duration(seconds: 3), (_) => refreshJobs());
   }
 
   void cloneSessionChanged() {
@@ -1320,15 +1305,16 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
         cloneCanRemove == canRemove)
       return;
     setState(() {
+      if (!canRemove || cloneGeneration != cloneConnection.generation) {
+        if (connectionId.isNotEmpty) url = '';
+        connections = [];
+        connectionId = '';
+        unavailableConnection = null;
+      }
       cloneCanRemove = canRemove;
       if (cloneGeneration != cloneConnection.generation) {
         cloneGeneration = cloneConnection.generation;
-        jobsRevision++;
-        jobs = [];
-        jobsLoaded = false;
-        completed = null;
-        busy = false;
-        removing = null;
+        completionRevision = 0;
         result = null;
       }
       if (!canRemove || removalGeneration != cloneGeneration)
@@ -1336,46 +1322,7 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
     });
   }
 
-  Future<void> refreshJobs() async {
-    final connection = dashboardConnection;
-    if (polling || removing != null || !connection.state.connected) return;
-    polling = true;
-    final epoch = connection.generation;
-    final revision = jobsRevision;
-    try {
-      final data = await connection.request('projects/jobs');
-      if (!mounted ||
-          epoch != connection.generation ||
-          revision != jobsRevision)
-        return;
-      final firstLoad = !jobsLoaded;
-      final previousStates = {for (final job in jobs) job['id']: job['state']};
-      jobsLoaded = true;
-      final next = List<Map<String, dynamic>>.from(data['jobs'] ?? []);
-      if (jsonEncode(next) != jsonEncode(jobs)) setState(() => jobs = next);
-      final latest = jobs.firstOrNull;
-      if (latest != null &&
-          ['failed', 'interrupted', 'completed'].contains(latest['state']) &&
-          result?.startsWith('Clone queued.') == true) {
-        setState(() => result = null);
-      }
-      if (latest?['state'] == 'completed' &&
-          latest?['id'] != completed &&
-          (firstLoad ||
-              ['queued', 'running'].contains(previousStates[latest?['id']]))) {
-        completed = latest!['id'] as String;
-        component.onCloned(latest['cwd'] as String);
-      }
-    } catch (exception) {
-      if (mounted && epoch == connection.generation && revision == jobsRevision)
-        setState(
-          () => result =
-              'Clone status unavailable; the server job may still be running. $exception',
-        );
-    } finally {
-      polling = false;
-    }
-  }
+  Future<void> refreshJobs() => bloc.refresh();
 
   Future<void> clone() async {
     if (unavailableConnection != null ||
@@ -1386,32 +1333,8 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       );
       return;
     }
-    final connection = dashboardConnection;
-    final epoch = connection.generation;
-    setState(() {
-      busy = true;
-      result = null;
-    });
-    try {
-      final data = await connection.request('projects/clone', {
-        'url': url.trim(),
-        'folder': folder.trim(),
-        if (connectionId.isNotEmpty) 'connection_id': connectionId,
-      });
-      if (!mounted || epoch != connection.generation) return;
-      setState(() {
-        jobs.insert(0, Map<String, dynamic>.from(data));
-        result =
-            'Clone queued. You can navigate away and return to see its status.';
-      });
-      await refreshJobs();
-    } catch (error) {
-      if (mounted && epoch == connection.generation)
-        setState(() => result = error.toString());
-    } finally {
-      if (mounted && epoch == connection.generation)
-        setState(() => busy = false);
-    }
+    setState(() => inputError = null);
+    await bloc.clone(url.trim(), folder.trim(), connectionId);
   }
 
   bool get canRemove =>
@@ -1444,52 +1367,35 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
         (deleteCloneFolder && !cloneFolderIdentityAvailable(job)) ||
         (deleteCloneFolder && removalConfirmation != job['folder']))
       return;
-    final connection = dashboardConnection;
-    final epoch = connection.generation;
-    final id = '${job['id']}';
-    jobsRevision++;
-    setState(() {
-      busy = true;
-      removing = id;
-      result = null;
+    final epoch = dashboardConnection.generation;
+    setState(() => inputError = null);
+    final data = await bloc.remove(
+      job,
+      deleteFolder: deleteCloneFolder,
+      confirmation: removalConfirmation,
+    );
+    if (!mounted ||
+        epoch != dashboardConnection.generation ||
+        !canRemove ||
+        data == null)
+      return;
+    setState(() => pendingRemoval = null);
+    if (data['folder_deleted'] == true)
+      component.onDeleted?.call('${job['cwd']}');
+    context.binding.addPostFrameCallback(() {
+      if (!mounted) return;
+      (web.document.querySelector(
+                '.clone-project .clone-remove:not(:disabled), .clone-project button[type=submit]',
+              )
+              as web.HTMLElement?)
+          ?.focus();
     });
-    try {
-      final data = await connection.request('projects/jobs/remove', {
-        'id': id,
-        'delete_folder': deleteCloneFolder,
-        if (deleteCloneFolder) 'confirm_folder': removalConfirmation,
-      });
-      if (!mounted || epoch != connection.generation || !canRemove) return;
-      setState(() {
-        jobs.removeWhere((item) => item['id'] == id);
-        pendingRemoval = null;
-        result = '${data['message']}';
-      });
-      if (data['folder_deleted'] == true)
-        component.onDeleted?.call('${job['cwd']}');
-      context.binding.addPostFrameCallback(() {
-        if (!mounted) return;
-        (web.document.querySelector(
-                  '.clone-project .clone-remove:not(:disabled), .clone-project button[type=submit]',
-                )
-                as web.HTMLElement?)
-            ?.focus();
-      });
-    } catch (error) {
-      if (mounted && epoch == connection.generation)
-        setState(() => result = '$error');
-    } finally {
-      if (mounted && epoch == connection.generation)
-        setState(() {
-          busy = false;
-          removing = null;
-        });
-    }
   }
 
   @override
   void dispose() {
-    timer?.cancel();
+    jobsSubscription?.cancel();
+    unawaited(bloc.close());
     cloneConnection.operator.removeListener(cloneSessionChanged);
     cloneSubscription?.cancel();
     super.dispose();

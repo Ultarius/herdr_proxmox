@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/workspace_blocs.dart';
 import 'operations_support.dart';
 import 'project_git_panel.dart';
 import 'project_analysis_card.dart';
@@ -11,43 +12,36 @@ class ProjectExplorerPage extends StatefulComponent {
 }
 
 class _ExplorerState extends OperationsState<ProjectExplorerPage> {
-  Map<String, dynamic>? directory, preview;
-  String path = '', filter = '';
+  late final ExplorerBloc feature;
+  StreamSubscription? featureSubscription;
+  Map<String, dynamic>? get directory => feature.state.value('directory');
+  Map<String, dynamic>? get preview => feature.state.value('preview');
+  String get path => feature.state.value<String>('path') ?? '';
+  String filter = '';
+  String? get error => feature.state.error;
+  bool get busy => feature.state.loading;
   bool showHidden = false, gitView = false;
-  int generation = 0;
   @override
   void initState() {
     super.initState();
+    feature = ExplorerBloc(connection);
+    featureSubscription = feature.stream.listen((_) {
+      if (mounted) setState(() {});
+    });
     gitView = component.initialPath.isNotEmpty;
     open(component.initialPath);
   }
 
+  @override
+  void dispose() {
+    featureSubscription?.cancel();
+    feature.dispose();
+    super.dispose();
+  }
+
   Future<void> open(String selected) async {
-    final epoch = connection.generation, current = ++generation;
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    try {
-      final result = Map<String, dynamic>.from(
-        await connection.request('projects/browse', {'path': selected}),
-      );
-      if (!valid(epoch) || current != generation) return;
-      setState(() {
-        if (result['kind'] == 'folder') {
-          directory = result;
-          path = selected;
-          preview = null;
-          filter = '';
-        } else {
-          preview = result;
-        }
-      });
-    } catch (e) {
-      if (valid(epoch) && current == generation) setState(() => error = '$e');
-    } finally {
-      if (valid(epoch) && current == generation) setState(() => busy = false);
-    }
+    if (await feature.open(selected) == true && mounted)
+      setState(() => filter = '');
   }
 
   String size(dynamic bytes) {
@@ -295,7 +289,7 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
                       ),
                       button(
                         'Close preview',
-                        () => setState(() => preview = null),
+                        feature.closePreview,
                         small: true,
                         variant: 'ghost',
                         iconName: 'x',

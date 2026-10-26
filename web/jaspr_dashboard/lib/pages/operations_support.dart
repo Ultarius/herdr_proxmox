@@ -3,6 +3,8 @@ import 'package:jaspr/client.dart';
 import 'package:jaspr/dom.dart' as dom;
 import '../services.dart';
 import '../ui.dart' show el;
+import 'package:herdr_dashboard_state/feature_bloc.dart';
+export 'package:herdr_dashboard_state/feature_bloc.dart';
 export 'dart:async';
 export 'package:jaspr/client.dart';
 export '../blocs.dart';
@@ -49,6 +51,37 @@ abstract class OperationsState<T extends StatefulComponent> extends State<T> {
         ),
     ],
   );
+}
+
+/// Projects Juice feedback into the existing DOM presentation helpers.
+/// Server values and operation ownership remain in the feature bloc.
+abstract class FeatureOperationsState<T extends StatefulComponent>
+    extends OperationsState<T> {
+  late final FeatureBloc feature;
+  StreamSubscription? _featureSubscription;
+  void bindFeature(
+    FeatureBloc bloc, {
+    String? Function(FeatureState)? errorFor,
+    void Function()? onChanged,
+  }) {
+    feature = bloc;
+    _featureSubscription = bloc.stream.listen((_) {
+      if (!mounted) return;
+      setState(() {
+        busy = bloc.state.busy || bloc.state.loading;
+        error = errorFor == null ? bloc.state.error : errorFor(bloc.state);
+        message = bloc.state.message;
+        onChanged?.call();
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _featureSubscription?.cancel();
+    unawaited(feature.close());
+    super.dispose();
+  }
 }
 
 Component paragraph(Object? value) => dom.p([Component.text('${value ?? ''}')]);

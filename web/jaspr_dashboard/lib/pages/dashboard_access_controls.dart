@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/settings_bloc.dart';
 import 'package:web/web.dart' as web;
 import 'operations_support.dart';
 import 'ops_ui.dart';
@@ -9,28 +10,18 @@ class DashboardAccessControls extends StatefulComponent {
   State<DashboardAccessControls> createState() => _AccessState();
 }
 
-class _AccessState extends OperationsState<DashboardAccessControls> {
-  String? mode, pending;
+class _AccessState extends FeatureOperationsState<DashboardAccessControls> {
+  late final DashboardAccessBloc bloc;
+  String? get mode => bloc.mode;
+  String? get pending => bloc.pending;
   @override
   void initState() {
     super.initState();
+    bindFeature(bloc = DashboardAccessBloc(connection));
     load();
   }
 
-  Future<void> load() async {
-    final epoch = connection.generation;
-    try {
-      final data = await connection.request('dashboard-access');
-      if (valid(epoch))
-        setState(() {
-          error = null;
-          mode = data['mode'] as String?;
-          pending = data['pending_mode'] as String?;
-        });
-    } catch (e) {
-      if (valid(epoch)) setState(() => error = '$e');
-    }
-  }
+  Future<void> load() => bloc.refresh();
 
   Future<void> change(String target) async {
     if (busy ||
@@ -75,19 +66,7 @@ class _AccessState extends OperationsState<DashboardAccessControls> {
       ]),
     );
     if (confirmed != true || !valid(epoch)) return;
-    await perform((epoch) async {
-      final data = await connection.request('dashboard-access', {
-        'mode': target,
-        'tunnel_ready': tested,
-      });
-      if (valid(epoch))
-        setState(() {
-          pending = data['pending_mode'] as String?;
-          message = target == 'ssh'
-              ? 'SSH-only access applies in 5 seconds. Continue through your tunnel at http://127.0.0.1:8787.'
-              : 'LAN access applies in 5 seconds. Reconnect using the LXC IP.';
-        });
-    });
+    await bloc.change(target, tunnelReady: tested);
   }
 
   @override

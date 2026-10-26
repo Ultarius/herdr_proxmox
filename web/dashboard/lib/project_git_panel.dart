@@ -1,7 +1,8 @@
+import 'package:herdr_dashboard_state/workspace_blocs.dart';
 import 'package:juice/juice.dart';
 import 'clipboard_copy.dart';
 import 'dashboard_bloc.dart';
-import 'integration.dart';
+import 'package:herdr_dashboard_state/integration.dart';
 import 'integration_board.dart';
 import 'request_id.dart';
 
@@ -14,52 +15,48 @@ class ProjectGitPanel extends StatefulWidget {
 }
 
 class _ProjectGitPanelState extends State<ProjectGitPanel> {
-  Map<String, dynamic>? data;
-  String? error;
-  bool loading = false;
-  Timer? timer;
-  bool showProgress = true;
-  String? notifying;
-  bool updatingBase = false;
+  late final GitBloc feature;
+  StreamSubscription? featureSubscription;
+  Map<String, dynamic>? get data => feature.state.value('data');
+  String? get error => feature.state.error;
+  bool get loading =>
+      feature.state.reading.contains('status') ||
+      feature.state.writing.contains('fetch');
+  bool get showProgress => feature.state.values['showProgress'] == true;
+  String? get notifying => feature.state.writing.contains('notify')
+      ? feature.state.value<String>('notifying')
+      : null;
+  bool reviewingBase = false;
+  bool get updatingBase =>
+      reviewingBase || feature.state.writing.contains('baseUpdate');
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
+  String? lastNotice;
   @override
   void initState() {
     super.initState();
+    feature = GitBloc(BlocScope.get<DashboardBloc>(), widget.path);
+    featureSubscription = feature.stream.listen((_) {
+      if (!mounted) return;
+      final notice = feature.state.message;
+      if (notice != null && notice != lastNotice)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(notice)));
+      lastNotice = notice;
+      setState(() {});
+    });
     load();
-    timer = Timer.periodic(
-      const Duration(seconds: 10),
-      (_) => load(quiet: true),
-    );
   }
 
   @override
   void dispose() {
-    timer?.cancel();
+    featureSubscription?.cancel();
+    feature.dispose();
     super.dispose();
   }
 
-  Future<void> load({bool quiet = false, bool fetch = false}) async {
-    if (loading) return;
-    final epoch = connection.generation;
-    setState(() {
-      loading = true;
-      showProgress = !quiet;
-      if (!quiet) error = null;
-    });
-    try {
-      final result = await connection.request('projects/git', {
-        'path': widget.path,
-        'action': fetch ? 'fetch' : 'status',
-      });
-      if (mounted && epoch == connection.generation)
-        setState(() => data = Map<String, dynamic>.from(result));
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = e.toString());
-    } finally {
-      if (mounted) setState(() => loading = false);
-    }
-  }
+  Future<void> load({bool quiet = false, bool fetch = false}) =>
+      feature.load(quiet: quiet, fetch: fetch);
 
   Future<void> updateBase() async {
     final initial = data?['base_update'];
@@ -111,18 +108,15 @@ class _ProjectGitPanelState extends State<ProjectGitPanel> {
     if (selected != true || !mounted) return;
     final epoch = connection.generation;
     setState(() {
-      updatingBase = true;
-      error = null;
+      reviewingBase = true;
     });
     try {
-      final inspected = await connection.request('projects/git', {
-        'path': initial['path'],
-        'base': selectedBase,
-      });
-      if (!mounted || epoch != connection.generation) return;
-      final plan = inspected['base_update'];
-      if (plan is! Map || plan['branch'] != selectedBranch)
-        throw Exception('Destination branch changed. Refresh before updating.');
+      final plan = await feature.inspectBase(
+        '${initial['path']}',
+        selectedBase,
+        selectedBranch,
+      );
+      if (plan == null || !(mounted && epoch == connection.generation)) return;
       final confirmed = await showDialog<bool>(
         context: context,
         builder: (context) => AlertDialog(
@@ -145,38 +139,21 @@ class _ProjectGitPanelState extends State<ProjectGitPanel> {
       if (confirmed != true || !mounted || epoch != connection.generation)
         return;
       final requestId = newRequestId();
-      final result = await connection.request('projects/git', {
-        ...Map<String, dynamic>.from(plan),
-        'action': 'update_base',
-        'request_id': requestId,
-      });
-      if (!mounted || epoch != connection.generation) return;
-      if (result['state'] != 'complete')
-        throw Exception(result['reason'] ?? 'Base update requires review.');
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Base checkout updated. Agent worktrees continue independently.',
-          ),
-        ),
-      );
-      await load();
+      await feature.updateBase(Map<String, dynamic>.from(plan), requestId);
     } catch (e) {
       if (mounted && epoch == connection.generation)
-        setState(() => error = e.toString());
+        feature.reportError('git', e);
     } finally {
       if (mounted && epoch == connection.generation)
-        setState(() => updatingBase = false);
+        setState(() => reviewingBase = false);
     }
   }
 
   Future<void> diff(Map tree, Map file) async {
     final epoch = connection.generation;
     try {
-      final result = await connection.request('projects/git', {
-        'path': tree['path'],
-        'file': file['path'],
-      });
+      final result = await feature.diff(tree, file);
+      if (result == null) return;
       if (!mounted || epoch != connection.generation) return;
       await showDialog<void>(
         context: context,
@@ -210,7 +187,7 @@ class _ProjectGitPanelState extends State<ProjectGitPanel> {
         ),
       );
     } catch (e) {
-      if (mounted) setState(() => error = e.toString());
+      if (mounted) feature.reportError('git', e);
     }
   }
 
@@ -231,27 +208,8 @@ class _ProjectGitPanelState extends State<ProjectGitPanel> {
         0,
   );
 
-  Future<void> notify(Map tree, Map agent) async {
-    setState(() {
-      notifying = '${agent['profile_id']}';
-      error = null;
-    });
-    try {
-      await requestIntegration(connection, noticeFor(tree, agent));
-      if (mounted)
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Merge request sent. Follow progress in the organization chat.',
-            ),
-          ),
-        );
-    } catch (e) {
-      if (mounted) setState(() => error = e.toString());
-    } finally {
-      if (mounted) setState(() => notifying = null);
-    }
-  }
+  Future<void> notify(Map tree, Map agent) async =>
+      feature.notify(noticeFor(tree, agent));
 
   Widget failedCard(Map tree) => Card(
     child: Padding(

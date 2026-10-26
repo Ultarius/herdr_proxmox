@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/workspace_blocs.dart';
 import 'dart:math';
 import 'operations_support.dart';
 import 'ops_ui.dart';
@@ -10,72 +11,39 @@ class IntegrationBoard extends StatefulComponent {
 }
 
 class _BoardState extends OperationsState<IntegrationBoard> {
-  Map<String, dynamic> data = {}, validation = {};
-  String? actionFailure, checked;
-  bool refreshing = false;
-  Timer? timer;
+  late final IntegrationBloc feature;
+  StreamSubscription? featureSubscription;
+  Map<String, dynamic> get data =>
+      feature.state.value<Map<String, dynamic>>('data') ?? const {};
+  Map<String, dynamic> get validation =>
+      feature.state.value<Map<String, dynamic>>('validation') ?? const {};
+  String? get error =>
+      feature.state.errors['refresh'] ?? feature.state.errors['log'];
+  String? get actionFailure => feature.state.errors['action'];
+  bool get busy => feature.state.busy || feature.state.reading.contains('log');
+  bool get refreshing => feature.state.reading.contains('refresh');
+  String? get checked => feature.state.value<String>('checked');
+  String? get message => feature.state.message;
   @override
   void initState() {
     super.initState();
+    feature = IntegrationBloc(connection);
+    featureSubscription = feature.stream.listen((_) {
+      if (mounted) setState(() {});
+    });
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 15), (_) => refresh());
   }
 
   @override
   void dispose() {
-    timer?.cancel();
+    featureSubscription?.cancel();
+    feature.dispose();
     super.dispose();
   }
 
-  Future<void> refresh() async {
-    if (busy || refreshing || !connection.state.connected) return;
-    final epoch = connection.generation;
-    refreshing = true;
-    try {
-      final result = await connection.request('integration');
-      Map<String, dynamic> validationData;
-      try {
-        validationData = Map<String, dynamic>.from(
-          await connection.request('validation'),
-        );
-      } catch (e) {
-        validationData = {'error': '$e'};
-      }
-      if (valid(epoch))
-        setState(() {
-          data = Map<String, dynamic>.from(result['coordination'] ?? {});
-          validation = validationData;
-          checked = result['checked'] as String?;
-          error = null;
-        });
-    } catch (e) {
-      if (valid(epoch)) setState(() => error = '$e');
-    } finally {
-      if (valid(epoch)) setState(() => refreshing = false);
-    }
-  }
-
-  Future<void> action(String endpoint, Map<String, dynamic> body) async {
-    if (busy || !connection.state.connected) return;
-    final epoch = connection.generation;
-    setState(() {
-      busy = true;
-      error = null;
-      actionFailure = null;
-    });
-    try {
-      await connection.request(endpoint, body);
-      if (!valid(epoch)) return;
-      await connection.request('organizations/directory');
-    } catch (e) {
-      if (valid(epoch)) setState(() => actionFailure = '$e');
-    } finally {
-      if (valid(epoch)) {
-        setState(() => busy = false);
-        await refresh();
-      }
-    }
-  }
+  Future<void> refresh() => feature.refresh();
+  Future<void> action(String endpoint, Map<String, dynamic> body) async =>
+      feature.action(endpoint, body);
 
   String profileName(dynamic id) =>
       '${(connection.organizationDirectory.value['profiles'] as List? ?? []).where((p) => p['id'] == id).firstOrNull?['name'] ?? id}';
@@ -117,15 +85,16 @@ class _BoardState extends OperationsState<IntegrationBoard> {
   }
 
   Future<void> downloadLog(Map run) async {
-    await perform((epoch) async {
-      final content = await connection.text(
-        'validation/log?id=${run['run_id']}',
-      );
-      if (!valid(epoch)) return;
+    final epoch = connection.generation;
+    final content = await feature.log(run);
+    if (content == null || !(valid(epoch))) return;
+    try {
       await downloadText(content, 'validation-${run['run_id']}.log');
       if (valid(epoch))
-        setState(() => message = 'Validation log download started.');
-    });
+        await feature.patch({}, message: 'Validation log download started.');
+    } catch (error) {
+      if (valid(epoch)) await feature.reportError('log', error);
+    }
   }
 
   Future<void> recoverWorker(Map event, String mode) async {
@@ -164,8 +133,9 @@ class _BoardState extends OperationsState<IntegrationBoard> {
       if (fresh) 'inspected': true,
     });
     if (valid(epoch) && actionFailure == null)
-      setState(
-        () => message = fresh
+      await feature.patch(
+        {},
+        message: fresh
             ? 'Fresh summary requested. The gateway waits for the coordinator to be ready.'
             : 'Saved coordinator report recovered.',
       );
@@ -645,7 +615,7 @@ class _BoardState extends OperationsState<IntegrationBoard> {
                       recoveryCommand(event),
                       filename: 'recovery-command.txt',
                     );
-                    if (mounted) setState(() => message = result);
+                    if (mounted) await feature.patch({}, message: result);
                   },
                   small: true,
                   iconName: 'copy',

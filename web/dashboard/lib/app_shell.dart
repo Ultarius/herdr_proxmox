@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/shell_bloc.dart';
 import 'package:juice/juice.dart';
 import 'clipboard_copy.dart';
 import 'dashboard_bloc.dart';
@@ -24,23 +25,26 @@ class AppShell extends StatefulWidget {
 class _AppShellState extends State<AppShell> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
   StreamSubscription? subscription;
-  bool loading = false;
-  bool polling = false;
-  int noticeGeneration = -1;
-  List<IntegrationNotice> notices = const [];
+  late final ShellBloc shell;
+  StreamSubscription? shellSubscription;
+  int observedNoticeRevision = -1;
+  List<IntegrationNotice> get notices => shell.notices;
   final Set<String> seen = {};
-  final Set<String> asking = {};
-  String? noticesChecked;
-  Timer? noticeTimer;
+  Set<String> get asking => shell.asking;
+  String? get noticesChecked => shell.checked;
   int sessionGeneration = -1;
 
   @override
   void initState() {
     super.initState();
+    shell = ShellBloc(connection);
+    shellSubscription = shell.stream.listen((_) => shellChanged());
     sessionGeneration = connection.generation;
     subscription = connection.stream.listen((_) {
       if (sessionGeneration != connection.generation) {
         sessionGeneration = connection.generation;
+        seen.clear();
+        observedNoticeRevision = -1;
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted) return;
           // Dialogs live above the page subtree in the root Navigator. Remove
@@ -52,36 +56,13 @@ class _AppShellState extends State<AppShell> {
         });
       }
       if (mounted) setState(() {});
-      load();
-      if (noticeGeneration != connection.generation)
-        pollNotices(announce: false);
     });
-    load();
-    pollNotices(announce: false);
-    noticeTimer = Timer.periodic(
-      const Duration(seconds: 15),
-      (_) => pollNotices(),
-    );
-  }
-
-  Future<void> load() async {
-    if (loading ||
-        !connection.state.connected ||
-        connection.organizationDirectory.value['loaded'] == true)
-      return;
-    loading = true;
-    try {
-      await connection.request('organizations/directory');
-    } catch (_) {
-      /* The active page reports connection errors. */
-    } finally {
-      loading = false;
-    }
   }
 
   @override
   void dispose() {
-    noticeTimer?.cancel();
+    shellSubscription?.cancel();
+    shell.dispose();
     subscription?.cancel();
     super.dispose();
   }
@@ -93,66 +74,27 @@ class _AppShellState extends State<AppShell> {
     widget.coordinator.navigate(route);
   }
 
-  /// Integration notices are polled here rather than on one page so drift is
-  /// visible wherever the operator is. Nothing is merged automatically and a
-  /// busy agent is left alone; a notice only asks for attention.
-  Future<void> pollNotices({bool announce = true}) async {
-    if (!connection.state.connected) {
-      if (notices.isNotEmpty || seen.isNotEmpty)
-        setState(() {
-          notices = const [];
-          seen.clear();
-          noticesChecked = null;
-        });
-      return;
+  void shellChanged() {
+    if (!mounted) return;
+    final fresh = <IntegrationNotice>[];
+    if (observedNoticeRevision != shell.noticeRevision) {
+      observedNoticeRevision = shell.noticeRevision;
+      seen.removeWhere((key) => !notices.any((notice) => notice.key == key));
+      fresh.addAll(notices.where((notice) => seen.add(notice.key)));
     }
-    if (noticeGeneration != connection.generation) {
-      noticeGeneration = connection.generation;
-      setState(() {
-        notices = const [];
-        seen.clear();
-        noticesChecked = null;
-      });
-    }
-    if (polling) return;
-    final epoch = connection.generation;
-    polling = true;
-    try {
-      final result = await connection.request('integration');
-      if (!mounted ||
-          epoch != connection.generation ||
-          !connection.state.connected)
-        return;
-      final notices = [
-        for (final notice in (result['alerts'] as List? ?? const []))
-          if (notice is Map<String, dynamic>)
-            IntegrationNotice.fromJson(notice),
-      ];
-      seen.removeWhere((key) => !notices.any((n) => n.key == key));
-      final fresh = notices.where((n) => seen.add(n.key)).toList();
-      if (mounted)
-        setState(() {
-          this.notices = notices;
-          noticesChecked = result['checked'] as String?;
-        });
-      if (announce && fresh.isNotEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              fresh.length == 1
-                  ? 'Integration notice: ${fresh.first.summary}'
-                  : '${fresh.length} integration notices need review',
-            ),
-            action: SnackBarAction(label: 'Review', onPressed: showNotices),
-            duration: const Duration(seconds: 8),
+    setState(() {});
+    if (shell.announce && fresh.isNotEmpty)
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            fresh.length == 1
+                ? 'Integration notice: ${fresh.first.summary}'
+                : '${fresh.length} integration notices need review',
           ),
-        );
-      }
-    } catch (_) {
-      // Notices are advisory; a failure must not disturb the current page.
-    } finally {
-      polling = false;
-    }
+          action: SnackBarAction(label: 'Review', onPressed: showNotices),
+          duration: const Duration(seconds: 8),
+        ),
+      );
   }
 
   Future<void> showNotices() async {
@@ -234,7 +176,10 @@ class _AppShellState extends State<AppShell> {
               runSpacing: 8,
               children: [
                 OutlinedButton.icon(
-                  onPressed: canAsk && !asking.contains(notice.profileId)
+                  onPressed:
+                      canAsk &&
+                          !shell.state.busy &&
+                          !asking.contains(notice.profileId)
                       ? () => askIntegration(notice)
                       : null,
                   icon: const Icon(Icons.notifications_outlined, size: 18),
@@ -278,11 +223,11 @@ class _AppShellState extends State<AppShell> {
   }
 
   Future<void> askIntegration(IntegrationNotice notice) async {
-    if (asking.contains(notice.profileId)) return;
-    setState(() => asking.add(notice.profileId));
+    if (shell.state.busy) return;
+    final epoch = connection.generation;
     try {
-      await requestIntegration(connection, notice);
-      if (!mounted) return;
+      final done = await shell.ask(notice);
+      if (!done || !mounted || epoch != connection.generation) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
@@ -290,13 +235,11 @@ class _AppShellState extends State<AppShell> {
           ),
         ),
       );
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Integration request failed: $e')));
-    } finally {
-      if (mounted) setState(() => asking.remove(notice.profileId));
+    } catch (error) {
+      if (!mounted || epoch != connection.generation) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Integration request failed: $error')),
+      );
     }
   }
 

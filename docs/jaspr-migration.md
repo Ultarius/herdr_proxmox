@@ -9,8 +9,11 @@ suite. The obsolete iframe wrapper has been removed.
 
 ## Business behavior and framework boundary
 
-`web/dashboard_state/lib` contains the shared dashboard and organization blocs,
-integration helpers and secure request-ID implementation. Existing Flutter bloc
+`web/dashboard_state/lib` contains the shared page and management-panel blocs,
+integration helpers and secure request-ID implementation. The complete
+[state ownership map](dashboard-juice-ownership.md) lists the feature used by
+each route and embedded workflow. Both renderers invoke feature events rather
+than calling the dashboard transport directly. Existing Flutter bloc
 imports forward to the shared package. The Juice 2.0 upgrade updates use-case
 registration and runtime contracts as described below; the shared package remains
 the boundary between application behavior and either UI framework.

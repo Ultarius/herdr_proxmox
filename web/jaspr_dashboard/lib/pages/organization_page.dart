@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/organization_tools_bloc.dart';
 import 'org_form_values.dart';
 import 'dart:async';
 import 'dart:convert';
@@ -24,7 +25,6 @@ class _OrganizationPageState extends State<OrganizationPage> {
   DashboardBloc get connection => dashboardConnection;
   late OrganizationBloc bloc;
   final subscriptions = <StreamSubscription>[];
-  Timer? timer;
   int generation = -1;
   late String view = component.initialView == 'collaboration'
       ? 'collaborate'
@@ -33,21 +33,22 @@ class _OrganizationPageState extends State<OrganizationPage> {
   String? readinessError;
   bool cleaningSessions = false, transferring = false;
   final sessionRequests = <String, String>{};
-  ModelCatalog catalog = const ModelCatalog({});
+  late final OrganizationToolsBloc tools;
+  StreamSubscription? toolsSubscription;
+  ModelCatalog get catalog => ModelCatalog.fromJson(tools.catalog);
   String? get selected => connection.selectedOrganization.value;
   set selected(String? value) => connection.selectedOrganization.value = value;
   void selectionChanged() {
     if (mounted) setState(() {});
   }
 
-  void notificationRefresh() {
-    if (connection.state.connected && bloc.pending == null)
-      bloc.send(OrganizationCommand('refresh'));
-  }
-
   @override
   void initState() {
     super.initState();
+    tools = OrganizationToolsBloc(connection);
+    toolsSubscription = tools.stream.listen((_) {
+      if (mounted) setState(() {});
+    });
     bind();
     subscriptions.add(
       connection.stream.listen((_) {
@@ -58,17 +59,11 @@ class _OrganizationPageState extends State<OrganizationPage> {
           sessionRequests.clear();
           error = null;
           readinessError = null;
-          catalog = const ModelCatalog({});
         }
         setState(() {});
       }),
     );
     connection.selectedOrganization.addListener(selectionChanged);
-    connection.notificationRevision.addListener(notificationRefresh);
-    timer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (connection.state.connected && bloc.pending == null)
-        bloc.send(OrganizationCommand('refresh'));
-    });
     loadCatalog();
   }
 
@@ -78,6 +73,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
     if (generation >= 0) bloc.dispose();
     generation = connection.generation;
     bloc = OrganizationBloc(connection);
+    bloc.startPolling();
     orgSubscription = bloc.stream.listen((_) {
       if (mounted) {
         final valid = bloc.state.organizations.where(
@@ -93,24 +89,21 @@ class _OrganizationPageState extends State<OrganizationPage> {
 
   @override
   void dispose() {
-    timer?.cancel();
+    toolsSubscription?.cancel();
+    tools.dispose();
     orgSubscription?.cancel();
     for (final s in subscriptions) s.cancel();
     connection.selectedOrganization.removeListener(selectionChanged);
-    connection.notificationRevision.removeListener(notificationRefresh);
     bloc.dispose();
     super.dispose();
   }
 
   Future<void> loadCatalog() async {
-    final epoch = connection.generation;
     try {
-      final result = await connection.request('models');
-      if (mounted && epoch == connection.generation)
-        setState(
-          () => catalog = ModelCatalog.fromJson(result is Json ? result : null),
-        );
-    } catch (_) {}
+      await tools.loadCatalog();
+    } catch (_) {
+      /* Manual model entry remains available. */
+    }
   }
 
   Future<void> submit(String action, Json body) async {
@@ -126,15 +119,13 @@ class _OrganizationPageState extends State<OrganizationPage> {
     String? projectFolderError;
     if (org == null) {
       try {
-        templates = Json.from(
-          await connection.request('organizations/templates'),
-        );
+        templates = Json.from(await tools.request('organizations/templates'));
       } catch (e) {
         templates = {'error': 'Role presets could not load: $e'};
       }
       try {
         projectFolders = projectDirectoryChoices(
-          Json.from(await connection.request('projects/browse', {'path': ''})),
+          Json.from(await tools.request('projects/browse', {'path': ''})),
         );
       } catch (e) {
         projectFolderError = 'Project folders could not load: $e';
@@ -148,7 +139,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
         if (epoch != connection.generation || !connection.state.connected)
           throw StateError('Connection changed. Reopen the organization form.');
         final result = Json.from(
-          await connection.request('organizations/templates', body),
+          await tools.request('organizations/templates', body),
         );
         if (epoch != connection.generation)
           throw StateError('Connection changed. Reopen the organization form.');
@@ -158,7 +149,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
         if (epoch != connection.generation || !connection.state.connected)
           throw StateError('Connection changed. Reopen the organization form.');
         final result = Json.from(
-          await connection.request('organizations/templates/library', body),
+          await tools.request('organizations/templates/library', body),
         );
         if (epoch != connection.generation)
           throw StateError('Connection changed. Reopen the organization form.');
@@ -184,7 +175,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
     // A failed lookup is a request error, not evidence of missing CLI accounts.
     var runtimes = const <Json>[];
     try {
-      final status = await connection.request('cli-setup');
+      final status = await tools.request('cli-setup');
       runtimes = [
         for (final cli in (status['clis'] as List? ?? []))
           if (cli is Json) cli,
@@ -346,7 +337,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
     final selection = 'session:${job['id']}:$mode';
     final request = sessionRequests.putIfAbsent(selection, requestId);
     try {
-      await connection.request('organizations/session', {
+      await tools.request('organizations/session', {
         'organization_id': job['organization_id'],
         'job_id': job['id'],
         'mode': mode,
@@ -447,12 +438,14 @@ class _OrganizationPageState extends State<OrganizationPage> {
       return;
     setState(() => cleaningSessions = true);
     try {
-      final result = await OrganizationCommand('session', {
-        'organization_id': organizationId,
-        'mode': 'cleanup',
-        'job_ids': chosen.toList(),
-        'inspected': true,
-      }).execute(connection);
+      final result = await tools.execute(
+        OrganizationCommand('session', {
+          'organization_id': organizationId,
+          'mode': 'cleanup',
+          'job_ids': chosen.toList(),
+          'inspected': true,
+        }),
+      );
       if (!mounted || epoch != connection.generation) return;
       await showDialog<void>(
         'Session cleanup results',
@@ -491,7 +484,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
     bool current() =>
         mounted && epoch == connection.generation && organizationId == selected;
     try {
-      final response = await connection.request('organizations/session', {
+      final response = await tools.request('organizations/session', {
         'mode': 'archives',
         'organization_id': organizationId,
       });
@@ -546,7 +539,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
         ]),
       );
       if (chosen == null || !current()) return;
-      final data = await connection.request('organizations/session', {
+      final data = await tools.request('organizations/session', {
         'mode': 'view_archive',
         'organization_id': organizationId,
         'archive_id': chosen['id'],
@@ -623,7 +616,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
     });
     try {
       if (!importing) {
-        final data = await connection.request('organizations/export');
+        final data = await tools.request('organizations/export');
         if (!mounted || epoch != connection.generation) return;
         await downloadText(
           const JsonEncoder.withIndent('  ').convert(data),
@@ -647,7 +640,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
         ))
           return;
         if (!mounted || epoch != connection.generation) return;
-        final imported = await connection.request('organizations/import', data);
+        final imported = await tools.request('organizations/import', data);
         final counts = imported['imported'] as Map? ?? {};
         if (!mounted || epoch != connection.generation) return;
         await bloc.send(OrganizationCommand('refresh'));

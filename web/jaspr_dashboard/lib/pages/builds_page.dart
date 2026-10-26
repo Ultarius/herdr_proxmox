@@ -1,4 +1,4 @@
-import 'dart:convert';
+import 'package:herdr_dashboard_state/workspace_blocs.dart';
 import 'package:herdr_dashboard_state/installation_status.dart';
 import 'build_timeline.dart';
 import 'operations_support.dart';
@@ -11,89 +11,49 @@ class BuildsPage extends StatefulComponent {
 }
 
 class _BuildsState extends OperationsState<BuildsPage> {
-  List<Map<String, dynamic>> runs = [];
-  Map<String, dynamic>? identity, deployment;
-  Map<String, dynamic>? buildService;
-  String executor = 'gateway';
-  int queued = 0;
-  bool refreshing = false;
-  bool loaded = false;
-  Map<String, dynamic>? performance;
-  int performanceEpoch = -1;
-  bool loadingPerformance = false;
-  String? performanceError;
-  String? downloading;
-  Timer? timer;
+  late final BuildsBloc feature;
+  StreamSubscription? featureSubscription;
+  List<Map<String, dynamic>> get runs =>
+      List<Map<String, dynamic>>.from(feature.state.values['runs']);
+  Map<String, dynamic>? get identity => feature.state.value('identity');
+  Map<String, dynamic>? get deployment => feature.state.value('deployment');
+  Map<String, dynamic>? get buildService => feature.state.value('buildService');
+  String get executor => feature.state.value<String>('executor') ?? 'gateway';
+  int get queued => feature.state.value<int>('queued') ?? 0;
+  String? get downloading => feature.state.reading.contains('download')
+      ? feature.state.value<String>('downloadId')
+      : null;
+  bool get busy => feature.state.busy;
+  String? get error => feature.state.error;
+  String? get message => feature.state.message;
+  bool get refreshing => feature.state.reading.contains('refresh');
+  bool get loaded => feature.state.values['loaded'] == true;
+  Map<String, dynamic>? get performance => feature.state.value('performance');
+  int get performanceEpoch =>
+      feature.state.value<int>('performanceEpoch') ?? -1;
+  bool get loadingPerformance => feature.state.reading.contains('performance');
+  String? get performanceError => feature.state.errors['performance'];
   @override
   void initState() {
     super.initState();
+    feature = BuildsBloc(connection);
+    featureSubscription = feature.stream.listen((_) {
+      if (!mounted) return;
+      setState(() {});
+    });
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 5), (_) => refresh());
   }
 
   @override
   void dispose() {
-    timer?.cancel();
+    featureSubscription?.cancel();
+    feature.dispose();
     super.dispose();
   }
 
-  Future<void> refresh() async {
-    if (refreshing || !connection.state.connected) return;
-    setState(() => refreshing = true);
-    final epoch = connection.generation;
-    try {
-      final validation = await connection.request('validation');
-      final deployed = await connection.request('build');
-      Map<String, dynamic>? installer;
-      try {
-        installer = Map<String, dynamic>.from(
-          await connection.request('build-service'),
-        );
-      } catch (_) {} // Older gateways retain the root-command fallback.
-      Map<String, dynamic>? status;
-      try {
-        status = Map<String, dynamic>.from(await connection.request('updates'));
-      } catch (_) {}
-      if (valid(epoch))
-        setState(() {
-          runs = List<Map<String, dynamic>>.from(validation['runs'] ?? []);
-          executor = '${validation['executor'] ?? 'gateway'}';
-          queued = validation['queued'] as int? ?? 0;
-          identity = Map<String, dynamic>.from(deployed);
-          deployment = status;
-          buildService = installer;
-          loaded = true;
-          error = null;
-        });
-    } catch (e) {
-      if (valid(epoch)) setState(() => error = '$e');
-    } finally {
-      if (mounted) setState(() => refreshing = false);
-    }
-  }
-
+  Future<void> refresh() => feature.refresh();
   bool get deploying => ['queued', 'running'].contains(deployment?['state']);
-
-  Future<void> loadPerformance() async {
-    if (!admin || loadingPerformance || !connection.state.connected) return;
-    final epoch = connection.generation;
-    setState(() {
-      loadingPerformance = true;
-      performanceError = null;
-    });
-    try {
-      final result = await connection.request('diagnostics/performance');
-      if (valid(epoch))
-        setState(() {
-          performance = Map<String, dynamic>.from(result);
-          performanceEpoch = epoch;
-        });
-    } catch (e) {
-      if (valid(epoch)) setState(() => performanceError = '$e');
-    } finally {
-      if (mounted) setState(() => loadingPerformance = false);
-    }
-  }
+  Future<void> loadPerformance() => feature.loadPerformance();
 
   Component performanceCard() {
     final data = performanceEpoch == connection.generation ? performance : null;
@@ -137,37 +97,7 @@ class _BuildsState extends OperationsState<BuildsPage> {
   bool get installingBuildService =>
       ['queued', 'running'].contains(buildService?['state']);
 
-  Future<void> installBuildService() async {
-    if (!admin ||
-        busy ||
-        installingBuildService ||
-        buildService?['supported'] != true)
-      return;
-    final epoch = connection.generation;
-    setState(() {
-      busy = true;
-      error = null;
-      message = null;
-    });
-    try {
-      final result = await connection.request(
-        'build-service/install',
-        const {},
-      );
-      if (valid(epoch)) {
-        setState(() {
-          buildService = {'supported': true, ...result};
-          message =
-              'Build-service installation queued. The gateway will restart; automation settings remain unchanged.';
-        });
-      }
-    } catch (e) {
-      if (valid(epoch)) setState(() => error = '$e');
-    } finally {
-      // Installation restarts the gateway; a lost response must release busy.
-      if (mounted) setState(() => busy = false);
-    }
-  }
+  Future<void> installBuildService() async => feature.installService();
 
   Future<void> promote(Map<String, dynamic> run) async {
     if (!admin ||
@@ -191,15 +121,7 @@ class _BuildsState extends OperationsState<BuildsPage> {
         ) ||
         !valid(epoch))
       return;
-    await perform((epoch) async {
-      await connection.request('updates/promote', {'run_id': run['id']});
-      if (valid(epoch))
-        setState(
-          () => message =
-              'Deployment queued. The gateway restarts when deployment finishes.',
-        );
-      await refresh();
-    });
+    await feature.promote(run);
   }
 
   Future<void> rollbackDeployment() async {
@@ -216,11 +138,7 @@ class _BuildsState extends OperationsState<BuildsPage> {
         ) ||
         !valid(epoch))
       return;
-    await perform((epoch) async {
-      await connection.request('updates/rollback', const {});
-      if (valid(epoch)) setState(() => message = 'Rollback queued.');
-      await refresh();
-    });
+    await feature.rollback();
   }
 
   Future<void> repairProvenance() async {
@@ -238,66 +156,23 @@ class _BuildsState extends OperationsState<BuildsPage> {
         ) ||
         !valid(epoch))
       return;
-    await perform((epoch) async {
-      await connection.request('updates/provenance', const {});
-      if (valid(epoch))
-        setState(() => message = 'Source identity resolution queued.');
-      await refresh();
-    });
+    await feature.repairProvenance();
   }
 
   Future<void> download(Map<String, dynamic> run, String kind) async {
-    if (downloading != null) return;
     final epoch = connection.generation;
-    setState(() {
-      downloading = '${run['id']}:$kind';
-      error = null;
-    });
+    final file = await feature.download(run, kind);
+    if (file == null || !(valid(epoch))) return;
     try {
-      if (kind == 'artifact' || kind == 'deployment') {
-        final content = await connection.bytes(
-          'validation/artifact?id=${run['id']}&kind=${kind == 'deployment' ? 'deployment' : 'static'}',
-        );
-        final manifest =
-            run[kind == 'deployment' ? 'deployment_package' : 'artifact']
-                as Map;
-        final expected = manifest['bytes'];
-        if (expected is! int || expected < 0 || content.length != expected)
-          throw Exception(
-            'Downloaded size ${content.length} does not match the manifest ($expected bytes).',
-          );
-        if (!valid(epoch)) return;
-        await downloadBytes(content, '$kind-${run['id']}.tar.gz');
-        if (valid(epoch))
-          setState(
-            () => message =
-                '$kind package fetched and handed to the browser · ${content.length} bytes verified.',
-          );
-      } else if (kind == 'manifest') {
-        final content = const JsonEncoder.withIndent(
-          '  ',
-        ).convert(run['artifact']);
-        if (!valid(epoch)) return;
-        await downloadText(content, 'build-${run['id']}.json');
-        if (valid(epoch))
-          setState(
-            () => message =
-                'Manifest fetched · ${utf8.encode(content).length} bytes.',
-          );
+      if (file.bytes != null) {
+        await downloadBytes(file.bytes!, file.filename);
       } else {
-        final content = await connection.text('validation/log?id=${run['id']}');
-        if (!valid(epoch)) return;
-        await downloadText(content, 'validation-${run['id']}.log');
-        if (valid(epoch))
-          setState(
-            () =>
-                message = 'Log fetched · ${utf8.encode(content).length} bytes.',
-          );
+        await downloadText(file.text!, file.filename);
       }
-    } catch (e) {
-      if (valid(epoch)) setState(() => error = 'Download failed: $e');
-    } finally {
-      if (valid(epoch)) setState(() => downloading = null);
+      if (valid(epoch)) await feature.patch({}, message: file.message);
+    } catch (error) {
+      if (valid(epoch))
+        await feature.reportError('download', 'Download failed: $error');
     }
   }
 

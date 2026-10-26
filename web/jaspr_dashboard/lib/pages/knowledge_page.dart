@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/knowledge_bloc.dart';
 import 'native_task_ui.dart';
 import 'package:jaspr/dom.dart' as dom;
 import 'package:web/web.dart' as web;
@@ -29,111 +30,55 @@ class KnowledgePage extends StatefulComponent {
 class _KnowledgePageState extends State<KnowledgePage> {
   DashboardBloc get connection => dashboardConnection;
   final search = TextEditingController();
-  List<Map<String, dynamic>> organizations = [], records = [];
-  List<String> repositories = [];
+  late final KnowledgeBloc bloc;
+  StreamSubscription? featureSubscription;
+  List<Map<String, dynamic>> get organizations => bloc.state.organizations;
+  List<Map<String, dynamic>> get records => bloc.state.records;
+  List<String> get repositories => bloc.state.repositories;
+  int? get before => bloc.state.before;
+  String? get error => bloc.state.error;
+  bool get loading => bloc.state.loading;
+  bool get mutating => bloc.state.mutating;
+  bool get initializing => bloc.state.initializing;
+  bool get busy => bloc.state.busy;
   String org = '', repository = '', kind = '', status = '';
-  String? error;
-  int? before;
-  int request = 0;
-  bool loading = false, mutating = false, initializing = true;
-  // Filter reads may finish while a write still owns the mutation guard.
-  bool get busy => loading || mutating;
   Timer? debounce;
   bool get admin => connection.operator.value['role'] == 'admin';
 
   @override
   void initState() {
     super.initState();
-    initialize();
+    bloc = KnowledgeBloc(connection);
+    featureSubscription = bloc.stream.listen((_) {
+      if (!mounted) return;
+      if (org.isEmpty || !organizations.any((item) => item['id'] == org))
+        org = bloc.state.organization;
+      setState(() {});
+    });
+    bloc.initialize(component.organizationId);
   }
 
   @override
   void dispose() {
-    request++;
     debounce?.cancel();
+    featureSubscription?.cancel();
+    bloc.dispose();
     search.dispose();
     super.dispose();
   }
 
-  Future<void> initialize() async {
-    try {
-      final directory = await connection.request('organizations/directory');
-      if (!mounted) return;
-      organizations = List<Map<String, dynamic>>.from(
-        directory['organizations'] ?? [],
-      );
-      org = organizations.any((o) => o['id'] == component.organizationId)
-          ? component.organizationId
-          : '${organizations.firstOrNull?['id'] ?? ''}';
-      if (org.isEmpty) {
-        setState(() {});
-        return;
-      }
-      await load();
-    } catch (e) {
-      if (mounted) setState(() => error = '$e');
-    } finally {
-      if (mounted) setState(() => initializing = false);
-    }
-  }
+  Future<void> load({bool more = false}) => bloc.load(
+    KnowledgeQuery(
+      organization: org,
+      repository: repository,
+      kind: kind,
+      status: status,
+      query: search.text,
+    ),
+    more: more,
+  );
 
-  Future<void> load({bool more = false}) async {
-    if (org.isEmpty) return;
-    final current = ++request, epoch = connection.generation;
-    setState(() {
-      loading = true;
-      error = null;
-    });
-    try {
-      final result = await connection.request('knowledge', {
-        'mode': 'list',
-        'organization_id': org,
-        'repository': repository,
-        'kind': kind,
-        'state': status,
-        'query': search.text,
-        if (more && before != null) 'before': before,
-      });
-      if (!mounted || current != request || epoch != connection.generation)
-        return;
-      setState(() {
-        final incoming = List<Map<String, dynamic>>.from(result['records']);
-        records = more ? [...records, ...incoming] : incoming;
-        repositories = List<String>.from(result['repositories']);
-        before = result['next_before'] as int?;
-      });
-    } catch (e) {
-      if (mounted && current == request && epoch == connection.generation)
-        setState(() => error = '$e');
-    } finally {
-      if (mounted && current == request && epoch == connection.generation)
-        setState(() => loading = false);
-    }
-  }
-
-  Future<void> mutate(Map<String, dynamic> body) async {
-    if (mutating || !connection.state.connected || org.isEmpty || !admin)
-      return;
-    final selectedOrg = org, epoch = connection.generation;
-    setState(() {
-      mutating = true;
-      error = null;
-    });
-    try {
-      await connection.request('knowledge', {
-        'organization_id': selectedOrg,
-        ...body,
-      });
-      if (mounted && org == selectedOrg && epoch == connection.generation)
-        await load();
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = '$e');
-    } finally {
-      if (mounted && epoch == connection.generation)
-        setState(() => mutating = false);
-    }
-  }
+  Future<void> mutate(Map<String, dynamic> body) => bloc.mutate(body);
 
   Future<void> create() async {
     if (busy || org.isEmpty || !admin) return;
@@ -395,7 +340,7 @@ class _KnowledgePageState extends State<KnowledgePage> {
                 setState(() {
                   org = v;
                   repository = '';
-                  records = [];
+                  bloc.clearRecords();
                 });
                 load();
               },

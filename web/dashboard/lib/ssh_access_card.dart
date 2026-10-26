@@ -1,3 +1,5 @@
+import 'package:herdr_dashboard_state/settings_bloc.dart';
+import 'feature_view.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'dashboard_access_controls.dart';
@@ -8,65 +10,24 @@ class SshAccessCard extends StatefulWidget {
   State<SshAccessCard> createState() => _SshAccessCardState();
 }
 
-class _SshAccessCardState extends State<SshAccessCard> {
+class _SshAccessCardState extends State<SshAccessCard>
+    with FeatureView<SshAccessCard> {
   final keyInput = TextEditingController();
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
-  int? count;
-  bool busy = false;
-  String? message;
-
+  late final SshAccessBloc bloc;
+  int? get count => bloc.count;
+  bool get busy => featureBusy;
+  String? get message => featureError ?? featureMessage;
   @override
   void initState() {
     super.initState();
+    bindFeature(bloc = SshAccessBloc(connection));
     load();
   }
 
-  Future<void> load() async {
-    final epoch = connection.generation;
-    try {
-      final data = await connection.request('ssh-access');
-      if (mounted &&
-          connection.state.connected &&
-          epoch == connection.generation) {
-        setState(() => count = data['key_count'] as int?);
-      }
-    } catch (error) {
-      if (mounted)
-        setState(
-          () => message = error.toString().replaceFirst('Exception: ', ''),
-        );
-    }
-  }
-
+  Future<void> load() => bloc.refresh();
   Future<void> add() async {
-    final epoch = connection.generation;
-    setState(() {
-      busy = true;
-      message = null;
-    });
-    try {
-      final data = await connection.request('ssh-access/add', {
-        'public_key': keyInput.text,
-      });
-      if (mounted &&
-          connection.state.connected &&
-          epoch == connection.generation) {
-        keyInput.clear();
-        setState(() {
-          count = data['key_count'] as int;
-          message = data['added'] == true
-              ? 'Public key added. You can now connect as herdr over SSH.'
-              : 'This public key is already configured.';
-        });
-      }
-    } catch (error) {
-      if (mounted)
-        setState(
-          () => message = error.toString().replaceFirst('Exception: ', ''),
-        );
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
+    if (await bloc.add(keyInput.text) && mounted) keyInput.clear();
   }
 
   @override

@@ -1,4 +1,4 @@
-import 'package:herdr_dashboard_state/cli_setup_session.dart';
+import 'package:herdr_dashboard_state/cli_setup_bloc.dart';
 import 'clipboard_copy.dart';
 import 'setup_links.dart';
 import 'external_link.dart';
@@ -19,234 +19,63 @@ class CliSetupPage extends StatefulWidget {
 class _CliSetupPageState extends State<CliSetupPage> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
   final terminal = Terminal(maxLines: 2000);
-  late final CliSetupSession setupSession;
+  late final CliSetupBloc feature;
+  StreamSubscription? subscription;
   final paste = TextEditingController();
-  List<Map<String, dynamic>> clis = [];
-  Map<String, dynamic>? integrations;
-  String? session;
-  String? selected;
-  String? error;
-  bool busy = false;
-  bool running = false;
-  bool polling = false;
-  int cursor = 0;
-  int generation = 0;
-  Timer? timer;
-  Future<void> writes = Future.value();
+  int outputRevision = 0, clearRevision = 0;
+  List<Map<String, dynamic>> get clis => feature.state.clis;
+  Map<String, dynamic>? get integrations => feature.state.integrations;
+  String? get session => feature.state.session;
+  String? get selected => feature.state.selected;
+  String? get error => feature.state.error;
+  bool get busy => feature.state.busy;
+  bool get running => feature.state.running;
 
   @override
   void initState() {
     super.initState();
-    setupSession = CliSetupSession(connection);
+    feature = CliSetupBloc(connection);
     terminal.onOutput = sendInput;
     terminal.onResize = (width, height, pixelWidth, pixelHeight) {
-      final id = session;
-      if (id != null && running) {
-        enqueue('resize', {
-          'id': id,
-          'cols': width.clamp(10, 400),
-          'rows': height.clamp(5, 150),
-        });
-      }
+      feature.resize(width, height);
     };
-    refresh();
-    timer = Timer.periodic(const Duration(milliseconds: 300), (_) => poll());
-  }
-
-  void showError(Object value) {
-    if (mounted)
-      setState(() => error = value.toString().replaceFirst('Exception: ', ''));
-  }
-
-  Future<void> refresh() async {
-    if (!connection.state.connected) return;
-    final epoch = connection.generation;
-    try {
-      final data = await connection.request('cli-setup');
-      if (mounted &&
-          connection.state.connected &&
-          epoch == connection.generation) {
-        setState(() {
-          clis = List<Map<String, dynamic>>.from(data['clis']);
-          integrations = data['integrations'] is Map
-              ? Map<String, dynamic>.from(data['integrations'] as Map)
-              : null;
-        });
+    subscription = feature.stream.listen((_) {
+      if (!mounted) return;
+      final state = feature.state;
+      if (state.clearRevision != clearRevision) {
+        clearRevision = state.clearRevision;
+        clearTerminal();
+        paste.clear();
+        if (state.session != null)
+          feature.resize(terminal.viewWidth, terminal.viewHeight);
       }
-    } catch (e) {
-      showError(e);
-    }
-  }
-
-  void enqueue(String action, Map<String, dynamic> body) {
-    final epoch = generation;
-    writes = writes.then((_) async {
-      if (!mounted ||
-          epoch != generation ||
-          !connection.state.connected ||
-          connection.disconnecting ||
-          setupSession.closing)
-        return;
-      try {
-        await connection.request('cli-setup/$action', body);
-      } catch (e) {
-        showError(e);
+      if (state.outputRevision != outputRevision) {
+        outputRevision = state.outputRevision;
+        terminal.write(state.output);
       }
+      setState(() {});
     });
   }
 
-  void sendInput(String data) {
-    if (session != null && running && data.isNotEmpty) {
-      enqueue('input', {'id': session, 'data': data});
+  Future<void> refresh() => feature.refresh();
+  void sendInput(String value) {
+    feature.input(value);
+  }
+
+  Future<void> start(String cli) => feature.openSession(cli);
+  Future<void> verify(String cli) => cliAction('verify', cli);
+  Future<void> installIntegration(String cli) =>
+      cliAction('install_integration', cli);
+  Future<void> cliAction(String action, String cli) async {
+    await feature.action(action, cli);
+    if (mounted && feature.state.message != null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(feature.state.message!)));
     }
   }
 
-  Future<void> start(String cli) async {
-    if (busy ||
-        session != null ||
-        connection.disconnecting ||
-        setupSession.closing)
-      return;
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    final epoch = ++generation;
-    try {
-      final data = await setupSession.start(cli);
-      if (data == null) return;
-      if (!mounted || epoch != generation || !connection.state.connected) {
-        await setupSession.close();
-        return;
-      }
-      clearTerminal();
-      setState(() {
-        session = data['id'];
-        selected = cli;
-        cursor = 0;
-        running = true;
-      });
-      enqueue('resize', {
-        'id': session,
-        'cols': terminal.viewWidth.clamp(10, 400),
-        'rows': terminal.viewHeight.clamp(5, 150),
-      });
-      await poll();
-    } catch (e) {
-      showError(e);
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
-
-  Future<void> verify(String cli) async {
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    final epoch = ++generation;
-    try {
-      final data = await connection.request('cli-setup/verify', {'cli': cli});
-      if (!mounted || epoch != generation || !connection.state.connected)
-        return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${data['detail'] ?? 'Account verified.'}')),
-      );
-      await refresh();
-    } catch (e) {
-      showError(e);
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
-
-  Future<void> installIntegration(String cli) async {
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    final epoch = ++generation;
-    try {
-      final data = await connection.request('cli-setup/install_integration', {
-        'cli': cli,
-      });
-      if (!mounted || epoch != generation || !connection.state.connected)
-        return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('${data['detail'] ?? 'Herdr integration installed.'}'),
-        ),
-      );
-      await refresh();
-    } catch (e) {
-      showError(e);
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
-
-  Future<void> poll() async {
-    final id = session;
-    if (id == null ||
-        polling ||
-        !running ||
-        connection.disconnecting ||
-        setupSession.closing)
-      return;
-    if (!connection.state.connected) {
-      await stop();
-      return;
-    }
-    polling = true;
-    try {
-      final data = await connection.request('cli-setup/poll', {
-        'id': id,
-        'cursor': cursor,
-      });
-      if (!mounted || session != id || !connection.state.connected) return;
-      if (data['truncated'] == true) {
-        terminal.write('\x1b[2J\x1b[H[Earlier output expired]\r\n');
-      }
-      terminal.write(data['output'] as String);
-      cursor = data['cursor'] as int;
-      if (data['running'] == false) {
-        terminal.write('\r\n[Setup command exited: ${data['exit_code']}]\r\n');
-        setState(() => running = false);
-        await refresh();
-      }
-    } catch (e) {
-      showError(e);
-      setStateIfMountedStopped();
-    } finally {
-      polling = false;
-    }
-  }
-
-  void setStateIfMountedStopped() {
-    if (mounted) setState(() => running = false);
-  }
-
-  Future<void> stop() async {
-    final id = session;
-    generation++;
-    clearTerminal();
-    paste.clear();
-    if (mounted)
-      setState(() {
-        session = null;
-        running = false;
-        selected = null;
-      });
-    if (id != null) {
-      try {
-        await setupSession.close();
-      } catch (e) {
-        showError(e);
-      }
-    }
-    await refresh();
-  }
-
+  Future<void> stop() => feature.stop();
   void clearTerminal() {
     terminal.mainBuffer.clear();
     terminal.altBuffer.clear();
@@ -255,9 +84,8 @@ class _CliSetupPageState extends State<CliSetupPage> {
 
   @override
   void dispose() {
-    timer?.cancel();
-    generation++;
-    setupSession.dispose();
+    subscription?.cancel();
+    feature.dispose();
     terminal.onOutput = null;
     terminal.onResize = null;
     clearTerminal();

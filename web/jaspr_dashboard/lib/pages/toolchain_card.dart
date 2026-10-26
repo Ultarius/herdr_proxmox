@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/settings_bloc.dart';
 import 'native_task_ui.dart';
 import 'operations_support.dart';
 import 'ops_ui.dart';
@@ -8,14 +9,12 @@ class ToolchainCard extends StatefulComponent {
   State<ToolchainCard> createState() => _ToolchainState();
 }
 
-class _ToolchainState extends OperationsState<ToolchainCard> {
-  Map<String, dynamic> sdk = {};
-  bool refreshing = false;
-  Timer? timer;
-  int tick = 0;
-  Map<String, dynamic> get toolchains =>
-      (sdk['toolchains'] as Map?)?.cast<String, dynamic>() ?? {};
-  bool get queued => ['queued', 'running'].contains(sdk['state']);
+class _ToolchainState extends FeatureOperationsState<ToolchainCard> {
+  late final ToolchainBloc bloc;
+  Map<String, dynamic> get sdk => bloc.sdk;
+  bool get refreshing => bloc.state.loading;
+  Map<String, dynamic> get toolchains => bloc.toolchains;
+  bool get queued => bloc.queued;
 
   /// Installer-reported percentage, or null when it has not reported one.
   int? get percent {
@@ -36,44 +35,16 @@ class _ToolchainState extends OperationsState<ToolchainCard> {
   @override
   void initState() {
     super.initState();
+    bindFeature(
+      bloc = ToolchainBloc(connection),
+      errorFor: (state) => state.errors['install'],
+    );
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (queued || ++tick % 6 == 0) refresh();
-    });
   }
 
-  @override
-  void dispose() {
-    timer?.cancel();
-    super.dispose();
-  }
-
-  Future<void> refresh() async {
-    if (refreshing || !connection.state.connected) return;
-    refreshing = true;
-    final epoch = connection.generation;
-    try {
-      final data = await connection.request('sdk');
-      if (valid(epoch)) setState(() => sdk = Map<String, dynamic>.from(data));
-    } catch (e) {
-      if (valid(epoch))
-        setState(() => sdk = {'state': 'unavailable', 'error': '$e'});
-    } finally {
-      if (valid(epoch)) setState(() => refreshing = false);
-    }
-  }
-
+  Future<void> refresh() => bloc.refresh();
   Future<void> install(String name) async {
-    if (!admin || queued || (toolchains[name]?['required'] ?? '') == '') return;
-    await perform((epoch) async {
-      await connection.request('sdk/install', {'toolchain': name});
-      if (valid(epoch))
-        setState(
-          () => message =
-              '$name installation queued. The root service installs the pinned toolchain.',
-        );
-    });
-    await refresh();
+    await bloc.install(name);
   }
 
   @override

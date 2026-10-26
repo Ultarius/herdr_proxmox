@@ -191,6 +191,7 @@ void main() {
 
   Future<void> mountJobs(String state, {bool legacy = false}) async {
     binding.detachRootComponent();
+    web.document.getElementById('repository-test')!.textContent = '';
     jobs = [
       {
         'id': 'a' * 32,
@@ -286,10 +287,38 @@ void main() {
   test(
     'running clones cannot be removed and non-admins have no removal controls',
     () async {
+      connections = [
+        {
+          'id': 'private-connection',
+          'label': 'Private connection',
+          'repository': 'owner/private',
+          'kind': 'token',
+          'access_state': 'verified',
+        },
+      ];
       await mountJobs('running');
+      await until(
+        () => nodes('option').any(
+          (item) =>
+              (item as web.HTMLOptionElement).value == 'private-connection',
+        ),
+      );
+      final selector = nodes('select').first as web.HTMLSelectElement;
+      selector.value = 'private-connection';
+      selector.dispatchEvent(web.Event('change', web.EventInit(bubbles: true)));
+      await settle();
       expect(nodes('.clone-remove').single.hasAttribute('disabled'), isTrue);
       connection.operator.value = {'role': 'operator'};
       await until(() => nodes('.clone-remove').isEmpty);
+      expect(
+        nodes('option').where(
+          (item) =>
+              (item as web.HTMLOptionElement).value == 'private-connection',
+        ),
+        isEmpty,
+      );
+      expect((nodes('select').first as web.HTMLSelectElement).value, '');
+      await until(() => nodes('.clone-job').length == 1);
       expect(nodes('.clone-job'), hasLength(1));
     },
   );

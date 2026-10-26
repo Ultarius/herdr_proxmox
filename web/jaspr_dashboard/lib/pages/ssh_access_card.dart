@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/settings_bloc.dart';
 import 'operations_support.dart';
 import 'dashboard_access_controls.dart';
 import 'ops_ui.dart';
@@ -8,50 +9,23 @@ class SshAccessCard extends StatefulComponent {
   State<SshAccessCard> createState() => _SshState();
 }
 
-class _SshState extends OperationsState<SshAccessCard> {
+class _SshState extends FeatureOperationsState<SshAccessCard> {
   String publicKey = '';
-  int? count;
-  bool loading = false;
+  late final SshAccessBloc bloc;
+  int? get count => bloc.count;
+  bool get loading => bloc.state.loading;
   @override
   void initState() {
     super.initState();
+    bindFeature(bloc = SshAccessBloc(connection));
     load();
   }
 
-  Future<void> load() async {
-    if (loading || !connection.state.connected) return;
-    final epoch = connection.generation;
-    setState(() {
-      loading = true;
-      error = null;
-    });
-    try {
-      final data = await connection.request('ssh-access');
-      if (valid(epoch))
-        setState(() {
-          count = data['key_count'] as int?;
-          error = null;
-        });
-    } catch (e) {
-      if (valid(epoch)) setState(() => error = '$e');
-    } finally {
-      if (valid(epoch)) setState(() => loading = false);
-    }
+  Future<void> load() => bloc.refresh();
+  Future<void> add() async {
+    if (await bloc.add(publicKey) && mounted) setState(() => publicKey = '');
   }
 
-  Future<void> add() => perform((epoch) async {
-    final data = await connection.request('ssh-access/add', {
-      'public_key': publicKey,
-    });
-    if (valid(epoch))
-      setState(() {
-        publicKey = '';
-        count = data['key_count'] as int;
-        message = data['added'] == true
-            ? 'Public key added. You can now connect as herdr over SSH.'
-            : 'This public key is already configured.';
-      });
-  });
   @override
   Component build(BuildContext context) => el('div', [
     card(

@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/tasks_bloc.dart';
 import 'dart:convert';
 import 'package:herdr_dashboard_state/task_execution.dart';
 import 'package:herdr_dashboard_state/task_validation_environment.dart';
@@ -120,20 +121,26 @@ class TasksPage extends StatefulComponent {
 
 class _TasksPageState extends State<TasksPage> {
   DashboardBloc get connection => dashboardConnection;
-  List<Map<String, dynamic>> tasks = [];
-  List<Map<String, dynamic>> releases = [];
-  Map<String, dynamic> github = {};
-  Map<String, dynamic> storage = {};
-  String executor = 'unavailable';
+  late final TasksBloc bloc;
+  StreamSubscription? featureSubscription;
+  List<Map<String, dynamic>> get tasks => bloc.state.tasks;
+  List<Map<String, dynamic>> get releases => bloc.state.releases;
+  Map<String, dynamic> get github => bloc.state.github;
+  Map<String, dynamic> get storage => bloc.state.storage;
+  String get executor => bloc.state.executor;
   String section = 'Overview';
   final Set<String> expandedMeetings = {};
   String? localTaskId;
   String? get selectedId => component.taskId ?? localTaskId;
-  String? error;
-  Map<String, String>? releaseFailure;
+  String? _error;
+  String? get error => _error ?? bloc.state.error;
+  set error(String? value) => _error = value;
+  Map<String, String>? get releaseFailure => bloc.state.releaseFailure;
   // A failed list read must not erase an action failure, and vice versa.
-  String? readError;
-  bool busy = false;
+  String? get readError => bloc.state.readError;
+  bool dialogBusy = false;
+  bool get busy => dialogBusy || bloc.state.busy;
+  set busy(bool value) => dialogBusy = value;
   bool configuringPublishing = false;
   late final TaskBackupController backup;
   bool get exportingTasks => backup.busy;
@@ -143,23 +150,21 @@ class _TasksPageState extends State<TasksPage> {
     if (mounted) setState(() {});
   }
 
-  bool refreshing = false;
+  bool get refreshing => bloc.state.loading;
   bool connected = true;
-  Future<void>? pending;
-  // Forced notification reads can overlap; only the newest may publish.
-  int readRevision = 0;
-  Timer? timer;
+  Future<void>? get pending => bloc.pending;
   StreamSubscription? subscription;
   int generation = -1;
   String liveActivity = '';
-  // Keep the exact request across lost responses. Changing the selection gets
-  // a new identity; retrying the same action reconciles the durable request.
-  final Map<String, String> requests = {};
   bool get admin => connection.operator.value['role'] == 'admin';
 
   @override
   void initState() {
     super.initState();
+    bloc = TasksBloc(connection);
+    featureSubscription = bloc.stream.listen((_) {
+      if (mounted) setState(() {});
+    });
     backup = TaskBackupController(
       connection,
       component.saveTaskBackup ??
@@ -184,15 +189,9 @@ class _TasksPageState extends State<TasksPage> {
       if (generation != connection.generation) {
         generation = connection.generation;
         setState(() {
-          tasks = [];
           busy = false;
           configuringPublishing = false;
-          releases = [];
-          github = {};
-          storage = {};
           error = null;
-          readError = null;
-          requests.clear();
           expandedMeetings.clear();
         });
         // A read begun before reconnect is not valid for the new connection.
@@ -200,21 +199,17 @@ class _TasksPageState extends State<TasksPage> {
       }
     });
     connected = connection.state.connected;
-    connection.notificationRevision.addListener(notificationRefresh);
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 15), (_) => refresh());
   }
 
   @override
   void didUpdateComponent(covariant TasksPage oldWidget) {
     super.didUpdateComponent(oldWidget);
     if (oldWidget.taskId != component.taskId) {
-      tasks = [];
+      bloc.clearRows();
       localTaskId = null;
       section = 'Overview';
       error = null;
-      readError = null;
-      requests.clear();
       refreshSelection();
     }
   }
@@ -229,83 +224,16 @@ class _TasksPageState extends State<TasksPage> {
 
   @override
   void dispose() {
-    readRevision++;
     backup.removeListener(backupChanged);
     backup.dispose();
-    connection.notificationRevision.removeListener(notificationRefresh);
-    timer?.cancel();
+    featureSubscription?.cancel();
+    bloc.dispose();
     subscription?.cancel();
     super.dispose();
   }
 
-  /// Read the task list. A read already in flight is joined, so a caller that
-  /// needs fresh data after an action never silently keeps stale state. A
-  /// reconnect forces a new read: the old one belongs to the old connection.
-  Future<void> refresh({bool force = false}) async {
-    if (!connection.state.connected) {
-      if (mounted) setState(() => connected = false);
-      return;
-    }
-    if (!force && pending != null) return pending;
-    final epoch = connection.generation;
-    final read = _read(epoch, ++readRevision);
-    pending = read;
-    refreshing = true;
-    try {
-      await read;
-    } finally {
-      if (identical(pending, read)) {
-        pending = null;
-        refreshing = false;
-      }
-    }
-  }
-
-  Future<void> _read(int epoch, int revision) async {
-    final id = selectedId;
-    bool current() =>
-        mounted &&
-        revision == readRevision &&
-        epoch == connection.generation &&
-        id == selectedId;
-    try {
-      final data = await connection.request('tasks');
-      if (!current()) return;
-      Map<String, dynamic>? detail;
-      String? detailError;
-      if (id != null) {
-        try {
-          detail = Map<String, dynamic>.from(
-            await connection.request('tasks/detail?id=$id'),
-          );
-        } catch (e) {
-          detailError = '$e';
-        }
-      }
-      if (current()) {
-        setState(() {
-          if (id == null) {
-            tasks = List<Map<String, dynamic>>.from(data['tasks'] ?? []);
-            readError = null;
-          } else {
-            // A failed detail read still shows the compact row it came from.
-            final rows = List<Map<String, dynamic>>.from(data['tasks'] ?? []);
-            final match = rows.where((row) => row['id'] == id).firstOrNull;
-            tasks = detail != null
-                ? [detail]
-                : (match != null ? [match] : <Map<String, dynamic>>[]);
-            readError = detailError;
-          }
-          github = Map<String, dynamic>.from(data['github'] ?? {});
-          storage = Map<String, dynamic>.from(data['storage'] ?? {});
-          releases = List<Map<String, dynamic>>.from(data['releases'] ?? []);
-          executor = '${data['executor'] ?? 'unavailable'}';
-        });
-      }
-    } catch (e) {
-      if (current()) setState(() => readError = '$e');
-    }
-  }
+  Future<void> refresh({bool force = false}) =>
+      bloc.refresh(taskId: selectedId, selection: true, force: force);
 
   Future<void> reviewTaskEnvironment(Map<String, dynamic> task) async {
     if (busy || !admin) return;
@@ -316,7 +244,7 @@ class _TasksPageState extends State<TasksPage> {
     });
     try {
       final review = await reviewValidationEnvironment(
-        connection.request,
+        bloc.request,
         '${task['id']}',
         'task-${requestId()}',
       );
@@ -358,84 +286,40 @@ class _TasksPageState extends State<TasksPage> {
   Future<void> act(String action, Map<String, dynamic> body) async {
     if (busy || !admin) return;
     final epoch = connection.generation;
-    final selection = '$action:$body';
-    final request = requests.putIfAbsent(
-      selection,
-      () => 'task-${requestId()}',
-    );
-    setState(() {
-      busy = true;
-      error = null;
-    });
+    _error = null;
+    dynamic result;
     try {
-      final result = await connection.request('tasks/$action', {
-        ...body,
-        'request_id': request,
-      });
-      if (!mounted || epoch != connection.generation) return;
-      if (result is Map && result['action_message'] is String) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(result['action_message'] as String)),
-        );
-      }
-      requests.remove(selection);
-      // A read begun before the mutation is not post-action evidence.
-      if (pending != null) await pending;
-      if (mounted && epoch == connection.generation) await refresh();
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = '$e');
-    } finally {
-      if (mounted) setState(() => busy = false);
+      result = await bloc.mutate(action, body);
+    } catch (_) {
+      return;
+    }
+    if (!mounted || epoch != connection.generation) return;
+    if (result is Map && result['action_message'] is String) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(result['action_message'] as String)),
+      );
     }
   }
 
   Future<void> releaseAct(String action, Map<String, dynamic> body) async {
     if (busy || !admin) return;
     final epoch = connection.generation;
-    final selection = 'release:$action:$body';
-    final request = requests.putIfAbsent(
-      selection,
-      () => 'release-${requestId()}',
-    );
-    setState(() {
-      busy = true;
-      error = null;
-      releaseFailure = null;
-    });
+    _error = null;
+    dynamic result;
     try {
-      final result = await connection.request('releases/$action', {
-        ...body,
-        'request_id': request,
-      });
-      if (!mounted || epoch != connection.generation) return;
-      requests.remove(selection);
-      if (pending != null) await pending;
-      if (mounted && epoch == connection.generation) await refresh();
-      if (mounted && epoch == connection.generation && action == 'single') {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Release candidate ${result['version']} is collecting this task. Freeze and publish it from the workflow board.',
-            ),
+      result = await bloc.mutate(action, body, release: true);
+    } catch (_) {
+      return;
+    }
+    if (!mounted || epoch != connection.generation) return;
+    if (action == 'single') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Release candidate ${result['version']} is collecting this task. Freeze and publish it from the workflow board.',
           ),
-        );
-      }
-    } catch (e) {
-      if (mounted && epoch == connection.generation) {
-        final message = '$e'.replaceFirst(RegExp(r'^Exception: '), '');
-        setState(() {
-          error = message;
-          releaseFailure = {
-            'id': '${body['id']}',
-            'action': action,
-            'message': message,
-          };
-        });
-        await refresh();
-      }
-    } finally {
-      if (mounted) setState(() => busy = false);
+        ),
+      );
     }
   }
 
@@ -452,7 +336,7 @@ class _TasksPageState extends State<TasksPage> {
         if (before != null) 'before': '$before',
       },
     ).query;
-    final result = await connection.request('releases/revisions?$query');
+    final result = await bloc.request('releases/revisions?$query');
     if (epoch != connection.generation)
       throw StateError('Connection changed; reopen release history.');
     return Map<String, dynamic>.from(result);
@@ -711,7 +595,7 @@ class _TasksPageState extends State<TasksPage> {
               }
             : {'mode': 'direct'};
       }
-      await connection.request('github/configure', {
+      await bloc.request('github/configure', {
         if (selection.manual) 'token': token.text.trim(),
         if (!selection.manual) 'connection_id': selection.selectedId,
         'repositories': listed(),
@@ -743,7 +627,7 @@ class _TasksPageState extends State<TasksPage> {
   Future<void> create() async {
     final epoch = connection.generation;
     try {
-      final directory = await connection.request('organizations/directory');
+      final directory = await bloc.request('organizations/directory');
       if (!mounted || epoch != connection.generation) return;
       final profiles =
           List<Map<String, dynamic>>.from(directory['profiles'] ?? [])
@@ -753,9 +637,7 @@ class _TasksPageState extends State<TasksPage> {
         throw StateError('Hire a worktree agent before creating a task.');
       final title = TextEditingController();
       final description = TextEditingController();
-      final projects = await connection.request('projects/browse', {
-        'path': '',
-      });
+      final projects = await bloc.request('projects/browse', {'path': ''});
       if (!mounted || epoch != connection.generation) return;
       final repositories = taskRepositories(
         profiles,
@@ -938,7 +820,7 @@ class _TasksPageState extends State<TasksPage> {
     final epoch = connection.generation;
     try {
       task = Map<String, dynamic>.from(
-        await connection.request('tasks/detail?id=${task['id']}'),
+        await bloc.request('tasks/detail?id=${task['id']}'),
       );
     } catch (e) {
       if (mounted && epoch == connection.generation)
@@ -1005,7 +887,7 @@ class _TasksPageState extends State<TasksPage> {
     final description = TextEditingController();
     try {
       final fresh = Map<String, dynamic>.from(
-        await connection.request('tasks/detail?id=${task['id']}'),
+        await bloc.request('tasks/detail?id=${task['id']}'),
       );
       if (!mounted || epoch != connection.generation) return;
       final preview = fresh['pull_preview'] as Map?;
@@ -1259,9 +1141,7 @@ class _TasksPageState extends State<TasksPage> {
                   final epoch = connection.generation;
                   try {
                     final id = build['run_id'] ?? build['id'];
-                    final bytes = await connection.bytes(
-                      'validation/log?id=$id',
-                    );
+                    final bytes = await bloc.bytes('validation/log?id=$id');
                     if (!mounted || epoch != connection.generation) return;
                     await downloadBytes(
                       bytes,
@@ -1486,11 +1366,10 @@ class _TasksPageState extends State<TasksPage> {
     } else {
       setState(() {
         localTaskId = id;
-        tasks = [];
+        bloc.clearRows();
         section = 'Overview';
       });
-      if (pending != null) await pending;
-      if (mounted) await refresh();
+      if (mounted) await refresh(force: true);
     }
   }
 
@@ -1501,19 +1380,16 @@ class _TasksPageState extends State<TasksPage> {
       setState(() {
         localTaskId = null;
         section = 'Overview';
-        tasks = [];
+        bloc.clearRows();
       });
-      if (pending != null) await pending;
-      if (mounted) await refresh();
+      if (mounted) await refresh(force: true);
     }
   }
 
   Future<void> showCommit(Map<String, dynamic> task, String sha) async {
     final epoch = connection.generation;
     try {
-      final data = await connection.request(
-        'tasks/commit?id=${task['id']}&sha=$sha',
-      );
+      final data = await bloc.request('tasks/commit?id=${task['id']}&sha=$sha');
       if (!mounted || epoch != connection.generation) return;
       await showDialog<void>(
         context: context,
@@ -1648,7 +1524,7 @@ class _TasksPageState extends State<TasksPage> {
 
   Future<void> discussTask(Map<String, dynamic> task) async {
     try {
-      final data = await connection.request('organizations/directory');
+      final data = await bloc.request('organizations/directory');
       if (!mounted) return;
       final groups = [
         for (final g in data['groups'] as List? ?? [])
@@ -1857,14 +1733,13 @@ class _TasksPageState extends State<TasksPage> {
       error = null;
     });
     try {
-      await connection.request('organizations/input', {
+      await bloc.request('organizations/input', {
         'organization_id': task['organization_id'],
         'profile_id': (task['availability'] as Map?)?['profile_id'],
         'key': key,
       });
       if (!mounted || epoch != connection.generation) return;
-      if (pending != null) await pending;
-      if (mounted && epoch == connection.generation) await refresh();
+      if (mounted && epoch == connection.generation) await refresh(force: true);
     } catch (e) {
       if (mounted && epoch == connection.generation)
         setState(() => error = '$e');
@@ -1932,7 +1807,7 @@ class _TasksPageState extends State<TasksPage> {
   }
 
   Future<List<Map<String, dynamic>>> _agents(Map task) async {
-    final directory = await connection.request('organizations/directory');
+    final directory = await bloc.request('organizations/directory');
     final profiles = List<Map<String, dynamic>>.from(
       directory['profiles'] ?? [],
     );
@@ -3600,7 +3475,7 @@ class _TasksPageState extends State<TasksPage> {
               ? null
               : () async {
                   try {
-                    final bytes = await connection.bytes(
+                    final bytes = await bloc.bytes(
                       'tasks/patch?id=${task['id']}',
                     );
                     if (!mounted) return;

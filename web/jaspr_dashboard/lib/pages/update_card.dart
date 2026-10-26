@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/settings_bloc.dart';
 import 'build_timeline.dart';
 import 'operations_support.dart';
 
@@ -7,40 +8,31 @@ class UpdateCard extends StatefulComponent {
   State<UpdateCard> createState() => _UpdateState();
 }
 
-class _UpdateState extends OperationsState<UpdateCard> {
-  Map<String, dynamic>? info;
-  List<Map<String, dynamic>> alphas = [];
+class _UpdateState extends FeatureOperationsState<UpdateCard> {
+  late final DashboardUpdatesBloc bloc;
+  Map<String, dynamic>? get info => bloc.info;
+  List<Map<String, dynamic>> get alphas => bloc.alphas;
   String? alphaVersion;
-  Timer? timer;
-  bool get queued => ['queued', 'running'].contains(info?['state']);
+  bool get queued => bloc.queued;
   @override
   void initState() {
     super.initState();
+    bindFeature(
+      bloc = DashboardUpdatesBloc(connection),
+      onChanged: () {
+        if (!alphas.any((release) => release['version'] == alphaVersion))
+          alphaVersion = null;
+      },
+      errorFor: (state) =>
+          state.error ??
+          (state.values['alphasLoaded'] == true && alphas.isEmpty
+              ? 'No installable alpha builds are available.'
+              : null),
+    );
     check();
   }
 
-  @override
-  void dispose() {
-    timer?.cancel();
-    super.dispose();
-  }
-
-  Future<void> check({bool force = false}) => perform((epoch) async {
-    final result = await connection.request(
-      force ? 'updates/check' : 'updates',
-      force ? <String, dynamic>{} : null,
-    );
-    if (valid(epoch))
-      setState(() {
-        info = result;
-        if (!queued) {
-          timer?.cancel();
-          timer = null;
-        } else {
-          timer ??= Timer.periodic(const Duration(seconds: 5), (_) => check());
-        }
-      });
-  });
+  Future<void> check({bool force = false}) => bloc.check(force: force);
   Future<void> install({bool alpha = false}) async {
     final version = alpha ? alphaVersion : info?['latest'];
     if (!admin ||
@@ -57,33 +49,13 @@ class _UpdateState extends OperationsState<UpdateCard> {
         ) ||
         !valid(epoch))
       return;
-    await perform((epoch) async {
-      await connection.request('updates/install', {
-        'version': version,
-        if (alpha) 'channel': 'alpha',
-        if (alpha) 'confirm_alpha': true,
-      });
-      if (valid(epoch))
-        setState(() {
-          info = {...?info, 'state': 'queued'};
-          timer ??= Timer.periodic(const Duration(seconds: 5), (_) => check());
-        });
-    });
+    await bloc.install('$version', alpha: alpha);
   }
 
-  Future<void> loadAlphas() => perform((epoch) async {
-    final result = await connection.request(
-      'updates/alphas',
-      <String, dynamic>{},
-    );
-    if (valid(epoch))
-      setState(() {
-        alphas = (result['releases'] as List).cast<Map<String, dynamic>>();
-        alphaVersion = null;
-        if (alphas.isEmpty)
-          error = 'No installable alpha builds are available.';
-      });
-  });
+  Future<void> loadAlphas() async {
+    await bloc.loadAlphas();
+    if (mounted) setState(() => alphaVersion = null);
+  }
 
   /// Lookup, completion and capability messages as template callouts.
   List<Component> _messages(Map<String, dynamic> info) => [

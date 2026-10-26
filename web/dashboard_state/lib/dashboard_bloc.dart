@@ -102,6 +102,7 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   Timer? _timer;
   Timer? _notificationTimer;
   int _mutationRevision = 0;
+  int _directoryRevision = 0, _directoryRead = 0;
   int? _mutationGeneration;
   final _disconnectCleanups = <Future<void> Function()>{};
   static final _disconnectCleanupZone = Object();
@@ -367,6 +368,28 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
   }) async {
     _checkRequestAdmission();
     final requestGeneration = generation;
+    final directoryRead =
+        body == null &&
+        const {
+          'organizations',
+          'organizations/directory',
+          'organizations/state',
+        }.contains(path);
+    // Independent features can read the shared directory while another one
+    // changes it. An older observation must not replace post-mutation metadata.
+    if (body != null &&
+        const {
+          'organizations/save',
+          'organizations/hire',
+          'organizations/group',
+          'organizations/remove_agent',
+          'organizations/remove_group',
+          'organizations/import',
+          'organizations/session',
+        }.contains(path))
+      _directoryRevision++;
+    final directoryRevision = _directoryRevision;
+    final directoryOrder = directoryRead ? ++_directoryRead : 0;
     final uri = Uri.base.resolve('/api/$path');
     final headers = {
       if (_credential != null && _credential!.isNotEmpty)
@@ -427,12 +450,9 @@ class DashboardBloc extends JuiceBloc<DashboardState> {
                 entry.key as String: entry.value as String,
         },
       );
-    if ([
-          'organizations',
-          'organizations/directory',
-          'organizations/state',
-        ].contains(path) &&
-        body == null &&
+    if (directoryRead &&
+        directoryRevision == _directoryRevision &&
+        directoryOrder == _directoryRead &&
         data is Map<String, dynamic> &&
         data['organizations'] is List &&
         data['profiles'] is List &&

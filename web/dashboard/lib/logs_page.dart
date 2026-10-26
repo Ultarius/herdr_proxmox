@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/workspace_blocs.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'log_window.dart';
@@ -17,76 +18,50 @@ class _LogsPageState extends State<LogsPage> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
   final pane = TextEditingController();
   final label = TextEditingController();
-  List<Map<String, dynamic>> logs = [];
+  late final LogsBloc feature;
+  StreamSubscription? featureSubscription;
+  List<Map<String, dynamic>> get logs =>
+      List<Map<String, dynamic>>.from(feature.state.values['logs']);
+  String? get preview => feature.state.value<String>('preview');
+  String? get error => feature.state.error;
+  bool get busy => feature.state.busy;
+  int get total => feature.state.value<int>('total') ?? 0;
+  bool get refreshing => feature.state.reading.contains('refresh');
+  bool get loaded => feature.state.values['loaded'] == true;
   String source = 'visible';
-  String? preview;
-  String? error;
-  bool busy = false;
-  int total = 0;
-
   @override
   void initState() {
     super.initState();
+    feature = LogsBloc(connection);
+    featureSubscription = feature.stream.listen((_) {
+      if (mounted) setState(() {});
+    });
     refresh();
   }
 
   @override
   void dispose() {
+    featureSubscription?.cancel();
+    feature.dispose();
     pane.dispose();
     label.dispose();
     super.dispose();
   }
 
-  Future<void> refresh() async {
-    if (!connection.state.connected) return;
-    final epoch = connection.generation;
-    try {
-      final data = await connection.request('logs');
-      if (mounted && epoch == connection.generation) {
-        setState(() {
-          logs = List<Map<String, dynamic>>.from(data['logs']);
-          total = data['total_bytes'] as int;
-        });
-      }
-    } catch (e) {
-      if (mounted) setState(() => error = '$e');
-    }
-  }
-
-  Future<void> action(String name, Map<String, dynamic> body) async {
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    final epoch = connection.generation;
-    try {
-      final data = await connection.request('logs/$name', body);
-      if (!mounted || epoch != connection.generation) return;
-      if (name == 'preview') {
-        setState(
-          () => preview =
-              '${data['truncated'] == true ? '[Last 8 KB of saved text]\n' : ''}${data['text']}',
-        );
-      } else {
-        setState(() => preview = null);
-        await refresh();
-      }
-    } catch (e) {
-      if (mounted) setState(() => error = '$e');
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
+  Future<void> refresh() => feature.refresh();
+  Future<void> action(String name, Map<String, dynamic> body) =>
+      feature.action(name, body);
 
   Future<void> open(Map<String, dynamic> log, String mode) async {
     LogWindow? window;
     try {
       window =
           LogWindow(); // Reserve the tab while the click still has user activation.
-      final data = await connection.request('logs/ticket', {
-        'id': log['id'],
-        'mode': mode,
-      });
+      final data = await feature.ticket(log, mode);
+      if (data == null) {
+        window.close();
+        return;
+      }
       if (!mounted || !connection.state.connected) {
         window.close();
         return;
@@ -98,7 +73,7 @@ class _LogsPageState extends State<LogsPage> {
       );
     } catch (e) {
       window?.close();
-      if (mounted) setState(() => error = '$e');
+      if (mounted) await feature.reportError('ticket', e);
     }
   }
 

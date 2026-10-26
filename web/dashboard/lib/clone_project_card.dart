@@ -1,5 +1,4 @@
 import 'package:juice/juice.dart';
-import 'dart:convert';
 import 'dashboard_bloc.dart';
 import 'repository_connections.dart';
 import 'package:herdr_dashboard_state/repository_connections.dart';
@@ -19,15 +18,15 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
   String connectionId = '';
   String? unavailableConnection;
   List<Map<String, dynamic>> connections = [];
-  bool busy = false;
-  Timer? timer;
-  List<Map<String, dynamic>> jobs = [];
-  String? completed;
-  bool polling = false;
-  String? pendingRemoval, removing;
-  bool deleteCloneFolder = false, jobsLoaded = false;
+  late final CloneJobsBloc bloc;
+  StreamSubscription? jobsSubscription;
+  int completionRevision = 0;
+  bool get busy => bloc.state.busy;
+  List<Map<String, dynamic>> get jobs => bloc.jobs;
+  String? get removing => bloc.removing;
+  String? pendingRemoval;
+  bool deleteCloneFolder = false;
   String removalConfirmation = '';
-  int jobsRevision = 0;
   int? removalGeneration;
   late final DashboardBloc cloneConnection;
   StreamSubscription? cloneSubscription;
@@ -47,6 +46,15 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
   void initState() {
     super.initState();
     cloneConnection = BlocScope.get<DashboardBloc>();
+    bloc = CloneJobsBloc(cloneConnection);
+    jobsSubscription = bloc.stream.listen((_) {
+      if (!mounted) return;
+      if (completionRevision != bloc.completionRevision) {
+        completionRevision = bloc.completionRevision;
+        if (bloc.clonedFolder != null) widget.onCloned(bloc.clonedFolder!);
+      }
+      setState(() {});
+    });
     cloneGeneration = cloneConnection.generation;
     cloneCanRemove = canRemove;
     cloneConnection.operator.addListener(cloneSessionChanged);
@@ -54,7 +62,6 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       (_) => cloneSessionChanged(),
     );
     refreshJobs();
-    timer = Timer.periodic(const Duration(seconds: 3), (_) => refreshJobs());
   }
 
   void cloneSessionChanged() {
@@ -63,15 +70,16 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
         cloneCanRemove == canRemove)
       return;
     setState(() {
+      if (!canRemove || cloneGeneration != cloneConnection.generation) {
+        if (connectionId.isNotEmpty) url.clear();
+        connections = [];
+        connectionId = '';
+        unavailableConnection = null;
+      }
       cloneCanRemove = canRemove;
       if (cloneGeneration != cloneConnection.generation) {
         cloneGeneration = cloneConnection.generation;
-        jobsRevision++;
-        jobs = [];
-        jobsLoaded = false;
-        completed = null;
-        busy = false;
-        removing = null;
+        completionRevision = 0;
         result = null;
       }
       if (!canRemove || removalGeneration != cloneGeneration)
@@ -79,48 +87,11 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
     });
   }
 
-  Future<void> refreshJobs() async {
-    final connection = BlocScope.get<DashboardBloc>();
-    if (polling || removing != null || !connection.state.connected) return;
-    polling = true;
-    final epoch = connection.generation;
-    final revision = jobsRevision;
-    try {
-      final data = await connection.request('projects/jobs');
-      if (!mounted ||
-          epoch != connection.generation ||
-          revision != jobsRevision)
-        return;
-      final firstLoad = !jobsLoaded;
-      final previousStates = {for (final job in jobs) job['id']: job['state']};
-      jobsLoaded = true;
-      final next = List<Map<String, dynamic>>.from(data['jobs'] ?? []);
-      if (jsonEncode(next) != jsonEncode(jobs)) setState(() => jobs = next);
-      final latest = jobs.firstOrNull;
-      if (latest != null &&
-          ['failed', 'interrupted', 'completed'].contains(latest['state']) &&
-          result?.startsWith('Clone queued.') == true) {
-        setState(() => result = null);
-      }
-      if (latest?['state'] == 'completed' &&
-          latest?['id'] != completed &&
-          (firstLoad ||
-              ['queued', 'running'].contains(previousStates[latest?['id']]))) {
-        completed = latest!['id'] as String;
-        widget.onCloned(latest['cwd'] as String);
-      }
-    } catch (exception) {
-      if (mounted && epoch == connection.generation && revision == jobsRevision)
-        setState(
-          () => result =
-              'Clone status unavailable; the server job may still be running. $exception',
-        );
-    } finally {
-      polling = false;
-    }
-  }
+  Future<void> refreshJobs() => bloc.refresh();
 
-  String? result;
+  String? inputError;
+  String? get result => inputError ?? bloc.result;
+  set result(String? value) => inputError = value;
 
   Future<void> removeClone(Map<String, dynamic> job) async {
     final connection = BlocScope.get<DashboardBloc>();
@@ -132,37 +103,26 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
         (deleteCloneFolder && removalConfirmation != job['folder']))
       return;
     final epoch = connection.generation;
-    final id = '${job['id']}';
-    jobsRevision++;
-    setState(() {
-      busy = true;
-      removing = id;
-      result = null;
+    setState(() => inputError = null);
+    final data = await bloc.remove(
+      job,
+      deleteFolder: deleteCloneFolder,
+      confirmation: removalConfirmation,
+    );
+    if (!mounted ||
+        epoch != connection.generation ||
+        !canRemove ||
+        data == null)
+      return;
+    setState(() => pendingRemoval = null);
+    if (data['folder_deleted'] == true) widget.onDeleted?.call('${job['cwd']}');
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final trigger = removalTriggers.values
+          .where((node) => node.context != null)
+          .firstOrNull;
+      trigger?.requestFocus();
     });
-    try {
-      final data = await connection.request('projects/jobs/remove', {
-        'id': id,
-        'delete_folder': deleteCloneFolder,
-        if (deleteCloneFolder) 'confirm_folder': removalConfirmation,
-      });
-      if (!mounted || epoch != connection.generation || !canRemove) return;
-      setState(() {
-        jobs.removeWhere((item) => item['id'] == id);
-        pendingRemoval = null;
-        result = '${data['message']}';
-      });
-      if (data['folder_deleted'] == true)
-        widget.onDeleted?.call('${job['cwd']}');
-    } catch (error) {
-      if (mounted && epoch == connection.generation)
-        setState(() => result = '$error');
-    } finally {
-      if (mounted && epoch == connection.generation)
-        setState(() {
-          busy = false;
-          removing = null;
-        });
-    }
   }
 
   Widget removalControls(Map<String, dynamic> job) => Padding(
@@ -319,7 +279,8 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
 
   @override
   void dispose() {
-    timer?.cancel();
+    jobsSubscription?.cancel();
+    unawaited(bloc.close());
     cloneConnection.operator.removeListener(cloneSessionChanged);
     cloneSubscription?.cancel();
     url.dispose();
@@ -341,32 +302,8 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       );
       return;
     }
-    final connection = BlocScope.get<DashboardBloc>();
-    final epoch = connection.generation;
-    setState(() {
-      busy = true;
-      result = null;
-    });
-    try {
-      final data = await connection.request('projects/clone', {
-        'url': url.text.trim(),
-        'folder': folder.text.trim(),
-        if (connectionId.isNotEmpty) 'connection_id': connectionId,
-      });
-      if (!mounted || epoch != connection.generation) return;
-      setState(() {
-        jobs.insert(0, Map<String, dynamic>.from(data));
-        result =
-            'Clone queued. You can navigate away and return to see its status.';
-      });
-      await refreshJobs();
-    } catch (error) {
-      if (mounted && epoch == connection.generation)
-        setState(() => result = error.toString());
-    } finally {
-      if (mounted && epoch == connection.generation)
-        setState(() => busy = false);
-    }
+    setState(() => inputError = null);
+    await bloc.clone(url.text.trim(), folder.text.trim(), connectionId);
   }
 
   @override
