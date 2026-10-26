@@ -33,7 +33,7 @@ from herdr_server import HerdrServer
 from herdr_ids import is_workspace_id
 from resource_usage import resources
 from organization_transfer import export_configuration, import_configuration
-from operators import Operators
+from operators import Operators, token_digest
 from sdk_install import SdkInstall
 from build_service_install import BuildServiceInstall
 from request_validation import FieldValidationError
@@ -148,20 +148,25 @@ class BrowserSessions:
             self.entries = {k: v for k, v in self.entries.items() if v[0] > now}
             if len(self.entries) >= 256:
                 del self.entries[min(self.entries, key=lambda k: self.entries[k][0])]
-            self.entries[key] = (now + self.lifetime, token)
+            self.entries[key] = (now + self.lifetime, token_digest(token))
         return key
 
     def valid(self, key, token):
         with self.lock:
             entry = self.entries.get(key)
-            return bool(entry and entry[0] > time.time() and hmac.compare_digest(entry[1], token))
+            return bool(entry and entry[0] > time.time()
+                        and hmac.compare_digest(entry[1], token_digest(token)))
 
     def operator(self, key, resolver):
-        """Resolve the session's identity at request time, so revocation takes effect."""
+        """Resolve the session's identity at request time, so revocation takes effect.
+
+        Only the token digest is retained, so the resolver maps a digest to an
+        identity rather than requiring the original bearer token.
+        """
         with self.lock:
             entry = self.entries.get(key)
-            token = entry[1] if entry and entry[0] > time.time() else None
-        return resolver(token) if token else None
+            digest = entry[1] if entry and entry[0] > time.time() else None
+        return resolver(digest) if digest else None
 
     def revoke(self, key):
         with self.lock:
@@ -240,22 +245,26 @@ class Handler(BaseHTTPRequestHandler):
         secure = '; Secure' if getattr(self.server, 'cookie_secure', False) else ''
         return f'herdr_session={key}; Path=/api/; Max-Age={age}; HttpOnly; SameSite=Strict{secure}'
 
-    def resolve_operator(self, token):
-        """Map a bearer token to a named operator, or to the shared administrator."""
-        if not isinstance(token, str) or not token:
+    def resolve_operator(self, digest):
+        """Map a bearer token digest to a named operator, or to the shared administrator.
+
+        The digest form lets browser sessions resolve an identity without the
+        gateway retaining the raw bearer token.
+        """
+        if not isinstance(digest, str) or not digest:
             return None
         operators = getattr(self.server, 'operators', None)
-        identity = operators.identify(token) if operators is not None else None
+        identity = operators.identify_digest(digest) if operators is not None else None
         if identity is not None:
             return identity
-        if hmac.compare_digest(token.encode(), self.server.token.encode()):
+        if hmac.compare_digest(digest, token_digest(self.server.token)):
             return {'name': 'dashboard', 'role': 'admin', 'master': True}
         return None
 
     def authenticated(self):
         supplied = self.headers.get('Authorization', '')
         token = supplied[len('Bearer '):] if supplied.startswith('Bearer ') else ''
-        identity = self.resolve_operator(token)
+        identity = self.resolve_operator(token_digest(token)) if token else None
         bearer = identity is not None
         if not bearer:
             sessions = getattr(self.server, 'sessions', None)
@@ -633,7 +642,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             supplied = self.headers.get('Authorization', '')
             token = supplied[len('Bearer '):] if supplied.startswith('Bearer ') else ''
-            identity = self.resolve_operator(token)
+            identity = self.resolve_operator(token_digest(token)) if token else None
             if identity is None:
                 self.reply(401, {'error': 'Invalid dashboard token.'})
                 return
