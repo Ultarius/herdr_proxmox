@@ -8,9 +8,15 @@ import 'stream_status.dart';
 import 'juice_logger.dart';
 import 'bloc_use_case.dart';
 import 'bloc_error_handler.dart';
+import 'juice_exception.dart';
 import 'cancellable_event.dart';
+import 'core/activity_probe.dart';
+import 'core/event_cause.dart';
 import 'core/event_concurrency.dart';
 import 'core/restartable_run.dart';
+import 'delayed_send.dart';
+import 'reaction.dart';
+import 'result_event.dart';
 import 'stream_binding.dart';
 import 'telemetry.dart';
 import 'core/type_names.dart';
@@ -84,6 +90,8 @@ class JuiceBloc<TState extends BlocState>
     _dispatcher = EventDispatcher<EventBase>(
       onUnhandledEvent: _handleUnhandledEvent,
       onSuperseded: _cancelBindingsOf,
+      onFlight: _watchFlight,
+      onJoined: _joinFlight,
       logger: _logger,
     );
 
@@ -107,6 +115,13 @@ class JuiceBloc<TState extends BlocState>
 
   /// Internal logger instance
   final JuiceLogger _logger;
+
+  /// Whether this bloc's telemetry goes to [logger] — false for a bloc given
+  /// its own `logger:`, or built while another logger was configured. A test
+  /// flow asks before it watches a bloc: it reads errors from its own
+  /// logger and would not see this bloc's.
+  @internal
+  bool reportsTo(JuiceLogger logger) => identical(_logger, logger);
 
   /// This bloc's type name, for telemetry.
   late final String _blocName = typeName(runtimeType);
@@ -236,6 +251,181 @@ class JuiceBloc<TState extends BlocState>
     if (JuiceLoggerConfig.logs(Level.info)) {
       _logger.record(JuiceTelemetry(JuiceTelemetryKind.streamBindingStarted,
           bloc: _blocName, key: key));
+    }
+    return binding;
+  }
+
+  // ============================================================
+  // Reactions
+  // ============================================================
+
+  /// The reactions this bloc owns (it is their destination).
+  final Set<ReactionBinding> _reactions = {};
+
+  /// Attach [reaction]: from now on, when its source's state does what the
+  /// reaction describes, THIS bloc is sent the reaction's event.
+  ///
+  /// This bloc owns the reaction — it ends when this bloc closes, with no
+  /// field to keep and nothing to cancel in `close()`. Call it in the
+  /// constructor body for wiring the bloc always has, or from whoever holds
+  /// the bloc for wiring that depends on what else exists.
+  ///
+  /// - The edge is judged SYNCHRONOUSLY on each emission of the source (no
+  ///   state is missed); the event is built and sent a microtask later, so
+  ///   another bloc's use case never runs inside the emitting one.
+  /// - The event must be one this bloc has a use case for; one it has not
+  ///   is an `unhandled_event`, as from any `send`.
+  /// - A catch-up fire ([AtAttach.catchUp]) is an ordinary hop: a microtask
+  ///   after the attach, never synchronously in a constructor.
+  /// - A chain of reactions deeper than [Reaction.maxHops] is refused at
+  ///   the hop that would exceed it, and recorded as an error
+  ///   (`reaction` / `refused`); the reaction stays attached.
+  /// - A throw from the reaction's own callbacks is recorded (`reaction` /
+  ///   `error`, with the `site`) and nothing is sent; the reaction stays
+  ///   attached, and the throw never reaches the use case that emitted.
+  /// - When the SOURCE closes the reaction ends (`reaction` / `end`). It
+  ///   holds no lease on the source and is not re-attached to a new
+  ///   instance of it.
+  ///
+  /// Throws [StateError] if this bloc is closed or closing, or if the
+  /// source is unregistered, a `leased` bloc resolved by type, closed or
+  /// closing: wiring is set up once, and a reaction that cannot work is a
+  /// bug to see now.
+  ///
+  /// Returns the [ReactionBinding], to detach early.
+  ReactionBinding react<TBloc extends JuiceBloc<TSourceState>,
+      TSourceState extends BlocState>(Reaction<TBloc, TSourceState> reaction) {
+    if (isClosing) {
+      throw StateError('react on a closed or closing $runtimeType');
+    }
+    final TBloc source = reaction.resolveSource();
+    if (source.isClosing) {
+      throw StateError(
+          'react: the source ${source.runtimeType} is closed or closing');
+    }
+    final sourceName = source._blocName;
+
+    late final ReactionBinding binding;
+    late final void Function() untap;
+    late final void Function() onSourceClosed;
+
+    void failed(String site, Object error, StackTrace stackTrace) =>
+        _logger.record(JuiceTelemetry(
+          JuiceTelemetryKind.reactionFailed,
+          sourceBloc: sourceName,
+          destBloc: _blocName,
+          reaction: reaction.form,
+          site: site,
+          error: error,
+          stackTrace: stackTrace,
+        ));
+
+    // One hop: [state] is what the reaction fired on, [depth] where the
+    // chain will be once the event is sent.
+    void hop(TSourceState state, int depth, int? causeExecutionId,
+        {bool atAttach = false}) {
+      if (depth > Reaction.maxHops) {
+        _logger.record(JuiceTelemetry(
+          JuiceTelemetryKind.reactionRefused,
+          sourceBloc: sourceName,
+          destBloc: _blocName,
+          reaction: reaction.form,
+          hopDepth: depth,
+          error: StateError('A chain of reactions reached hop $depth, past '
+              'Reaction.maxHops (${Reaction.maxHops}): $sourceName → '
+              '$_blocName was not sent. A ring of reactions, or a chain '
+              'that should be one use case.'),
+          stackTrace: StackTrace.current,
+        ));
+        return;
+      }
+      // A test flow counts the hop from here until it is sent or dropped.
+      final probe = JuiceActivityProbe.current;
+      final work = probe == null ? null : JuiceWork.hop(sourceName, _blocName);
+      if (work != null) probe!.began(work);
+      scheduleMicrotask(() {
+        try {
+          // Ended in the meantime (cancelled, or either bloc closed): the
+          // hop is discarded.
+          if (!binding.isActive) return;
+          final EventBase event;
+          try {
+            event = reaction.send(state);
+          } catch (error, stackTrace) {
+            failed('send', error, stackTrace);
+            return;
+          }
+          final cause = EventCause(causeExecutionId, depth);
+          EventCause.stamp(event, cause);
+          if (JuiceLoggerConfig.logs(Level.info)) {
+            _logger.record(JuiceTelemetry(
+              JuiceTelemetryKind.reactionFired,
+              sourceBloc: sourceName,
+              destBloc: _blocName,
+              reaction: reaction.form,
+              event: typeName(event.runtimeType),
+              causeExecutionId: causeExecutionId,
+              hopDepth: depth,
+              reason: atAttach ? 'attach' : null,
+            ));
+          }
+          // The cause belongs to the run it causes, not to the instance:
+          // when that run ends it is released, so the same instance sent
+          // again later by anything else starts at depth zero.
+          send(event).whenComplete(() => EventCause.release(event, cause));
+        } finally {
+          if (work != null) probe!.ended(work);
+        }
+      });
+    }
+
+    binding = ReactionBinding.create(() {
+      untap();
+      source._closeHooks.remove(onSourceClosed);
+      _reactions.remove(binding);
+    });
+    untap = source.tapEmissions((status) {
+      // Inside the emit of whichever use case changed the source's state:
+      // nothing here may throw into it.
+      final emitter = source._statusEmitter;
+      // A re-emitted event repeats the last status's states: not a
+      // transition, so not judged as one.
+      if (emitter.reEmitting) return;
+      final bool fires;
+      try {
+        fires = reaction.fires(status.oldState, status.state);
+      } catch (error, stackTrace) {
+        failed(reaction.judgeSite, error, stackTrace);
+        return;
+      }
+      if (!fires) return;
+      hop(status.state, EventCause.depthOf(status.event) + 1,
+          emitter.emittingExecutionId);
+    });
+    onSourceClosed = () {
+      binding.cancel();
+      if (JuiceLoggerConfig.logs(Level.info)) {
+        _logger.record(JuiceTelemetry(
+          JuiceTelemetryKind.reactionEnded,
+          sourceBloc: sourceName,
+          destBloc: _blocName,
+          reaction: reaction.form,
+          reason: 'source closed',
+        ));
+      }
+    };
+    source._closeHooks.add(onSourceClosed);
+    _reactions.add(binding);
+
+    if (reaction.atAttach == AtAttach.catchUp) {
+      final now = source.state;
+      var fires = false;
+      try {
+        fires = reaction.firesAtAttach(now);
+      } catch (error, stackTrace) {
+        failed(reaction.judgeSite, error, stackTrace);
+      }
+      if (fires) hop(now, 1, null, atAttach: true);
     }
     return binding;
   }
@@ -374,7 +564,164 @@ class JuiceBloc<TState extends BlocState>
       ));
       return Future<void>.value();
     }
-    return _dispatcher.dispatch(event);
+    final probe = JuiceActivityProbe.current;
+    if (probe == null) return _dispatcher.dispatch(event);
+    // Inside a test flow: the send is in flight until its processing is
+    // over (one microtask later than outside a flow).
+    final work = JuiceWork.send(_blocName, typeName(event.runtimeType));
+    probe.began(work);
+    return _dispatcher.dispatch(event).whenComplete(() => probe.ended(work));
+  }
+
+  // ============================================================
+  // Singleflight
+  // ============================================================
+
+  /// A `singleflight` run started: keep the first status it emits that is
+  /// not a waiting one — the answer `sendAndWait` gives — for an event that
+  /// joins after it was emitted.
+  void _watchFlight(Flight<EventBase> flight) {
+    late final void Function() untap;
+    untap = tapEmissions((status) {
+      if (identical(status.event, flight.leader) &&
+          status is! WaitingStatus<TState>) {
+        flight.firstStatus = status;
+        untap();
+      }
+    });
+    flight.onEnd = untap;
+  }
+
+  /// [event] joined [flight] instead of running: recorded, and — for a
+  /// result event — completed with whatever the running event completes
+  /// with.
+  void _joinFlight(EventBase event, Flight<EventBase> flight) {
+    if (JuiceLoggerConfig.logs(Level.info)) {
+      _logger.record(JuiceTelemetry(
+        JuiceTelemetryKind.eventJoined,
+        bloc: _blocName,
+        event: typeName(event.runtimeType),
+        key: flight.key?.toString(),
+      ));
+    }
+    final leader = flight.leader;
+    if (event is ResultEvent && leader is ResultEvent) event.follow(leader);
+  }
+
+  // ============================================================
+  // Delayed sends
+  // ============================================================
+
+  /// Every pending delayed send; keyed ones are also in
+  /// [_keyedDelayedSends].
+  final Map<DelayedSend, _PendingSend> _delayedSends = {};
+  final Map<String, DelayedSend> _keyedDelayedSends = {};
+
+  /// Sends [event] once [delay] has elapsed. The bloc owns the timer: no
+  /// `Timer` field, no `isClosed` guard, no cancel in `close()`.
+  ///
+  /// ```dart
+  /// // A debounce: each keystroke replaces the search still waiting.
+  /// bloc.sendAfter(SearchEvent(text), kSearchDebounce, key: 'search');
+  /// ```
+  ///
+  /// [key] makes it replaceable: a later `sendAfter` with the same key
+  /// REPLACES the pending one — its event is never sent — and
+  /// [cancelSend] cancels it by name. An anonymous delayed send is
+  /// cancelled through the returned [DelayedSend.cancel].
+  ///
+  /// A replaced or cancelled send is not an error: it is recorded as
+  /// `event_dropped`, with the reason.
+  ///
+  /// When the bloc closes, a pending delayed send is DISCARDED — recorded
+  /// as `event_ignored` — never sent early. Called on a closing or closed
+  /// bloc, `sendAfter` is refused the same way and returns a handle that
+  /// was never pending.
+  ///
+  /// A zero [delay] sends on the next timer turn, never synchronously; a
+  /// negative one throws [ArgumentError].
+  ///
+  /// The event is sent as a fresh one: whatever chain of reactions the
+  /// caller was part of does not continue through a delay (a hop count
+  /// starts again at zero).
+  DelayedSend sendAfter(EventBase event, Duration delay, {String? key}) {
+    if (delay.isNegative) {
+      throw ArgumentError.value(
+          delay, 'delay', 'sendAfter: a delay cannot be negative');
+    }
+    final eventName = typeName(event.runtimeType);
+    if (isClosing) {
+      _logger.record(JuiceTelemetry(
+        JuiceTelemetryKind.eventIgnored,
+        bloc: _blocName,
+        event: eventName,
+        key: key,
+        reason: 'sendAfter: $_closedReason',
+      ));
+      return DelayedSend.inert(key);
+    }
+    if (key != null) {
+      final replaced = _keyedDelayedSends[key];
+      if (replaced != null) {
+        _dropDelayedSend(replaced, 'sendAfter: replaced by a later $eventName');
+      }
+    }
+
+    final handle = DelayedSend.create(
+        key, (send) => _dropDelayedSend(send, 'sendAfter: cancelled'));
+    // A test flow knows the send is pending from here until it is over.
+    final probe = JuiceActivityProbe.current;
+    final work =
+        probe == null ? null : JuiceWork.delayed(_blocName, eventName, delay);
+    if (work != null) probe!.began(work);
+    final timer = Timer(delay, () {
+      final pending = _takeDelayedSend(handle)!;
+      EventCause.clear(event);
+      // The send begins before the delayed work ends: no idle moment
+      // between the two for a flow to mistake for the end.
+      send(event);
+      pending.over();
+    });
+    _delayedSends[handle] = _PendingSend(timer, eventName, probe, work);
+    if (key != null) _keyedDelayedSends[key] = handle;
+    return handle;
+  }
+
+  /// Cancels the pending [sendAfter] that was given [key]: its event is not
+  /// sent. Nothing happens if none is pending.
+  void cancelSend(String key) {
+    final pending = _keyedDelayedSends[key];
+    if (pending != null) _dropDelayedSend(pending, 'sendAfter: cancelled');
+  }
+
+  /// Takes [handle] out of the pending sends, timer cancelled: its event
+  /// will not be sent by the timer. Null if it was already over.
+  _PendingSend? _takeDelayedSend(DelayedSend handle) {
+    final pending = _delayedSends.remove(handle);
+    if (pending == null) return null;
+    pending.timer.cancel();
+    // A pending keyed send is the one its key names: a replace drops the
+    // earlier one before the later one takes the key.
+    if (handle.key != null) _keyedDelayedSends.remove(handle.key);
+    DelayedSend.end(handle);
+    return pending;
+  }
+
+  /// [handle]'s event will not be sent — cancelled or replaced ([reason]);
+  /// recorded as a dropped event.
+  void _dropDelayedSend(DelayedSend handle, String reason) {
+    final pending = _takeDelayedSend(handle);
+    if (pending == null) return;
+    if (JuiceLoggerConfig.logs(Level.info)) {
+      _logger.record(JuiceTelemetry(
+        JuiceTelemetryKind.eventDropped,
+        bloc: _blocName,
+        event: pending.eventName,
+        key: handle.key,
+        reason: reason,
+      ));
+    }
+    pending.over();
   }
 
   /// Sends a cancellable event and returns it for cancellation control.
@@ -444,7 +791,7 @@ class JuiceBloc<TState extends BlocState>
       if (done.isCompleted) return;
       untap();
       timer.cancel();
-      _pendingWaits.remove(failOnClose);
+      _closeHooks.remove(failOnClose);
       if (error != null) {
         done.completeError(error, stackTrace);
       } else {
@@ -452,8 +799,13 @@ class JuiceBloc<TState extends BlocState>
       }
     }
 
+    // The event whose emissions answer this wait: the event itself — or,
+    // once it has joined a `singleflight` run, the event that is running.
+    EventBase answeredBy = event;
     untap = tapEmissions((s) {
-      if (identical(s.event, event) && s is! WaitingStatus<TState>) finish(s);
+      if (identical(s.event, answeredBy) && s is! WaitingStatus<TState>) {
+        finish(s);
+      }
     });
     timer = Timer(timeout, () {
       finish(
@@ -463,10 +815,19 @@ class JuiceBloc<TState extends BlocState>
         null,
         StateError(
             '$runtimeType closed while sendAndWait(${event.runtimeType}) was pending'));
-    _pendingWaits.add(failOnClose);
+    _closeHooks.add(failOnClose);
 
     final restartable = _dispatcher.isRestartable(event.runtimeType);
-    send(event).then((_) {
+    final sent = send(event);
+    final flight = _dispatcher.flightJoinedBy(event);
+    if (flight != null) {
+      // Joined: answered by the run in flight — at once, if that run
+      // already emitted its answer.
+      answeredBy = flight.leader;
+      final answer = flight.firstStatus;
+      if (answer != null) finish(answer as StreamStatus<TState>);
+    }
+    sent.then((_) {
       // Processing is over. A restartable run that was superseded answers
       // below; anything else that emitted nothing never will.
       if (done.isCompleted ||
@@ -497,9 +858,118 @@ class JuiceBloc<TState extends BlocState>
     return done.future;
   }
 
-  /// The `sendAndWait`s still pending, each as the closure that fails it; a
-  /// close runs them so no wait is left to time out.
-  final Set<void Function()> _pendingWaits = {};
+  /// Waits until [predicate] holds for this bloc's state and returns the
+  /// state it held for.
+  ///
+  /// The predicate sees state only. It is checked against the current state
+  /// first — a wait for something already true returns that state — and
+  /// then against every emission, of every status kind, SYNCHRONOUSLY (the
+  /// tap [sendAndWait] uses), so a state that holds for one emission is not
+  /// missed.
+  ///
+  /// [timeout] is required: there is no default and no "forever".
+  ///
+  /// Every other exit fails loud:
+  /// - nothing matched within [timeout]: [TimeoutException], naming the
+  ///   bloc;
+  /// - the bloc is closed or closing at the call, or closes while the wait
+  ///   is pending: [StateError];
+  /// - [predicate] throws: the wait fails with that error and is over. A
+  ///   throw on an emission never reaches the use case that emitted.
+  ///
+  /// Called inside a `restartable` use case the wait belongs to that run:
+  /// when the run is superseded the wait fails with a [CancelledException]
+  /// (at once, if the run is superseded already) instead of holding a
+  /// fenced run until [timeout]. A superseded run that ends on that
+  /// exception is not a failure: its span closes flagged superseded and the
+  /// error handler is not called.
+  ///
+  /// ```dart
+  /// final s = await llm.waitFor(
+  ///   (s) => s.isReady || s.modelStatus == LlmModelStatus.error,
+  ///   timeout: const Duration(minutes: 8),
+  /// );
+  /// if (!s.isReady) return;
+  /// ```
+  Future<TState> waitFor(
+    bool Function(TState state) predicate, {
+    required Duration timeout,
+  }) {
+    // The CALLER's run (the zone's), not this bloc's: a wait is usually on
+    // another bloc.
+    final run = RestartableRun.current;
+    if (run?.isSuperseded ?? false) {
+      return Future<TState>.error(
+          CancelledException(
+              'waitFor on $runtimeType: the calling run was superseded'),
+          StackTrace.current);
+    }
+    if (isClosing) {
+      return Future<TState>.error(
+          StateError('waitFor on a closed or closing $runtimeType'),
+          StackTrace.current);
+    }
+    try {
+      if (predicate(state)) return Future<TState>.value(state);
+    } catch (error, stackTrace) {
+      return Future<TState>.error(error, stackTrace);
+    }
+
+    final done = Completer<TState>();
+    late final void Function() untap;
+    late final Timer timer;
+    late final void Function() failOnClose;
+    // Every exit goes through here once: the tap, the timer and the close
+    // hook are all removed, so a finished wait leaves nothing behind.
+    bool settle() {
+      if (done.isCompleted) return false;
+      untap();
+      timer.cancel();
+      _closeHooks.remove(failOnClose);
+      return true;
+    }
+
+    void fail(Object error, [StackTrace? stackTrace]) {
+      if (settle()) done.completeError(error, stackTrace);
+    }
+
+    untap = tapEmissions((status) {
+      // Inside the emit of whichever use case changed the state: a throwing
+      // predicate fails THIS wait, it does not unwind into that use case.
+      final bool matched;
+      try {
+        matched = predicate(status.state);
+      } catch (error, stackTrace) {
+        fail(error, stackTrace);
+        return;
+      }
+      if (matched && settle()) done.complete(status.state);
+    });
+    timer = Timer(timeout,
+        () => fail(TimeoutException('waitFor on $runtimeType', timeout)));
+    failOnClose = () =>
+        fail(StateError('$runtimeType closed while a waitFor was pending'));
+    _closeHooks.add(failOnClose);
+    run?.whenSuperseded.then((_) => fail(CancelledException(
+        'waitFor on $runtimeType: the calling run was superseded')));
+    return done.future;
+  }
+
+  /// What a close of THIS bloc must tell: every pending `sendAndWait` and
+  /// `waitFor` (as the closure that fails it, so no wait is left to time
+  /// out) and every reaction observing this bloc (as the closure that ends
+  /// it).
+  final Set<void Function()> _closeHooks = {};
+
+  /// Framework-internal: run [hook] when this bloc closes — after its
+  /// bindings are cancelled, before its use cases close. Returns the
+  /// remover. `sendAndWaitResult` uses it so a wait on an event's RESULT
+  /// fails at the close, as a wait on its status already does.
+  @internal
+  void Function() onClose(void Function() hook) {
+    _closeHooks.add(hook);
+    return () => _closeHooks.remove(hook);
+  }
 
   /// Observes every emission SYNCHRONOUSLY (inside the emit, before stream
   /// delivery). Returns the remover. Framework-internal — `sendAndWaitResult`
@@ -519,6 +989,7 @@ class JuiceBloc<TState extends BlocState>
   @visibleForTesting
   @override
   void emit(StreamStatus<TState> status) {
+    _statusEmitter.emittingExecutionId = null;
     _stateManager.emit(status);
   }
 
@@ -572,6 +1043,26 @@ class JuiceBloc<TState extends BlocState>
   Future<void> _close() async {
     if (isClosed) return;
     _closing = true;
+    // The reactions this bloc owns end with it, silently — and at once,
+    // before the first await: a hop already decided must not be built for
+    // a bloc that will refuse it.
+    for (final reaction in _reactions.toList()) {
+      reaction.cancel();
+    }
+    // Pending delayed sends are discarded — at once too, so no timer fires
+    // into the close — and each is recorded: an event the bloc was asked
+    // to send was not.
+    for (final handle in _delayedSends.keys.toList()) {
+      final pending = _takeDelayedSend(handle)!;
+      _logger.record(JuiceTelemetry(
+        JuiceTelemetryKind.eventIgnored,
+        bloc: _blocName,
+        event: pending.eventName,
+        key: handle.key,
+        reason: 'sendAfter: discarded, the bloc closed',
+      ));
+      pending.over();
+    }
 
     if (JuiceLoggerConfig.logs(Level.info)) {
       _logger.record(JuiceTelemetry(
@@ -582,8 +1073,22 @@ class JuiceBloc<TState extends BlocState>
     }
 
     await _cancelBindings();
-    for (final fail in _pendingWaits.toList()) {
-      fail();
+    // Whoever was waiting on this bloc or reacting to it is told. A hook
+    // runs code another bloc owns (a reaction's destination records into
+    // ITS logger): one that throws is recorded and the close goes on, so
+    // the waits behind it are still failed and this bloc still closes.
+    for (final hook in _closeHooks.toList()) {
+      try {
+        hook();
+      } catch (error, stackTrace) {
+        _logger.record(JuiceTelemetry(
+          JuiceTelemetryKind.blocCloseFailed,
+          bloc: _blocName,
+          reason: 'a close hook threw',
+          error: error,
+          stackTrace: stackTrace,
+        ));
+      }
     }
     await _useCaseRegistry.closeAll();
     await _aviatorManager.closeAll();
@@ -664,6 +1169,7 @@ class JuiceBloc<TState extends BlocState>
       (event) => _useCaseExecutor.execute(builder, event),
       eventType: builder.eventType,
       concurrency: builder.concurrency,
+      joinKey: builder is UseCaseBuilder ? builder.joinKey : null,
     );
   }
 
@@ -701,23 +1207,28 @@ class JuiceBloc<TState extends BlocState>
   late final void Function(String?, Map<String, dynamic>?) _sharedNavigate =
       _aviatorManager.navigate;
 
-  UseCaseContext<JuiceBloc<TState>, TState> _createContext(EventBase event) {
+  /// [executionId] is the run's id (the executor's): every status the run
+  /// emits carries it on its telemetry entry.
+  UseCaseContext<JuiceBloc<TState>, TState> _createContext(
+      EventBase event, int executionId) {
     if (_dispatcher.isRestartable(event.runtimeType)) {
-      return _fencedContext(event);
+      return _fencedContext(event, executionId);
     }
     return UseCaseContext(
       bloc: this,
       emitUpdate: (newState, groups, {bool skipIfSame = false}) =>
           _statusEmitter.emitUpdate(event, newState, groups,
-              skipIfSame: skipIfSame),
-      emitWaiting: (newState, groups) =>
-          _statusEmitter.emitWaiting(event, newState, groups),
+              skipIfSame: skipIfSame, executionId: executionId),
+      emitWaiting: (newState, groups) => _statusEmitter
+          .emitWaiting(event, newState, groups, executionId: executionId),
       emitFailure: (newState, groups,
               {Object? error, StackTrace? errorStackTrace}) =>
           _statusEmitter.emitFailure(event, newState, groups,
-              error: error, errorStackTrace: errorStackTrace),
-      emitCancel: (newState, groups) =>
-          _statusEmitter.emitCancel(event, newState, groups),
+              error: error,
+              errorStackTrace: errorStackTrace,
+              executionId: executionId),
+      emitCancel: (newState, groups) => _statusEmitter
+          .emitCancel(event, newState, groups, executionId: executionId),
       emitEvent: _sharedEmitEvent,
       navigate: _sharedNavigate,
     );
@@ -733,7 +1244,8 @@ class JuiceBloc<TState extends BlocState>
   /// dropped once the run is superseded, each drop logged as
   /// `state_emission_superseded`. Built only for restartable types, so the
   /// other modes pay nothing for the fence.
-  UseCaseContext<JuiceBloc<TState>, TState> _fencedContext(EventBase event) {
+  UseCaseContext<JuiceBloc<TState>, TState> _fencedContext(
+      EventBase event, int executionId) {
     // The RUN, not the event, is what gets superseded: the same event
     // instance sent twice is two runs, and only the first is fenced. The
     // context is created inside the run's zone (the executor runs there),
@@ -752,6 +1264,7 @@ class JuiceBloc<TState extends BlocState>
           JuiceTelemetryKind.emissionSuperseded,
           bloc: _blocName,
           event: typeName(event.runtimeType),
+          executionId: executionId,
           status: status,
         ));
       }
@@ -763,21 +1276,25 @@ class JuiceBloc<TState extends BlocState>
       emitUpdate: (newState, groups, {bool skipIfSame = false}) {
         if (fenced(EmissionKind.update)) return;
         _statusEmitter.emitUpdate(event, newState, groups,
-            skipIfSame: skipIfSame);
+            skipIfSame: skipIfSame, executionId: executionId);
       },
       emitWaiting: (newState, groups) {
         if (fenced(EmissionKind.waiting)) return;
-        _statusEmitter.emitWaiting(event, newState, groups);
+        _statusEmitter.emitWaiting(event, newState, groups,
+            executionId: executionId);
       },
       emitFailure: (newState, groups,
           {Object? error, StackTrace? errorStackTrace}) {
         if (fenced(EmissionKind.failure)) return;
         _statusEmitter.emitFailure(event, newState, groups,
-            error: error, errorStackTrace: errorStackTrace);
+            error: error,
+            errorStackTrace: errorStackTrace,
+            executionId: executionId);
       },
       emitCancel: (newState, groups) {
         if (fenced(EmissionKind.cancel)) return;
-        _statusEmitter.emitCancel(event, newState, groups);
+        _statusEmitter.emitCancel(event, newState, groups,
+            executionId: executionId);
       },
       emitEvent: (EventBase? e) {
         if (e == null || fenced(EmissionKind.event)) return;
@@ -813,4 +1330,21 @@ class JuiceBloc<TState extends BlocState>
   /// error reaches [onError] (the `bloc_error` hook and the error handler).
   void _handleUseCaseError(Object error, StackTrace stack, EventBase event) =>
       onError(error, stack);
+}
+
+/// A delayed send the bloc is holding: its timer, and what a test flow was
+/// told about it.
+class _PendingSend {
+  _PendingSend(this.timer, this.eventName, this._probe, this._work);
+
+  final Timer timer;
+  final String eventName;
+  final JuiceActivityProbe? _probe;
+  final JuiceWork? _work;
+
+  /// The delayed send is over, however it ended.
+  void over() {
+    final work = _work;
+    if (work != null) _probe!.ended(work);
+  }
 }

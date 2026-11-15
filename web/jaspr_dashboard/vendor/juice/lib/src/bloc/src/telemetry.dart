@@ -51,8 +51,23 @@ enum JuiceTelemetryKind {
       'sequential_run_error', 'Sequential run failed outside the executor',
       level: Level.error),
 
+  /// A `singleflight` builder's `joinKey` threw for an event: the event is
+  /// not run, and its send's future fails with that error.
+  joinKeyFailed('join_key_error', 'Join key threw', level: Level.error),
+
   /// A `restartable` run was superseded by a newer same-type event.
   useCaseSuperseded('use_case_superseded', 'Use case superseded'),
+
+  /// An event was dropped before any use case ran for it (`reason`): a
+  /// `droppable` builder had an earlier one of its type still running, or a
+  /// `sendAfter` was replaced or cancelled (then with `bloc`, and `key`
+  /// when it had one). Not an error.
+  eventDropped('event_dropped', 'Event dropped'),
+
+  /// An event joined the `singleflight` run already in flight for its type
+  /// (and `key`, as text, when its builder has a `joinKey`) instead of
+  /// running: it is answered with that run's outcome.
+  eventJoined('event_joined', 'Event joined'),
 
   /// Superseding a run threw (a throwing `cancel()`, logger or binding
   /// cancel); the new run still starts.
@@ -60,8 +75,9 @@ enum JuiceTelemetryKind {
       level: Level.error),
 
   // --- emissions
-  /// A status is being put on the stream: `status`, `state`, `groups`;
-  /// `error` and `stackTrace` on a failure.
+  /// A status is being put on the stream: `status`, `state`, `groups`,
+  /// the `executionId` of the run emitting it; `error` and `stackTrace` on
+  /// a failure.
   stateEmitted('state_emission', 'State emitted'),
 
   /// `emitUpdate(skipIfSame: true)` found `newState == state`.
@@ -77,7 +93,9 @@ enum JuiceTelemetryKind {
       level: Level.warning),
 
   // --- the bloc's lifecycle
-  /// A `send` on a closed or closing bloc was refused (`reason`).
+  /// A `send` on a closed or closing bloc was refused (`reason`) — or a
+  /// `sendAfter` was (`key` when it had one), or a pending one was discarded
+  /// because the bloc closed.
   eventIgnored('bloc_lifecycle', 'Event ignored',
       action: 'event_ignored', level: Level.warning),
 
@@ -201,6 +219,28 @@ enum JuiceTelemetryKind {
   /// `transform` or `stream`). An `initialize` failure is also thrown.
   relayFailed('relay_error', 'Relay failed', level: Level.error),
 
+  // --- reactions
+  /// A reaction fired: its event is being sent to the destination
+  /// (`sourceBloc`, `destBloc`, `reaction`, `event`, `hopDepth`, and the
+  /// `causeExecutionId` of the run whose emission it observed; `reason` is
+  /// `attach` for a catch-up fire).
+  reactionFired('reaction', 'Reaction fired', action: 'fire'),
+
+  /// A reaction did NOT send: the hop would be deeper than
+  /// `Reaction.maxHops` (`sourceBloc`, `destBloc`, `reaction`, `hopDepth`).
+  /// A ring of reactions, or a chain that should be one use case.
+  reactionRefused('reaction', 'Reaction refused: the chain is too long',
+      action: 'refused', level: Level.error),
+
+  /// A reaction ended because its source closed (`sourceBloc`, `destBloc`,
+  /// `reaction`, `reason`).
+  reactionEnded('reaction', 'Reaction ended', action: 'end'),
+
+  /// A reaction's own callback threw (`site`: `predicate`, `select`,
+  /// `edge` or `send`). Nothing was sent; the reaction stays attached.
+  reactionFailed('reaction', 'Reaction failed',
+      action: 'error', level: Level.error),
+
   /// `BlocScope.enableLeakDetection`.
   leakDetectionEnabled('leak_detection', 'Leak detection enabled',
       action: 'enable');
@@ -227,8 +267,10 @@ enum JuiceTelemetryKind {
 
 /// One framework telemetry entry: the typed record the framework hands to
 /// [JuiceLogger.record] in place of a message plus a `Map<String, dynamic>`
-/// context. One allocation per entry; fields read by name; nothing is
-/// stringified until a logger prints or ships it.
+/// context. One allocation per entry (two for the entries of a relay, a
+/// subscription or a reaction, which carry their wiring beside the entry);
+/// fields read by name; nothing is stringified until a logger prints or
+/// ships it.
 ///
 /// Fields are LIVE objects — [state] is the emitted state, [groups] the
 /// caller's set, [error] the error — so a logger that drops the entry pays
@@ -241,7 +283,16 @@ enum JuiceTelemetryKind {
 /// for loggers and tools that key on those strings.
 final class JuiceTelemetry {
   /// Creates an entry of [kind] with the fields that kind sets.
-  const JuiceTelemetry(
+  ///
+  /// Not `const`: the wiring facts ([sourceBloc], [sourceEvent],
+  /// [localEvent], [destBloc], [relay], [reaction], [causeExecutionId],
+  /// [hopDepth]) are held together, beside the entry, and only by the
+  /// entries that have one. The entry itself stays within the size it had
+  /// at 2.0.0, which is what a send with every record built is priced on:
+  /// one more stored field than that tripled the cost of building an entry
+  /// (`benchmarks/RESULTS.md`; pinned by
+  /// `test/bloc/telemetry_record_shape_test.dart`).
+  JuiceTelemetry(
     this.kind, {
     this.bloc,
     this.event,
@@ -266,12 +317,25 @@ final class JuiceTelemetry {
     this.leaseCount,
     this.bindingCount,
     this.blocCount,
-    this.sourceBloc,
-    this.sourceEvent,
-    this.localEvent,
-    this.destBloc,
-    this.relay,
-  });
+    String? sourceBloc,
+    String? sourceEvent,
+    String? localEvent,
+    String? destBloc,
+    String? relay,
+    String? reaction,
+    int? causeExecutionId,
+    int? hopDepth,
+  }) : _wiring = (sourceBloc == null &&
+                sourceEvent == null &&
+                localEvent == null &&
+                destBloc == null &&
+                relay == null &&
+                reaction == null &&
+                causeExecutionId == null &&
+                hopDepth == null)
+            ? null
+            : _TelemetryWiring(sourceBloc, sourceEvent, localEvent, destBloc,
+                relay, reaction, causeExecutionId, hopDepth);
 
   /// What happened.
   final JuiceTelemetryKind kind;
@@ -299,7 +363,8 @@ final class JuiceTelemetry {
   /// The use case's type name (the builder's, when the generator threw).
   final String? useCase;
 
-  /// The span id shared by a use case's start and end entries.
+  /// The span id shared by a use case's start and end entries, and by the
+  /// entries of every status that run emits.
   final int? executionId;
 
   /// The span's duration, when the span was being timed (the chatter was
@@ -319,7 +384,8 @@ final class JuiceTelemetry {
   /// widget).
   final Set<String>? groups;
 
-  /// A stream binding's key.
+  /// A stream binding's key, a delayed send's, or — as text — the join key
+  /// of a `singleflight` join.
   final String? key;
 
   /// Why: a refusal's or an ignored event's cause (`bloc is closed`,
@@ -365,20 +431,36 @@ final class JuiceTelemetry {
   /// Blocs a feature scope managed when it ended.
   final int? blocCount;
 
+  /// The wiring facts, for the entries that have any; null for every other
+  /// entry.
+  final _TelemetryWiring? _wiring;
+
   /// A subscription's or relay's source bloc type name.
-  final String? sourceBloc;
+  String? get sourceBloc => _wiring?.sourceBloc;
 
   /// A subscription's source event type name.
-  final String? sourceEvent;
+  String? get sourceEvent => _wiring?.sourceEvent;
 
   /// A subscription's local event type name.
-  final String? localEvent;
+  String? get localEvent => _wiring?.localEvent;
 
   /// A relay's destination bloc type name.
-  final String? destBloc;
+  String? get destBloc => _wiring?.destBloc;
 
   /// A relay's type name (`StateRelay`, `StatusRelay`).
-  final String? relay;
+  String? get relay => _wiring?.relay;
+
+  /// A reaction's form: `becomes`, `changes` or `edge`.
+  String? get reaction => _wiring?.reaction;
+
+  /// The `executionId` of the run whose emission a reaction observed — on
+  /// the reaction's `reactionFired` entry and on the start entry of the run
+  /// its event causes. Absent when no run made that emission.
+  int? get causeExecutionId => _wiring?.causeExecutionId;
+
+  /// How many reaction hops deep a chain is at this entry (1 for the first
+  /// reaction in it).
+  int? get hopDepth => _wiring?.hopDepth;
 
   /// The entry as the context map it was before 2.0.0 — `type`, `action`
   /// and every field that is set, under the keys the 1.x entries used
@@ -414,5 +496,34 @@ final class JuiceTelemetry {
         if (localEvent != null) 'localEvent': localEvent,
         if (destBloc != null) 'destBloc': destBloc,
         if (relay != null) 'relay': relay,
+        if (reaction != null) 'reaction': reaction,
+        if (causeExecutionId != null) 'causeExecutionId': causeExecutionId,
+        if (hopDepth != null) 'hopDepth': hopDepth,
       };
+}
+
+/// What a relay's, a subscription's or a reaction's entry says about its
+/// wiring. Held beside the [JuiceTelemetry] entry, not in it: these eight
+/// facts are set by a handful of kinds, and an entry that carried them all
+/// inline was three times as costly to build as one that did not.
+final class _TelemetryWiring {
+  const _TelemetryWiring(
+    this.sourceBloc,
+    this.sourceEvent,
+    this.localEvent,
+    this.destBloc,
+    this.relay,
+    this.reaction,
+    this.causeExecutionId,
+    this.hopDepth,
+  );
+
+  final String? sourceBloc;
+  final String? sourceEvent;
+  final String? localEvent;
+  final String? destBloc;
+  final String? relay;
+  final String? reaction;
+  final int? causeExecutionId;
+  final int? hopDepth;
 }

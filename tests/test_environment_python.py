@@ -304,7 +304,7 @@ class AcquisitionTests(unittest.TestCase):
     def run_fixture(self, arguments, **context):
         self.calls.append((arguments, context))
         if arguments[1:] == ['--version']:
-            return Mock(returncode=0, stdout='uv 0.12.19 (fixture)\n')
+            return Mock(returncode=0, stdout=f"uv {self.spec['uv_version']} (fixture)\n")
         if arguments[1:4] == ['--no-config', 'python', 'install']:
             env = context['env']
             final = Path(env['UV_PYTHON_INSTALL_DIR'])

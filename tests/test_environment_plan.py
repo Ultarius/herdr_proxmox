@@ -33,7 +33,7 @@ def report(*requirements, project='app', revision='a' * 40, scope='committed'):
                             analyzer=5, boundary='repository root', at='', cache_seconds=0))
 
 
-RELEASE = {'flutter': dict(label='Flutter', version='3.44.8', acquirable=True,
+RELEASE = {'flutter': dict(label='Flutter', version='3.47.9', acquirable=True,
                            declared_by='.fvmrc#flutter', script='install/dev-tools-install.sh')}
 
 
@@ -69,8 +69,8 @@ class CapabilityTests(unittest.TestCase):
         entries = environment_capabilities.release_catalog()
         self.assertIn('flutter', entries)
         self.assertTrue(entries['flutter']['acquirable'])
-        self.assertEqual(entries['flutter']['version'], '3.44.8')
-        self.assertEqual(environment_capabilities.release_exact('flutter'), '3.44.8')
+        self.assertEqual(entries['flutter']['version'], '3.47.9')
+        self.assertEqual(environment_capabilities.release_exact('flutter'), '3.47.9')
         # No capability claims acquisition from the release catalog.
         self.assertFalse(environment_capabilities.describe('flutter')['acquirable'])
 
@@ -95,7 +95,7 @@ class SelectionPolicyTests(unittest.TestCase):
         self.assertEqual(value['requirements'][0]['basis'], 'override')
 
     def test_every_range_and_selection_participates_in_selection(self):
-        data = requirement('flutter', '>=3.0.0', notation='pub', selected='3.44.8')
+        data = requirement('flutter', '>=3.0.0', notation='pub', selected='3.47.9')
         value = environment_plan.build(report(data), release_entries={}, measure=lambda name: ('3.40.0', ''))
         self.assertNotEqual(value['requirements'][0]['state'], 'ready')
 
@@ -133,11 +133,11 @@ class SelectionPolicyTests(unittest.TestCase):
         self.assertIn('20.11.1', item['reason'])
 
     def test_an_artifact_the_release_can_install_becomes_acquire(self):
-        plan = environment_plan.build(report(requirement('flutter', '^3.44.0', notation='pub')),
+        plan = environment_plan.build(report(requirement('flutter', '^3.47.0', notation='pub')),
                                       release_entries=RELEASE, measure=lambda name: (None, 'absent'))
         item = plan['requirements'][0]
         self.assertEqual(item['state'], environment_plan.ACQUIRE)
-        self.assertEqual(item['version'], '3.44.8')
+        self.assertEqual(item['version'], '3.47.9')
         self.assertEqual(item['selected_from'], 'artifact')
 
     def test_a_release_pin_below_the_requirement_is_unsupported_with_the_reason(self):
@@ -145,7 +145,7 @@ class SelectionPolicyTests(unittest.TestCase):
                                       release_entries=RELEASE, measure=lambda name: (None, 'absent'))
         item = plan['requirements'][0]
         self.assertEqual(item['state'], environment_plan.UNSUPPORTED)
-        self.assertIn('3.44.8', item['reason'])
+        self.assertIn('3.47.9', item['reason'])
         self.assertIn('does not satisfy', item['reason'])
 
     def test_a_declared_version_with_no_installer_is_unsupported_not_unresolved(self):

@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:meta/meta.dart';
+
 import 'bloc_event.dart';
 import 'bloc_state.dart';
 import 'juice_bloc.dart';
@@ -43,6 +45,16 @@ abstract class ResultEvent<TResult> extends EventBase {
       // when the result is never awaited (e.g., in tests).
       _completer.future.ignore();
     }
+  }
+
+  /// Framework-internal: complete this event with whatever [leader]
+  /// completes with — the event joined [leader]'s `singleflight` run
+  /// instead of running, so the leader's result is its own.
+  @internal
+  void follow(ResultEvent<Object?> leader) {
+    leader.result.then((value) => succeed(value as TResult),
+        onError: (Object error, StackTrace stackTrace) =>
+            fail(error, stackTrace));
   }
 }
 
@@ -94,7 +106,15 @@ extension ResultEventOps<TState extends BlocState> on JuiceBloc<TState> {
   /// closed or closing bloc, a close during the wait, an event dropped by a
   /// `droppable` builder or whose use case emitted nothing, all throw
   /// [StateError] (the event's `result` is failed with it too); a
-  /// superseded `restartable` run answers canceled. On success the wait on
+  /// superseded `restartable` run answers canceled. A close AFTER the use
+  /// case's first status and before its value throws [StateError] too, at
+  /// the close — and its message says the outcome is UNKNOWN: a
+  /// `restartable` run is fenced and will never succeed the event, but any
+  /// other run goes on after the close has begun and may still finish. The
+  /// wait cannot tell which, and a value given after it has failed is not
+  /// delivered. One exception: a use
+  /// case that emitted nothing but FAILED the event itself (`event.fail`) —
+  /// a refusal that should not touch the stream — throws that error. On success the wait on
   /// the value is bounded by [timeout] as well, in case the use case
   /// emitted success but never called `succeed`.
   ///
@@ -108,6 +128,10 @@ extension ResultEventOps<TState extends BlocState> on JuiceBloc<TState> {
     try {
       status = await sendAndWait(event, timeout: timeout);
     } catch (error, stackTrace) {
+      // A use case that REFUSED the event — failed it and emitted nothing
+      // for it — has already said why: its error is the answer, not the
+      // wait's "finished without a terminal status".
+      if (event.isCompleted) await event.result;
       event.fail(error, stackTrace);
       rethrow;
     }
@@ -126,8 +150,24 @@ extension ResultEventOps<TState extends BlocState> on JuiceBloc<TState> {
       return OperationResult(status: status, value: null);
     }
 
-    final value = await event.result.timeout(timeout);
-    return OperationResult(status: status, value: value);
+    // The status said "so far, so good"; the value comes when the use case
+    // calls `succeed`. If the bloc closes first that never happens — the
+    // close fences the run — so the wait is failed at the close, not left
+    // to the timeout.
+    void failClosed() => event.fail(
+        StateError('$runtimeType closed while ${event.runtimeType} was '
+            'waiting for its result. Whether it completed is unknown: the '
+            'use case may still finish after the close began, and its value '
+            'would not be delivered.'),
+        StackTrace.current);
+    if (isClosing) failClosed();
+    final forget = onClose(failClosed);
+    try {
+      final value = await event.result.timeout(timeout);
+      return OperationResult(status: status, value: value);
+    } finally {
+      forget();
+    }
   }
 
   /// Sends [event] and returns its value, or throws the failure's error (with

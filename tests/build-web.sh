@@ -35,7 +35,7 @@ case "$1" in
     ;;
   --version)
     [[ -f $HERDR_BUILD_TEST_STATE ]] || echo 'Welcome to Flutter! First-run setup.'
-    printf '{"frameworkVersion":"%s"}\n' "${HERDR_BUILD_TEST_VERSION:-3.44.8}"
+    printf '{"frameworkVersion":"%s"}\n' "${HERDR_BUILD_TEST_VERSION:-3.47.9}"
     ;;
   build)
     mkdir -p build/web
@@ -100,8 +100,8 @@ if grep -q '^flutter build ' "$HERDR_BUILD_TEST_LOG"; then exit 1; fi
 # The fix must still enforce the pinned version and stop before building.
 : >"$HERDR_BUILD_TEST_LOG"
 export HERDR_CHECK_REPORT="$tmp/version-mismatch-checks.jsonl"
-if HERDR_BUILD_TEST_VERSION=3.44.7 bash "$tmp/project/scripts/build-web.sh" >"$tmp/output" 2>&1; then exit 1; fi
-grep -q 'Flutter 3.44.8 required' "$tmp/output"
+if HERDR_BUILD_TEST_VERSION=3.47.8 bash "$tmp/project/scripts/build-web.sh" >"$tmp/output" 2>&1; then exit 1; fi
+grep -q 'Flutter 3.47.9 required' "$tmp/output"
 if grep -q '^flutter build ' "$HERDR_BUILD_TEST_LOG"; then exit 1; fi
 python3 - "$HERDR_CHECK_REPORT" <<'PY'
 import json, sys

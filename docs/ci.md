@@ -33,7 +33,7 @@ features. New regression tests belong in the existing discovered suites:
 `tests/test_*.py` files are discovered by `scripts/test-project-discovery.py --all`
 on both Python lanes; no workflow test-file allowlist needs extending. The minimum
 version comes from `requires-python = ">=major.minor"`. The primary minor version
-is pinned once in the workflow's `CI_PRIMARY_PYTHON` setting (currently 3.12);
+is pinned once in the workflow's `CI_PRIMARY_PYTHON` setting (currently 3.14);
 `setup-python` installs its current patch release. Runner-image Python changes
 therefore do not silently change gateway test coverage. If the floor matches the
 primary version, compatibility reports that the primary job covers it and does

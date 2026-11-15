@@ -57,6 +57,16 @@ class StatusEmitter<TState extends BlocState> {
   /// Whether the underlying state manager is closed.
   bool get isClosed => _stateManager.isClosed;
 
+  /// The id of the run making the emission that is going out RIGHT NOW —
+  /// read by a synchronous tap (a reaction) from inside that emission; null
+  /// when no run made it. Meaningless between emissions.
+  int? emittingExecutionId;
+
+  /// True while an event is being RE-emitted ([emitEvent]): the status that
+  /// goes out repeats the last one's states, so it is not a transition and
+  /// a reaction must not judge it as one.
+  bool reEmitting = false;
+
   /// Emits an updating status.
   ///
   /// Used for normal state transitions after successful operations.
@@ -68,11 +78,15 @@ class StatusEmitter<TState extends BlocState> {
   ///   set after passing it.
   /// [skipIfSame] - If true, skips emission when newState equals current state.
   ///   This helps prevent unnecessary widget rebuilds when state hasn't changed.
+  /// [executionId] - The id of the use case run making the emission (the
+  ///   one on its `use_case_execution` span), so the emission's entry pairs
+  ///   with its run; null for an emission no run made.
   void emitUpdate(
     EventBase event,
     TState? newState,
     Set<String>? groups, {
     bool skipIfSame = false,
+    int? executionId,
   }) {
     if (skipIfSame && newState == state) {
       if (JuiceLoggerConfig.logs(Level.info)) {
@@ -80,18 +94,22 @@ class StatusEmitter<TState extends BlocState> {
           JuiceTelemetryKind.emissionSkipped,
           bloc: _blocName,
           event: typeName(event.runtimeType),
+          executionId: executionId,
         ));
       }
       return;
     }
-    _emit(EmissionKind.update, event, newState, groups);
+    _emit(EmissionKind.update, event, newState, groups,
+        executionId: executionId);
   }
 
   /// Emits a waiting status.
   ///
   /// Used to indicate an async operation is in progress.
-  void emitWaiting(EventBase event, TState? newState, Set<String>? groups) {
-    _emit(EmissionKind.waiting, event, newState, groups);
+  void emitWaiting(EventBase event, TState? newState, Set<String>? groups,
+      {int? executionId}) {
+    _emit(EmissionKind.waiting, event, newState, groups,
+        executionId: executionId);
   }
 
   /// Emits a failure status.
@@ -106,35 +124,48 @@ class StatusEmitter<TState extends BlocState> {
     Set<String>? groups, {
     Object? error,
     StackTrace? errorStackTrace,
+    int? executionId,
   }) {
     _emit(EmissionKind.failure, event, newState, groups,
-        error: error, errorStackTrace: errorStackTrace);
+        error: error,
+        errorStackTrace: errorStackTrace,
+        executionId: executionId);
   }
 
   /// Emits a canceling status.
   ///
   /// Used to indicate an operation was cancelled.
-  void emitCancel(EventBase event, TState? newState, Set<String>? groups) {
-    _emit(EmissionKind.cancel, event, newState, groups);
+  void emitCancel(EventBase event, TState? newState, Set<String>? groups,
+      {int? executionId}) {
+    _emit(EmissionKind.cancel, event, newState, groups,
+        executionId: executionId);
   }
 
   /// Re-emits the current status carrying [event] — no state change, no
   /// groups: a signal to listeners that watch events.
   void emitEvent(EventBase event) {
     if (_droppedAfterClose(EmissionKind.event, event)) return;
-    _stateManager.emit(_stateManager.current.copyWith(event: event));
+    emittingExecutionId = null;
+    reEmitting = true;
+    try {
+      _stateManager.emit(_stateManager.current.copyWith(event: event));
+    } finally {
+      reEmitting = false;
+    }
   }
 
   /// The close fence. A use case still running when its bloc closes (the
   /// user left mid-fetch) must not crash on its next emit — that emit is
   /// dropped, and logged as `emission_after_close` so it stays visible.
-  bool _droppedAfterClose(EmissionKind kind, EventBase event, {Object? error}) {
+  bool _droppedAfterClose(EmissionKind kind, EventBase event,
+      {Object? error, int? executionId}) {
     if (!_stateManager.isClosed) return false;
     _logger.record(JuiceTelemetry(
       JuiceTelemetryKind.emissionAfterClose,
       status: kind,
       bloc: _blocName,
       event: typeName(event.runtimeType),
+      executionId: executionId,
       error: error,
     ));
     return true;
@@ -147,8 +178,12 @@ class StatusEmitter<TState extends BlocState> {
     Set<String>? groupsToRebuild, {
     Object? error,
     StackTrace? errorStackTrace,
+    int? executionId,
   }) {
-    if (_droppedAfterClose(kind, event, error: error)) return;
+    if (_droppedAfterClose(kind, event,
+        error: error, executionId: executionId)) {
+      return;
+    }
 
     // A failure emission is never chatter: it is logged whatever the floor.
     if (kind == EmissionKind.failure || JuiceLoggerConfig.logs(Level.info)) {
@@ -161,6 +196,7 @@ class StatusEmitter<TState extends BlocState> {
         bloc: _blocName,
         groups: groupsToRebuild,
         event: typeName(event.runtimeType),
+        executionId: executionId,
         error: error,
         stackTrace: errorStackTrace,
       ));
@@ -180,6 +216,7 @@ class StatusEmitter<TState extends BlocState> {
 
     final current = state;
     final next = newState ?? current;
+    emittingExecutionId = executionId;
     _stateManager.emit(switch (kind) {
       EmissionKind.update => UpdatingStatus<TState>(next, current, event),
       EmissionKind.waiting => WaitingStatus<TState>(next, current, event),

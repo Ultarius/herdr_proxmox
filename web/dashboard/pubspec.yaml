@@ -1,18 +1,17 @@
 name: herdr_dashboard
 publish_to: none
 environment:
-  sdk: '>=3.12.0 <4.0.0'
+  sdk: '>=3.13.0 <4.0.0'
 dependencies:
   flutter:
     sdk: flutter
   http: 1.6.0
-  juice: 2.0.0
+  juice: 2.1.0
   herdr_dashboard_state:
     path: ../dashboard_state
   zenrouter: 3.0.0
   xterm: 4.0.0
-  cupertino_icons: 1.0.8
-  web: 1.1.1
+  web: 1.1.2
 dev_dependencies:
   flutter_test:
     sdk: flutter

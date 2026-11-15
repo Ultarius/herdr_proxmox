@@ -14,11 +14,11 @@ integration helpers and secure request-ID implementation. The complete
 [state ownership map](dashboard-juice-ownership.md) lists the feature used by
 each route and embedded workflow. Both renderers invoke feature events rather
 than calling the dashboard transport directly. Existing Flutter bloc
-imports forward to the shared package. The Juice 2.0 upgrade updates use-case
+imports forward to the shared package. The Juice 2.1 upgrade updates use-case
 registration and runtime contracts as described below; the shared package remains
 the boundary between application behavior and either UI framework.
 
-The Jaspr package uses the private, MIT-licensed Juice **2.0.0** adapter under
+The Jaspr package uses the private, MIT-licensed Juice **2.1.0** adapter under
 `vendor/juice`. It retains upstream event dispatch, state, lifecycle, concurrency,
 use-case and typed telemetry logic, replaces Flutter foundation types with a
 small pure-Dart notifier/annotation shim, and excludes Flutter widgets and
@@ -29,7 +29,7 @@ helpers, excluding Flutter async/selector/UI widgets. Rebuild-group helpers and
 the framework-independent portion of widget support remain available; Flutter
 widget APIs and tests are outside this adapter's scope.
 
-Juice 2.0 requires an explicit `EventConcurrency` on each use-case builder.
+Juice 2.x requires an explicit `EventConcurrency` on each use-case builder.
 Shared dashboard registrations use `UseCaseBuilder.typed` for checked event and
 use-case pairing. Refreshes and mutations have separate `droppable` handlers:
 polling cannot discard an operator's write, while duplicate writes are still
@@ -44,9 +44,14 @@ longer included. Keeping upstream implementations does not imply unchanged
 per-event scheduling, cancellation or error behavior across the major upgrade;
 the adapter and both dashboard trees require regression verification.
 
-The source is the [Juice 2.0.0 pub.dev archive](https://pub.dev/api/archives/juice-2.0.0.tar.gz),
-published **15 October 2026**, verified against SHA-256
-`96e02ef03529f74d4443bd25567914789e91102a9ffbb6ac8f06a5688ccf9711`.
+Juice 2.1 adds bloc-to-bloc `Reaction`s, owned `sendAfter` timers,
+`EventConcurrency.singleflight`, and multi-bloc `juiceFlowTest`; the vendored
+testing API includes all three, while Flutter widget tests remain outside this
+adapter's scope.
+
+The source is the [Juice 2.1.0 pub.dev archive](https://pub.dev/api/archives/juice-2.1.0.tar.gz),
+published **13 November 2026**, verified against SHA-256
+`83b23be59f15648a8e07cfcbde9f2a9a6658cce4edf395d33dd50c4d8e2ac737`.
 The vendored `LICENSE` retains the upstream MIT license; the adapter README
 records its framework boundary and provenance.
 

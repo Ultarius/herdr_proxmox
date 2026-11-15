@@ -19,7 +19,7 @@ permissions:
 
 env:
   # Reviewed minor version; setup-python supplies its current patch release.
-  CI_PRIMARY_PYTHON: '3.12'
+  CI_PRIMARY_PYTHON: '3.14'
 
 # Only PR runs supersede one another. Unique groups preserve every push/manual
 # run, including release publication and provisioning/cleanup sequences.

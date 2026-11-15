@@ -1,8 +1,8 @@
 # Dashboard state ownership
 
 Both dashboard renderers use the feature implementations in
-`web/dashboard_state/lib`. The Jaspr application uses the vendored Juice 2.0
-core; the Flutter reference application uses published Juice 2.0. Backend reads,
+`web/dashboard_state/lib`. The Jaspr application uses the vendored Juice 2.1
+core; the Flutter reference application uses published Juice 2.1. Backend reads,
 mutations, operation status, server observations and polling belong to these
 shared blocs. Renderers subscribe to feature state and close owned features on
 disposal.

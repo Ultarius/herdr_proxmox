@@ -6,7 +6,7 @@ change global PATH, write shell startup files or use pyenv shims.
 
 ## Selection and acquisition
 
-`install/python-tools.json` freezes uv 0.12.19, its Linux x64/arm64 archive
+`install/python-tools.json` freezes uv 0.13.8, its Linux x64/arm64 archive
 checksums, and stable CPython 3.11-and-newer entries from that release's download catalog.
 The supported host is Linux glibc x64/arm64. All component declarations must be
 decidably satisfied. A range selects the highest compatible stable version in
