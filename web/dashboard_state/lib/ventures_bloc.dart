@@ -6,11 +6,7 @@ class VenturesBloc extends FeatureBloc {
   VenturesBloc(super.connection)
     : super(initial: {'data': <String, dynamic>{}, 'pending': null}) {
     connection.notificationRevision.addListener(_notified);
-    poll(
-      'ventures',
-      const Duration(seconds: 15),
-      () => refresh(quiet: true),
-    );
+    poll('ventures', const Duration(seconds: 15), () => refresh(quiet: true));
   }
 
   String _selected = '';
@@ -24,12 +20,23 @@ class VenturesBloc extends FeatureBloc {
   List<Map<String, dynamic>> get ticks => _rows('ticks');
   List<Map<String, dynamic>> get outreach => _rows('outreach');
   List<Map<String, dynamic>> get feeds => _rows('feeds');
+  List<Map<String, dynamic>> get reviews => _rows('reviews');
+  List<Map<String, dynamic>> get candidates => _rows('candidates');
+  Map<String, dynamic>? get studio => data['studio'] as Map<String, dynamic>?;
+  List<Map<String, dynamic>> get studios => _rows('studios');
   Map<String, dynamic>? get selected =>
       data['selected'] as Map<String, dynamic>?;
   Map<String, dynamic>? get pending =>
       state.values['pending'] as Map<String, dynamic>?;
   Map<String, dynamic> get limits =>
       Map<String, dynamic>.from(data['limits'] as Map? ?? {});
+
+  Map<String, dynamic>? studioFor(String organization) {
+    for (final item in studios) {
+      if (item['organization_id'] == organization) return item;
+    }
+    return studio;
+  }
 
   /// False only when the gateway reports the module switched off.
   bool get enabled => data['enabled'] != false;
@@ -65,13 +72,16 @@ class VenturesBloc extends FeatureBloc {
     final path = _selected.isEmpty
         ? 'ventures'
         : 'ventures?venture=${Uri.encodeQueryComponent(_selected)}';
-    await read('snapshot', () async {
-      final data = Map<String, dynamic>.from(
-        await connection.request(path),
-      );
-      if (data['selected'] == null && _selected.isNotEmpty) _selected = '';
-      return FeatureResult(patch: {'data': data});
-    }, replace: false, quiet: quiet);
+    await read(
+      'snapshot',
+      () async {
+        final data = Map<String, dynamic>.from(await connection.request(path));
+        if (data['selected'] == null && _selected.isNotEmpty) _selected = '';
+        return FeatureResult(patch: {'data': data});
+      },
+      replace: false,
+      quiet: quiet,
+    );
   }
 
   /// One administrator action with a stable request id for create retries.
@@ -87,15 +97,19 @@ class VenturesBloc extends FeatureBloc {
       ...body,
       if (ventureId != null) 'venture_id': ventureId,
     };
-    final done = await mutate<bool>('action', () async {
-      final result = await connection.request('ventures', request);
-      if (mode == 'create' &&
-          result is Map &&
-          result['id'] is String) {
-        _selected = result['id'] as String;
-      }
-      return const FeatureResult(patch: {'pending': null}, value: true);
-    }, admin: true, rethrowErrors: true, start: {'pending': request});
+    final done = await mutate<bool>(
+      'action',
+      () async {
+        final result = await connection.request('ventures', request);
+        if (mode == 'create' && result is Map && result['id'] is String) {
+          _selected = result['id'] as String;
+        }
+        return const FeatureResult(patch: {'pending': null}, value: true);
+      },
+      admin: true,
+      rethrowErrors: true,
+      start: {'pending': request},
+    );
     if (done == true) await refresh();
     return done == true;
   }

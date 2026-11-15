@@ -296,3 +296,41 @@ def brief(configuration, roles, names, standing):
             + STAGE[outreach['stage']] + ' Use {{name}} and {{company}} placeholders; never real people, '
             'addresses or invented quotes.\n'
             'Standing: ' + standing + '\n')
+
+
+def strategy_brief(configuration, roles, names, standing):
+    """The role-aware part of a no-news strategy review.
+
+    Strategy days have no external evidence. The group may review the venture's
+    own standing, recent decisions, recorded outreach outcomes and open
+    objections, but it must not invent news or market events.
+    """
+    simulation, outreach = configuration['simulation'], configuration['outreach']
+    strict = simulation['red_team']
+    duties = dict(
+        analyst='Read the internal evidence only. Identify the most important unresolved question '
+                'for this venture and cite S, T, O or R items. Do not invent news or outside events.',
+        founder='Decide whether the current product and monthly price should change. A no-change '
+                'answer is preferred unless internal evidence forces an adjustment.',
+        red_team='Strictness ' + str(strict) + '/10. Attack the current plan using the open objections, '
+                 'outreach outcomes and recent decisions. Rate each objection 1-5.',
+        outreach='Draft no messages unless a recorded O outcome gives a concrete reason to follow up. '
+                 'Use persona ' + outreach['persona'] + ', stage ' + outreach['stage']
+                 + ', language ' + outreach['language'] + ', tone '
+                 + str(outreach.get('tone') or 'direct')[:100] + '.')
+    lines = []
+    for role in ROLES:
+        owners = ', '.join(names.get(identity, identity) for identity in roles.get(role, [])) or 'the facilitator'
+        lines.append('- ' + ROLE_LABELS[role] + ' (' + owners + '): ' + duties[role])
+    return ('Strategy roles:\n' + '\n'.join(lines) + '\n'
+            'Order: Analyst, then Founder, then Red Team, then the Founder may answer objections once; the '
+            'Outreach writer drafts last; the facilitator writes the final JSON.\n'
+            'No news is available. Do not fabricate events, headlines, buyers or quotes.\n'
+            'Deltas (-3..3): demand must be 0 on a strategy day. Competition, regulatory and delivery_risk '
+            'may move only when the internal evidence supports it.\n'
+            'A price above the reference price in Standing costs customers (ten demand points per doubling) '
+            'and cannot pass ' + str(PRICE_CEILING) + ' times it.\n'
+            'Outreach etiquette: ' + etiquette(outreach['language']) + ' ' + PERSONA[outreach['persona']] + ' '
+            + STAGE[outreach['stage']] + ' Use {{name}} and {{company}} placeholders; never real people, '
+            'addresses or invented quotes.\n'
+            'Standing: ' + standing + '\n')
