@@ -166,8 +166,8 @@ void main() {
               if (body['action'] == 'create')
                 connections.add({
                   'id': 'managed',
-                  'label': 'Bevy SSH',
-                  'repository': 'Ultarius/bevy_game',
+                  'label': 'Project SSH',
+                  'repository': 'SourceOwner/project',
                   'kind': 'ssh',
                   'public_key': 'ssh-ed25519 PUBLIC test',
                   'host_verified': false,
@@ -235,11 +235,11 @@ void main() {
       await tester.pumpAndSettle();
       await tester.enterText(
         find.widgetWithText(TextField, 'Connection name'),
-        'Bevy SSH',
+        'Project SSH',
       );
       await tester.enterText(
         find.widgetWithText(TextField, 'GitHub repository (owner/repository)'),
-        'Ultarius/bevy_game',
+        'SourceOwner/project',
       );
       Future<void> click(String text) async {
         await tester.ensureVisible(find.text(text));
@@ -250,29 +250,29 @@ void main() {
       await click('Create SSH connection');
       expect(requests.last, {
         'action': 'create',
-        'label': 'Bevy SSH',
-        'repository': 'Ultarius/bevy_game',
+        'label': 'Project SSH',
+        'repository': 'SourceOwner/project',
         'kind': 'ssh',
       });
       expect(find.text('ssh-ed25519 PUBLIC test'), findsOneWidget);
       await click('Verify GitHub host key');
       expect(requests.last['id'], 'managed');
       await click('Test repository access');
-      expect(requests.last['url'], 'git@github.com:Ultarius/bevy_game.git');
+      expect(requests.last['url'], 'git@github.com:SourceOwner/project.git');
       await tester.ensureVisible(find.byKey(const ValueKey('')));
       await tester.tap(find.byKey(const ValueKey('')));
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Bevy SSH · ssh · verified').last);
+      await tester.tap(find.text('Project SSH · ssh · verified').last);
       await tester.pumpAndSettle();
       final url = tester.widget<TextField>(
         find.byKey(const PageStorageKey('clone-url-field')),
       );
-      expect(url.controller!.text, 'git@github.com:Ultarius/bevy_game.git');
+      expect(url.controller!.text, 'git@github.com:SourceOwner/project.git');
       await click('Clone repository');
       expect(requests.last, {
         'action': 'clone',
-        'url': 'git@github.com:Ultarius/bevy_game.git',
-        'folder': 'bevy_game',
+        'url': 'git@github.com:SourceOwner/project.git',
+        'folder': 'project',
         'connection_id': 'managed',
       });
       expect(find.text('Access denied. Destination retained.'), findsOneWidget);
@@ -281,18 +281,18 @@ void main() {
       await click('Retry in a new folder');
       expect(requests.length, count);
       await click('Clone repository');
-      expect(requests.last['folder'], 'bevy_game-retry');
+      expect(requests.last['folder'], 'project-retry');
       expect(requests.last['connection_id'], 'managed');
       await tester.enterText(
         find.byKey(const PageStorageKey('repository-connection-folder')),
-        'bevy_game',
+        'project',
       );
       await tester.pumpAndSettle();
       await click('Assign to existing project');
       expect(requests.last, {
         'action': 'bind',
         'id': 'managed',
-        'folder': 'bevy_game',
+        'folder': 'project',
       });
       expect(
         tester
@@ -306,7 +306,7 @@ void main() {
       expect(requests.last, {
         'action': 'unbind',
         'id': 'managed',
-        'folder': 'bevy_game',
+        'folder': 'project',
       });
       final beforeRemoval = requests.length;
       await click('Remove connection');

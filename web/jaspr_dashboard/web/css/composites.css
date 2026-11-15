@@ -71,8 +71,8 @@ a.runtime-pill:hover { background: var(--color-hover); border-color: var(--color
 .tabpanel:focus-visible { outline-offset: var(--space-1); border-radius: var(--radius-sm); }
 
 /* ---- Dialog ------------------------------------------------------------------
-   The dashboard renders its own modal layer (ui.dart buildDialogs:
-   .dialog-layer > section.dialog[role=dialog] > .dialog__header + content).
+   Shared native dialogs (ui.dart buildDialogs) keep the same content hooks:
+   .dialog-layer > dialog.dialog > .dialog__header + content.
    Its Phase 2 look lives in styles.css next to the layering rules.          */
 
 /* ---- Form rows (inside dialogs and cards) ---------------------------------- */

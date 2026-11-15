@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/workspace_blocs.dart';
 import 'operations_support.dart';
 import 'project_git_panel.dart';
 import 'project_analysis_card.dart';
@@ -11,43 +12,36 @@ class ProjectExplorerPage extends StatefulComponent {
 }
 
 class _ExplorerState extends OperationsState<ProjectExplorerPage> {
-  Map<String, dynamic>? directory, preview;
-  String path = '', filter = '';
+  late final ExplorerBloc feature;
+  StreamSubscription? featureSubscription;
+  Map<String, dynamic>? get directory => feature.state.value('directory');
+  Map<String, dynamic>? get preview => feature.state.value('preview');
+  String get path => feature.state.value<String>('path') ?? '';
+  String filter = '';
+  String? get error => feature.state.error;
+  bool get busy => feature.state.loading;
   bool showHidden = false, gitView = false;
-  int generation = 0;
   @override
   void initState() {
     super.initState();
+    feature = ExplorerBloc(connection);
+    featureSubscription = feature.stream.listen((_) {
+      if (mounted) setState(() {});
+    });
     gitView = component.initialPath.isNotEmpty;
     open(component.initialPath);
   }
 
+  @override
+  void dispose() {
+    featureSubscription?.cancel();
+    feature.dispose();
+    super.dispose();
+  }
+
   Future<void> open(String selected) async {
-    final epoch = connection.generation, current = ++generation;
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    try {
-      final result = Map<String, dynamic>.from(
-        await connection.request('projects/browse', {'path': selected}),
-      );
-      if (!valid(epoch) || current != generation) return;
-      setState(() {
-        if (result['kind'] == 'folder') {
-          directory = result;
-          path = selected;
-          preview = null;
-          filter = '';
-        } else {
-          preview = result;
-        }
-      });
-    } catch (e) {
-      if (valid(epoch) && current == generation) setState(() => error = '$e');
-    } finally {
-      if (valid(epoch) && current == generation) setState(() => busy = false);
-    }
+    if (await feature.open(selected) == true && mounted)
+      setState(() => filter = '');
   }
 
   String size(dynamic bytes) {
@@ -78,6 +72,7 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
           'role': 'tab',
           'id': id,
           'aria-selected': '$selected',
+          'tabindex': selected ? '0' : '-1',
           'aria-controls': 'explorer-panel',
         },
         events: {
@@ -127,6 +122,7 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
         ],
         classes: 'tabs explorer-tabs',
         attributes: {'role': 'tablist', 'aria-label': 'Explorer view'},
+        events: {'keydown': tabListKeyDown},
       ),
       el('div', [
         el(
@@ -207,7 +203,13 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
                           'Listing limited to 1,000 items. Open a subfolder to explore further.',
                         ),
                       ]),
-                    if (entries.isEmpty)
+                    if (directory == null && busy)
+                      meta('Loading folder…', iconName: 'hourglass')
+                    else if (directory == null && error != null)
+                      meta(
+                        'Folder contents are unavailable. Refresh to try again.',
+                      )
+                    else if (entries.isEmpty)
                       emptyState(
                         filter.isNotEmpty
                             ? 'No entries match your filter.'
@@ -223,22 +225,29 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
                           [
                             for (final entry in entries)
                               [
-                                button(
-                                  '${entry['name']}',
-                                  () => open(entry['path'] as String),
-                                  disabled:
-                                      busy ||
-                                      ![
-                                        'folder',
-                                        'file',
-                                      ].contains(entry['kind']),
-                                  variant: 'ghost',
-                                  small: true,
-                                  iconName: entry['kind'] == 'folder'
-                                      ? 'folder'
-                                      : 'file-text',
-                                  classes: 'file-link',
-                                ),
+                                el('div', [
+                                  button(
+                                    '${entry['name']}',
+                                    () => open(entry['path'] as String),
+                                    disabled:
+                                        busy ||
+                                        ![
+                                          'folder',
+                                          'file',
+                                        ].contains(entry['kind']),
+                                    variant: 'ghost',
+                                    small: true,
+                                    iconName: entry['kind'] == 'folder'
+                                        ? 'folder'
+                                        : 'file-text',
+                                    classes: 'file-link',
+                                  ),
+                                  el('span', [
+                                    text(
+                                      '${entry['kind']} · ${displayTime(entry['modified'])}',
+                                    ),
+                                  ], classes: 'file-details'),
+                                ], classes: 'file-identity'),
                                 text(entry['kind']),
                                 mono(displayTime(entry['modified'])),
                                 mono(size(entry['size'])),
@@ -248,7 +257,7 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
                       ], classes: 'file-table'),
                   ],
                   iconName: 'folder-open',
-                  count: entries.length,
+                  count: directory == null ? null : entries.length,
                   classes: 'explorer-files',
                 ),
                 if (preview != null)
@@ -263,7 +272,10 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
                       else ...[
                         if (preview!['truncated'] == true)
                           callout([calloutText('Showing the first 64 KB.')]),
-                        codeText(preview!['content']),
+                        codeText(
+                          preview!['content'],
+                          label: 'File preview for ${preview!['path']}',
+                        ),
                       ],
                     ],
                     iconName: 'file-text',
@@ -277,7 +289,7 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
                       ),
                       button(
                         'Close preview',
-                        () => setState(() => preview = null),
+                        feature.closePreview,
                         small: true,
                         variant: 'ghost',
                         iconName: 'x',
@@ -295,6 +307,8 @@ class _ExplorerState extends OperationsState<ProjectExplorerPage> {
         attributes: {
           'id': 'explorer-panel',
           'role': 'tabpanel',
+          'tabindex': '0',
+          'aria-busy': '$busy',
           'aria-labelledby': gitView
               ? 'explorer-tab-git'
               : 'explorer-tab-files',

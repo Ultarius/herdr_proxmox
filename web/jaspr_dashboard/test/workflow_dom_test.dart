@@ -158,6 +158,67 @@ void main() {
     web.document.getElementById('workflow-test')!.textContent = '';
   });
 
+  test('workflow and list tabs switch by keyboard with one tab stop', () async {
+    final tabs = nodes('.task-wf-tabs [role=tab]').toList();
+    Future<void> selected(web.HTMLElement tab) async {
+      final deadline = DateTime.now().add(const Duration(seconds: 5));
+      while ((web.document.activeElement != tab ||
+              tab.getAttribute('aria-selected') != 'true') &&
+          DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 15));
+      }
+      expect(web.document.activeElement, tab);
+      expect(tab.getAttribute('aria-selected'), 'true');
+    }
+
+    expect(tabs.where((tab) => tab.tabIndex == 0), [tabs.first]);
+    tabs.first.focus();
+    key(tabs.first, 'ArrowRight');
+    await selected(tabs.last);
+    expect(tabs.last.getAttribute('aria-selected'), 'true');
+    expect(web.document.activeElement, tabs.last);
+    expect(nodes('.task-wf-list-panel').single.tabIndex, 0);
+    expect(
+      nodes('.task-wf-list-panel').single.getAttribute('aria-labelledby'),
+      tabs.last.id,
+    );
+    key(tabs.last, 'ArrowRight');
+    await selected(tabs.first);
+    expect(tabs.first.getAttribute('aria-selected'), 'true');
+    expect(web.document.activeElement, tabs.first);
+    expect(nodes('.task-wf-board').single.tabIndex, 0);
+  });
+
+  test('workflow actions wrap inside a tablet-width content area', () async {
+    final root =
+        web.document.getElementById('workflow-test')! as web.HTMLElement;
+    root.style.width =
+        '641px'; // Available content at the 768px shell breakpoint.
+    addTearDown(() => root.style.width = '760px');
+    state.replace([row('review', state: 'review_ready')]);
+    await settle();
+    final actions = nodes('.wf-view').single;
+    final bounds = root.getBoundingClientRect();
+    expect(root.scrollWidth, lessThanOrEqualTo(root.clientWidth + 1));
+    expect(
+      actions.getBoundingClientRect().right,
+      lessThanOrEqualTo(bounds.right + 1),
+    );
+    for (final control in nodes('.wf-view button')) {
+      expect(
+        control.getBoundingClientRect().right,
+        lessThanOrEqualTo(bounds.right + 1),
+        reason: control.textContent,
+      );
+    }
+    expect(
+      nodes(
+        '.wf-view button',
+      ).any((button) => button.textContent == 'Full screen'),
+      true,
+    );
+  });
+
   Map<String, dynamic> release({String state = 'collecting'}) => {
     'id': 'release-one',
     'version': 'alpha.15',
@@ -417,6 +478,104 @@ void main() {
         ).any((b) => b.textContent == 'Create reviewed draft release PR'),
         false,
       );
+    },
+  );
+
+  test(
+    'a live policy error leaves release details readable and disables PR writes until recovery',
+    () async {
+      final published = release(state: 'published')
+        ..['manual_pr_required'] = true
+        ..['resulting_sha'] = 'c' * 40
+        ..['pull_preview'] = {
+          'title': 'Release title',
+          'body': 'Reviewed description',
+        };
+      state.replaceReleases([
+        Map<String, dynamic>.from(published)
+          ..['publication_error'] = 'Operator policy requires repair.',
+      ]);
+      await settle();
+      task('release:release-one').click();
+      await settle();
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('Operator policy requires repair.'),
+      );
+      expect(
+        nodes(
+          'button',
+        ).any((e) => e.textContent == 'Check for operator-created release PR'),
+        isFalse,
+      );
+      expect(state.releaseActions, isEmpty);
+      state.replaceReleases([published]);
+      await settle();
+      expect(
+        nodes(
+          'button',
+        ).any((e) => e.textContent == 'Check for operator-created release PR'),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'manual release PR handoff shows compare link and adopts without another publication',
+    () async {
+      const compare =
+          'https://github.com/SourceOwner/project/compare/main...ForkOwner:project:herdr%2Frelease-branch?expand=1';
+      final published = release(state: 'published')
+        ..['resulting_sha'] = 'c' * 40
+        ..['revision'] = {'digest': 'manifest-digest'}
+        ..['manual_pr_required'] = true
+        ..['pull_preview'] = {
+          'title': 'Operator release',
+          'body': 'Copy to GitHub.',
+        }
+        ..['pull_request'] = {
+          'state': 'awaiting_manual_pr',
+          'message': 'Open a draft PR, then check here to adopt it.',
+          'compare_url': compare,
+        };
+      state.replaceReleases([published]);
+      await settle();
+      task('release:release-one').click();
+      await settle();
+      final link = nodes('a').singleWhere(
+        (e) => e.textContent == 'Open GitHub comparison and create draft PR',
+      );
+      expect(link.getAttribute('href'), compare);
+      expect(link.getAttribute('rel'), 'noopener noreferrer');
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('preserves the existing PR’s text'),
+      );
+      await click('Check for operator-created release PR');
+      expect(state.releaseActions.single, containsPair('action', 'pull'));
+      expect(state.releaseActions.single, containsPair('head_sha', 'c' * 40));
+      expect(state.releaseActions.single, containsPair('reviewed', true));
+      state.replaceReleases([
+        Map<String, dynamic>.from(published)
+          ..['pull_request'] = {
+            'state': 'complete',
+            'origin': 'adopted',
+            'number': 42,
+            'url': 'https://github.com/SourceOwner/project/pull/42',
+          },
+      ]);
+      await settle();
+      expect(
+        nodes('.task-wf-inspector').single.textContent,
+        contains('Operator-created PR adopted'),
+      );
+      expect(
+        nodes(
+          'button',
+        ).any((e) => e.textContent == 'Check for operator-created release PR'),
+        isFalse,
+      );
+      expect(state.releaseActions.length, 1);
     },
   );
 

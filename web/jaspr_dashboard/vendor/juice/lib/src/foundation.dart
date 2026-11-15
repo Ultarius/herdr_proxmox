@@ -2,7 +2,7 @@ export 'package:meta/meta.dart';
 
 typedef VoidCallback = void Function();
 
-/// UI-independent observable used by the unchanged dashboard blocs.
+/// UI-independent observable used by the shared dashboard blocs.
 /// Listener snapshots preserve additions/removals during notification.
 class ValueNotifier<T> {
   ValueNotifier(this._value);

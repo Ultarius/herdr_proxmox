@@ -1,5 +1,6 @@
+import 'package:herdr_dashboard_state/settings_bloc.dart';
+import 'pages/operations_support.dart' show FeatureOperationsState;
 import 'dart:async';
-import 'dart:convert';
 import 'package:jaspr/dom.dart' as dom;
 import 'package:web/web.dart' as web;
 import 'ui.dart';
@@ -8,6 +9,7 @@ import 'navigation.dart';
 import 'repository_connections.dart';
 import 'storage_panel.dart';
 import 'package:herdr_dashboard_state/repository_connections.dart';
+import 'package:herdr_dashboard_state/clone_jobs.dart';
 
 String agentName(Map<String, dynamic> agent) =>
     '${agent['display_name'] ?? agent['name'] ?? agent['agent'] ?? agent['pane_id'] ?? 'Agent'}';
@@ -262,14 +264,6 @@ class _OverviewPageState extends State<OverviewPage> {
             disabled: state.busy,
             primary: true,
             iconName: 'play',
-          )
-        else if (admin)
-          button(
-            'Stop',
-            () => dashboardConnection.send(DashboardCommand('stop-server')),
-            disabled: state.busy,
-            variant: 'danger',
-            iconName: 'square',
           ),
       ],
       classes: 'runtime',
@@ -699,37 +693,37 @@ class _OverviewPageState extends State<OverviewPage> {
           ],
         )
       else
-        el(
-          'ul',
-          [
-            for (final workspace in state.workspaces)
-              el('li', [_workspaceTile(state, workspace, admin)]),
-            if (admin)
-              el('li', [
+        el('div', [
+          el(
+            'ul',
+            [
+              for (final workspace in state.workspaces)
+                el('li', [_workspaceTile(state, workspace, admin)]),
+            ],
+            classes: 'ws-grid',
+            attributes: {'role': 'list'},
+          ),
+          if (admin)
+            el(
+              'button',
+              [
                 el(
-                  'button',
-                  [
-                    el(
-                      'span',
-                      [icon('plus')],
-                      classes: 'icon-tile',
-                      attributes: {'aria-hidden': 'true'},
-                    ),
-                    _text('ws-create__title', 'Create workspace'),
-                    _text(
-                      'ws-create__meta',
-                      'Use a project directory or clone a repository',
-                    ),
-                  ],
-                  classes: 'ws-create',
-                  attributes: {'type': 'button'},
-                  events: {'click': (_) => openProject()},
+                  'span',
+                  [icon('plus')],
+                  classes: 'icon-tile',
+                  attributes: {'aria-hidden': 'true'},
                 ),
-              ], classes: 'ws-grid__create'),
-          ],
-          classes: 'ws-grid',
-          attributes: {'role': 'list'},
-        ),
+                _text('ws-create__title', 'Create workspace'),
+                _text(
+                  'ws-create__meta',
+                  'Use a project directory or clone a repository',
+                ),
+              ],
+              classes: 'ws-create',
+              attributes: {'type': 'button'},
+              events: {'click': (_) => openProject()},
+            ),
+        ], classes: 'ws-section'),
     ],
     iconName: 'folder',
     count: state.workspaces.length,
@@ -800,7 +794,12 @@ class _OverviewPageState extends State<OverviewPage> {
               },
             ),
           ], classes: 'overview-disclosure__section'),
-          CloneProjectCard(onCloned: (path) => setState(() => cwd = path)),
+          CloneProjectCard(
+            onCloned: (path) => setState(() => cwd = path),
+            onDeleted: (path) {
+              if (cwd == path) setState(() => cwd = '');
+            },
+          ),
         ],
         classes: 'overview-disclosure__body overview-disclosure__body--split',
       ),
@@ -882,25 +881,30 @@ class _OverviewPageState extends State<OverviewPage> {
         _attention(blocked),
       ],
       el('div', [
-        _agents(),
-        if (overview) ...[_workspaces(state, admin), const RecentActivity()],
-        const SystemHealth(),
+        el('div', [
+          _agents(),
+          if (overview) _workspaces(state, admin),
+        ], classes: 'overview-lane overview-lane--primary'),
+        el('div', [
+          const SystemHealth(),
+          if (overview) const RecentActivity(),
+          el('details', [
+            _disclosureSummary(
+              'terminal',
+              'Terminal access',
+              'Connect to the container over SSH to run Herdr directly',
+            ),
+            el('div', [
+              _text(
+                'code-output',
+                'ssh herdr@<container-ip>\nThen: cd ~/projects && herdr',
+                'pre',
+              ),
+            ], classes: 'overview-disclosure__body'),
+          ], classes: 'card overview-disclosure'),
+        ], classes: 'overview-lane overview-lane--secondary'),
       ], classes: 'overview-grid'),
       if (overview && admin) _projectForm(state),
-      el('details', [
-        _disclosureSummary(
-          'terminal',
-          'Terminal access',
-          'Connect to the container over SSH to run Herdr directly',
-        ),
-        el('div', [
-          _text(
-            'code-output',
-            'ssh herdr@<container-ip>\nThen: cd ~/projects && herdr',
-            'pre',
-          ),
-        ], classes: 'overview-disclosure__body'),
-      ], classes: 'card overview-disclosure'),
     ], classes: 'overview-page');
   }
 }
@@ -1025,48 +1029,23 @@ class SystemHealth extends StatefulComponent {
   State<SystemHealth> createState() => _SystemHealthState();
 }
 
-class _SystemHealthState extends State<SystemHealth> {
-  Timer? timer;
-  Map<String, dynamic>? data;
-  bool loading = false;
-  String? error;
+class _SystemHealthState extends FeatureOperationsState<SystemHealth> {
+  late final ResourcesBloc bloc;
+  Map<String, dynamic>? get data => bloc.data;
+  bool get loading => bloc.state.loading;
   @override
   void initState() {
     super.initState();
+    bindFeature(
+      bloc = ResourcesBloc(dashboardConnection),
+      errorFor: (state) => state.error == null
+          ? null
+          : 'Resource monitor unavailable; displayed values may be stale.',
+    );
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 10), (_) => refresh());
   }
 
-  Future<void> refresh() async {
-    if (loading) return;
-    setState(() => loading = true);
-    final epoch = dashboardConnection.generation;
-    try {
-      final result = await dashboardConnection.request('resources');
-      if (mounted && epoch == dashboardConnection.generation)
-        setState(() {
-          data = Map<String, dynamic>.from(result);
-          error = null;
-        });
-      if (mounted && !(timer?.isActive ?? false))
-        timer = Timer.periodic(const Duration(seconds: 10), (_) => refresh());
-    } catch (_) {
-      timer?.cancel();
-      if (mounted && epoch == dashboardConnection.generation)
-        setState(
-          () => error =
-              'Resource monitor unavailable; displayed values may be stale.',
-        );
-    } finally {
-      if (mounted) setState(() => loading = false);
-    }
-  }
-
-  @override
-  void dispose() {
-    timer?.cancel();
-    super.dispose();
-  }
+  Future<void> refresh() => bloc.refresh();
 
   String mib(dynamic value) => _grouped((value as num? ?? 0) / 1048576);
   String bytes(dynamic value) => '${mib(value)} MiB';
@@ -1268,8 +1247,9 @@ class _SystemHealthState extends State<SystemHealth> {
 }
 
 class CloneProjectCard extends StatefulComponent {
-  const CloneProjectCard({required this.onCloned, super.key});
+  const CloneProjectCard({required this.onCloned, this.onDeleted, super.key});
   final void Function(String) onCloned;
+  final void Function(String)? onDeleted;
   @override
   State<CloneProjectCard> createState() => _CloneProjectCardState();
 }
@@ -1280,49 +1260,69 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
   String connectionId = '';
   String? unavailableConnection;
   List<Map<String, dynamic>> connections = [];
-  bool busy = false;
-  Timer? timer;
-  List<Map<String, dynamic>> jobs = [];
-  String? completed;
-  bool polling = false;
-  String? result;
+  late final CloneJobsBloc bloc;
+  StreamSubscription? jobsSubscription;
+  int completionRevision = 0;
+  bool get busy => bloc.state.busy;
+  List<Map<String, dynamic>> get jobs => bloc.jobs;
+  String? get removing => bloc.removing;
+  String? inputError;
+  String? get result => inputError ?? bloc.result;
+  set result(String? value) => inputError = value;
+  String? pendingRemoval;
+  bool deleteCloneFolder = false;
+  String removalConfirmation = '';
+  int? removalGeneration;
+  late final DashboardBloc cloneConnection;
+  StreamSubscription? cloneSubscription;
+  late int cloneGeneration;
+  late bool cloneCanRemove;
   @override
   void initState() {
     super.initState();
+    cloneConnection = dashboardConnection;
+    bloc = CloneJobsBloc(cloneConnection);
+    jobsSubscription = bloc.stream.listen((_) {
+      if (!mounted) return;
+      if (completionRevision != bloc.completionRevision) {
+        completionRevision = bloc.completionRevision;
+        if (bloc.clonedFolder != null) component.onCloned(bloc.clonedFolder!);
+      }
+      setState(() {});
+    });
+    cloneGeneration = cloneConnection.generation;
+    cloneCanRemove = canRemove;
+    cloneConnection.operator.addListener(cloneSessionChanged);
+    cloneSubscription = cloneConnection.stream.listen(
+      (_) => cloneSessionChanged(),
+    );
     refreshJobs();
-    timer = Timer.periodic(const Duration(seconds: 3), (_) => refreshJobs());
   }
 
-  Future<void> refreshJobs() async {
-    final connection = dashboardConnection;
-    if (polling || !connection.state.connected) return;
-    polling = true;
-    final epoch = connection.generation;
-    try {
-      final data = await connection.request('projects/jobs');
-      if (!mounted || epoch != connection.generation) return;
-      final next = List<Map<String, dynamic>>.from(data['jobs'] ?? []);
-      if (jsonEncode(next) != jsonEncode(jobs)) setState(() => jobs = next);
-      final latest = jobs.firstOrNull;
-      if (latest != null &&
-          ['failed', 'interrupted', 'completed'].contains(latest['state']) &&
-          result?.startsWith('Clone queued.') == true) {
-        setState(() => result = null);
+  void cloneSessionChanged() {
+    if (!mounted) return;
+    if (cloneGeneration == cloneConnection.generation &&
+        cloneCanRemove == canRemove)
+      return;
+    setState(() {
+      if (!canRemove || cloneGeneration != cloneConnection.generation) {
+        if (connectionId.isNotEmpty) url = '';
+        connections = [];
+        connectionId = '';
+        unavailableConnection = null;
       }
-      if (latest?['state'] == 'completed' && latest?['id'] != completed) {
-        completed = latest!['id'] as String;
-        component.onCloned(latest['cwd'] as String);
+      cloneCanRemove = canRemove;
+      if (cloneGeneration != cloneConnection.generation) {
+        cloneGeneration = cloneConnection.generation;
+        completionRevision = 0;
+        result = null;
       }
-    } catch (exception) {
-      if (mounted && epoch == connection.generation)
-        setState(
-          () => result =
-              'Clone status unavailable; the server job may still be running. $exception',
-        );
-    } finally {
-      polling = false;
-    }
+      if (!canRemove || removalGeneration != cloneGeneration)
+        pendingRemoval = null;
+    });
   }
+
+  Future<void> refreshJobs() => bloc.refresh();
 
   Future<void> clone() async {
     if (unavailableConnection != null ||
@@ -1333,37 +1333,71 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       );
       return;
     }
-    final connection = dashboardConnection;
-    final epoch = connection.generation;
+    setState(() => inputError = null);
+    await bloc.clone(url.trim(), folder.trim(), connectionId);
+  }
+
+  bool get canRemove =>
+      dashboardConnection.state.connected &&
+      dashboardConnection.operator.value['role'] == 'admin';
+
+  void prepareRemoval(Map<String, dynamic> job) {
+    if (busy || !canRemove) return;
     setState(() {
-      busy = true;
-      result = null;
+      pendingRemoval = '${job['id']}';
+      removalGeneration = dashboardConnection.generation;
+      deleteCloneFolder = false;
+      removalConfirmation = '';
     });
-    try {
-      final data = await connection.request('projects/clone', {
-        'url': url.trim(),
-        'folder': folder.trim(),
-        if (connectionId.isNotEmpty) 'connection_id': connectionId,
-      });
-      if (!mounted || epoch != connection.generation) return;
-      setState(() {
-        jobs.insert(0, Map<String, dynamic>.from(data));
-        result =
-            'Clone queued. You can navigate away and return to see its status.';
-      });
-      await refreshJobs();
-    } catch (error) {
-      if (mounted && epoch == connection.generation)
-        setState(() => result = error.toString());
-    } finally {
-      if (mounted && epoch == connection.generation)
-        setState(() => busy = false);
-    }
+    context.binding.addPostFrameCallback(() {
+      if (!mounted) return;
+      (web.document.querySelector(
+                '#clone-removal-$pendingRemoval input:not(:disabled), #clone-removal-$pendingRemoval .clone-removal__confirm',
+              )
+              as web.HTMLElement?)
+          ?.focus();
+    });
+  }
+
+  Future<void> removeClone(Map<String, dynamic> job) async {
+    if (busy ||
+        !canRemove ||
+        removalGeneration != dashboardConnection.generation ||
+        pendingRemoval != job['id'] ||
+        (deleteCloneFolder && !cloneFolderIdentityAvailable(job)) ||
+        (deleteCloneFolder && removalConfirmation != job['folder']))
+      return;
+    final epoch = dashboardConnection.generation;
+    setState(() => inputError = null);
+    final data = await bloc.remove(
+      job,
+      deleteFolder: deleteCloneFolder,
+      confirmation: removalConfirmation,
+    );
+    if (!mounted ||
+        epoch != dashboardConnection.generation ||
+        !canRemove ||
+        data == null)
+      return;
+    setState(() => pendingRemoval = null);
+    if (data['folder_deleted'] == true)
+      component.onDeleted?.call('${job['cwd']}');
+    context.binding.addPostFrameCallback(() {
+      if (!mounted) return;
+      (web.document.querySelector(
+                '.clone-project .clone-remove:not(:disabled), .clone-project button[type=submit]',
+              )
+              as web.HTMLElement?)
+          ?.focus();
+    });
   }
 
   @override
   void dispose() {
-    timer?.cancel();
+    jobsSubscription?.cancel();
+    unawaited(bloc.close());
+    cloneConnection.operator.removeListener(cloneSessionChanged);
+    cloneSubscription?.cancel();
     super.dispose();
   }
 
@@ -1376,23 +1410,10 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
       'p',
     ),
     if (dashboardConnection.operator.value['role'] == 'admin')
-      RepositoryConnectionsPanel(
-        onChanged: (values) {
-          if (mounted)
-            setState(() {
-              connections = values;
-              if (unavailableConnection != null &&
-                  knownRepositoryConnection(values, unavailableConnection!)) {
-                connectionId = unavailableConnection!;
-                unavailableConnection = null;
-              }
-              if (!values.any((item) => item['id'] == connectionId))
-                if (connectionId.isNotEmpty) {
-                  unavailableConnection = connectionId;
-                  connectionId = '';
-                }
-            });
-        },
+      _text(
+        'overview-disclosure__hint',
+        'For a private repository, add a connection below.',
+        'p',
       ),
     el(
       'form',
@@ -1443,6 +1464,25 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
         },
       },
     ),
+    if (dashboardConnection.operator.value['role'] == 'admin')
+      RepositoryConnectionsPanel(
+        onChanged: (values) {
+          if (mounted)
+            setState(() {
+              connections = values;
+              if (unavailableConnection != null &&
+                  knownRepositoryConnection(values, unavailableConnection!)) {
+                connectionId = unavailableConnection!;
+                unavailableConnection = null;
+              }
+              if (!values.any((item) => item['id'] == connectionId))
+                if (connectionId.isNotEmpty) {
+                  unavailableConnection = connectionId;
+                  connectionId = '';
+                }
+            });
+        },
+      ),
     if (jobs.isNotEmpty)
       el(
         'ul',
@@ -1485,6 +1525,110 @@ class _CloneProjectCardState extends State<CloneProjectCard> {
                   () => component.onCloned(job['cwd'] as String),
                   small: true,
                 ),
+              if (canRemove) ...[
+                dom.button(
+                  [icon('trash-2'), text('Remove clone')],
+                  type: dom.ButtonType.button,
+                  classes: 'btn btn--ghost btn--sm clone-remove',
+                  disabled:
+                      busy ||
+                      ![
+                        'completed',
+                        'failed',
+                        'interrupted',
+                      ].contains(job['state']),
+                  attributes: {
+                    'id': 'clone-remove-${job['id']}',
+                    'aria-label': 'Remove clone ${job['folder']}',
+                    'aria-expanded':
+                        '${pendingRemoval == job['id'] && removalGeneration == dashboardConnection.generation}',
+                    if (pendingRemoval == job['id'] &&
+                        removalGeneration == dashboardConnection.generation)
+                      'aria-controls': 'clone-removal-${job['id']}',
+                  },
+                  onClick: () => prepareRemoval(job),
+                ),
+                if (pendingRemoval == job['id'] &&
+                    removalGeneration == dashboardConnection.generation)
+                  el(
+                    'div',
+                    [
+                      el('p', [
+                        text(
+                          'Remove ${job['folder']} from clone history? Your files are kept unless you choose deletion below.',
+                        ),
+                      ]),
+                      el('p', [text(cloneRemovalPreservationNotice)]),
+                      if (!cloneFolderIdentityAvailable(job))
+                        el('p', [text(legacyCloneRemovalNotice)]),
+                      el('label', [
+                        dom.input<bool>(
+                          type: dom.InputType.checkbox,
+                          checked: deleteCloneFolder,
+                          disabled: busy || !cloneFolderIdentityAvailable(job),
+                          onChange: (value) =>
+                              setState(() => deleteCloneFolder = value),
+                        ),
+                        text('Also permanently delete the cloned folder'),
+                      ], classes: 'clone-removal__option'),
+                      if (deleteCloneFolder) ...[
+                        el('p', [
+                          text(
+                            'This deletes ${job['cwd']} and all files inside, including local changes. This cannot be undone.',
+                          ),
+                        ]),
+                        field(
+                          'Type ${job['folder']} to confirm deletion',
+                          removalConfirmation,
+                          (value) =>
+                              setState(() => removalConfirmation = value),
+                          disabled: busy,
+                          autocomplete: 'off',
+                          spellcheck: false,
+                        ),
+                      ],
+                      el('div', [
+                        button(
+                          'Cancel removal',
+                          () {
+                            setState(() => pendingRemoval = null);
+                            context.binding.addPostFrameCallback(() {
+                              if (mounted)
+                                (web.document.getElementById(
+                                          'clone-remove-${job['id']}',
+                                        )
+                                        as web.HTMLElement?)
+                                    ?.focus();
+                            });
+                          },
+                          disabled: busy,
+                          small: true,
+                        ),
+                        button(
+                          removing == job['id']
+                              ? 'Removing…'
+                              : deleteCloneFolder
+                              ? 'Delete folder and history'
+                              : 'Remove history entry',
+                          () => removeClone(job),
+                          disabled:
+                              busy ||
+                              (deleteCloneFolder &&
+                                  removalConfirmation != job['folder']),
+                          variant: deleteCloneFolder ? 'danger' : 'primary',
+                          small: true,
+                          classes: 'clone-removal__confirm',
+                        ),
+                      ], classes: 'actions'),
+                    ],
+                    classes: 'clone-removal',
+                    attributes: {
+                      'id': 'clone-removal-${job['id']}',
+                      'role': 'group',
+                      'aria-label': 'Remove clone ${job['folder']}',
+                    },
+                  ),
+              ],
             ], classes: 'job-row clone-job'),
         ],
         classes: 'clone-jobs',

@@ -29,6 +29,26 @@ Future<void> downloadBinaryArtifact(
   );
 }
 
+/// Let the browser stream a cookie-authenticated backup to disk, honoring the
+/// gateway's Content-Disposition. No database bytes enter JavaScript memory.
+Future<void> downloadTaskBackupLink(Uri uri) async {
+  if (uri.origin != Uri.base.origin ||
+      !const {
+        '/api/tasks/export',
+        '/api/tasks/export/json',
+      }.contains(uri.path) ||
+      uri.hasQuery ||
+      uri.hasFragment) {
+    throw ArgumentError('Invalid task backup download URL');
+  }
+  final link = web.HTMLAnchorElement()
+    ..href = uri.toString()
+    ..download = '';
+  web.document.body!.appendChild(link);
+  link.click();
+  link.remove();
+}
+
 Future<void> downloadArtifact(String content, String filename) async {
   _save(
     web.Blob(
@@ -41,4 +61,21 @@ Future<void> downloadArtifact(String content, String filename) async {
     ),
     filename,
   );
+}
+
+Future<void> openGitHubCompare(Uri uri) async {
+  if (uri.scheme != 'https' ||
+      uri.host != 'github.com' ||
+      !uri.path.contains('/compare/') ||
+      uri.userInfo.isNotEmpty ||
+      uri.hasFragment) {
+    throw ArgumentError('Invalid GitHub compare URL');
+  }
+  final link = web.HTMLAnchorElement()
+    ..href = uri.toString()
+    ..target = '_blank'
+    ..rel = 'noopener noreferrer';
+  web.document.body!.appendChild(link);
+  link.click();
+  link.remove();
 }

@@ -3,6 +3,8 @@ import 'dart:math' as math;
 import 'dart:js_interop';
 import 'package:jaspr/dom.dart' as dom;
 import 'package:web/web.dart' as web;
+import 'package:herdr_dashboard_state/publishing_connections.dart'
+    show githubCompareUri;
 import 'package:herdr_dashboard_state/task_execution.dart';
 import '../ui.dart';
 import '../navigation.dart' as navigation;
@@ -520,6 +522,7 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
                     'id': '$instance-tab-$value',
                     'aria-selected': '${view == value}',
                     'aria-controls': '$instance-panel-$value',
+                    'tabindex': view == value ? '0' : '-1',
                   },
                   events: {
                     'click': (_) => setState(() {
@@ -531,6 +534,7 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
             ],
             classes: 'tabs task-wf-tabs',
             attributes: {'role': 'tablist', 'aria-label': 'Task view'},
+            events: {'keydown': tabListKeyDown},
           ),
           if (view == 'workflow')
             el('div', [
@@ -644,6 +648,7 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
               'role': 'tabpanel',
               'id': '$instance-panel-workflow',
               'aria-labelledby': '$instance-tab-workflow',
+              'tabindex': '0',
             },
           )
         else
@@ -672,6 +677,7 @@ class _TaskWorkflowState extends State<TaskWorkflow> {
               'role': 'tabpanel',
               'id': '$instance-panel-list',
               'aria-labelledby': '$instance-tab-list',
+              'tabindex': '0',
             },
           ),
         el(

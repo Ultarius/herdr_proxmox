@@ -41,10 +41,16 @@ void main() {
   late ClientAppBinding binding;
   late List<Map<String, dynamic>> connections, jobs, requests, bindings;
   Completer<http.Response>? pendingProbe;
+  Completer<http.Response>? pendingRemoval;
   String? saveError;
+  String? removalError;
+  final deletedFolders = <String>[];
   setUp(() async {
     pendingProbe = null;
+    pendingRemoval = null;
     saveError = null;
+    removalError = null;
+    deletedFolders.clear();
     connections = [];
     bindings = [];
     jobs = [];
@@ -57,6 +63,17 @@ void main() {
           if (request.method == 'POST') {
             final body = Map<String, dynamic>.from(jsonDecode(request.body));
             requests.add(body);
+            if (body['action'] == 'discover') {
+              return http.Response(
+                jsonEncode({
+                  'repositories': [
+                    {'repository': 'owner/private', 'private': true},
+                  ],
+                  'next_page': null,
+                }),
+                200,
+              );
+            }
             if (['create', 'rotate'].contains(body['action']) &&
                 saveError != null) {
               return http.Response(jsonEncode({'error': saveError}), 503);
@@ -95,6 +112,25 @@ void main() {
           } else {
             response = {'connections': connections, 'bindings': bindings};
           }
+        } else if (path == '/api/projects/jobs/remove') {
+          final body = Map<String, dynamic>.from(jsonDecode(request.body));
+          requests.add({'action': 'remove_clone', ...body});
+          if (pendingRemoval != null) {
+            final outcome = await pendingRemoval!.future;
+            if (outcome.statusCode == 200)
+              jobs.removeWhere((job) => job['id'] == body['id']);
+            return outcome;
+          }
+          if (removalError != null)
+            return http.Response(jsonEncode({'error': removalError}), 400);
+          jobs.removeWhere((job) => job['id'] == body['id']);
+          response = {
+            'removed': true,
+            'folder_deleted': body['delete_folder'] == true,
+            'message': body['delete_folder'] == true
+                ? 'Clone folder and history entry deleted.'
+                : 'Clone history entry removed. Existing files were preserved.',
+          };
         } else if (path == '/api/projects/jobs') {
           response = {'jobs': jobs};
         } else if (path == '/api/projects/clone') {
@@ -126,7 +162,7 @@ void main() {
     );
     binding = ClientAppBinding();
     binding.attachRootComponent(
-      CloneProjectCard(onCloned: (_) {}),
+      CloneProjectCard(onCloned: (_) {}, onDeleted: deletedFolders.add),
       attachTo: '#repository-test',
     );
     await settle();
@@ -134,30 +170,244 @@ void main() {
   tearDown(() async {
     if (pendingProbe != null && !pendingProbe!.isCompleted)
       pendingProbe!.complete(http.Response('{}', 503));
+    if (pendingRemoval != null && !pendingRemoval!.isCompleted)
+      pendingRemoval!.complete(http.Response('{}', 503));
     binding.detachRootComponent();
     web.document.getElementById('repository-test')!.remove();
     await connection.disconnect();
     BlocScope.endAll();
   });
 
+  Future<void> until(bool Function() ready) async {
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (!ready()) {
+      if (DateTime.now().isAfter(deadline))
+        fail(
+          'Clone removal did not settle: ${nodes('.clone-project').firstOrNull?.textContent}',
+        );
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+  }
+
+  Future<void> mountJobs(String state, {bool legacy = false}) async {
+    binding.detachRootComponent();
+    web.document.getElementById('repository-test')!.textContent = '';
+    jobs = [
+      {
+        'id': 'a' * 32,
+        'folder': 'old-repo',
+        'cwd': '/projects/old-repo',
+        'state': state,
+        if (!legacy) 'destination_identity': [1, 2],
+      },
+    ];
+    binding.attachRootComponent(
+      CloneProjectCard(onCloned: (_) {}, onDeleted: deletedFolders.add),
+      attachTo: '#repository-test',
+    );
+    await until(() => nodes('.clone-job').length == 1);
+  }
+
+  test(
+    'clone history removal defaults to preserving files and can be cancelled',
+    () async {
+      await mountJobs('failed');
+      await click('Remove clone');
+      expect(
+        nodes('.clone-removal').single.textContent,
+        contains(
+          'remote repository and saved GitHub credentials are not deleted or revoked',
+        ),
+      );
+      expect(
+        nodes(
+          '.clone-removal__confirm',
+        ).single.classList.contains('btn--danger'),
+        isFalse,
+      );
+      expect(
+        requests.where((request) => request['action'] == 'remove_clone'),
+        isEmpty,
+      );
+      expect(
+        (nodes('.clone-removal input[type=checkbox]').single
+                as web.HTMLInputElement)
+            .checked,
+        isFalse,
+      );
+      await click('Cancel removal');
+      await until(() => nodes('.clone-removal').isEmpty);
+      expect(web.document.activeElement, nodes('.clone-remove').single);
+      await click('Remove clone');
+      await click('Remove history entry');
+      await until(() => nodes('.clone-job').isEmpty);
+      expect(requests.last, {
+        'action': 'remove_clone',
+        'id': 'a' * 32,
+        'delete_folder': false,
+      });
+      expect(
+        nodes('.clone-project').single.textContent,
+        contains('files were preserved'),
+      );
+    },
+  );
+
+  test(
+    'deleting a clone folder requires opting in and typing its exact name',
+    () async {
+      await mountJobs('completed');
+      await click('Remove clone');
+      final checkbox =
+          nodes('.clone-removal input[type=checkbox]').single
+              as web.HTMLInputElement;
+      checkbox.click();
+      await until(() => nodes('.clone-removal input[type=text]').isNotEmpty);
+      final confirm = nodes(
+        'button',
+      ).firstWhere((item) => item.textContent == 'Delete folder and history');
+      expect(confirm.hasAttribute('disabled'), isTrue);
+      expect(confirm.classList.contains('btn--danger'), isTrue);
+      await field('Type old-repo to confirm deletion', 'wrong');
+      expect(confirm.hasAttribute('disabled'), isTrue);
+      await field('Type old-repo to confirm deletion', 'old-repo');
+      await until(() => !confirm.hasAttribute('disabled'));
+      await click('Delete folder and history');
+      await until(() => nodes('.clone-job').isEmpty);
+      expect(requests.last, {
+        'action': 'remove_clone',
+        'id': 'a' * 32,
+        'delete_folder': true,
+        'confirm_folder': 'old-repo',
+      });
+      expect(deletedFolders, ['/projects/old-repo']);
+    },
+  );
+
+  test(
+    'running clones cannot be removed and non-admins have no removal controls',
+    () async {
+      connections = [
+        {
+          'id': 'private-connection',
+          'label': 'Private connection',
+          'repository': 'owner/private',
+          'kind': 'token',
+          'access_state': 'verified',
+        },
+      ];
+      await mountJobs('running');
+      await until(
+        () => nodes('option').any(
+          (item) =>
+              (item as web.HTMLOptionElement).value == 'private-connection',
+        ),
+      );
+      final selector = nodes('select').first as web.HTMLSelectElement;
+      selector.value = 'private-connection';
+      selector.dispatchEvent(web.Event('change', web.EventInit(bubbles: true)));
+      await settle();
+      expect(nodes('.clone-remove').single.hasAttribute('disabled'), isTrue);
+      connection.operator.value = {'role': 'operator'};
+      await until(() => nodes('.clone-remove').isEmpty);
+      expect(
+        nodes('option').where(
+          (item) =>
+              (item as web.HTMLOptionElement).value == 'private-connection',
+        ),
+        isEmpty,
+      );
+      expect((nodes('select').first as web.HTMLSelectElement).value, '');
+      await until(() => nodes('.clone-job').length == 1);
+      expect(nodes('.clone-job'), hasLength(1));
+    },
+  );
+
+  test(
+    'legacy clone entries allow history-only removal and focus its safe action',
+    () async {
+      await mountJobs('completed', legacy: true);
+      await click('Remove clone');
+      final checkbox =
+          nodes('.clone-removal input[type=checkbox]').single
+              as web.HTMLInputElement;
+      expect(checkbox.disabled, isTrue);
+      expect(
+        nodes('.clone-removal').single.textContent,
+        contains('no verified original folder identity'),
+      );
+      expect(
+        web.document.activeElement,
+        nodes('.clone-removal__confirm').single,
+      );
+      await click('Remove history entry');
+      await until(() => nodes('.clone-job').isEmpty);
+      expect(requests.last['delete_folder'], isFalse);
+      expect(deletedFolders, isEmpty);
+    },
+  );
+
+  test(
+    'removal failure retains the entry and pending deletion prevents duplicate requests',
+    () async {
+      await mountJobs('interrupted');
+      removalError = 'This project is in use.';
+      await click('Remove clone');
+      await click('Remove history entry');
+      await until(
+        () => nodes(
+          '.clone-project',
+        ).single.textContent!.contains('This project is in use.'),
+      );
+      expect(nodes('.clone-job'), hasLength(1));
+      removalError = null;
+      pendingRemoval = Completer<http.Response>();
+      await click('Remove history entry');
+      expect(
+        nodes('button')
+            .where((button) => button.textContent == 'Removing…')
+            .single
+            .hasAttribute('disabled'),
+        isTrue,
+      );
+      final before = requests
+          .where((request) => request['action'] == 'remove_clone')
+          .length;
+      nodes(
+        'button',
+      ).firstWhere((item) => item.textContent == 'Removing…').click();
+      expect(
+        requests.where((request) => request['action'] == 'remove_clone'),
+        hasLength(before),
+      );
+      pendingRemoval!.complete(
+        http.Response('{"removed":true,"message":"Removed."}', 200),
+      );
+      await until(() => nodes('.clone-job').isEmpty);
+    },
+  );
+
   test(
     'SSH connection creation, verification, selection and clone retry use the explicit identity',
     () async {
-      nodes('summary').single.click();
+      nodes('.repository-connections > summary').single.click();
       await settle();
-      await field('Connection name', 'Bevy SSH');
-      await field('GitHub repository (owner/repository)', 'Ultarius/bevy_game');
+      await field('Connection name', 'Project SSH');
+      await field(
+        'GitHub repository (owner/repository)',
+        'SourceOwner/project',
+      );
       await click('Create SSH connection');
       expect(requests.last, {
         'action': 'create',
-        'label': 'Bevy SSH',
-        'repository': 'Ultarius/bevy_game',
+        'label': 'Project SSH',
+        'repository': 'SourceOwner/project',
         'kind': 'ssh',
       });
       expect(nodes('pre').single.textContent, 'ssh-ed25519 PUBLIC test');
       expect(
         nodes('a').single.getAttribute('href'),
-        'https://github.com/Ultarius/bevy_game/settings/keys',
+        'https://github.com/SourceOwner/project/settings/keys',
       );
       await click('Verify GitHub host key');
       expect(requests.last, {'action': 'verify_host', 'id': 'key-one'});
@@ -165,7 +415,7 @@ void main() {
       expect(requests.last, {
         'action': 'test',
         'id': 'key-one',
-        'url': 'git@github.com:Ultarius/bevy_game.git',
+        'url': 'git@github.com:SourceOwner/project.git',
       });
       final selector =
           nodes('label')
@@ -188,12 +438,12 @@ void main() {
                   )
                   .querySelector('input')
               as web.HTMLInputElement;
-      expect(url.value, 'git@github.com:Ultarius/bevy_game.git');
+      expect(url.value, 'git@github.com:SourceOwner/project.git');
       await click('Clone project');
       expect(requests.last, {
         'action': 'clone',
-        'url': 'git@github.com:Ultarius/bevy_game.git',
-        'folder': 'bevy_game',
+        'url': 'git@github.com:SourceOwner/project.git',
+        'folder': 'project',
         'connection_id': 'key-one',
       });
       expect(
@@ -208,17 +458,17 @@ void main() {
       await click('Retry in a new folder');
       expect(requests.length, before);
       await click('Clone project');
-      expect(requests.last['folder'], 'bevy_game-retry');
+      expect(requests.last['folder'], 'project-retry');
       expect(requests.last['connection_id'], 'key-one');
       await field(
         'Existing project folder (direct child, optional)',
-        'bevy_game',
+        'project',
       );
       await click('Assign to existing project');
       expect(requests.last, {
         'action': 'bind',
         'id': 'key-one',
-        'folder': 'bevy_game',
+        'folder': 'project',
       });
       expect(
         nodes('button')
@@ -230,7 +480,7 @@ void main() {
       expect(requests.last, {
         'action': 'unbind',
         'id': 'key-one',
-        'folder': 'bevy_game',
+        'folder': 'project',
       });
       final beforeRemoval = requests.length;
       await click('Remove connection');
@@ -245,9 +495,18 @@ void main() {
   test(
     'a fine-grained token can be saved, tested and selected for HTTPS cloning',
     () async {
-      nodes('summary').single.click();
+      nodes('.repository-connections > summary').single.click();
       await settle();
-      final authentication = nodes('select').first as web.HTMLSelectElement;
+      final authentication =
+          nodes('select').firstWhere(
+                (node) =>
+                    node.getAttribute('aria-label') == 'Authentication' ||
+                    node.parentElement?.textContent?.startsWith(
+                          'Authentication',
+                        ) ==
+                        true,
+              )
+              as web.HTMLSelectElement;
       authentication.value = 'token';
       authentication.dispatchEvent(
         web.Event('change', web.EventInit(bubbles: true)),
@@ -288,7 +547,15 @@ void main() {
       );
       await click('Test repository access');
       expect(requests.last['url'], 'https://github.com/owner/private.git');
-      final selector = nodes('select').last as web.HTMLSelectElement;
+      final selector =
+          nodes('select').firstWhere(
+                (node) =>
+                    node.parentElement?.textContent?.startsWith(
+                      'Repository connection',
+                    ) ==
+                    true,
+              )
+              as web.HTMLSelectElement;
       selector.value = 'key-one';
       selector.dispatchEvent(web.Event('change', web.EventInit(bubbles: true)));
       await settle();
@@ -302,6 +569,66 @@ void main() {
       expect(
         nodes('.clone-project').single.textContent,
         isNot(contains('github_pat_test_fixture')),
+      );
+    },
+  );
+  test(
+    'PAT discovery fills the repository and connection name before saving',
+    () async {
+      nodes('.repository-connections > summary').single.click();
+      await settle();
+      final authentication =
+          nodes('select').firstWhere(
+                (node) =>
+                    node.getAttribute('aria-label') == 'Authentication' ||
+                    node.parentElement?.textContent?.startsWith(
+                          'Authentication',
+                        ) ==
+                        true,
+              )
+              as web.HTMLSelectElement;
+      authentication.value = 'token';
+      authentication.dispatchEvent(
+        web.Event('change', web.EventInit(bubbles: true)),
+      );
+      await settle();
+      await field('GitHub personal access token', 'github_pat_test_fixture');
+      await click('Discover repositories');
+      expect(requests.last, {
+        'action': 'discover',
+        'token': 'github_pat_test_fixture',
+        'page': 1,
+      });
+      expect(requests.where((item) => item['action'] == 'create'), isEmpty);
+      final picker =
+          nodes('select').firstWhere(
+                (node) => node.textContent!.contains('Choose a repository'),
+              )
+              as web.HTMLSelectElement;
+      picker.value = 'owner/private';
+      picker.dispatchEvent(web.Event('change', web.EventInit(bubbles: true)));
+      await settle();
+      await field('GitHub repository (owner/repository)', 'owner/manual');
+      expect(
+        (nodes('select').firstWhere(
+                  (node) => node.textContent!.contains('Choose a repository'),
+                )
+                as web.HTMLSelectElement)
+            .value,
+        '',
+      );
+      await field('GitHub repository (owner/repository)', 'owner/private');
+      await click('Save token connection');
+      expect(requests.last, {
+        'action': 'create',
+        'token': 'github_pat_test_fixture',
+        'kind': 'token',
+        'repository': 'owner/private',
+        'label': 'owner/private',
+      });
+      expect(
+        (nodes('input[type=password]').single as web.HTMLInputElement).value,
+        isEmpty,
       );
     },
   );
@@ -336,9 +663,18 @@ void main() {
   test(
     'failed token saves retain the masked paste and rotation preserves the connection',
     () async {
-      nodes('summary').single.click();
+      nodes('.repository-connections > summary').single.click();
       await settle();
-      final authentication = nodes('select').first as web.HTMLSelectElement;
+      final authentication =
+          nodes('select').firstWhere(
+                (node) =>
+                    node.getAttribute('aria-label') == 'Authentication' ||
+                    node.parentElement?.textContent?.startsWith(
+                          'Authentication',
+                        ) ==
+                        true,
+              )
+              as web.HTMLSelectElement;
       authentication.value = 'token';
       authentication.dispatchEvent(
         web.Event('change', web.EventInit(bubbles: true)),
@@ -416,7 +752,15 @@ void main() {
       );
       await settle();
       final restoredAuthentication =
-          nodes('select').first as web.HTMLSelectElement;
+          nodes('select').firstWhere(
+                (node) =>
+                    node.getAttribute('aria-label') == 'Authentication' ||
+                    node.parentElement?.textContent?.startsWith(
+                          'Authentication',
+                        ) ==
+                        true,
+              )
+              as web.HTMLSelectElement;
       restoredAuthentication.value = 'token';
       restoredAuthentication.dispatchEvent(
         web.Event('change', web.EventInit(bubbles: true)),
@@ -437,7 +781,7 @@ void main() {
   test(
     'account changes clear connection state and ignore a late access result',
     () async {
-      nodes('summary').single.click();
+      nodes('.repository-connections > summary').single.click();
       await settle();
       await field('Connection name', 'Previous account');
       await field('GitHub repository (owner/repository)', 'owner/private');

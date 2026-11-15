@@ -1,5 +1,5 @@
 """Local, authenticated dashboard gateway to the official Herdr CLI."""
-from contextlib import closing
+from contextlib import closing, nullcontext, ExitStack
 import hmac
 import secrets
 import time
@@ -202,6 +202,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def task_backup(self, output_format='sqlite'):
+        from datetime import datetime, timezone
+        from task_backup import BackupBusy, export_database, readable_json
+        with ExitStack() as stack:
+            try:
+                backup = stack.enter_context(export_database(self.server.contributions.connect))
+                if output_format == 'json':
+                    backup = readable_json(backup)
+                stream = stack.enter_context(backup.open('rb'))
+                size = backup.stat().st_size
+            except BackupBusy as error:
+                self.reply(409, {'error': str(error)}, retry_after=2)
+                return
+            except ValueError as error:
+                self.reply(503, {'error': str(error)})
+                return
+            except (OSError, sqlite3.Error):
+                self.reply(503, {'error': 'Could not export task storage. Check gateway storage and available disk space, then retry.'})
+                return
+            suffix = '.json' if output_format == 'json' else '.sqlite3'
+            filename = 'herdr-tasks-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + suffix
+            try:
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8' if output_format == 'json' else 'application/vnd.sqlite3')
+                self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('Content-Length', str(size))
+                self.end_headers()
+                while chunk := stream.read(65536):
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # Browser cancellation is routine. ExitStack still removes the
+                # copy and releases the export lease; no second response/log.
+                return
+
     def validation_artifact(self, run_id, kind='static'):
         try:
             archive, manifest = self.server.validation.artifact(run_id, kind)
@@ -227,6 +263,35 @@ class Handler(BaseHTTPRequestHandler):
         # Minimal gateways used for setup can serve organization storage before
         # the background integration watcher is attached.
         return watcher.annotate_profiles(data) if watcher else data
+
+    def prepare_clone_usage(self):
+        workspaces = listing(command('workspace', 'list'), 'workspaces')
+        if any(not workspace.get('cwd') for workspace in workspaces):
+            raise ValueError('Could not verify a workspace directory. The clone folder was preserved.')
+        return lambda target: self.clone_project_in_use(target, workspaces)
+
+    def clone_project_in_use(self, target, workspaces):
+        def overlaps(value):
+            if not isinstance(value, str) or not value:
+                return False
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                path = self.server.projects.root / path
+            path = path.resolve()
+            return path.is_relative_to(target) or target.is_relative_to(path)
+
+        organizations = self.server.organizations
+        if organizations.checkout_in_use(target):
+            return True
+        data = organizations.snapshot(directory=True)
+        if any(overlaps(item.get('project')) for item in data['profiles']):
+            return True
+        if any(overlaps(item.get('project_dir')) for item in data['organizations']):
+            return True
+        for workspace in workspaces:
+            if overlaps(workspace['cwd']):
+                return True
+        return False
 
     def session_key(self):
         cookies = SimpleCookie()
@@ -304,6 +369,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith('/api/'):
             if not self.authenticated():
+                return
+            if urlsplit(self.path).path in ('/api/tasks/export', '/api/tasks/export/info', '/api/tasks/export/json', '/api/tasks/export/json/info'):
+                if self.operator['role'] != 'admin':
+                    self.reply(403, {'error': 'Only an administrator can export task data.'})
+                    return
+                output_format = 'json' if '/json' in urlsplit(self.path).path else 'sqlite'
+                if urlsplit(self.path).path.endswith('/info'):
+                    from task_backup import BackupBusy, export_info
+                    try:
+                        self.reply(200, export_info(self.server.contributions.connect, output_format))
+                    except BackupBusy as error:
+                        self.reply(409, {'error': str(error)}, retry_after=2)
+                    except ValueError as error:
+                        self.reply(503, {'error': str(error)})
+                    except (OSError, sqlite3.Error):
+                        self.reply(503, {'error': 'Could not inspect task backup storage. Check storage and permissions, then retry.'})
+                else:
+                    self.task_backup(output_format)
                 return
             if urlsplit(self.path).path == '/api/organizations/automation':
                 org_id = (parse_qs(urlsplit(self.path).query).get('organization_id') or [''])[0]
@@ -674,6 +757,7 @@ class Handler(BaseHTTPRequestHandler):
         actor = getattr(self, 'operator', {}).get('name', 'dashboard_operator')
         role = getattr(self, 'operator', {}).get('role', 'operator')
         actions = {f'/api/workspaces/{name}': name for name in ('create', 'focus', 'rename')}
+        actions['/api/projects/jobs/remove'] = 'remove_clone'
         actions['/api/organizations/templates'] = 'templates'
         actions['/api/organizations/templates/library'] = 'template_library'
         actions['/api/storage'] = 'storage'
@@ -737,7 +821,10 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == '/api/github/configure':
                 if role != 'admin':
                     raise ValueError('Only an administrator can configure GitHub publishing.')
-                self.reply(200, self.server.github.configure(body))
+                if isinstance(body, dict) and 'connection_id' in body:
+                    self.reply(200, self.server.repository_connections.configure_publishing(body))
+                else:
+                    self.reply(200, self.server.github.configure(body))
             elif self.path == '/api/tasks/discovery':
                 self.reply(200, self.server.contributions.discovery.action(body, actor, role))
             elif self.path.startswith('/api/tasks/'):
@@ -821,6 +908,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.reply(403, dict(error='Only an administrator can clone with a managed repository connection.'))
                     return
                 self.reply(200, self.server.projects.start(body))
+            elif self.path == '/api/projects/jobs/remove':
+                if role != 'admin':
+                    self.reply(403, {'error': 'Only an administrator can remove clone history or project folders.'})
+                    return
+                self.reply(200, self.server.projects.remove(body, prepare_usage=self.prepare_clone_usage))
             elif self.path == '/api/knowledge':
                 self.reply(200, self.server.contributions.knowledge.action(body, actor, role))
             elif self.path == '/api/models':
@@ -882,11 +974,24 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path in organization_actions:
                 self.reply(200, self.server.organizations.action(organization_actions[self.path], body))
             else:
-                self.reply(200, workspace_action(actions[self.path], body))
+                projects = getattr(self.server, 'projects', None)
+                reservation = projects.lock if projects is not None and self.path == '/api/workspaces/create' else nullcontext()
+                with reservation:
+                    self.reply(200, workspace_action(actions[self.path], body))
         except GitHubError as exc:
             # HTTP 401 is reserved for dashboard authentication. An upstream
             # 401 must not revoke a valid browser session or erase task state.
-            self.reply(502, {'error': str(exc)[:500], 'source': 'github', 'github_status': exc.status})
+            details = {key: value for key, value in {
+                'github_repository': exc.repository, 'github_operation': exc.operation,
+                'github_credential_role': exc.credential_role, 'github_request_id': exc.request_id}.items() if value is not None}
+            if exc.validation:
+                details['github_validation'] = list(exc.validation)
+                self.log_message('GitHub validation: %s', ' '.join(exc.validation))
+            self.log_message('GitHub failure: status=%s repository=%s operation=%s credential=%s',
+                             exc.status, exc.repository or '-', exc.operation or '-', exc.credential_role or '-')
+            # GitHubError bounds its context and three summaries below this limit,
+            # so complete validation reasons reach both dashboards.
+            self.reply(502, {'error': str(exc)[:2000], 'source': 'github', 'github_status': exc.status, **details})
         except FieldValidationError as exc:
             self.reply(400, {'error': str(exc)[:500], 'field_errors': exc.field_errors})
         except StorageBusy as exc:
@@ -944,7 +1049,13 @@ def main():
     organizations = OrganizationStore(DATABASE, PROJECTS, command, runtime_status=cli_setup.status, runtime_ready=cli_setup.ready,
                                       model_validator=lambda profile: model_catalog.validate_selection(cli_setup, PROJECTS, profile),
                                       template_catalog=lambda project: team_templates.catalog(cli_setup, PROJECTS, project))
-    github = GitHub(DATABASE.parent / 'github.json')
+    github = GitHub(DATABASE.parent / 'github.json', require_root_policy=True)
+    # Missing policy means no protected projects; a present invalid file is a
+    # deployment error and must never silently remove protection at startup.
+    try:
+        github.validate_policy()
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
     contributions = Contributions(DATABASE.with_name('tasks.sqlite3'), PROJECTS, organizations, github)
     run_logs = RunLogs(DATABASE.parent / 'run-logs', BIN)
     ssh_access = SshAccess()

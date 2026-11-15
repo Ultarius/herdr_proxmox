@@ -10,12 +10,16 @@
    ========================================================================== */
 
 /* ---- Page rhythm: 24px steps; banner + stat strip belong together -------- */
-.overview-page { display: flex; flex-direction: column; min-width: 0; }
+.overview-page { display: flex; flex-direction: column; min-width: 0; container: overview / inline-size; }
 .overview-page > * { margin: 0; }
 .overview-page > * + * { margin-top: var(--space-6); }
 .overview-page > .runtime + .overview-stats { margin-top: var(--space-4); }
 /* styles.css gives every p/h a 12px bottom margin; the template has none */
 .overview-page :where(p, h2, h3) { margin-bottom: 0; }
+/* Three summary items use the entire last row in the two-column tablet layout. */
+@container stat-strip (min-width: 560px) and (max-width: 799.98px) {
+  .overview-stats .stat-strip > li:last-child { grid-column: 1 / -1; }
+}
 
 /* ---- Runtime banner (slim, one row) -----------------------------------------
    Tile · "Herdr is running" + meta on one line · toggle. Wraps on phones.    */
@@ -55,15 +59,17 @@
   .overview-attention .attention__action { grid-column: 3; }
 }
 
-/* ---- Overview grid -------------------------------------------------------------
-     < xl   one column: agents, workspaces, activity, health
-     >= xl  main column + activity rail; agents and system health span both. */
-.overview-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-6); }
-.overview-grid > .card { display: flex; flex-direction: column; }
-.overview-grid > .card > .card__body { flex: 1; }
-@media (min-width: 1280px) {
-  .overview-grid { grid-template-columns: minmax(0, 1fr) minmax(300px, .5fr); }
-  .overview-grid > .overview-grid__wide { grid-column: 1 / -1; }
+/* Independent stacks give cards their natural heights: adding agents or opening
+   a disclosure never stretches cards in the other lane. Columns total the
+   available content width: (width - 24px gutter) * 3/5 and * 2/5. The container
+   breakpoint also handles an expanded/collapsed sidebar without viewport hacks.
+   DOM and keyboard order stay column-first; small screens use the same order. */
+.overview-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-6); align-items: start; }
+.overview-lane { display: flex; flex-direction: column; gap: var(--space-6); min-width: 0; }
+.overview-lane > * { margin: 0; }
+.overview-activity .empty { padding-block: var(--space-4); }
+@container overview (min-width: 880px) {
+  .overview-grid { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
 }
 
 /* ---- Agents card ------------------------------------------------------------- */
@@ -110,7 +116,7 @@ a.agent__name:hover { text-decoration: underline; text-underline-offset: 3px; }
 
 /* ---- Workspaces card ----------------------------------------------------------- */
 .ws-grid { display: grid; gap: var(--space-3); grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); }
-.ws-grid > .ws-grid__create { grid-column: 1 / -1; } /* "create" is always its own slim row */
+.ws-section { display: grid; gap: var(--space-3); }
 .ws-tile.workspace-tile {
   display: flex; flex-direction: column; gap: var(--space-2); height: 100%; padding: var(--space-4);
   border: 1px solid var(--color-border); border-radius: var(--radius-lg); background: var(--color-surface); box-shadow: none;
@@ -155,7 +161,7 @@ a.agent__name:hover { text-decoration: underline; text-underline-offset: 3px; }
 @container health (min-width: 760px) { .meters { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-8); } }
 .health > .notice { margin: var(--space-4) 0 0; }
 /* The processes disclosure bleeds to the card edges like the template's */
-.overview-health .processes { margin: var(--space-5) calc(-1 * var(--space-5)) calc(-1 * var(--space-5)); border-top: 1px solid var(--color-border); }
+.overview-health .processes { margin: var(--space-5) calc(-1 * var(--space-5)) 0; border-top: 1px solid var(--color-border); }
 .processes > .processes__summary {
   display: flex; align-items: center; gap: var(--space-3); min-height: 0; margin: 0; padding: var(--space-3) var(--space-5);
   border-radius: 0 0 var(--radius-lg) var(--radius-lg); font-weight: var(--weight-regular);
@@ -210,6 +216,9 @@ details.overview-disclosure > .overview-disclosure__summary {
 .clone-job { padding-block: var(--space-2-5); }
 .clone-job__text { display: flex; flex-direction: column; flex: 1 1 200px; min-width: 0; }
 .clone-job__detail { font-family: var(--font-mono); font-size: var(--text-xs-size); line-height: var(--text-xs-leading); color: var(--color-text-tertiary); overflow-wrap: anywhere; }
+.clone-removal { flex: 1 0 100%; min-width: 0; display: grid; gap: var(--space-3); padding: var(--space-4); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-sunken); overflow-wrap: anywhere; }
+.clone-removal p { margin: 0; }
+.clone-removal__option { display: flex; align-items: center; gap: var(--space-2); }
 .overview-disclosure .code-output { margin: 0; }
 
 /* ---- Small screens ----------------------------------------------------------------- */
@@ -217,7 +226,7 @@ details.overview-disclosure > .overview-disclosure__summary {
   .runtime { padding: var(--space-3) var(--space-4) var(--space-4); }
   .runtime .btn { width: 100%; }
   .agents-search { max-width: none; flex-basis: 100%; }
-  .overview-health .processes { margin: var(--space-4) calc(-1 * var(--space-4)) calc(-1 * var(--space-4)); }
+  .overview-health .processes { margin: var(--space-4) calc(-1 * var(--space-4)) 0; }
   .processes > .processes__summary { padding-inline: var(--space-4); }
   .processes__empty { padding-inline: var(--space-4); }
   .processes .table :is(td, th):first-child { padding-left: var(--space-4); }
@@ -236,7 +245,21 @@ details.overview-disclosure > .overview-disclosure__summary {
 /* Outbound repository credentials are separate from inbound SSH access. */
 .repository-connections { margin-block: var(--space-4); padding: var(--space-4); border: 1px solid var(--color-border); border-radius: var(--radius-md); min-width: 0; }
 .repository-connections > summary { cursor: pointer; font-weight: var(--weight-semibold); }
-.repository-connections > p { margin-top: var(--space-3); color: var(--color-text-secondary); }
+.repository-setup { display: grid; gap: var(--space-4); padding-top: var(--space-4); }
+.repository-setup > .field { margin: 0; }
+.repository-setup > :is(.btn, a) { justify-self: start; }
+.repository-setup p, .repository-help { color: var(--color-text-secondary); font-size: var(--text-sm-size); line-height: var(--text-sm-leading); }
+.repository-fields { display: grid; gap: var(--space-4); }
+.repository-fields > .field { margin: 0; }
+.repository-help > summary { min-height: 40px; font-weight: var(--weight-medium); }
+.repository-help > p { margin-block: var(--space-3); }
+.repository-existing { margin-top: var(--space-5); border-top: 1px solid var(--color-border); padding-top: var(--space-3); }
+.repository-existing > summary { min-height: 44px; }
+.repository-connections > summary { min-height: 44px; }
+.repository-connections .notice { margin-top: var(--space-4); }
+.overview-health .managed-storage { margin-top: var(--space-3); border-top: 1px solid var(--color-border); }
+.overview-health .managed-storage > summary { min-height: 56px; padding-block: var(--space-3); }
+.processes > .processes__summary { min-height: 56px; }
 .repository-connection { margin-top: var(--space-4); padding-top: var(--space-4); border-top: 1px solid var(--color-border); }
 .repository-connection > :is(.btn, a) { margin: var(--space-1) var(--space-2) var(--space-1) 0; }
 .repository-connection pre { padding: var(--space-3); background: var(--color-surface-sunken); border-radius: var(--radius-md); overflow-wrap: anywhere; }

@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'package:herdr_dashboard_state/organization_tools_bloc.dart';
 import '../ui.dart';
 
 import '../services.dart';
@@ -173,14 +175,36 @@ class ModelFields extends StatefulComponent {
 }
 
 class _ModelFieldsState extends State<ModelFields> {
-  RuntimeCatalog? discovered;
-  bool busy = false;
-  String? error;
-  int requestId = 0;
+  ModelDiscoveryBloc? discovery;
+  StreamSubscription? discoverySubscription;
+  RuntimeCatalog? get discovered {
+    final raw = discovery?.catalog;
+    if (raw == null) return null;
+    final found = RuntimeCatalog.fromJson(raw);
+    return RuntimeCatalog(
+      models: found.models,
+      efforts: found.efforts.isEmpty
+          ? component.catalog[component.runtime].efforts
+          : found.efforts,
+      source: found.source,
+      supportsVariants: found.supportsVariants,
+    );
+  }
+
+  bool get busy => discovery?.state.loading ?? false;
+  String? get error => discovery?.state.error ?? discovery?.warning;
   final manualKeys = <String>{};
   @override
   void initState() {
     super.initState();
+    try {
+      discovery = ModelDiscoveryBloc(dashboardConnection);
+      discoverySubscription = discovery!.stream.listen((_) {
+        if (mounted) setState(() {});
+      });
+    } catch (_) {
+      /* Standalone draft forms may not have a connection. */
+    }
     if (component.runtime == 'opencode' && component.project.isNotEmpty)
       discover();
   }
@@ -189,65 +213,20 @@ class _ModelFieldsState extends State<ModelFields> {
       discovered ?? component.catalog[component.runtime];
 
   Future<void> discover({bool force = false}) async {
-    if (busy || component.runtime != 'opencode') return;
-
-    final epoch = dashboardConnection.generation;
-    final id = ++requestId;
-
-    setState(() {
-      busy = true;
-      error = null;
-    });
-
-    try {
-      final result = await dashboardConnection.request('models', {
-        'runtime': component.runtime,
-        'project': component.project,
-        'force': force,
-        'provider': component.values['provider'] ?? '',
-        'model': component.values['model'] ?? '',
-      });
-
-      if (!mounted ||
-          epoch != dashboardConnection.generation ||
-          id != requestId)
-        return;
-
-      final found = RuntimeCatalog.fromJson(
-        result is Map<String, dynamic> ? result : null,
-      );
-
-      setState(() {
-        if (found.models.isEmpty) {
-          error = 'The CLI reported no models.';
-          return;
-        }
-        discovered = RuntimeCatalog(
-          models: found.models,
-          efforts: found.efforts.isEmpty ? options.efforts : found.efforts,
-          source: found.source,
-          supportsVariants: found.supportsVariants,
-        );
-        error = result['stale'] == true
-            ? 'Using cached models because refresh failed: ${result['refresh_error']}'
-            : null;
-      });
-    } catch (e) {
-      if (mounted && epoch == dashboardConnection.generation && id == requestId)
-        setState(() => error = '$e');
-    } finally {
-      if (mounted && id == requestId) setState(() => busy = false);
-    }
+    await discovery?.discover(
+      runtime: component.runtime,
+      project: component.project,
+      provider: '${component.values['provider'] ?? ''}',
+      model: '${component.values['model'] ?? ''}',
+      force: force,
+    );
   }
 
   @override
   void didUpdateComponent(ModelFields old) {
     super.didUpdateComponent(old);
     if (old.runtime != component.runtime || old.project != component.project) {
-      requestId++;
-      discovered = null;
-      busy = false;
-      error = null;
+      discovery?.reset();
       manualKeys.clear();
       if (component.runtime == 'opencode' && component.project.isNotEmpty)
         discover();
@@ -295,6 +274,13 @@ class _ModelFieldsState extends State<ModelFields> {
           component.values[key] = v;
         }),
     ], classes: 'org-model__picker');
+  }
+
+  @override
+  void dispose() {
+    discoverySubscription?.cancel();
+    discovery?.dispose();
+    super.dispose();
   }
 
   @override
@@ -354,8 +340,7 @@ class _ModelFieldsState extends State<ModelFields> {
         'Use CLI defaults',
         () => setState(() {
           manualKeys.clear();
-          discovered = null;
-          error = null;
+          discovery?.reset();
           for (final key in ['provider', 'model', 'reasoning'])
             component.values[key] = '';
           component.onChanged();

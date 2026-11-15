@@ -1,4 +1,7 @@
+import 'package:herdr_dashboard_state/tasks_bloc.dart';
 import 'dart:convert';
+import 'package:herdr_dashboard_state/publishing_connections.dart';
+import 'package:herdr_dashboard_state/task_backup.dart';
 import 'discovery_panel.dart';
 import 'routes.dart';
 import 'task_activity.dart';
@@ -115,36 +118,54 @@ List<String> taskRepositories(
 }
 
 class TasksPage extends StatefulWidget {
-  const TasksPage({super.key, this.taskId, this.coordinator});
+  const TasksPage({
+    super.key,
+    this.taskId,
+    this.coordinator,
+    this.saveTaskBackup,
+  });
   final String? taskId;
   final AppCoordinator? coordinator;
+  final TaskBackupSaver? saveTaskBackup;
   @override
   State<TasksPage> createState() => _TasksPageState();
 }
 
 class _TasksPageState extends State<TasksPage> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
-  List<Map<String, dynamic>> tasks = [];
-  Map<String, dynamic> github = {};
-  Map<String, dynamic> storage = {};
-  String executor = 'unavailable';
+  late final TasksBloc bloc;
+  StreamSubscription? featureSubscription;
+  List<Map<String, dynamic>> get tasks => bloc.state.tasks;
+  List<Map<String, dynamic>> get releases => bloc.state.releases;
+  Map<String, dynamic> get github => bloc.state.github;
+  Map<String, dynamic> get storage => bloc.state.storage;
+  String get executor => bloc.state.executor;
   String section = 'Overview';
   final Set<String> expandedMeetings = {};
   String? localTaskId;
   String? get selectedId => widget.taskId ?? localTaskId;
-  String? error;
+  String? _error;
+  String? get error => _error ?? bloc.state.error;
+  set error(String? value) => _error = value;
   // A failed list read must not erase an action failure, and vice versa.
-  String? readError;
-  bool busy = false;
-  bool refreshing = false;
+  String? get readError => bloc.state.readError;
+  bool dialogBusy = false;
+  bool get busy => dialogBusy || bloc.state.busy;
+  set busy(bool value) => dialogBusy = value;
+  bool configuringPublishing = false;
+  late final TaskBackupController backup;
+  bool get exportingTasks => backup.busy;
+  bool get backupFailed => backup.failed;
+  String? get backupMessage => backup.message;
+  void backupChanged() {
+    if (mounted) setState(() {});
+  }
+
+  bool get refreshing => bloc.state.loading;
   bool connected = true;
-  Future<void>? pending;
-  Timer? timer;
+  Future<void>? get pending => bloc.pending;
   StreamSubscription? subscription;
   int generation = -1;
-  // Keep the exact request across lost responses. Changing the selection gets
-  // a new identity; retrying the same action reconciles the durable request.
-  final Map<String, String> requests = {};
   String liveActivity = '';
   Map<String, Map<String, dynamic>> get taskExecutions => taskExecutionBindings(
     connection.state.agents,
@@ -159,6 +180,22 @@ class _TasksPageState extends State<TasksPage> {
   @override
   void initState() {
     super.initState();
+    bloc = TasksBloc(connection);
+    featureSubscription = bloc.stream.listen((_) {
+      if (mounted) setState(() {});
+    });
+    backup = TaskBackupController(
+      connection,
+      widget.saveTaskBackup ??
+          (file) => file.downloadUri != null
+              ? downloadTaskBackupLink(file.downloadUri!)
+              : downloadBinaryArtifact(
+                  file.bytes,
+                  file.filename,
+                  contentType: file.contentType,
+                ),
+    );
+    backup.addListener(backupChanged);
     generation = connection.generation;
     subscription = connection.stream.listen((_) {
       if (!mounted) return;
@@ -169,12 +206,9 @@ class _TasksPageState extends State<TasksPage> {
       if (generation != connection.generation) {
         generation = connection.generation;
         setState(() {
-          tasks = [];
-          github = {};
-          storage = {};
+          busy = false;
+          configuringPublishing = false;
           error = null;
-          readError = null;
-          requests.clear();
           expandedMeetings.clear();
         });
         // A read begun before reconnect is not valid for the new connection.
@@ -182,21 +216,17 @@ class _TasksPageState extends State<TasksPage> {
       }
     });
     connected = connection.state.connected;
-    connection.notificationRevision.addListener(notificationRefresh);
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 15), (_) => refresh());
   }
 
   @override
   void didUpdateWidget(covariant TasksPage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.taskId != widget.taskId) {
-      tasks = [];
+      bloc.clearRows();
       localTaskId = null;
       section = 'Overview';
       error = null;
-      readError = null;
-      requests.clear();
       refreshSelection();
     }
   }
@@ -211,112 +241,34 @@ class _TasksPageState extends State<TasksPage> {
 
   @override
   void dispose() {
-    connection.notificationRevision.removeListener(notificationRefresh);
-    timer?.cancel();
+    backup.removeListener(backupChanged);
+    backup.dispose();
+    featureSubscription?.cancel();
+    bloc.dispose();
     subscription?.cancel();
     super.dispose();
   }
 
-  /// Read the task list. A read already in flight is joined, so a caller that
-  /// needs fresh data after an action never silently keeps stale state. A
-  /// reconnect forces a new read: the old one belongs to the old connection.
-  Future<void> refresh({bool force = false}) async {
-    if (!connection.state.connected) {
-      if (mounted) setState(() => connected = false);
-      return;
-    }
-    if (!force && pending != null) return pending;
-    final epoch = connection.generation;
-    final read = _read(epoch);
-    pending = read;
-    refreshing = true;
-    try {
-      await read;
-    } finally {
-      if (identical(pending, read)) {
-        pending = null;
-        refreshing = false;
-      }
-    }
-  }
-
-  Future<void> _read(int epoch) async {
-    final id = selectedId;
-    try {
-      final data = await connection.request('tasks');
-      if (id != selectedId) return;
-      Map<String, dynamic>? detail;
-      String? detailError;
-      if (id != null) {
-        try {
-          detail = Map<String, dynamic>.from(
-            await connection.request('tasks/detail?id=$id'),
-          );
-        } catch (e) {
-          detailError = '$e';
-        }
-      }
-      if (id != selectedId) return;
-      if (mounted && epoch == connection.generation) {
-        setState(() {
-          if (id == null) {
-            tasks = List<Map<String, dynamic>>.from(data['tasks'] ?? []);
-            readError = null;
-          } else {
-            // A failed detail read still shows the compact row it came from.
-            final rows = List<Map<String, dynamic>>.from(data['tasks'] ?? []);
-            final match = rows.where((row) => row['id'] == id).firstOrNull;
-            tasks = detail != null
-                ? [detail]
-                : (match != null ? [match] : <Map<String, dynamic>>[]);
-            readError = detailError;
-          }
-          github = Map<String, dynamic>.from(data['github'] ?? {});
-          storage = Map<String, dynamic>.from(data['storage'] ?? {});
-          executor = '${data['executor'] ?? 'unavailable'}';
-        });
-      }
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => readError = '$e');
-    }
-  }
+  Future<void> refresh({bool force = false}) =>
+      bloc.refresh(taskId: selectedId, selection: true, force: force);
 
   Future<void> releaseAct(String action, Map<String, dynamic> body) async {
     if (busy || !admin) return;
     final epoch = connection.generation;
-    final selection = 'release:$action:$body';
-    final request = requests.putIfAbsent(
-      selection,
-      () => 'release-${newRequestId()}',
-    );
-    setState(() {
-      busy = true;
-      error = null;
-    });
+    _error = null;
     try {
-      await connection.request('releases/$action', {
-        ...body,
-        'request_id': request,
-      });
-      if (!mounted || epoch != connection.generation) return;
-      requests.remove(selection);
-      await refresh();
-      if (mounted && epoch == connection.generation) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Release candidate created. Manage it in the workflow board.',
-            ),
-          ),
-        );
-      }
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = '$e');
-    } finally {
-      if (mounted) setState(() => busy = false);
+      await bloc.mutate(action, body, release: true);
+    } catch (_) {
+      return;
     }
+    if (!mounted || epoch != connection.generation) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Release candidate created. Manage it in the workflow board.',
+        ),
+      ),
+    );
   }
 
   Future<void> reviewTaskEnvironment(Map<String, dynamic> task) async {
@@ -328,7 +280,7 @@ class _TasksPageState extends State<TasksPage> {
     });
     try {
       final review = await reviewValidationEnvironment(
-        connection.request,
+        bloc.request,
         '${task['id']}',
         'task-${newRequestId()}',
       );
@@ -370,40 +322,42 @@ class _TasksPageState extends State<TasksPage> {
   Future<void> act(String action, Map<String, dynamic> body) async {
     if (busy || !admin) return;
     final epoch = connection.generation;
-    final selection = '$action:$body';
-    final request = requests.putIfAbsent(
-      selection,
-      () => 'task-${newRequestId()}',
-    );
-    setState(() {
-      busy = true;
-      error = null;
-    });
+    _error = null;
+    dynamic result;
     try {
-      final result = await connection.request('tasks/$action', {
-        ...body,
-        'request_id': request,
-      });
-      if (!mounted || epoch != connection.generation) return;
-      if (result is Map && result['action_message'] is String) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(result['action_message'] as String)),
-        );
-      }
-      requests.remove(selection);
-      // A read begun before the mutation is not post-action evidence.
-      if (pending != null) await pending;
-      if (mounted && epoch == connection.generation) await refresh();
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = '$e');
-    } finally {
-      if (mounted) setState(() => busy = false);
+      result = await bloc.mutate(action, body);
+    } catch (_) {
+      return;
+    }
+    if (!mounted || epoch != connection.generation) return;
+    if (result is Map && result['action_message'] is String) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(result['action_message'] as String)),
+      );
     }
   }
 
+  Future<void> exportTasks() =>
+      backup.export(blocked: busy || configuringPublishing);
+
+  Future<void> exportJson() =>
+      backup.export(blocked: busy || configuringPublishing, asJson: true);
+
   Future<void> configure() async {
+    if (!admin) {
+      setState(
+        () => error = 'Only an administrator can configure GitHub publishing.',
+      );
+      return;
+    }
+    if (busy ||
+        configuringPublishing ||
+        exportingTasks ||
+        !connection.state.connected)
+      return;
     final token = TextEditingController();
+    final prToken = TextEditingController();
+    var clearPrCredential = false;
     final repos = TextEditingController(
       text: (github['repositories'] as List? ?? []).join('\n'),
     );
@@ -424,8 +378,36 @@ class _TasksPageState extends State<TasksPage> {
         .map((line) => line.trim())
         .where((line) => line.isNotEmpty)
         .toList();
+    TextEditingController forkController(String name) {
+      final controller = forks.putIfAbsent(name, () => TextEditingController());
+      final requiredFork = protectedPublishingPolicy(github, name)?['fork'];
+      if (requiredFork is String && controller.text != requiredFork)
+        controller.text = requiredFork;
+      return controller;
+    }
+
     final epoch = connection.generation;
     try {
+      setState(() {
+        busy = true;
+        configuringPublishing = true;
+      });
+      var sources = <Map<String, String>>[];
+      String? sourceError;
+      try {
+        sources = await publishingTokenConnections(connection);
+      } catch (_) {
+        sourceError = publishingSourcesUnavailable;
+      }
+      if (!mounted ||
+          epoch != connection.generation ||
+          !admin ||
+          !connection.state.connected)
+        return;
+      // Waiting for operator input is not an in-flight request. Keep the
+      // separate guard active to prevent opening duplicate setup dialogs.
+      setState(() => busy = false);
+      final selection = PublishingTokenSelection(sources);
       final setupRoute = DialogRoute<bool>(
         context: context,
         builder: (context) => StatefulBuilder(
@@ -438,19 +420,75 @@ class _TasksPageState extends State<TasksPage> {
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      'Use a fine-grained token for selected repositories: Contents write, Pull requests write, Checks read, and Commit statuses read. Workflow changes may also require Workflows write. Setup verifies account access; it cannot prove the token has these write permissions. Keep branch protection enabled.\n\nAgents and gateway share a Linux user; this credential is not isolated from same-user agents. Use only trusted agents and repositories.',
+                    const Text(publishingPushTokenNotice),
+                    DropdownButtonFormField<String>(
+                      key: const ValueKey('publishing-token-source'),
+                      initialValue: selection.selectedId,
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                        labelText: publishingTokenSourceLabel,
+                      ),
+                      items: [
+                        for (final option in selection.options.entries)
+                          DropdownMenuItem(
+                            value: option.key,
+                            child: Text(option.value),
+                          ),
+                      ],
+                      onChanged: (value) => setDialogState(() {
+                        repos.text = selection.select(value, repos.text);
+                        token.clear();
+                      }),
                     ),
+                    if (sourceError != null) Text(sourceError),
+                    if (!selection.manual)
+                      const Text(savedPublishingTokenNotice),
+                    if (selection.manual)
+                      TextField(
+                        controller: token,
+                        obscureText: true,
+                        enableSuggestions: false,
+                        autocorrect: false,
+                        decoration: const InputDecoration(
+                          labelText: 'Personal access token',
+                        ),
+                        maxLength: 255,
+                      ),
+                    const Text(publishingPrTokenNotice),
                     TextField(
-                      controller: token,
+                      controller: prToken,
                       obscureText: true,
                       enableSuggestions: false,
                       autocorrect: false,
-                      decoration: const InputDecoration(
-                        labelText: 'Personal access token',
+                      decoration: InputDecoration(
+                        labelText:
+                            listed().any(
+                              (name) =>
+                                  protectedPublishingPolicy(github, name) !=
+                                  null,
+                            )
+                            ? 'Upstream fine-grained PAT (required)'
+                            : 'Pull request token (optional)',
                       ),
                       maxLength: 255,
                     ),
+                    if (github['pr_configured'] == true)
+                      CheckboxListTile(
+                        value: clearPrCredential,
+                        onChanged:
+                            listed().any(
+                              (name) =>
+                                  protectedPublishingPolicy(github, name) !=
+                                  null,
+                            )
+                            ? null
+                            : (value) => setDialogState(
+                                () => clearPrCredential = value ?? false,
+                              ),
+                        title: const Text(
+                          'Remove saved pull request credential',
+                        ),
+                      ),
                     TextField(
                       controller: repos,
                       minLines: 2,
@@ -461,20 +499,23 @@ class _TasksPageState extends State<TasksPage> {
                       ),
                     ),
                     const SizedBox(height: 12),
-                    const Text(
-                      'Publication mode. Direct pushes the task branch and opens the pull request in the same repository. Through a fork pushes the branch to your fork and opens the pull request upstream, so the upstream repository does not need push access. A fine-grained token for your fork cannot authorize a cross-owner upstream PR. For that workflow, use a classic token with appropriate repository scopes. The dashboard currently stores one credential for both push and PR creation; separate PR credentials are not supported.',
-                    ),
+                    const Text(publishingModeNotice),
                     for (final name in listed()) ...[
                       Row(
                         children: [
                           Expanded(child: Text(name)),
                           DropdownButton<String>(
-                            value: modes[name] ?? 'direct',
-                            items: const [
-                              DropdownMenuItem(
-                                value: 'direct',
-                                child: Text('Direct'),
-                              ),
+                            value:
+                                protectedPublishingPolicy(github, name) != null
+                                ? 'fork'
+                                : modes[name] ?? 'direct',
+                            items: [
+                              if (protectedPublishingPolicy(github, name) ==
+                                  null)
+                                const DropdownMenuItem(
+                                  value: 'direct',
+                                  child: Text('Direct'),
+                                ),
                               DropdownMenuItem(
                                 value: 'fork',
                                 child: Text('Through a fork'),
@@ -492,9 +533,12 @@ class _TasksPageState extends State<TasksPage> {
                           ),
                         ],
                       ),
-                      if (modes[name] == 'fork')
+                      if (modes[name] == 'fork' ||
+                          protectedPublishingPolicy(github, name) != null)
                         TextField(
-                          controller: forks[name],
+                          readOnly:
+                              protectedPublishingPolicy(github, name) != null,
+                          controller: forkController(name),
                           decoration: InputDecoration(
                             labelText: 'Fork for $name (owner/repository)',
                           ),
@@ -520,7 +564,11 @@ class _TasksPageState extends State<TasksPage> {
       final confirmed = await Navigator.of(context).push(setupRoute);
       // Keep controllers alive until the dialog has left the overlay.
       await setupRoute.completed;
-      if (confirmed != true || !mounted || epoch != connection.generation)
+      if (confirmed != true ||
+          !mounted ||
+          epoch != connection.generation ||
+          !admin ||
+          !connection.state.connected)
         return;
       setState(() {
         busy = true;
@@ -528,17 +576,23 @@ class _TasksPageState extends State<TasksPage> {
       });
       final publication = <String, dynamic>{};
       for (final name in listed()) {
-        publication[name] = modes[name] == 'fork'
+        publication[name] =
+            modes[name] == 'fork' ||
+                protectedPublishingPolicy(github, name) != null
             ? {
                 'mode': 'fork',
-                'publishing_repository': '${forks[name]?.text.trim() ?? ''}',
+                'publishing_repository':
+                    '${protectedPublishingPolicy(github, name)?['fork'] ?? forks[name]?.text.trim() ?? ''}',
               }
             : {'mode': 'direct'};
       }
-      await connection.request('github/configure', {
-        'token': token.text.trim(),
+      await bloc.request('github/configure', {
+        if (selection.manual) 'token': token.text.trim(),
+        if (!selection.manual) 'connection_id': selection.selectedId,
         'repositories': listed(),
         'publication': publication,
+        if (prToken.text.trim().isNotEmpty) 'pr_token': prToken.text.trim(),
+        if (clearPrCredential) 'clear_pr_credential': true,
       });
       await refresh();
     } catch (e) {
@@ -547,18 +601,24 @@ class _TasksPageState extends State<TasksPage> {
     } finally {
       token.clear();
       token.dispose();
+      prToken.clear();
+      prToken.dispose();
       repos.dispose();
       for (final controller in forks.values) {
         controller.dispose();
       }
-      if (mounted) setState(() => busy = false);
+      if (mounted && epoch == connection.generation)
+        setState(() {
+          busy = false;
+          configuringPublishing = false;
+        });
     }
   }
 
   Future<void> create() async {
     final epoch = connection.generation;
     try {
-      final directory = await connection.request('organizations/directory');
+      final directory = await bloc.request('organizations/directory');
       if (!mounted || epoch != connection.generation) return;
       final profiles =
           List<Map<String, dynamic>>.from(directory['profiles'] ?? [])
@@ -568,9 +628,7 @@ class _TasksPageState extends State<TasksPage> {
         throw StateError('Hire a worktree agent before creating a task.');
       final title = TextEditingController();
       final description = TextEditingController();
-      final projects = await connection.request('projects/browse', {
-        'path': '',
-      });
+      final projects = await bloc.request('projects/browse', {'path': ''});
       if (!mounted || epoch != connection.generation) return;
       final repositories = taskRepositories(
         profiles,
@@ -753,7 +811,7 @@ class _TasksPageState extends State<TasksPage> {
     final epoch = connection.generation;
     try {
       task = Map<String, dynamic>.from(
-        await connection.request('tasks/detail?id=${task['id']}'),
+        await bloc.request('tasks/detail?id=${task['id']}'),
       );
     } catch (e) {
       if (mounted && epoch == connection.generation)
@@ -820,7 +878,7 @@ class _TasksPageState extends State<TasksPage> {
     final description = TextEditingController();
     try {
       final fresh = Map<String, dynamic>.from(
-        await connection.request('tasks/detail?id=${task['id']}'),
+        await bloc.request('tasks/detail?id=${task['id']}'),
       );
       if (!mounted || epoch != connection.generation) return;
       final preview = fresh['pull_preview'] as Map?;
@@ -856,8 +914,10 @@ class _TasksPageState extends State<TasksPage> {
                         'Target branch: ${preview['base']}\n\n'
                         'Exact candidate: ${preview['head_sha']}',
                       ),
-                      const Text(
-                        'This title and Markdown description will be public on the selected repository. The branch is already published. Creating a draft PR does not merge or deploy it.',
+                      Text(
+                        manualPrRequired(github, '${task['github_repository']}')
+                            ? 'Copy this title and description into your draft PR on GitHub. Checking for adoption preserves the PR’s existing text. The branch is already published; merging and deployment remain separate.'
+                            : 'This title and Markdown description will be public on the selected repository. The branch is already published. Creating a draft PR does not merge or deploy it.',
                       ),
                       TextFormField(
                         controller: title,
@@ -931,7 +991,11 @@ class _TasksPageState extends State<TasksPage> {
                   if (form.currentState!.validate())
                     Navigator.pop(context, true);
                 },
-                child: const Text('Create draft PR'),
+                child: Text(
+                  manualPrRequired(github, '${task['github_repository']}')
+                      ? 'Check for operator-created PR'
+                      : 'Create draft PR',
+                ),
               ),
             ],
           ),
@@ -972,7 +1036,11 @@ class _TasksPageState extends State<TasksPage> {
       return;
     }
     final current = '${task['publishing_repository'] ?? upstream}';
-    var mode = current == upstream ? 'direct' : 'fork';
+    var mode = protectedPublishingPolicy(github, upstream) != null
+        ? 'fork'
+        : current == upstream
+        ? 'direct'
+        : 'fork';
     try {
       final route = DialogRoute<bool>(
         context: context,
@@ -995,10 +1063,11 @@ class _TasksPageState extends State<TasksPage> {
                   DropdownButton<String>(
                     value: mode,
                     items: [
-                      DropdownMenuItem(
-                        value: 'direct',
-                        child: Text('Direct \u00b7 $upstream'),
-                      ),
+                      if (protectedPublishingPolicy(github, upstream) == null)
+                        DropdownMenuItem(
+                          value: 'direct',
+                          child: Text('Direct \u00b7 $upstream'),
+                        ),
                       DropdownMenuItem(
                         value: 'fork',
                         child: Text('Through a fork \u00b7 $fork'),
@@ -1063,9 +1132,7 @@ class _TasksPageState extends State<TasksPage> {
                   final epoch = connection.generation;
                   try {
                     final id = build['run_id'] ?? build['id'];
-                    final bytes = await connection.bytes(
-                      'validation/log?id=$id',
-                    );
+                    final bytes = await bloc.bytes('validation/log?id=$id');
                     if (!mounted || epoch != connection.generation) return;
                     await downloadBinaryArtifact(
                       bytes,
@@ -1118,9 +1185,47 @@ class _TasksPageState extends State<TasksPage> {
                     label: const Text('Create task'),
                   ),
                   OutlinedButton.icon(
-                    onPressed: admin && !busy ? configure : null,
+                    onPressed:
+                        admin &&
+                            !busy &&
+                            !exportingTasks &&
+                            !configuringPublishing
+                        ? configure
+                        : null,
                     icon: const Icon(Icons.key),
                     label: const Text('GitHub publishing'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed:
+                        admin &&
+                            connection.state.connected &&
+                            !busy &&
+                            !configuringPublishing &&
+                            !exportingTasks
+                        ? exportTasks
+                        : null,
+                    icon: const Icon(Icons.download),
+                    label: Text(
+                      exportingTasks && !backup.jsonExport
+                          ? 'Exporting tasks…'
+                          : taskBackupLabel,
+                    ),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed:
+                        admin &&
+                            connection.state.connected &&
+                            !busy &&
+                            !configuringPublishing &&
+                            !exportingTasks
+                        ? exportJson
+                        : null,
+                    icon: const Icon(Icons.data_object),
+                    label: Text(
+                      exportingTasks && backup.jsonExport
+                          ? 'Exporting JSON…'
+                          : taskJsonLabel,
+                    ),
                   ),
                   IconButton(
                     onPressed: busy || refreshing ? null : refresh,
@@ -1138,12 +1243,35 @@ class _TasksPageState extends State<TasksPage> {
                     ? 'GitHub publishing is unavailable: ${github['error']}'
                     : 'GitHub publishing is not configured. Local task work is available.',
               ),
+              if (admin && publishingPolicyNotice(github) != null)
+                Text(publishingPolicyNotice(github)!),
               if (admin && github['publication'] is Map)
                 for (final entry in (github['publication'] as Map).entries)
                   if (entry.value is Map && entry.value['mode'] == 'fork')
                     Text(
                       publicationSummary('${entry.key}', entry.value as Map),
                     ),
+              if (backupMessage != null)
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Semantics(
+                      liveRegion: true,
+                      child: Text(
+                        backupMessage!,
+                        style: backupFailed
+                            ? TextStyle(
+                                color: Theme.of(context).colorScheme.error,
+                              )
+                            : null,
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: backup.dismiss,
+                      child: const Text('Dismiss backup message'),
+                    ),
+                  ],
+                ),
               if (busy) const LinearProgressIndicator(),
               if ((error ?? readError) != null)
                 Padding(
@@ -1211,11 +1339,10 @@ class _TasksPageState extends State<TasksPage> {
     } else {
       setState(() {
         localTaskId = id;
-        tasks = [];
+        bloc.clearRows();
         section = 'Overview';
       });
-      if (pending != null) await pending;
-      if (mounted) await refresh();
+      if (mounted) await refresh(force: true);
     }
   }
 
@@ -1236,10 +1363,9 @@ class _TasksPageState extends State<TasksPage> {
       setState(() {
         localTaskId = null;
         section = 'Overview';
-        tasks = [];
+        bloc.clearRows();
       });
-      if (pending != null) await pending;
-      if (mounted) await refresh();
+      if (mounted) await refresh(force: true);
     }
   }
 
@@ -1292,9 +1418,7 @@ class _TasksPageState extends State<TasksPage> {
   Future<void> showCommit(Map<String, dynamic> task, String sha) async {
     final epoch = connection.generation;
     try {
-      final data = await connection.request(
-        'tasks/commit?id=${task['id']}&sha=$sha',
-      );
+      final data = await bloc.request('tasks/commit?id=${task['id']}&sha=$sha');
       if (!mounted || epoch != connection.generation) return;
       await showDialog<void>(
         context: context,
@@ -1429,7 +1553,7 @@ class _TasksPageState extends State<TasksPage> {
 
   Future<void> discussTask(Map<String, dynamic> task) async {
     try {
-      final data = await connection.request('organizations/directory');
+      final data = await bloc.request('organizations/directory');
       if (!mounted) return;
       final groups = [
         for (final g in data['groups'] as List? ?? [])
@@ -1638,14 +1762,13 @@ class _TasksPageState extends State<TasksPage> {
       error = null;
     });
     try {
-      await connection.request('organizations/input', {
+      await bloc.request('organizations/input', {
         'organization_id': task['organization_id'],
         'profile_id': (task['availability'] as Map?)?['profile_id'],
         'key': key,
       });
       if (!mounted || epoch != connection.generation) return;
-      if (pending != null) await pending;
-      if (mounted && epoch == connection.generation) await refresh();
+      if (mounted && epoch == connection.generation) await refresh(force: true);
     } catch (e) {
       if (mounted && epoch == connection.generation)
         setState(() => error = '$e');
@@ -1712,7 +1835,7 @@ class _TasksPageState extends State<TasksPage> {
   }
 
   Future<List<Map<String, dynamic>>> _agents(Map task) async {
-    final directory = await connection.request('organizations/directory');
+    final directory = await bloc.request('organizations/directory');
     final profiles = List<Map<String, dynamic>>.from(
       directory['profiles'] ?? [],
     );
@@ -2497,6 +2620,22 @@ class _TasksPageState extends State<TasksPage> {
               ),
           if (task['review_error'] != null)
             Text('Group review waiting: ${task['review_error']}'),
+          if (task['manual_pr'] is Map) ...[
+            Text('${task['manual_pr']['message']}'),
+            SelectableText('${task['manual_pr']['compare_url']}'),
+            if (githubCompareUri(task['manual_pr']['compare_url']) != null)
+              TextButton(
+                onPressed: () => openGitHubCompare(
+                  githubCompareUri(task['manual_pr']['compare_url'])!,
+                ),
+                child: const Text('Open GitHub comparison and create draft PR'),
+              ),
+          ],
+          if (task['checks_unavailable'] is Map &&
+              (task['checks_unavailable'] as Map).isNotEmpty)
+            const Text(
+              'Some GitHub check evidence is unavailable. Delivery remains pending; unavailable checks are not passing checks.',
+            ),
           if (task['pull_notice'] != null) Text('${task['pull_notice']}'),
 
           if (github['configured'] != true)
@@ -2507,7 +2646,13 @@ class _TasksPageState extends State<TasksPage> {
                   'GitHub publishing is not configured. Local group review and validation remain available. Publishing requires GitHub setup.',
                 ),
                 TextButton.icon(
-                  onPressed: admin && !busy ? configure : null,
+                  onPressed:
+                      admin &&
+                          !busy &&
+                          !exportingTasks &&
+                          !configuringPublishing
+                      ? configure
+                      : null,
                   icon: const Icon(Icons.key),
                   label: const Text('Set up GitHub publishing'),
                 ),
@@ -2647,7 +2792,7 @@ class _TasksPageState extends State<TasksPage> {
                 ),
                 SwitchListTile(
                   title: const Text(
-                    'Automatically publish a validated draft PR',
+                    'Publish verified branch and follow the configured PR/adoption workflow',
                   ),
                   subtitle: const Text(
                     'Checks current GitHub account access and the direct/fork destination before enabling. Authorizes pushing verified commits and publishing generated task/check details. Token write access is only proven by successful writes. The agent stays reserved until it reviews the results. Merge and deployment remain manual.',
@@ -3168,7 +3313,7 @@ class _TasksPageState extends State<TasksPage> {
               ? null
               : () async {
                   try {
-                    final bytes = await connection.bytes(
+                    final bytes = await bloc.bytes(
                       'tasks/patch?id=${task['id']}',
                     );
                     if (!mounted) return;
@@ -3226,6 +3371,8 @@ class _TasksPageState extends State<TasksPage> {
           child: Text(
             needsPrAuthentication(github, task['github_repository'] as String?)
                 ? 'Configure authentication for upstream PR'
+                : manualPrRequired(github, '${task['github_repository']}')
+                ? 'Check for operator-created PR'
                 : 'Open draft PR',
           ),
         ),

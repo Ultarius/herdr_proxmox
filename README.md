@@ -24,8 +24,8 @@ from its own upstream repository, where a renamed Herdr installer does not exist
 
 This targets **herdrdev/herdr**, not the separate **herdr-webui** project.
 Access terminals through the Proxmox console or SSH. An optional custom dashboard
-uses Jaspr **0.23.5** with the preserved Juice **1.10.0** bloc core.
-Flutter **3.44.8** supplies the pinned Dart toolchain and legacy contract tests.
+uses Jaspr **0.23.5** with the preserved Juice **2.1.0** bloc core.
+Flutter **3.47.9** supplies the pinned Dart toolchain and legacy contract tests.
 Herdr starts its session server when you launch it and
 keeps panes running after you detach. Dashboard installation adds an on-demand
 `herdr-session` user service so the dashboard can start its server.
@@ -221,7 +221,7 @@ refresh timer, errors and workspace use cases. Browser hash routes preserve old
 deep links and back navigation. Tokens stay in memory and clear on disconnect;
 the existing server-issued browser session handles restoration.
 
-Build on your development machine with Flutter 3.44.8 on PATH:
+Build on your development machine with Flutter 3.47.9 on PATH:
 
 ```powershell
 # Windows
@@ -261,7 +261,7 @@ host; the hosted Debian smoke job tests provisioning, not Proxmox storage/networ
 
 Open this repository in VS Code, select **Web build: Edge** (or **Chrome**) in
 Run and Debug, and press **F5**. The prelaunch tasks validate and build the dashboard, start a
-static Dart server on `127.0.0.1:8788`, and launch the browser. Flutter 3.44.8
+static Dart server on `127.0.0.1:8788`, and launch the browser. Flutter 3.47.9
 and its Dart executable must be on PATH. The preview server remains in the task
 terminal; terminate **web: serve build** when finished.
 
@@ -634,4 +634,4 @@ Before a merge request, the gateway pins a stash-shaped snapshot under `refs/her
 
 ### Development agent toolchain
 
-For an LXC used for Flutter development, explicitly run `bash install/dev-tools-install.sh` as root from this repository. It installs Flutter 3.44.8 for the `herdr` user, selects the exact stable architecture from the official manifest, verifies SHA-256 before extraction, and adds `flutter` and `dart` under `~/.local/bin`. Existing unrelated launchers are preserved. The SDK, package cache and build outputs add several GiB, so size `var_disk` with headroom for them. Run `scripts/build-web.sh` as `herdr` from the assigned repository/worktree to validate the preserved contracts and build the Jaspr dashboard. Dashboard-only installations do not need this SDK. The web installer also provides a root-owned `herdr-sdk.path` service: when the Integration card reports a missing toolchain, an administrator can queue the same pinned installation from the dashboard, which only writes a fixed request file. Existing OpenCode processes must be relaunched to pick up saved dashboard-output permission policies; changing a profile does not change a running process.
+For an LXC used for Flutter development, explicitly run `bash install/dev-tools-install.sh` as root from this repository. It installs Flutter 3.47.9 for the `herdr` user, selects the exact stable architecture from the official manifest, verifies SHA-256 before extraction, and adds `flutter` and `dart` under `~/.local/bin`. Existing unrelated launchers are preserved. The SDK, package cache and build outputs add several GiB, so size `var_disk` with headroom for them. Run `scripts/build-web.sh` as `herdr` from the assigned repository/worktree to validate the preserved contracts and build the Jaspr dashboard. Dashboard-only installations do not need this SDK. The web installer also provides a root-owned `herdr-sdk.path` service: when the Integration card reports a missing toolchain, an administrator can queue the same pinned installation from the dashboard, which only writes a fixed request file. Existing OpenCode processes must be relaunched to pick up saved dashboard-output permission policies; changing a profile does not change a running process.

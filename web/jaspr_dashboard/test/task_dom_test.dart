@@ -188,6 +188,66 @@ void main() {
       : {'workspaces': [], 'agents': []};
 
   test(
+    'task detail tabs support roving keyboard focus and named panels',
+    () async {
+      final task = publishedTask();
+      await mount(
+        const TasksPage(taskId: 'task'),
+        (r) => taskResponse(r, task),
+      );
+      final tabs = elements('.task-detail__tabs [role=tab]').toList();
+      expect(tabs, hasLength(4));
+      Future<void> selected(web.HTMLElement tab) async {
+        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        while ((web.document.activeElement != tab ||
+                tab.getAttribute('aria-selected') != 'true') &&
+            DateTime.now().isBefore(deadline)) {
+          await Future<void>.delayed(const Duration(milliseconds: 15));
+        }
+        expect(web.document.activeElement, tab);
+        expect(tab.getAttribute('aria-selected'), 'true');
+      }
+
+      expect(tabs.where((tab) => tab.tabIndex == 0), [tabs.first]);
+      tabs.first.focus();
+      tabs.first.dispatchEvent(
+        web.KeyboardEvent(
+          'keydown',
+          web.KeyboardEventInit(
+            key: 'ArrowRight',
+            bubbles: true,
+            cancelable: true,
+          ),
+        ),
+      );
+      await selected(tabs[1]);
+      expect(web.document.activeElement, tabs[1]);
+      expect(tabs[1].getAttribute('aria-selected'), 'true');
+      expect(tabs.where((tab) => tab.tabIndex == 0), [tabs[1]]);
+      final panel = elements('#task-detail-panel').single;
+      expect(panel.getAttribute('aria-labelledby'), tabs[1].id);
+      expect(panel.tabIndex, 0);
+      tabs[1].dispatchEvent(
+        web.KeyboardEvent(
+          'keydown',
+          web.KeyboardEventInit(key: 'End', bubbles: true, cancelable: true),
+        ),
+      );
+      await selected(tabs.last);
+      expect(web.document.activeElement, tabs.last);
+      expect(panel.getAttribute('aria-labelledby'), tabs.last.id);
+      tabs.last.dispatchEvent(
+        web.KeyboardEvent(
+          'keydown',
+          web.KeyboardEventInit(key: 'Home', bubbles: true, cancelable: true),
+        ),
+      );
+      await selected(tabs.first);
+      expect(web.document.activeElement, tabs.first);
+    },
+  );
+
+  test(
     'environment recovery reviews exact candidate and requires explicit approval',
     () async {
       final task = publishedTask()
@@ -789,6 +849,300 @@ void main() {
     return {'workspaces': [], 'agents': []};
   }
 
+  for (final state in ['absent', 'empty']) {
+    test(
+      'administrator sees never-enabled publishing policy: $state',
+      () async {
+        await mount(
+          const TasksPage(),
+          (r) => r.url.path == '/api/tasks'
+              ? {
+                  'tasks': [],
+                  'github': {
+                    'configured': true,
+                    'protected_publication_state': state,
+                  },
+                }
+              : {'workspaces': [], 'agents': []},
+        );
+        final text = elements(
+          '.task-page__intro',
+        ).first.parentElement!.textContent!;
+        expect(
+          text,
+          contains(
+            state == 'absent'
+                ? 'operator policy file is absent'
+                : 'no protected repositories',
+          ),
+        );
+      },
+    );
+  }
+
+  Map<String, dynamic> protectedGithub() => {
+    'configured': true,
+    'pr_configured': true,
+    'repositories': ['SourceOwner/project'],
+    'publication': {
+      'SourceOwner/project': {
+        'mode': 'fork',
+        'publishing_repository': 'stale/fork',
+      },
+    },
+    'protected_publication': {
+      'sourceowner/project': {
+        'fork': 'ForkOwner/project',
+        'arrangement': 'manual_adoption',
+      },
+    },
+  };
+
+  test(
+    'protected publishing setup offers only the fixed fork and cannot clear its upstream PAT',
+    () async {
+      await mount(
+        const TasksPage(),
+        (r) => r.url.path == '/api/tasks'
+            ? {'tasks': [], 'github': protectedGithub()}
+            : {'workspaces': [], 'agents': []},
+      );
+      await click('GitHub publishing');
+      expect(
+        elements('option').where((e) => e.textContent == 'Direct'),
+        isEmpty,
+      );
+      final fork =
+          field('Fork for SourceOwner/project (owner/repository)')
+              as web.HTMLInputElement;
+      expect(fork.readOnly, isTrue);
+      expect(fork.value, 'ForkOwner/project');
+      final remove =
+          elements('label')
+                  .firstWhere(
+                    (e) =>
+                        e.textContent?.contains(
+                          'Remove separate PR credential',
+                        ) ==
+                        true,
+                  )
+                  .querySelector('input')
+              as web.HTMLInputElement;
+      expect(remove.disabled, isTrue);
+      await type('Personal access token', 'github_pat_push');
+      await type('Upstream fine-grained PAT (required)', 'github_pat_upstream');
+      await click('Validate and save');
+      expect(posts.single['publication'], {
+        'SourceOwner/project': {
+          'mode': 'fork',
+          'publishing_repository': 'ForkOwner/project',
+        },
+      });
+      expect(posts.single['pr_token'], 'github_pat_upstream');
+      expect(posts.single['clear_pr_credential'], isNull);
+    },
+  );
+
+  for (final link in [
+    'https://github.com/SourceOwner/project/compare/main...ForkOwner:project:herdr%2Ftask-branch?expand=1',
+    'https://evil.example/compare/main',
+  ]) {
+    test(
+      'manual PR handoff renders only a verified GitHub compare link: $link',
+      () async {
+        final task = publishedTask()
+          ..['github_repository'] = 'SourceOwner/project'
+          ..['manual_pr'] = {
+            'state': 'awaiting_manual_pr',
+            'message': 'Open the operator draft PR, then check for adoption.',
+            'compare_url': link,
+          }
+          ..['checks_unavailable'] = {
+            'check_runs': {'github_status': 403},
+          };
+        await mount(
+          const TasksPage(taskId: 'task'),
+          (r) => r.url.path == '/api/tasks'
+              ? {
+                  'tasks': [task],
+                  'github': protectedGithub(),
+                }
+              : taskResponse(r, task),
+        );
+        final links = elements('a')
+            .where(
+              (e) =>
+                  e.textContent == 'Open GitHub comparison and create draft PR',
+            )
+            .toList();
+        expect(
+          links,
+          hasLength(link.startsWith('https://github.com/') ? 1 : 0),
+        );
+        if (links.isNotEmpty) {
+          expect(links.single.getAttribute('href'), link);
+          expect(links.single.getAttribute('rel'), 'noopener noreferrer');
+        }
+        expect(
+          elements('*').any(
+            (e) =>
+                e.textContent?.contains(
+                  'Delivery remains pending; unavailable checks are not passing checks.',
+                ) ==
+                true,
+          ),
+          isTrue,
+        );
+      },
+    );
+  }
+
+  Map<String, dynamic> savedPublishingResponse(http.Request request) {
+    if (request.url.path == '/api/projects/connections')
+      return {
+        'connections': [
+          {
+            'id': 'a' * 32,
+            'kind': 'token',
+            'label': 'Saved repository PAT',
+            'repository': 'owner/repo',
+            'token': 'must_not_reach_the_form',
+          },
+          {
+            'id': 'b' * 32,
+            'kind': 'token',
+            'label': 'Another saved PAT',
+            'repository': 'owner/other',
+          },
+          {
+            'id': 'c' * 32,
+            'kind': 'ssh',
+            'label': 'SSH connection',
+            'repository': 'owner/repo',
+          },
+          {
+            'id': 'd' * 32,
+            'kind': 'github',
+            'label': 'Configured account',
+            'repository': 'owner/repo',
+          },
+        ],
+      };
+    if (request.url.path == '/api/tasks')
+      return {
+        'tasks': [],
+        'github': {'configured': false},
+      };
+    if (request.url.path == '/api/github/configure')
+      return {'configured': true};
+    return {'workspaces': [], 'agents': []};
+  }
+
+  test(
+    'publishing reuses saved PAT metadata without sending a token from the browser',
+    () async {
+      await mount(const TasksPage(), savedPublishingResponse);
+      await click('GitHub publishing');
+      final source = field('Publishing token source') as web.HTMLSelectElement;
+      expect(source.options.length, 3);
+      expect(source.textContent, isNot(contains('SSH connection')));
+      expect(source.textContent, isNot(contains('Configured account')));
+      source.focus();
+      await choose('Publishing token source', 'a' * 32);
+      expect(field('Publishing token source'), same(source));
+      expect(web.document.activeElement, source);
+      expect(
+        elements(
+          'label',
+        ).where((label) => label.textContent == 'Personal access token'),
+        isEmpty,
+      );
+      expect(
+        (field('Allowed owner/repository (one per line)')
+                as web.HTMLTextAreaElement)
+            .value,
+        'owner/repo',
+      );
+      expect(
+        web.document.getElementById('task-dom-test')!.textContent,
+        contains('gateway copies this token'),
+      );
+      expect(
+        web.document.getElementById('task-dom-test')!.outerHTML,
+        isNot(contains('must_not_reach_the_form')),
+      );
+      expect(posts, isEmpty);
+      await click('Validate and save');
+      expect(posts.single, {
+        'path': '/api/github/configure',
+        'connection_id': 'a' * 32,
+        'repositories': ['owner/repo'],
+        'publication': {
+          'owner/repo': {'mode': 'direct'},
+        },
+      });
+      expect(elements('.dialog'), isEmpty);
+    },
+  );
+
+  test(
+    'saved publishing source updates suggested repositories and preserves deliberate edits',
+    () async {
+      await mount(const TasksPage(), savedPublishingResponse);
+      await click('GitHub publishing');
+      await choose('Publishing token source', 'a' * 32);
+      await choose('Publishing token source', 'b' * 32);
+      expect(
+        (field('Allowed owner/repository (one per line)')
+                as web.HTMLTextAreaElement)
+            .value,
+        'owner/other',
+      );
+      await type(
+        'Allowed owner/repository (one per line)',
+        'custom/repository',
+      );
+      await choose('Publishing token source', 'a' * 32);
+      expect(
+        (field('Allowed owner/repository (one per line)')
+                as web.HTMLTextAreaElement)
+            .value,
+        'custom/repository',
+      );
+      await click('Cancel');
+      expect(posts, isEmpty);
+    },
+  );
+
+  test(
+    'switching to a saved token clears the manual secret and switching back starts empty',
+    () async {
+      await mount(const TasksPage(), savedPublishingResponse);
+      await click('GitHub publishing');
+      await type('Personal access token', 'github_pat_${'m' * 40}');
+      await choose('Publishing token source', 'a' * 32);
+      await choose('Publishing token source', '');
+      expect(
+        (field('Personal access token') as web.HTMLInputElement).value,
+        isEmpty,
+      );
+      await click('Cancel');
+      expect(posts, isEmpty);
+    },
+  );
+
+  test(
+    'a role change cannot submit a selected saved publishing source',
+    () async {
+      await mount(const TasksPage(), savedPublishingResponse);
+      await click('GitHub publishing');
+      await choose('Publishing token source', 'a' * 32);
+      connection!.operator.value = {'role': 'operator'};
+      await click('Validate and save');
+      expect(posts, isEmpty);
+    },
+  );
+
   test(
     'publishing sends a separate PR token without asking for its account',
     () async {
@@ -1211,6 +1565,66 @@ void main() {
       await click('Record decision');
       expect(posts.first['mode'], 'review');
       expect(posts.first['id'], 'knowledge-1');
+    },
+  );
+
+  test(
+    'knowledge filter disclosure preserves user choices during refresh',
+    () async {
+      var revision = 1;
+      await mount(
+        const KnowledgePage(organizationId: 'org'),
+        (request) => request.url.path.endsWith('/organizations/directory')
+            ? {
+                'organizations': [
+                  {'id': 'org', 'name': 'Engineering'},
+                ],
+              }
+            : request.url.path.endsWith('/knowledge')
+            ? {
+                'records': [
+                  {
+                    'id': 'finding',
+                    'title': 'Finding revision $revision',
+                    'body': 'Retained review evidence',
+                    'kind': 'finding',
+                    'state': 'reported',
+                    'repository': 'repo',
+                    'source': {},
+                    'audit': [],
+                  },
+                ],
+                'repositories': ['repo'],
+                'next_before': null,
+              }
+            : {'workspaces': [], 'agents': []},
+      );
+      final filters =
+          elements('.knowledge-filters').single as web.HTMLDetailsElement;
+      Future<void> refresh() async {
+        revision++;
+        await click('Refresh knowledge');
+        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        while (!elements(
+              '.knowledge-record',
+            ).single.textContent!.contains('Finding revision $revision') &&
+            DateTime.now().isBefore(deadline)) {
+          await Future<void>.delayed(const Duration(milliseconds: 15));
+        }
+        expect(
+          elements('.knowledge-record').single.textContent,
+          contains('Finding revision $revision'),
+        );
+        expect(elements('.knowledge-filters').single, same(filters));
+      }
+
+      if (filters.open)
+        (filters.querySelector('summary')! as web.HTMLElement).click();
+      await refresh();
+      expect(filters.open, isFalse);
+      (filters.querySelector('summary')! as web.HTMLElement).click();
+      await refresh();
+      expect(filters.open, isTrue);
     },
   );
 

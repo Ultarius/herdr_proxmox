@@ -27,6 +27,57 @@ def poetry(constraint, version):
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_python_family_conflicts_use_normalized_overlap(self):
+        from dependency_constraints import family_verdict
+        for family in ('3.12', 'v3.12', 'V3.12'):
+            self.assertEqual(family_verdict(family, '>=3.12.1,<3.13', 'pep440'), SATISFIED)
+            self.assertEqual(family_verdict(family, '>=3.13', 'pep440'), VIOLATED)
+            self.assertEqual(family_verdict(family, '<3.12', 'pep440'), VIOLATED)
+            self.assertEqual(family_verdict(family, '!=3.12.*', 'pep440'), VIOLATED)
+
+    def test_python_major_request_can_use_another_minor_family(self):
+        from dependency_constraints import family_verdict
+        for constraint in ('!=3.0.*', '!=3.0.*,!=3.1.*', '>3.12,<3.13'):
+            with self.subTest(constraint=constraint):
+                self.assertEqual(family_verdict('3', constraint, 'pep440'), SATISFIED)
+        self.assertEqual(family_verdict('3', '!=3.*', 'pep440'), VIOLATED)
+
+    def test_composer_exact_versions_and_comparators_are_zero_padded(self):
+        for constraint, version, expected in (
+                ('8.1', '8.1.9', VIOLATED), ('8.1', '8.1.0', SATISFIED),
+                ('=8.1', '8.1.1', VIOLATED), ('>8.1', '8.1.1', SATISFIED),
+                ('>8.1', '8.1.0', VIOLATED), ('<=8.1', '8.1.1', VIOLATED),
+                ('<=8.1', '8.1.0', SATISFIED), ('8.1.*', '8.1.9', SATISFIED),
+                ('8.1.0.0', '8.1', SATISFIED), ('>=8.1.*', '8.2', UNDECIDABLE)):
+            with self.subTest(constraint=constraint, version=version):
+                self.assertEqual(evaluate(constraint, version, 'composer'), expected)
+    def test_python_version_file_families_do_not_change_pep440_equality(self):
+        for request, accepted, rejected in (
+                ('3', '3.13.1', '4.0.0'), ('3.12', '3.12.14', '3.13.0'),
+                ('3.12.1', '3.12.1', '3.12.14')):
+            with self.subTest(request=request):
+                self.assertEqual(evaluate(request, accepted, 'python-version'), SATISFIED)
+                self.assertEqual(evaluate(request, rejected, 'python-version'), VIOLATED)
+        self.assertEqual(pep440('3.12', '3.12.14'), VIOLATED)
+        self.assertEqual(evaluate('>=3.12,<3.13', '3.12.14', 'python-version'), SATISFIED)
+        self.assertEqual(evaluate('==3.12', '3.12.14', 'python-version'), VIOLATED)
+        self.assertEqual(evaluate('==3.12.*', '3.12.14', 'python-version'), SATISFIED)
+        for request in ('3.12.*', 'pypy@3.12', '3.12.1.2'):
+            self.assertEqual(evaluate(request, '3.12.14', 'python-version'), UNDECIDABLE)
+
+    def test_composer_tilde_bounds_depend_on_the_number_of_components(self):
+        for constraint, accepted, rejected in (
+                ('~8', '8.9.0', '9.0.0'), ('~8.1', '8.3.0', '9.0.0'),
+                ('~8.1.2', '8.1.9', '8.2.0'), ('~0.1', '0.9.0', '1.0.0')):
+            with self.subTest(constraint=constraint):
+                self.assertEqual(evaluate(constraint, accepted, 'composer'), SATISFIED)
+                self.assertEqual(evaluate(constraint, rejected, 'composer'), VIOLATED)
+        self.assertEqual(evaluate('~8.1', '8.0.9', 'composer'), VIOLATED)
+        self.assertEqual(semver('~8.1', '8.3.0'), VIOLATED)
+        self.assertEqual(poetry('~8.1', '8.3.0'), VIOLATED)
+        self.assertEqual(evaluate('~1.2.3.4', '1.2.3.9', 'composer'), SATISFIED)
+        self.assertEqual(evaluate('~1.2.3.4', '1.2.4.0', 'composer'), VIOLATED)
+
     def test_missing_components_are_zero_on_both_sides(self):
         # The padding contract: 1.2 and 1.2.0 are the same version.
         self.assertEqual(semver('=1.2', '1.2.0'), SATISFIED)

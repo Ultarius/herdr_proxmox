@@ -11,13 +11,13 @@ spec.loader.exec_module(module)
 
 class FlutterReleaseTests(unittest.TestCase):
     def release(self, **changes):
-        return dict(dict(version='3.44.8', channel='stable', dart_sdk_arch='x64',
-                         archive='stable/linux/flutter_linux_3.44.8-stable.tar.xz', sha256='a' * 64), **changes)
+        return dict(dict(version='3.47.9', channel='stable', dart_sdk_arch='x64',
+                         archive='stable/linux/flutter_linux_3.47.9-stable.tar.xz', sha256='a' * 64), **changes)
 
     def test_exact_pinned_version_and_architecture(self):
-        manifest = {'releases': [self.release(version='3.45.0'), self.release(dart_sdk_arch='arm64'), self.release()]}
-        archive, checksum = module.select_release(manifest, '3.44.8', 'x64')
-        self.assertIn('3.44.8', archive)
+        manifest = {'releases': [self.release(version='3.50.0'), self.release(dart_sdk_arch='arm64'), self.release()]}
+        archive, checksum = module.select_release(manifest, '3.47.9', 'x64')
+        self.assertIn('3.47.9', archive)
         self.assertEqual(checksum, 'a' * 64)
         with self.assertRaises(ValueError):
             module.select_release(manifest, 'missing', 'x64')
@@ -25,7 +25,7 @@ class FlutterReleaseTests(unittest.TestCase):
     def test_untrusted_path_or_missing_checksum_is_rejected(self):
         for changes in ({'archive': '../escape.tar.xz'}, {'archive': 'https://other/sdk.tar.xz'}, {'sha256': ''}):
             with self.assertRaises(ValueError):
-                module.select_release({'releases': [self.release(**changes)]}, '3.44.8', 'x64')
+                module.select_release({'releases': [self.release(**changes)]}, '3.47.9', 'x64')
 
     def test_installer_reads_the_declared_version_instead_of_its_own_pin(self):
         root = Path(__file__).parents[1]
@@ -43,7 +43,7 @@ class FlutterReleaseTests(unittest.TestCase):
         # version must read it: the installer, the build guard, CI, and the
         # catalog. Nothing may state a version of its own.
         root = Path(__file__).parents[1]
-        pinned = '3.44.8'
+        pinned = '3.47.9'
         self.assertEqual(json.loads((root / '.fvmrc').read_text())['flutter'], pinned)
         ci = (root / '.github/workflows/ci.yml').read_text()
         self.assertIn('.fvmrc', ci)

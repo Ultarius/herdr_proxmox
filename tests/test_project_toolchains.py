@@ -50,6 +50,9 @@ class RequirementShapeTests(unittest.TestCase):
                 project_toolchains.tool_constraint(value)
 
     def test_a_notation_must_be_one_the_evaluator_understands(self):
+        self.assertNotIn('python-version', project_toolchains.NOTATIONS)
+        with self.assertRaises(ValueError):
+            project_toolchains.tool_notation('python-version')
         self.assertEqual(project_toolchains.tool_notation(None), 'semver')
         self.assertEqual(project_toolchains.tool_notation('pep440'), 'pep440')
         for value in ('npm', 'semvar', '', 7):

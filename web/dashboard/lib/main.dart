@@ -263,6 +263,9 @@ class _DashboardState extends State<Dashboard> {
                             const SizedBox(height: 24),
                             CloneProjectCard(
                               onCloned: (path) => cwd.text = path,
+                              onDeleted: (path) {
+                                if (cwd.text == path) cwd.clear();
+                              },
                             ),
                           ],
                         ),

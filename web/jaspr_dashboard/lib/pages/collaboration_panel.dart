@@ -1,7 +1,6 @@
+import 'package:herdr_dashboard_state/planning_blocs.dart';
 import 'snapshot_terminal.dart';
 import 'dart:async';
-
-import 'dart:convert';
 
 import '../services.dart';
 
@@ -65,197 +64,59 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
 
   String prompt = '';
 
-  List<Map<String, dynamic>> groups = [];
-
-  List<Map<String, dynamic>> jobs = [];
-
-  String? profile;
-
-  String? error;
-
-  String output = '';
-
-  String status = '';
-
-  String draft = '';
-
-  String? draftJob;
-
-  bool busy = false;
-
-  bool polling = false;
-
-  OrganizationCommand? pending;
-  StreamSubscription? connectionSubscription;
-  int generation = -1;
-
-  String? snapshotSignature;
-
-  int pollTick = 0;
-
-  Timer? timer;
+  late final CollaborationBloc bloc;
+  StreamSubscription? featureSubscription;
+  List<Map<String, dynamic>> get groups => bloc.groups;
+  List<Map<String, dynamic>> get jobs => bloc.jobs;
+  String? get profile => bloc.profile;
+  set profile(String? value) => bloc.select(value);
+  String? _error;
+  String? get error => _error ?? bloc.state.error;
+  set error(String? value) => _error = value;
+  String get output => bloc.output;
+  String get status => bloc.status;
+  String get draft => bloc.draft;
+  String? get draftJob => bloc.draftJob;
+  bool get busy => bloc.state.busy;
+  OrganizationCommand? get pending => bloc.pending;
+  set pending(OrganizationCommand? value) {
+    if (value == null) bloc.abandon();
+  }
 
   @override
   void initState() {
     super.initState();
-    generation = connection.generation;
-    connectionSubscription = connection.stream.listen((_) {
-      if (!mounted) return;
-      if (generation != connection.generation || !connection.state.connected) {
-        generation = connection.generation;
-        setState(() {
-          groups = [];
-          jobs = [];
-          profile = null;
-          output = '';
-          status = '';
-          draft = '';
-          draftJob = null;
-          snapshotSignature = null;
-          pending = null;
-          error = null;
-          prompt = '';
-        });
-      }
-      if (connection.state.connected) refresh();
+    bloc = CollaborationBloc(connection, '${component.organization['id']}');
+    featureSubscription = bloc.stream.listen((_) {
+      if (mounted) setState(() {});
     });
-
     refresh();
-
-    timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (profile != null || ++pollTick % 10 == 0) refresh();
-    });
   }
 
   @override
   void dispose() {
-    connectionSubscription?.cancel();
-    timer?.cancel();
+    featureSubscription?.cancel();
+    bloc.dispose();
 
     super.dispose();
   }
 
-  Map<String, dynamic> body(Map<String, dynamic> values) => OrganizationCommand(
-    'inspect',
-
-    {...values, 'organization_id': component.organization['id']},
-  ).body!;
-
-  Future<void> refresh() async {
-    if (polling || !connection.state.connected) return;
-
-    polling = true;
-
-    final epoch = connection.generation;
-
-    final selected = profile;
-
-    try {
-      final data = await connection.request('organizations/activity', {
-        'organization_id': component.organization['id'],
-      });
-
-      if (!mounted || epoch != connection.generation) return;
-
-      final signature = jsonEncode(data);
-
-      if (snapshotSignature != signature)
-        setState(() {
-          snapshotSignature = signature;
-
-          groups = List<Map<String, dynamic>>.from(data['groups'] ?? [])
-              .where(
-                (g) => g['organization_id'] == component.organization['id'],
-              )
-              .toList();
-
-          jobs = List<Map<String, dynamic>>.from(data['jobs'])
-              .where(
-                (j) => j['organization_id'] == component.organization['id'],
-              )
-              .toList();
-        });
-
-      if (selected != null) {
-        final result = await connection.request(
-          'organizations/inspect',
-
-          body({'profile_id': selected}),
-        );
-
-        if (mounted &&
-            epoch == connection.generation &&
-            selected == profile &&
-            (output != result['output'] ||
-                status != result['status'] ||
-                draft != (result['reply_draft'] ?? '') ||
-                draftJob != result['reply_job_id'] ||
-                (error != null && pending == null))) {
-          setState(() {
-            output = result['output'] as String;
-
-            status = result['status'] as String;
-
-            draft = result['reply_draft'] as String? ?? '';
-
-            draftJob = result['reply_job_id'] as String?;
-
-            if (pending == null) error = null;
-          });
-        }
-      }
-    } catch (exception) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = exception.toString());
-    } finally {
-      polling = false;
-    }
-  }
+  Future<void> refresh() => bloc.refresh();
 
   Future<void> submit(
     String action,
-
     Map<String, dynamic> values, {
-
     bool retry = false,
   }) async {
-    if (busy ||
-        !connection.state.connected ||
-        (!retry && pending != null) ||
-        (retry && pending == null))
-      return;
-
+    if (busy || !connection.state.connected) return;
     final epoch = connection.generation;
-
-    if (!retry) {
-      pending = OrganizationCommand(action, {
-        ...values,
-
-        'organization_id': component.organization['id'],
-      });
-    }
-
-    setState(() {
-      busy = true;
-
-      error = null;
-    });
-
-    try {
-      await pending!.execute(connection);
-
-      if (!mounted || epoch != connection.generation) return;
-
-      pending = null;
-
-      if (action == 'chat') setState(() => prompt = '');
-
-      await refresh();
-    } catch (exception) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = exception.toString());
-    } finally {
-      if (mounted) setState(() => busy = false);
+    _error = null;
+    final saved = await bloc.submit(action, values, retry: retry);
+    if (saved &&
+        mounted &&
+        epoch == connection.generation &&
+        action == 'chat') {
+      setState(() => prompt = '');
     }
   }
 
@@ -511,10 +372,6 @@ class _CollaborationPanelState extends State<CollaborationPanel> {
             if (busy) return;
             setState(() {
               profile = value.isEmpty ? null : value;
-              output = '';
-              status = '';
-              draft = '';
-              draftJob = null;
               error = null;
             });
             refresh();

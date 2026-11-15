@@ -738,7 +738,8 @@ class _OrgChartState extends State<OrgChart> {
           'id': viewportId,
           'tabindex': '0',
           'role': 'group',
-          'aria-label': 'Organization chart. Drag to pan, scroll to zoom.',
+          'aria-label':
+              'Organization chart. Use arrow keys to pan, plus or minus to zoom, and 0 to fit. Drag to pan or scroll to zoom.',
           'style': '--chart-natural-height:${layout.height + 40}px;',
           if (empty) 'data-empty': '',
         },

@@ -1,4 +1,4 @@
-import 'dart:convert';
+import 'package:herdr_dashboard_state/workspace_blocs.dart';
 import 'package:herdr_dashboard_state/installation_status.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
@@ -13,100 +13,50 @@ class BuildsPage extends StatefulWidget {
 
 class _BuildsPageState extends State<BuildsPage> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
-  List<Map<String, dynamic>> runs = [];
-  Map<String, dynamic>? identity;
-  Map<String, dynamic>? deployment;
-  Map<String, dynamic>? buildService;
-  String executor = 'gateway';
-  int queued = 0;
-  String? error;
-  String? actionError;
-  String? downloading;
-  bool acting = false;
-  bool busy = false;
-  Timer? timer;
+  late final BuildsBloc feature;
+  StreamSubscription? featureSubscription;
+  List<Map<String, dynamic>> get runs =>
+      List<Map<String, dynamic>>.from(feature.state.values['runs']);
+  Map<String, dynamic>? get identity => feature.state.value('identity');
+  Map<String, dynamic>? get deployment => feature.state.value('deployment');
+  Map<String, dynamic>? get buildService => feature.state.value('buildService');
+  String get executor => feature.state.value<String>('executor') ?? 'gateway';
+  int get queued => feature.state.value<int>('queued') ?? 0;
+  String? get downloading => feature.state.reading.contains('download')
+      ? feature.state.value<String>('downloadId')
+      : null;
+  bool get busy => feature.state.reading.contains('refresh');
+  bool get acting => feature.state.busy;
+  String? get error =>
+      feature.state.errors['refresh'] ?? feature.state.errors['download'];
+  String? get actionError => feature.state.errors['action'];
+  String? lastNotice;
   @override
   void initState() {
     super.initState();
+    feature = BuildsBloc(connection);
+    featureSubscription = feature.stream.listen((_) {
+      if (!mounted) return;
+      final notice = feature.state.message;
+      if (notice != null && notice != lastNotice) notify(notice);
+      lastNotice = notice;
+      setState(() {});
+    });
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 5), (_) => refresh());
   }
 
   @override
   void dispose() {
-    timer?.cancel();
+    featureSubscription?.cancel();
+    feature.dispose();
     super.dispose();
   }
 
-  Future<void> refresh() async {
-    if (busy || !connection.state.connected) return;
-    final epoch = connection.generation;
-    busy = true;
-    try {
-      final result = await connection.request('validation');
-      final deployed = await connection.request('build');
-      Map<String, dynamic>? installer;
-      try {
-        installer = Map<String, dynamic>.from(
-          await connection.request('build-service'),
-        );
-      } catch (_) {} // Older gateways retain the root-command fallback.
-      Map<String, dynamic>? status;
-      try {
-        status = Map<String, dynamic>.from(await connection.request('updates'));
-      } catch (_) {
-        // Deployment status is unavailable until the release check succeeds.
-      }
-      if (mounted && epoch == connection.generation)
-        setState(() {
-          runs = List<Map<String, dynamic>>.from(result['runs'] ?? []);
-          executor = '${result['executor'] ?? 'gateway'}';
-          queued = result['queued'] as int? ?? 0;
-          identity = Map<String, dynamic>.from(deployed);
-          deployment = status;
-          buildService = installer;
-          error = null;
-        });
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = '$e');
-    } finally {
-      busy = false;
-    }
-  }
-
+  Future<void> refresh() => feature.refresh();
   bool get installingBuildService =>
       ['queued', 'running'].contains(buildService?['state']);
 
-  Future<void> installBuildService() async {
-    if (acting ||
-        installingBuildService ||
-        connection.operator.value['role'] != 'admin' ||
-        buildService?['supported'] != true)
-      return;
-    final epoch = connection.generation;
-    setState(() {
-      acting = true;
-      actionError = null;
-    });
-    try {
-      final result = await connection.request(
-        'build-service/install',
-        const {},
-      );
-      if (mounted && epoch == connection.generation) {
-        setState(() => buildService = {'supported': true, ...result});
-        notify(
-          'Build-service installation queued. The gateway will restart; automation settings remain unchanged.',
-        );
-      }
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => actionError = '$e');
-    } finally {
-      if (mounted) setState(() => acting = false);
-    }
-  }
+  Future<void> installBuildService() async => feature.installService();
 
   Future<void> promote(Map<String, dynamic> run) async {
     final epoch = connection.generation;
@@ -137,28 +87,7 @@ class _BuildsPageState extends State<BuildsPage> {
       ),
     );
     if (confirmed != true || !mounted || epoch != connection.generation) return;
-    if (acting) return;
-    setState(() {
-      acting = true;
-      actionError = null;
-    });
-    try {
-      await connection.request('updates/promote', {'run_id': run['id']});
-      if (!mounted || epoch != connection.generation) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Deployment queued. The gateway restarts when the deployment finishes.',
-          ),
-        ),
-      );
-      await refresh();
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => actionError = '$e');
-    } finally {
-      if (mounted) setState(() => acting = false);
-    }
+    await feature.promote(run);
   }
 
   Future<void> rollbackDeployment() async {
@@ -184,24 +113,7 @@ class _BuildsPageState extends State<BuildsPage> {
       ),
     );
     if (confirmed != true || !mounted || epoch != connection.generation) return;
-    if (acting) return;
-    setState(() {
-      acting = true;
-      actionError = null;
-    });
-    try {
-      await connection.request('updates/rollback', const {});
-      if (!mounted || epoch != connection.generation) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Rollback queued.')));
-      await refresh();
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => actionError = '$e');
-    } finally {
-      if (mounted) setState(() => acting = false);
-    }
+    await feature.rollback();
   }
 
   void notify(String message) {
@@ -213,49 +125,19 @@ class _BuildsPageState extends State<BuildsPage> {
 
   Future<void> download(Map<String, dynamic> run, String kind) async {
     final epoch = connection.generation;
-    if (downloading != null) return;
-    setState(() {
-      downloading = '${run['id']}:$kind';
-      error = null;
-    });
+    final file = await feature.download(run, kind);
+    if (file == null || !(mounted && epoch == connection.generation)) return;
     try {
-      if (kind == 'artifact' || kind == 'deployment') {
-        final content = await connection.bytes(
-          'validation/artifact?id=${run['id']}&kind=${kind == 'deployment' ? 'deployment' : 'static'}',
-        );
-        final manifest =
-            run[kind == 'deployment' ? 'deployment_package' : 'artifact']
-                as Map;
-        final expected = manifest['bytes'];
-        if (expected is! int || expected < 0 || content.length != expected) {
-          throw Exception(
-            'Downloaded size ${content.length} does not match the manifest ($expected bytes).',
-          );
-        }
-        if (epoch != connection.generation) return;
-        await downloadBinaryArtifact(content, '$kind-${run['id']}.tar.gz');
-        notify(
-          '$kind package fetched and handed to the browser · ${content.length} bytes verified.',
-        );
-      } else if (kind == 'manifest') {
-        final text = const JsonEncoder.withIndent(
-          '  ',
-        ).convert(run['artifact']);
-        await downloadArtifact(text, 'build-${run['id']}.json');
-        notify('Manifest fetched · ${utf8.encode(text).length} bytes.');
+      if (file.bytes != null) {
+        await downloadBinaryArtifact(file.bytes!, file.filename);
       } else {
-        final content = await connection.text('validation/log?id=${run['id']}');
-        if (epoch != connection.generation) return;
-        await downloadArtifact(content, 'validation-${run['id']}.log');
-        notify('Log fetched · ${utf8.encode(content).length} bytes.');
+        await downloadArtifact(file.text!, file.filename);
       }
-    } catch (e) {
-      if (mounted && epoch == connection.generation) {
-        setState(() => error = '$e');
-        notify('Download failed: $e');
-      }
-    } finally {
-      if (mounted) setState(() => downloading = null);
+      if (mounted && epoch == connection.generation)
+        await feature.patch({}, message: file.message);
+    } catch (error) {
+      if (mounted && epoch == connection.generation)
+        await feature.reportError('download', 'Download failed: $error');
     }
   }
 
@@ -282,21 +164,7 @@ class _BuildsPageState extends State<BuildsPage> {
       ),
     );
     if (confirmed != true || !mounted || epoch != connection.generation) return;
-    if (acting) return;
-    setState(() {
-      acting = true;
-      actionError = null;
-    });
-    try {
-      await connection.request('updates/provenance', const {});
-      if (mounted && epoch == connection.generation)
-        notify('Source identity resolution queued.');
-      await refresh();
-    } catch (e) {
-      if (mounted) setState(() => actionError = '$e');
-    } finally {
-      if (mounted) setState(() => acting = false);
-    }
+    await feature.repairProvenance();
   }
 
   @override

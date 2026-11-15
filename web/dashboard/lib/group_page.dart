@@ -1,6 +1,6 @@
+import 'package:herdr_dashboard_state/group_bloc.dart';
 import 'organization_automation.dart';
 import 'artifact_export.dart';
-import 'dart:convert';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'organization_bloc.dart';
@@ -12,13 +12,6 @@ import 'folder_access_panel.dart';
 
 /// Job states that keep a group conversation live. Shared so the poll interval
 /// and the live-streaming guard cannot drift apart.
-const _activeJobStates = [
-  'queued',
-  'running',
-  'waiting_for_members',
-  'needs_attention',
-  'waiting_for_input',
-];
 
 class GroupPage extends StatefulWidget {
   const GroupPage({super.key, required this.id, required this.coordinator});
@@ -30,201 +23,72 @@ class GroupPage extends StatefulWidget {
 
 class _GroupPageState extends State<GroupPage> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
-  Map<String, dynamic>? group;
-  List<Map<String, dynamic>> profiles = [];
-  List<Map<String, dynamic>> jobs = [];
-  Map<String, dynamic> memberStates = {};
-  List<Map<String, dynamic>> allJobs = [];
-  final live = <String, Map<String, dynamic>>{};
-  final message = TextEditingController();
-  Timer? timer;
-  bool loading = false;
-  bool busy = false;
-  bool loaded = false;
-  String? snapshotSignature;
-  int pollTick = 0;
-  int? nextBefore;
-  int historyLimit = 20;
-  String tab = 'posts';
+  late final GroupBloc feature;
+  StreamSubscription? subscription;
+  int sessionGeneration = -1;
+  Map<String, dynamic>? get group => feature.state.group;
+  List<Map<String, dynamic>> get profiles => feature.state.profiles;
+  List<Map<String, dynamic>> get jobs => feature.state.jobs;
+  List<Map<String, dynamic>> get allJobs => feature.state.allJobs;
+  Map<String, dynamic> get memberStates => feature.state.memberStates;
+  Map<String, Map<String, dynamic>> get live => feature.state.live;
+  bool get loading => feature.state.loading;
+  bool get busy => feature.state.busy;
+  bool get loaded => feature.state.loaded;
+  String? uiError;
+  String? get error => uiError ?? feature.state.error;
+  String? get readError => feature.state.readError;
+  OrganizationCommand? get pending => feature.state.pending;
+  int? get nextBefore => feature.state.nextBefore;
+  final int historyLimit = groupHistoryLimit;
+  String _tab = 'posts';
+  String get tab => _tab;
+  set tab(String value) {
+    _tab = value;
+    feature.liveViewing = value == 'posts';
+  }
+
   String? artifact;
-  String? error;
-  OrganizationCommand? pending;
+  final message = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    connection.notificationRevision.addListener(notificationRefresh);
-    refresh();
-    timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      final active = jobs.any((j) => _activeJobStates.contains(j['state']));
-      final interval = active && tab == 'posts' ? 1 : 10;
-      if (++pollTick % interval == 0) refresh();
+    feature = GroupBloc(connection, widget.id);
+    sessionGeneration = connection.generation;
+    subscription = feature.stream.listen((_) {
+      if (!mounted) return;
+      if (sessionGeneration != connection.generation ||
+          !connection.state.connected) {
+        sessionGeneration = connection.generation;
+        message.clear();
+        uiError = null;
+        artifact = null;
+        _tab = 'posts';
+      }
+      setState(() {});
     });
-  }
-
-  void notificationRefresh() {
-    if (mounted) refresh();
   }
 
   @override
   void dispose() {
-    connection.notificationRevision.removeListener(notificationRefresh);
-    timer?.cancel();
+    subscription?.cancel();
+    feature.dispose();
     message.dispose();
     super.dispose();
   }
 
-  Future<void> refresh() async {
-    if (loading || !connection.state.connected) return;
-    loading = true;
-    final epoch = connection.generation;
-    try {
-      final data = await connection.request('organizations/history', {
-        'group_id': widget.id,
-        'limit': historyLimit,
-      });
-      if (!mounted || epoch != connection.generation) return;
-      final current =
-          List<Map<String, dynamic>>.from(
-            data['groups'] ?? [],
-          ).where((g) => g['id'] == widget.id).firstOrNull ??
-          data['group'] as Map<String, dynamic>?;
-      final signature = jsonEncode(data);
-      if (signature != snapshotSignature)
-        setState(() {
-          snapshotSignature = signature;
-          group = current;
-          if (jobs.length <= historyLimit)
-            nextBefore = data['next_before'] as int?;
-          memberStates = Map<String, dynamic>.from(data['member_states'] ?? {});
-          allJobs = List<Map<String, dynamic>>.from(data['jobs']);
-          profiles = List<Map<String, dynamic>>.from(data['profiles'])
-              .where((p) => p['organization_id'] == current?['organization_id'])
-              .toList();
-          final older = jobs
-              .where(
-                (j) => !(data['jobs'] as List).any((n) => n['id'] == j['id']),
-              )
-              .toList();
-          jobs = List<Map<String, dynamic>>.from(data['jobs'])
-              .where(
-                (j) => j['kind'] == 'discussion' && j['group_id'] == widget.id,
-              )
-              .toList()
-              .reversed
-              .toList();
-          jobs.addAll(older);
-          loaded = true;
-          if (pending == null) error = null;
-        });
-      if (current != null)
-        connection.selectedOrganization.value =
-            current['organization_id'] as String;
-      final active = jobs
-          .where((j) => _activeJobStates.contains(j['state']))
-          .firstOrNull;
-      if (tab == 'posts' && current != null && active != null) {
-        try {
-          final result = await connection.request('organizations/inspect', {
-            'organization_id': current['organization_id'],
-            'job_id': active['id'],
-            'request_id':
-                'group_stream_${DateTime.now().microsecondsSinceEpoch}',
-          });
-          if (mounted && epoch == connection.generation) {
-            final previous = live[active['id']];
-            // A file can briefly be incomplete while the facilitator rewrites it.
-            // Keep the last valid draft/replies until the next valid document arrives.
-            if ((result['contributions'] as List? ?? []).isEmpty &&
-                previous != null) {
-              result['contributions'] = previous['contributions'];
-            }
-            if ((result['artifact_draft'] as String? ?? '').isEmpty &&
-                previous != null) {
-              result['artifact_draft'] = previous['artifact_draft'];
-            }
-            if (jsonEncode(previous) != jsonEncode(result))
-              setState(() => live[active['id'] as String] = result);
-          }
-        } catch (exception) {
-          if (mounted && epoch == connection.generation) {
-            setState(
-              () => live[active['id'] as String] = {
-                ...?live[active['id']],
-                'inspection_error': exception.toString(),
-              },
-            );
-          }
-        }
-      }
-    } catch (exception) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = exception.toString());
-    } finally {
-      loading = false;
-    }
-  }
-
-  Future<void> loadOlder() async {
-    if (loading || nextBefore == null) return;
-    final epoch = connection.generation;
-    loading = true;
-    try {
-      final data = await connection.request('organizations/history', {
-        'group_id': widget.id,
-        'before': nextBefore,
-      });
-      if (!mounted || epoch != connection.generation) return;
-      setState(() {
-        final ids = jobs.map((j) => j['id']).toSet();
-        jobs.addAll(
-          List<Map<String, dynamic>>.from(data['jobs'])
-              .where((j) => j['kind'] == 'discussion' && !ids.contains(j['id']))
-              .toList()
-              .reversed,
-        );
-        nextBefore = data['next_before'] as int?;
-      });
-    } catch (exception) {
-      if (mounted) setState(() => error = exception.toString());
-    } finally {
-      loading = false;
-    }
-  }
-
+  Future<void> refresh() => feature.refresh();
+  Future<void> loadOlder() => feature.loadOlder();
   Future<void> submit(
     String action,
     Map<String, dynamic> body, {
     bool retry = false,
   }) async {
-    if (busy || group == null || !connection.state.connected) return;
-    final epoch = connection.generation;
-    pending = retry
-        ? pending
-        : OrganizationCommand(action, {
-            ...body,
-            'organization_id': group!['organization_id'],
-          });
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    try {
-      await pending!.execute(connection);
-      if (!mounted || epoch != connection.generation) return;
-      final removed = pending!.action == 'remove_group';
-      pending = null;
-      if (action == 'group' || removed)
-        await connection.request('organizations/directory');
-      await refresh();
-      if (removed && mounted) widget.coordinator.navigate(DashboardRoute());
-      if (action == 'discuss') message.clear();
-    } catch (exception) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = exception.toString());
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
+    final result = await feature.submit(action, body, retry: retry);
+    if (!mounted || !result.succeeded) return;
+    if (result.removed) widget.coordinator.navigate(DashboardRoute());
+    if (action == 'discuss') message.clear();
   }
 
   Future<void> managePreparation(Map job, bool retry) async {
@@ -579,12 +443,16 @@ class _GroupPageState extends State<GroupPage> {
 
   Future<void> downloadTranscript(Map<String, dynamic> job) async {
     try {
-      final result = await connection.request('organizations/transcript', {
+      final result = await feature.query('organizations/transcript', {
         'organization_id': job['organization_id'],
         'job_id': job['id'],
         'request_id': 'transcript_${DateTime.now().microsecondsSinceEpoch}',
       });
-      await downloadArtifact(result['content'] as String, 'discussion.json');
+      if (result == null) return;
+      await downloadArtifact(
+        result['content'] as String? ?? '',
+        'discussion.json',
+      );
     } catch (exception) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -611,7 +479,11 @@ class _GroupPageState extends State<GroupPage> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text(error ?? (loaded ? 'Group not found.' : 'Loading group…')),
+            Text(
+              error ??
+                  readError ??
+                  (loaded ? 'Group not found.' : 'Loading group…'),
+            ),
             TextButton(onPressed: refresh, child: const Text('Refresh')),
           ],
         ),
@@ -812,6 +684,7 @@ class _GroupPageState extends State<GroupPage> {
               const SizedBox(height: 20),
             ],
             if (error != null) Text(error!),
+            if (readError != null) Text(readError!),
             if (pending != null && !busy)
               Wrap(
                 children: [
@@ -821,10 +694,10 @@ class _GroupPageState extends State<GroupPage> {
                     child: const Text('Retry same request'),
                   ),
                   TextButton(
-                    onPressed: () => setState(() {
-                      pending = null;
-                      error = null;
-                    }),
+                    onPressed: () {
+                      uiError = null;
+                      feature.clearFailure();
+                    },
                     child: const Text('Dismiss request'),
                   ),
                 ],

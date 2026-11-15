@@ -1,3 +1,5 @@
+import 'package:herdr_dashboard_state/settings_bloc.dart';
+import 'feature_view.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 import 'overview_panels.dart';
@@ -10,48 +12,22 @@ class ResourcePanel extends StatefulWidget {
   State<ResourcePanel> createState() => _ResourcePanelState();
 }
 
-class _ResourcePanelState extends State<ResourcePanel> {
-  Timer? timer;
-  Map<String, dynamic>? data;
-  bool loading = false;
-  String? error;
+class _ResourcePanelState extends State<ResourcePanel>
+    with FeatureView<ResourcePanel> {
+  late final ResourcesBloc bloc;
+  Map<String, dynamic>? get data => bloc.data;
+  bool get loading => bloc.state.loading;
+  String? get error => featureError == null
+      ? null
+      : 'Resource monitor unavailable; displayed values may be stale.';
   @override
   void initState() {
     super.initState();
+    bindFeature(bloc = ResourcesBloc(BlocScope.get<DashboardBloc>()));
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 10), (_) => refresh());
   }
 
-  Future<void> refresh() async {
-    if (loading) return;
-    setState(() => loading = true);
-    try {
-      final result = await BlocScope.get<DashboardBloc>().request('resources');
-      if (mounted)
-        setState(() {
-          data = Map<String, dynamic>.from(result);
-          error = null;
-        });
-      if (mounted && !(timer?.isActive ?? false)) {
-        timer = Timer.periodic(const Duration(seconds: 10), (_) => refresh());
-      }
-    } catch (_) {
-      timer?.cancel();
-      if (mounted)
-        setState(() {
-          error =
-              'Resource monitor unavailable; displayed values may be stale.';
-        });
-    } finally {
-      if (mounted) setState(() => loading = false);
-    }
-  }
-
-  @override
-  void dispose() {
-    timer?.cancel();
-    super.dispose();
-  }
+  Future<void> refresh() => bloc.refresh();
 
   String bytes(dynamic value) =>
       '${((value as num? ?? 0) / 1048576).toStringAsFixed(0)} MiB';

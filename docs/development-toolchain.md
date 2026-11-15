@@ -15,7 +15,7 @@ cwd-aware dispatcher. Discovery reads alone do not prepare an environment.
 
 There are separate provisioning scopes:
 
-1. **The project's own pinned build toolchain** — Flutter 3.44.8 and its bundled Dart SDK, installed
+1. **The project's own pinned build toolchain** — Flutter 3.47.9 and its bundled Dart SDK, installed
    by the root-run `install/dev-tools-install.sh`. The Flutter files are owned
    by `herdr` and symlinked into
    `/home/herdr/.local/bin`. The dashboard's SDK service requests it because
@@ -108,7 +108,7 @@ a session, a verification run and a publication gate can all compare:
 
 Verification selects the approved SDK itself, probes the real executable, and runs
 the repository's scripts with that SDK first on `PATH`. A declared
-`flutter-3.44.8` cannot prove which executable ran, so the run records what it
+`flutter-3.47.9` cannot prove which executable ran, so the run records what it
 actually measured:
 
 - the exact candidate commit,

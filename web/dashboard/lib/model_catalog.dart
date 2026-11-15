@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/organization_tools_bloc.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 
@@ -130,12 +131,24 @@ class ModelFields extends StatefulWidget {
 }
 
 class _ModelFieldsState extends State<ModelFields> {
-  RuntimeCatalog? discovered;
+  ModelDiscoveryBloc? discovery;
+  StreamSubscription? discoverySubscription;
+  RuntimeCatalog? get discovered {
+    final raw = discovery?.catalog;
+    if (raw == null) return null;
+    final found = RuntimeCatalog.fromJson(raw);
+    return RuntimeCatalog(
+      models: found.models,
+      efforts: found.efforts.isEmpty ? widget.catalog.efforts : found.efforts,
+      source: found.source,
+      supportsVariants: found.supportsVariants,
+    );
+  }
+
   bool manualProvider = false;
   bool manualModel = false;
-  bool busy = false;
-  String? error;
-  int requestId = 0;
+  bool get busy => discovery?.state.loading ?? false;
+  String? get error => discovery?.state.error ?? discovery?.warning;
 
   RuntimeCatalog get options => discovered ?? widget.catalog;
   String get selectedProvider => widget.provider.text.trim();
@@ -145,6 +158,14 @@ class _ModelFieldsState extends State<ModelFields> {
   @override
   void initState() {
     super.initState();
+    try {
+      discovery = ModelDiscoveryBloc(BlocScope.get<DashboardBloc>());
+      discoverySubscription = discovery!.stream.listen((_) {
+        if (mounted) setState(() {});
+      });
+    } catch (_) {
+      /* Standalone draft forms may not have a connection. */
+    }
     if (widget.runtime == 'opencode') {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) discover();
@@ -158,12 +179,9 @@ class _ModelFieldsState extends State<ModelFields> {
     // Another runtime has its own provider list and model identifiers. A
     // rebuild follows, so no setState is needed here.
     if (old.runtime != widget.runtime || old.project != widget.project) {
-      requestId++;
-      busy = false;
-      discovered = null;
+      discovery?.reset();
       manualProvider = false;
       manualModel = false;
-      error = null;
       if (widget.runtime == 'opencode') {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) discover();
@@ -177,64 +195,22 @@ class _ModelFieldsState extends State<ModelFields> {
     widget.model.clear();
     widget.reasoning.clear();
     setState(() {
-      discovered = null;
+      discovery?.reset();
       manualProvider = false;
       manualModel = false;
-      error = null;
     });
   }
 
   /// Let the CLI enumerate the connected account's own catalog. Codex and
   /// Claude expose no such command, so this stays OpenCode-only.
   Future<void> discover({bool force = false}) async {
-    if (busy) return;
-    DashboardBloc connection;
-    try {
-      connection = BlocScope.get<DashboardBloc>();
-    } catch (_) {
-      return;
-    }
-    final epoch = connection.generation;
-    final current = ++requestId;
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    try {
-      final result = await connection.request('models', {
-        'runtime': widget.runtime,
-        'project': widget.project,
-        'force': force,
-        'provider': selectedProvider,
-        'model': selectedModel,
-      });
-      if (!mounted || epoch != connection.generation || current != requestId)
-        return;
-      final found = RuntimeCatalog.fromJson(
-        result is Map<String, dynamic> ? result : null,
-      );
-      if (found.models.isEmpty) {
-        setState(() => error = 'The CLI reported no models.');
-        return;
-      }
-      setState(() {
-        error = result['stale'] == true
-            ? 'Using cached models because refresh failed: ${result['refresh_error']}'
-            : null;
-        discovered = RuntimeCatalog(
-          models: found.models,
-          efforts: found.efforts.isEmpty ? options.efforts : found.efforts,
-          source: found.source,
-          supportsVariants: found.supportsVariants,
-        );
-      });
-    } catch (e) {
-      if (!mounted || epoch != connection.generation || current != requestId)
-        return;
-      setState(() => error = e.toString());
-    } finally {
-      if (mounted && current == requestId) setState(() => busy = false);
-    }
+    await discovery?.discover(
+      runtime: widget.runtime ?? '',
+      project: widget.project,
+      provider: selectedProvider,
+      model: selectedModel,
+      force: force,
+    );
   }
 
   /// Offer the catalog, an empty default, and any value already stored.
@@ -301,6 +277,13 @@ class _ModelFieldsState extends State<ModelFields> {
     decoration: InputDecoration(labelText: label, helperText: helper),
     onChanged: (_) => setState(() {}),
   );
+
+  @override
+  void dispose() {
+    discoverySubscription?.cancel();
+    discovery?.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {

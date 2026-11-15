@@ -774,6 +774,22 @@ class ReleaseCandidateTests(unittest.TestCase):
             db.execute('INSERT INTO release_candidates VALUES (?,?)', (duplicate['id'], json.dumps(duplicate)))
         self.assertEqual(len(ReleaseCandidates(self.service).snapshot()), 2)
 
+    def test_published_release_listing_survives_a_live_policy_error(self):
+        release = self.frozen(self.task())
+        release = self.releases.get(release['id'])
+        release.update(state='published', resulting_sha='b' * 40)
+        self.releases.save(release)
+        self.service.github.publication_mode.side_effect = ValueError('Operator policy requires repair.')
+        displayed = self.releases.snapshot()[0]
+        self.assertEqual(displayed['state'], 'published')
+        self.assertEqual(displayed['publication_error'], 'Operator policy requires repair.')
+        self.assertFalse(displayed['manual_pr_required'])
+        self.service.github.publication_mode.side_effect = None
+        self.service.github.publication_mode.return_value = 'manual_adoption'
+        recovered = self.releases.snapshot()[0]
+        self.assertNotIn('publication_error', recovered)
+        self.assertTrue(recovered['manual_pr_required'])
+
     def test_release_push_requires_the_recorded_run_not_only_a_branch_pattern(self):
         from contributions import push
         identifier, sha = 'a' * 32, 'b' * 40
@@ -782,13 +798,13 @@ class ReleaseCandidateTests(unittest.TestCase):
                       revision=dict(generation=1), publication=dict(destination='contributor/repo'))
         with patch('contributions.sys.platform', 'win32'), patch('contributions.subprocess.run') as transport:
             with self.assertRaisesRegex(ValueError, 'recorded release run'):
-                push(self.repo, branch, sha, self.service.github, 'contributor/repo')
+                push(self.repo, branch, sha, self.service.github, 'contributor/repo', upstream='owner/repo')
             for bad in (dict(record, resulting_sha='c' * 40), dict(record, state='ready'),
                         dict(record, revision=dict(generation=2))):
                 with self.assertRaisesRegex(ValueError, 'does not match'):
-                    push(self.repo, branch, sha, self.service.github, 'contributor/repo', release_lookup=lambda _: bad)
+                    push(self.repo, branch, sha, self.service.github, 'contributor/repo', upstream='owner/repo', release_lookup=lambda _: bad)
             with self.assertRaisesRegex(ValueError, 'Linux LXC'):
-                push(self.repo, branch, sha, self.service.github, 'contributor/repo', release_lookup=lambda _: record)
+                push(self.repo, branch, sha, self.service.github, 'contributor/repo', upstream='owner/repo', release_lookup=lambda _: record)
         transport.assert_not_called()
 
     def test_revision_history_is_paginated_and_scoped_to_its_release(self):

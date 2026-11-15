@@ -7,6 +7,7 @@ by the gateway build runner; the gateway enforces administrator approval and
 this worker re-verifies the approved build ID and SHA-256 before installing.
 """
 import errno
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -26,6 +27,7 @@ ROOT = Path('/opt/herdr-web')
 STATE = Path('/var/lib/herdr-updater')
 REQUEST = Path('/var/lib/herdr-update-requests/request.json')
 CONFIG = Path('/home/herdr/.config/herdr-web')
+PUBLISHING_POLICY = Path('/etc/herdr/publishing-policy.json')
 LOCAL_ARTIFACTS = Path('/home/herdr/herdr-validation')
 REPOSITORY = 'Ultarius/herdr_proxmox'
 REQUIRED = ('web/gateway/server.py', 'web/public/index.html',
@@ -38,8 +40,9 @@ REQUIRED = ('web/gateway/server.py', 'web/public/index.html',
 RELEASE = re.compile(r'v[0-9]+\.[0-9]+\.[0-9]+')
 ALPHA = re.compile(r'alpha-[a-z0-9-]+-[a-f0-9]{12}-b[1-9][0-9]*')
 # Operator state that outlives any single deployment: task records and the
-# GitHub publishing credential.
+# GitHub publishing credential, plus repository connections and their secrets.
 PRESERVED_CONFIG = ('tasks.sqlite3', 'github.json')
+PRESERVED_DIRECTORIES = ('repository-connections',)
 BUILD_ID = re.compile(r'[a-f0-9]{32}')
 SHA256 = re.compile(r'[a-f0-9]{64}')
 SOURCE = re.compile(r'(?:[a-f0-9]{40}|[a-f0-9]{64})')
@@ -124,7 +127,7 @@ def deployment_storage(source, config_source=None):
         size, count = footprint(config_source)
         # Rollback also preserves current task records/credentials. Budget their
         # writes even if they have grown beyond the older saved configuration.
-        preserved = [footprint(CONFIG / name) for name in PRESERVED_CONFIG]
+        preserved = [footprint(CONFIG / name) for name in (*PRESERVED_CONFIG, *PRESERVED_DIRECTORIES)]
         allocations.append((CONFIG, size + sum(n for n, _ in preserved), count + sum(n for _, n in preserved)))
     require_storage(allocations)
 
@@ -259,7 +262,7 @@ def verify_config(config):
                     connection.close()
 
 
-def verify_backup(backup):
+def verify_backup(backup, *, allow_added_parts=False):
     """Always revalidate contents; a sidecar certificate is never a cache hit."""
     if backup.is_symlink() or not re.fullmatch(r'backup-[0-9]+', backup.name):
         raise ValueError('Only a completed backup directory can be restored.')
@@ -291,6 +294,9 @@ def verify_backup(backup):
             if (ROOT / name).exists() and not (backup / name).exists():
                 raise ValueError(f'Legacy backup is unverified: missing {name}; refusing a mixed deployment.')
         method = 'legacy-witness'
+    for name in ('install', 'VERSION', '.fvmrc', 'BUILD.json'):
+        if not (allow_added_parts and method == 'manifest') and (ROOT / name).exists() and not (backup / name).exists():
+            raise ValueError(f'Backup is missing {name}; refusing a mixed deployment.')
     verify_config(backup / 'config')
     evidence = dict(method=method, file_count=actual['file_count'],
                     digest=hashlib.sha256(json.dumps(actual, sort_keys=True).encode()).hexdigest())
@@ -474,11 +480,67 @@ def wait_for_ready(expected=None):
     raise ValueError('Updated gateway failed its startup check.')
 
 
+def guard_publishing_policy_migration(legacy_root=None, *, require_root=True):
+    """Never erase legacy protection before root migrates and enables it.
+
+    Inspect bounded JSON only: the updater does not import or execute gateway
+    code from an installed tree, backup or incoming archive.
+    """
+    def read(path):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 16384:
+            raise ValueError('Publishing policy migration requires a plain, bounded policy file.')
+        if require_root:
+            if info.st_uid != 0 or stat.S_IMODE(info.st_mode) not in (0o444, 0o644):
+                raise ValueError('Publishing policy migration requires root-owned policy files with mode 0444 or 0644.')
+            for parent in path.absolute().parents:
+                ancestor = parent.lstat()
+                if not stat.S_ISDIR(ancestor.st_mode) or ancestor.st_uid != 0 or ancestor.st_mode & 0o022:
+                    raise ValueError('Publishing policy migration requires trusted root-owned parent directories.')
+        return path.read_text(encoding='utf-8')
+    def mappings(path):
+        content = read(path)
+        if content is None:
+            return set()
+        try:
+            data = json.loads(content)
+            if type(data.get('version')) is not int or data['version'] != 1 or not isinstance(data.get('protected'), list):
+                raise ValueError()
+            values = set()
+            for record in data['protected']:
+                if (not isinstance(record, dict) or set(record) != {'upstream', 'fork', 'mode', 'arrangement'}
+                        or any(not isinstance(record.get(key), str) or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', record[key])
+                               or any(part in ('.', '..') for part in record[key].split('/')) for key in ('upstream', 'fork'))
+                        or record['mode'] != 'fork_only' or record['arrangement'] != 'manual_adoption'):
+                    raise ValueError()
+                values.add((record['upstream'].lower(), record['fork'].lower(), record['mode'], record['arrangement']))
+            return values
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError('Publishing policy migration requires readable version-1 fork-only policy data.') from None
+    legacy = mappings((legacy_root or ROOT) / 'web/gateway/publishing-policy.json')
+    external = mappings(PUBLISHING_POLICY)
+    required = read(PUBLISHING_POLICY.with_suffix('.required'))
+    if legacy - external:
+        raise ValueError('Existing release-tree publishing protection must be migrated to /etc/herdr/publishing-policy.json before updating. Root must preserve every protected upstream/fork mapping and enable the external policy; the live installation was not replaced.')
+    if (external and required != 'required\n') or (required is not None and not external):
+        raise ValueError('Publishing protection requires root provisioning before updating. Restore the external policy and run publication_policy.py --arm /etc/herdr/publishing-policy.json.')
+
+
 def replace_install(source, build_identity):
     """Replace gateway and UI together, preserving installers and provenance."""
+    guard_publishing_policy_migration()
+    if os.name != 'nt':
+        for directory in (ROOT, ROOT / 'web'):
+            os.chown(directory, 0, 0)
+            directory.chmod(0o755)
     for part in ('gateway', 'public'):
         shutil.rmtree(ROOT / 'web' / part)
         shutil.copytree(source / 'web' / part, ROOT / 'web' / part)
+        # Resetting every mode to 0644/0755 also strips group/other write,
+        # matching the initial installer's chmod -R go-w guarantee.
         for installed in (ROOT / 'web' / part).rglob('*'):
             installed.chmod(0o755 if installed.is_dir() else 0o644)
         (ROOT / 'web' / part).chmod(0o755)
@@ -531,45 +593,89 @@ def backup_current():
     return backup
 
 
-def restore(backup):
-    # Validate again immediately before any stop/removal, including automated
-    # recovery paths which do not pass through rollback's candidate selection.
-    evidence = verify_backup(backup)
-    record_backup_verification(backup, evidence)
-    service('stop')
-    # Tasks and GitHub credentials were created after this deployment backup.
-    # Restoring the older configuration directory must not silently discard
-    # them, and an older gateway cannot read them either way.
-    preserved = {}
-    for name in PRESERVED_CONFIG:
-        source = CONFIG / name
-        if source.is_file() and not source.is_symlink():
-            preserved[name] = source.read_bytes()
+@contextmanager
+def configuration_stage():
+    folder = Path(tempfile.mkdtemp(prefix='herdr-restore-', dir=CONFIG.parent))
     try:
-        shutil.rmtree(ROOT / 'web')
-        shutil.copytree(backup / 'web', ROOT / 'web')
-        if (ROOT / 'install').exists():
-            shutil.rmtree(ROOT / 'install')
-        if (backup / 'install').exists():
-            shutil.copytree(backup / 'install', ROOT / 'install')
-        shutil.rmtree(CONFIG)
-        shutil.copytree(backup / 'config', CONFIG)
-        for name, content in preserved.items():
-            target = CONFIG / name
-            target.write_bytes(content)
-            target.chmod(0o600)
-        subprocess.run(['chown', '-R', 'herdr:herdr', str(CONFIG)], check=True)
-        (ROOT / 'VERSION').unlink(missing_ok=True)
-        if (backup / 'VERSION').exists():
-            shutil.copy2(backup / 'VERSION', ROOT / 'VERSION')
-        (ROOT / '.fvmrc').unlink(missing_ok=True)
-        if (backup / '.fvmrc').exists():
-            shutil.copy2(backup / '.fvmrc', ROOT / '.fvmrc')
-        (ROOT / 'BUILD.json').unlink(missing_ok=True)
-        if (backup / 'BUILD.json').exists():
-            shutil.copy2(backup / 'BUILD.json', ROOT / 'BUILD.json')
+        yield folder
+    except BaseException:
+        if (folder / 'original').exists():
+            warn('Original configuration retained for recovery at ' + str(folder / 'original'))
+        else:
+            shutil.rmtree(folder)
+        raise
+    else:
+        shutil.rmtree(folder)
+
+
+def validate_preserved(config):
+    for name in (*PRESERVED_CONFIG, *PRESERVED_DIRECTORIES):
+        path = config / name
+        footprint(path)
+        if path.exists() and (path.is_dir() if name in PRESERVED_CONFIG else not path.is_dir()):
+            raise ValueError('Invalid preserved configuration path type: ' + str(path))
+
+
+def restore(backup, *, recovery=False):
+    # Never accumulate or delete the only surviving live credentials. An
+    # operator must recover and remove this private staging directory first.
+    for retained in CONFIG.parent.glob('herdr-restore-*'):
+        if (retained / 'original').exists():
+            raise ValueError('Configuration recovery required before another restore: ' + str(retained / 'original'))
+    validate_preserved(CONFIG)
+    validate_preserved(backup / 'config')
+    # Automatic recovery restores the exact snapshot taken before this attempt;
+    # parts added by the failed upgrade must disappear again. User-selected old
+    # backups retain the stricter compatibility guard.
+    evidence = verify_backup(backup, allow_added_parts=True) if recovery else verify_backup(backup)
+    record_backup_verification(backup, evidence)
+    guard_publishing_policy_migration(backup)
+    service('stop')
+    try:
+        # Build the complete replacement beside CONFIG. Every fallible copy
+        # finishes while the original configuration is still intact.
+        with configuration_stage() as folder:
+            staging = Path(folder)
+            replacement = staging / 'replacement'
+            sizes = [footprint(CONFIG / name) for name in (*PRESERVED_CONFIG, *PRESERVED_DIRECTORIES)]
+            config_size, config_count = footprint(backup / 'config')
+            require_storage([(staging, config_size + sum(size for size, _ in sizes),
+                              config_count + sum(count for _, count in sizes))])
+            shutil.copytree(backup / 'config', replacement)
+            for name in (*PRESERVED_CONFIG, *PRESERVED_DIRECTORIES):
+                target, source = replacement / name, CONFIG / name
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink(missing_ok=True)
+                if source.is_dir():
+                    shutil.copytree(source, target)
+                elif source.is_file():
+                    shutil.copy2(source, target)
+                    target.chmod(0o600)
+            subprocess.run(['chown', '-R', 'herdr:herdr', str(replacement)], check=True)
+            shutil.rmtree(ROOT / 'web')
+            shutil.copytree(backup / 'web', ROOT / 'web')
+            if (ROOT / 'install').exists():
+                shutil.rmtree(ROOT / 'install')
+            if (backup / 'install').exists():
+                shutil.copytree(backup / 'install', ROOT / 'install')
+            original = staging / 'original'
+            CONFIG.rename(original)
+            try:
+                replacement.rename(CONFIG)
+            except OSError:
+                original.rename(CONFIG)
+                raise
+        for name in ('VERSION', '.fvmrc', 'BUILD.json'):
+            (ROOT / name).unlink(missing_ok=True)
+            if (backup / name).exists():
+                shutil.copy2(backup / name, ROOT / name)
     finally:
-        service('start')
+        if CONFIG.is_dir() and not CONFIG.is_symlink():
+            service('start')
+        else:
+            warn('Configuration recovery required: gateway left stopped because ' + str(CONFIG) + ' is unavailable.')
     return evidence
 
 
@@ -600,6 +706,7 @@ def rollback(actor=''):
         expected = json.loads((backup / 'BUILD.json').read_text()).get('build_id')
     except (OSError, ValueError, AttributeError):
         expected = None
+    guard_publishing_policy_migration(backup)
     # Stop writers before copying SQLite files. Preserve the current state too:
     # an unsuccessful rollback must restore it rather than strand the operator.
     service('stop')
@@ -614,7 +721,7 @@ def rollback(actor=''):
     except Exception as error:
         error.recovery_backup = str(safety)
         try:
-            restore(safety)
+            restore(safety, recovery=True)
         except Exception as recovery:
             error.recovery_error = failure_message(recovery)
             warn(f'Rollback safety restore failed: {error.recovery_error}; backup: {safety}')
@@ -677,6 +784,8 @@ def main():
                     raise ValueError('Deployment identity is unreadable; refusing a release update.') from error
                 if not isinstance(identity, dict) or identity.get('deployment_mode') == 'local':
                     raise ValueError('Release installation is disabled for a local deployment.')
+        if request['mode'] != 'provenance':
+            guard_publishing_policy_migration()
         REQUEST.unlink()
         status('running', mode=request['mode'],
                backup=previous_backup,
@@ -758,7 +867,7 @@ def main():
         rolled_back = False
         try:
             if replaced:
-                recovery_verification = restore(backup)
+                recovery_verification = restore(backup, recovery=True)
                 rolled_back = True
             elif stopped:
                 service('start')

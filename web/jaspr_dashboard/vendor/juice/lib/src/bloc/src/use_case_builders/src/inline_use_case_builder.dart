@@ -160,12 +160,14 @@ typedef InlineHandler<TBloc extends JuiceBloc<TState>, TState extends BlocState,
 ///           groups: {CounterGroups.counter},
 ///         );
 ///       },
+///       concurrency: EventConcurrency.sequential,
 ///     ),
 ///
 ///     // Complex fetch - use class-based
 ///     () => UseCaseBuilder(
 ///       typeOfEvent: FetchDataEvent,
 ///       useCaseGenerator: () => FetchDataUseCase(),
+///       concurrency: EventConcurrency.droppable,
 ///     ),
 ///   ]);
 /// }
@@ -193,7 +195,7 @@ class InlineUseCaseBuilder<
     required this.typeOfEvent,
     required this.handler,
     UseCaseEventBuilder? initialEventBuilder,
-    this.concurrency = EventConcurrency.concurrent,
+    required this.concurrency,
   }) : _initialEventBuilder = initialEventBuilder;
 
   /// The event type this use case handles.
@@ -250,7 +252,7 @@ class _InlineUseCase<TBloc extends JuiceBloc<TState>, TState extends BlocState,
         newState: newState,
         groupsToRebuild: groups,
       ),
-      navigate: (aviator, args) => bloc.navigateAviator(aviator, args),
+      navigate: navigate,
     );
 
     final context = InlineContext<TBloc, TState>(

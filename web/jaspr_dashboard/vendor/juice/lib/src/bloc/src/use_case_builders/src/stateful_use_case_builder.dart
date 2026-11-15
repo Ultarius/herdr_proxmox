@@ -13,6 +13,7 @@ import '../../../bloc.dart';
 /// StatefulUseCaseBuilder(
 ///   typeOfEvent: ChatEvent,
 ///   useCaseGenerator: () => ChatConnectionUseCase(webSocketService),
+///   concurrency: EventConcurrency.sequential, // never restartable: one instance
 /// )
 /// ```
 class StatefulUseCaseBuilder extends UseCaseBuilderBase {
@@ -26,7 +27,7 @@ class StatefulUseCaseBuilder extends UseCaseBuilderBase {
       {required this.typeOfEvent,
       required this.useCaseGenerator,
       UseCaseEventBuilder? initialEventBuilder,
-      this.concurrency = EventConcurrency.concurrent})
+      required this.concurrency})
       : _initialEventBuilder = initialEventBuilder;
 
   /// The type of event this use case handles
@@ -65,8 +66,6 @@ class StatefulUseCaseBuilder extends UseCaseBuilderBase {
   /// allowing for proper resource cleanup.
   @override
   Future<void> close() async {
-    JuiceLoggerConfig.logger.log(
-        "Closing StatefulUseCase instance of type ${_instance.runtimeType}");
     _instance?.close();
     _instance = null;
   }

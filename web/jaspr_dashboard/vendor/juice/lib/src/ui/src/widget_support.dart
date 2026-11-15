@@ -6,6 +6,33 @@ const String _alwaysRebuild = '*';
 /// Special marker for indicating opt-out behavior
 const String _optOut = '-';
 
+/// What a Juice widget's bloc subscription depends on: the bloc
+/// instance(s), by identity. Passed as `JuiceAsyncBuilder`'s `streamKey`,
+/// so a parent rebuild over the same blocs keeps the subscription (no
+/// cancel + re-listen per rebuild) and one that swaps a bloc replaces it.
+/// The groups and `onStateChange` are applied through the builder's live
+/// `where`, so they need no place in the key.
+class SubscriptionKey {
+  const SubscriptionKey(this.blocs);
+
+  /// The observed bloc instances, compared by identity.
+  final List<Object> blocs;
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    if (other is! SubscriptionKey) return false;
+    if (other.blocs.length != blocs.length) return false;
+    for (var i = 0; i < blocs.length; i++) {
+      if (!identical(blocs[i], other.blocs[i])) return false;
+    }
+    return true;
+  }
+
+  @override
+  int get hashCode => Object.hashAll(blocs.map(identityHashCode));
+}
+
 /// Constant for triggering rebuilds in all participating widgets.
 ///
 /// When an event includes this in its rebuild groups, it will trigger rebuilds
@@ -55,13 +82,12 @@ const Set<String> optOutOfRebuilds = {_optOut};
 ///
 /// Parameters:
 /// * [event] - The event that triggered the potential rebuild
-/// * [key] - The widget's key (reserved for future use)
+
 /// * [rebuildGroups] - The set of rebuild groups specified by the widget
 ///
 /// Returns true if the widget should skip rebuilding, false if it should rebuild.
 bool denyRebuild({
   EventBase? event,
-  Object? key,
   required Set<String> rebuildGroups,
 }) {
   if (rebuildGroups.contains(_optOut)) {
@@ -80,7 +106,10 @@ bool denyRebuild({
 bool _isInRebuildGroup(EventBase? event, Set<String> rebuildGroups) {
   final groups = event?.groupsToRebuild;
   if (groups == null || groups.isEmpty) return false;
-  return groups.contains(_alwaysRebuild) ||
-      groups.intersection(rebuildGroups).isNotEmpty;
+  if (groups.contains(_alwaysRebuild)) return true;
+  // Every listening widget runs this per emission, so no intersection set
+  // is built: probe the larger set with the smaller one's members.
+  return groups.length <= rebuildGroups.length
+      ? groups.any(rebuildGroups.contains)
+      : rebuildGroups.any(groups.contains);
 }
-

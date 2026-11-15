@@ -18,6 +18,10 @@ extension type _Xterm._(JSObject _) implements JSObject {
   external void dispose();
   external JSObject onData(JSFunction listener);
   external JSObject onResize(JSFunction listener);
+  external JSObject onScroll(JSFunction listener);
+  external void scrollToLine(JSNumber line);
+  external void scrollToBottom();
+  external void attachCustomKeyEventHandler(JSFunction listener);
   external JSObject get buffer;
   external JSNumber get cols;
   external JSNumber get rows;
@@ -45,7 +49,7 @@ String _darkToken(String name, String fallback) {
 /// No canvas or WebGL addon is loaded. VT state, alternate buffers, selection,
 /// paste and keyboard input are handled by the same terminal emulator.
 class BrowserTerminal {
-  BrowserTerminal({int maxLines = 2000}) {
+  BrowserTerminal({int maxLines = 2000, bool readOnly = false}) {
     _term = _Xterm(
       {
             'scrollback': maxLines,
@@ -57,6 +61,7 @@ class BrowserTerminal {
             'lineHeight': 1.35,
             'cursorBlink': true,
             'screenReaderMode': true,
+            'disableStdin': readOnly,
             'theme': {
               'background': _darkToken('--color-surface-sunken', '#101414'),
               'foreground': _darkToken('--color-text', '#dce6e2'),
@@ -65,6 +70,16 @@ class BrowserTerminal {
           }.jsify()
           as JSObject,
     );
+    if (readOnly) {
+      // Snapshot output has no remote stdin. Keep keyboard navigation available
+      // to the surrounding page/fullscreen controls instead of consuming Tab
+      // and Escape as terminal input.
+      _term.attachCustomKeyEventHandler(
+        ((web.KeyboardEvent event) =>
+                event.key != 'Tab' && event.key != 'Escape')
+            .toJS,
+      );
+    }
     _term.onData(((JSString value) => onOutput?.call(value.toDart)).toJS);
     _term.onResize(
       ((JSObject size) {
@@ -74,28 +89,315 @@ class BrowserTerminal {
         );
       }).toJS,
     );
+    _term.onScroll(((JSNumber _) => _viewportChanged()).toJS);
   }
   late final _Xterm _term;
   void Function(String)? onOutput;
   void Function(int cols, int rows)? onResize;
   void Function()? onChange;
+  void Function()? onViewportChange;
   bool _disposed = false;
+  bool _snapshotWriting = false;
+  String? _pendingSnapshot;
+  ({int line, List<String?> anchor})? _snapshotReaderPosition;
+  bool _followingOutput = true;
+  web.HTMLElement? _viewport;
+  web.HTMLElement? _navigationRoot;
+  ({int serial, double top, int fromLine, bool towardTail})?
+  _pendingReaderScroll;
+  Timer? _readerScrollExpiry;
+  int _readerGestureSerial = 0;
+  bool _pointerNavigation = false, _pointerTouch = false;
+  double _pointerY = 0;
+  late final JSFunction _readerGesture = ((web.Event event) {
+    // package:web event wrappers erase to JSObject; branch by event.type.
+    if (event.type == 'keydown') {
+      final key = event as web.KeyboardEvent;
+      if (!const [
+        'PageUp',
+        'PageDown',
+        'Home',
+        'End',
+        'ArrowUp',
+        'ArrowDown',
+        ' ',
+      ].contains(key.key))
+        return;
+      _observeReaderGesture(
+        const ['PageDown', 'End', 'ArrowDown'].contains(key.key) ||
+            (key.key == ' ' && !key.shiftKey),
+      );
+    } else if (event.type == 'wheel') {
+      final wheel = event as web.WheelEvent;
+      if (wheel.deltaY != 0) _observeReaderGesture(wheel.deltaY > 0);
+    } else if (event.type == 'pointerdown') {
+      final pointer = event as web.PointerEvent;
+      final bounds = _viewport?.getBoundingClientRect();
+      // A held pointer alone is never evidence that the viewport moved.
+      if (pointer.pointerType != 'touch' &&
+          (bounds == null || pointer.clientX < bounds.right - 22))
+        return;
+      _pointerNavigation = true;
+      _pointerTouch = pointer.pointerType == 'touch';
+      _pointerY = pointer.clientY.toDouble();
+      _observeReaderGesture(true);
+    }
+  }).toJS;
+  late final JSFunction _readerPointerMove = ((web.Event event) {
+    if (!_pointerNavigation) return;
+    final pointer = event as web.PointerEvent;
+    final delta = pointer.clientY - _pointerY;
+    _pointerY = pointer.clientY.toDouble();
+    if (delta != 0)
+      _observeReaderGesture(_pointerTouch ? delta < 0 : delta > 0);
+  }).toJS;
+  late final JSFunction _endReaderGesture = ((web.Event _) {
+    _pointerNavigation = false;
+  }).toJS;
+  late final JSFunction _cancelReaderGesture = ((web.Event _) {
+    _pointerNavigation = false;
+    _clearReaderGesture();
+  }).toJS;
+  late final JSFunction _viewportScroll = ((web.Event _) {
+    // Native scrollbar scrolling suppresses xterm's public onScroll event.
+    // Observe after its handler, correlating intent with a real DOM movement.
+    scheduleMicrotask(() {
+      if (_disposed) return;
+      final pending = _pendingReaderScroll;
+      final sameMovement =
+          pending != null && (_viewport!.scrollTop - pending.top).abs() <= 1;
+      // Xterm can ignore a queued scrollbar synchronization event before the
+      // reader's event. Keep intent until the buffer actually reflects a move.
+      final readerNavigation =
+          sameMovement &&
+          viewportLine != pending.fromLine &&
+          (viewportLine < lastViewportLine || pending.towardTail);
+      if (pending != null && (readerNavigation || !sameMovement)) {
+        _clearReaderGesture();
+      }
+      _viewportChanged(readerNavigation: readerNavigation);
+    });
+  }).toJS;
+
+  void _clearReaderGesture() {
+    _readerGestureSerial++;
+    _readerScrollExpiry?.cancel();
+    _readerScrollExpiry = null;
+    _pendingReaderScroll = null;
+  }
+
+  void _observeReaderGesture(bool towardTail) {
+    final viewport = _viewport;
+    if (_disposed || viewport == null) return;
+    _clearReaderGesture();
+    final serial = _readerGestureSerial;
+    final beforeTop = viewport.scrollTop;
+    final beforeLine = viewportLine;
+    // Xterm changes scrollTop synchronously for ordinary wheel/key input.
+    // Ignored keys and pointer presses without movement must leave no intent
+    // for a later, unrelated snapshot parser event to consume.
+    scheduleMicrotask(() {
+      if (_disposed || serial != _readerGestureSerial || viewport != _viewport)
+        return;
+      if (viewportLine != beforeLine) {
+        _viewportChanged(readerNavigation: true);
+      } else if (viewport.scrollTop != beforeTop) {
+        _pendingReaderScroll = (
+          serial: serial,
+          top: viewport.scrollTop,
+          fromLine: beforeLine,
+          towardTail: towardTail,
+        );
+        // A queued native scroll is normally delivered in the next frame. A
+        // lost/suppressed event cannot leave navigation authority indefinitely.
+        _readerScrollExpiry = Timer(const Duration(milliseconds: 250), () {
+          if (_pendingReaderScroll?.serial == serial) _clearReaderGesture();
+        });
+      }
+    });
+  }
+
+  bool get followingOutput => _followingOutput;
+  JSObject get _active => _term.buffer.getProperty<JSObject>('active'.toJS);
+  int get viewportLine =>
+      _active.getProperty<JSNumber>('viewportY'.toJS).toDartInt;
+  int get lastViewportLine =>
+      _active.getProperty<JSNumber>('baseY'.toJS).toDartInt;
   int get viewWidth => _term.cols.toDartInt;
   int get viewHeight => _term.rows.toDartInt;
+
+  /// Append interactive output deltas, retaining xterm's native scroll rules.
+  /// Complete polled inspections use [replaceSnapshot] and restore the reader.
   void write(String value) {
     if (_disposed) return;
-    _term.write(value.toJS, (() => onChange?.call()).toJS);
+    _term.write(
+      value.toJS,
+      (() {
+        if (_disposed) return;
+        _observeViewport();
+        onChange?.call();
+      }).toJS,
+    );
   }
 
   void clear() {
     if (!_disposed) _term.reset();
   }
 
-  /// Queue complete inspections atomically. Resetting synchronously before an
-  /// asynchronous write lets an older queued inspection append after the reset.
-  /// RIS travels through the same VT parser queue as its replacement output.
+  void _viewportChanged({bool readerNavigation = false}) {
+    if (_disposed) return;
+    final following = viewportLine >= lastViewportLine;
+    if (_snapshotWriting) {
+      // RIS resets to an empty tail and parser output follows that tail. A
+      // viewport below it is reader navigation, even during a long write.
+      // Retain that newer intent instead of restoring the pre-write position.
+      if (following && !readerNavigation) return;
+      // Reaching the tail by reader navigation resumes following, while an
+      // automatic parser reset/tail event must retain the reader's anchor.
+      _snapshotReaderPosition = following ? null : _capturePosition();
+    }
+    if (following == _followingOutput) return;
+    _followingOutput = following;
+    onViewportChange?.call();
+  }
+
+  void _observeViewport() {
+    final viewport =
+        _term.element?.querySelector('.xterm-viewport') as web.HTMLElement?;
+    if (viewport == _viewport) return;
+    _clearReaderGesture();
+    _pointerNavigation = false;
+    _viewport?.removeEventListener('scroll', _viewportScroll);
+    _viewport = viewport;
+    viewport?.addEventListener('scroll', _viewportScroll);
+    final root = _term.element;
+    if (root != _navigationRoot) {
+      _detachNavigation();
+      _navigationRoot = root;
+      for (final type in ['wheel', 'keydown', 'pointerdown']) {
+        root?.addEventListener(type, _readerGesture, true.toJS);
+      }
+      if (root != null) {
+        web.window.addEventListener('pointermove', _readerPointerMove);
+        web.window.addEventListener('pointerup', _endReaderGesture);
+        web.window.addEventListener('pointercancel', _cancelReaderGesture);
+        web.window.addEventListener('lostpointercapture', _cancelReaderGesture);
+        web.window.addEventListener('blur', _cancelReaderGesture);
+      }
+    }
+  }
+
+  void _detachNavigation() {
+    for (final type in ['wheel', 'keydown', 'pointerdown']) {
+      _navigationRoot?.removeEventListener(type, _readerGesture, true.toJS);
+    }
+    web.window.removeEventListener('pointermove', _readerPointerMove);
+    web.window.removeEventListener('pointerup', _endReaderGesture);
+    web.window.removeEventListener('pointercancel', _cancelReaderGesture);
+    web.window.removeEventListener('lostpointercapture', _cancelReaderGesture);
+    web.window.removeEventListener('blur', _cancelReaderGesture);
+    _navigationRoot = null;
+    _clearReaderGesture();
+    _pointerNavigation = false;
+  }
+
+  /// Moving back to the bottom resumes following subsequent inspections.
+  void jumpToLatest() {
+    if (_disposed) return;
+    _clearReaderGesture();
+    _followingOutput = true;
+    _snapshotReaderPosition = null;
+    _term.scrollToBottom();
+    onViewportChange?.call();
+  }
+
+  void scrollToLine(int line) {
+    if (_disposed) return;
+    _clearReaderGesture();
+    _term.scrollToLine(line.clamp(0, lastViewportLine).toJS);
+    // Explicit navigation is authoritative even when xterm emits no event
+    // because the requested line was already its temporary parser tail.
+    _viewportChanged(readerNavigation: true);
+  }
+
+  String? _lineText(JSObject active, int index) => active
+      .callMethod<JSObject?>('getLine'.toJS, index.toJS)
+      ?.callMethod<JSString>('translateToString'.toJS, true.toJS)
+      .toDart;
+
+  ({int line, List<String?> anchor}) _capturePosition() => (
+    line: viewportLine,
+    anchor: [
+      for (var offset = 0; offset < 3; offset++)
+        _lineText(_active, viewportLine + offset),
+    ],
+  );
+
+  int _matchingPosition(({int line, List<String?> anchor}) position) {
+    final fallback = position.line.clamp(0, lastViewportLine);
+    if (!position.anchor.any((line) => line?.trim().isNotEmpty ?? false)) {
+      return fallback;
+    }
+    final active = _active;
+    final decoded = <int, String?>{};
+    String? lineAt(int line) =>
+        decoded.putIfAbsent(line, () => _lineText(active, line));
+    bool matches(int line) =>
+        line >= 0 &&
+        line <= lastViewportLine &&
+        const [
+          0,
+          1,
+          2,
+        ].every((offset) => lineAt(line + offset) == position.anchor[offset]);
+    // Most polls keep the same prefix: check the current position first, then
+    // search outwards. Stop at the nearest match (lower line wins a tie), and
+    // decode each candidate line at most once if retained output has shifted.
+    for (var distance = 0; distance <= lastViewportLine; distance++) {
+      final before = fallback - distance;
+      if (matches(before)) return before;
+      final after = fallback + distance;
+      if (distance > 0 && matches(after)) return after;
+    }
+    return fallback;
+  }
+
+  /// Serialize complete inspections, including their viewport restoration.
+  /// Capturing every viewport before queuing RIS would instead capture an
+  /// intermediate reset position for later polls. Pending polls coalesce to the
+  /// newest snapshot while a write is in progress.
   void replaceSnapshot(String value) {
-    write('\x1bc$value');
+    if (_disposed) return;
+    _pendingSnapshot = value;
+    if (!_snapshotWriting) _writeSnapshot();
+  }
+
+  void _writeSnapshot() {
+    if (_disposed || _pendingSnapshot == null) return;
+    final value = _pendingSnapshot!;
+    _pendingSnapshot = null;
+    final previous = _capturePosition();
+    _snapshotReaderPosition = null;
+    _snapshotWriting = true;
+    // RIS must travel through the same parser queue as replacement output.
+    _term.write(
+      ('\x1bc$value').toJS,
+      (() {
+        if (_disposed) return;
+        _observeViewport();
+        final reader = _snapshotReaderPosition;
+        _snapshotReaderPosition = null;
+        _snapshotWriting = false;
+        if (_followingOutput && reader == null) {
+          _term.scrollToBottom();
+        } else {
+          _term.scrollToLine(_matchingPosition(reader ?? previous).toJS);
+        }
+        _viewportChanged();
+        onChange?.call();
+        if (_pendingSnapshot != null) _writeSnapshot();
+      }).toJS,
+    );
   }
 
   void focus() {
@@ -134,6 +436,11 @@ class BrowserTerminal {
     onOutput = null;
     onResize = null;
     onChange = null;
+    onViewportChange = null;
+    _pendingSnapshot = null;
+    _viewport?.removeEventListener('scroll', _viewportScroll);
+    _viewport = null;
+    _detachNavigation();
     _term.dispose();
   }
 }
@@ -143,11 +450,13 @@ class TerminalView extends StatefulComponent {
     this.terminal, {
     super.key,
     this.height = 400,
+    this.fill = false,
     this.autofocus = true,
     this.label = 'Interactive terminal',
   });
   final BrowserTerminal terminal;
   final int height;
+  final bool fill;
   final bool autofocus;
   final String label;
   @override
@@ -182,7 +491,9 @@ class _TerminalViewState extends State<TerminalView> {
   @override
   void didUpdateComponent(TerminalView old) {
     super.didUpdateComponent(old);
-    if (old.terminal != component.terminal || old.height != component.height) {
+    if (old.terminal != component.terminal ||
+        old.height != component.height ||
+        old.fill != component.fill) {
       // A stream can replace its controller while Jaspr retains the host state.
       // Rebind after its new attributes and owner have finished rendering.
       Timer.run(() {
@@ -212,6 +523,9 @@ class _TerminalViewState extends State<TerminalView> {
       attached = terminal;
       if (component.autofocus) terminal.focus();
     }
+    // Recheck after a reveal/rebind/resize in case the emulator replaces its
+    // viewport element. The observer moves its listener without accumulating it.
+    terminal._observeViewport();
     fit(host);
     // Revealing a disclosure may leave unchanged row/column counts. Explicit
     // refresh still paints snapshots written while its panel was hidden.
@@ -245,9 +559,11 @@ class _TerminalViewState extends State<TerminalView> {
   @override
   Component build(BuildContext context) => dom.div(
     id: id,
-    classes: 'terminal-host',
+    classes: 'terminal-host${component.fill ? ' terminal-host--fill' : ''}',
     attributes: {
-      'style': 'height:${component.height}px;padding:8px;overflow:hidden',
+      'style':
+          '${component.fill ? '' : 'height:${component.height}px;'}'
+          'padding:8px;overflow:hidden',
       'aria-label': component.label,
     },
     [],

@@ -1,3 +1,5 @@
+import 'package:herdr_dashboard_state/settings_bloc.dart';
+import 'feature_view.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 
@@ -11,85 +13,32 @@ class ToolchainCard extends StatefulWidget {
   State<ToolchainCard> createState() => _ToolchainCardState();
 }
 
-class _ToolchainCardState extends State<ToolchainCard> {
-  // Resolved once: asking the scope for a bloc while building disturbs the
-  // surrounding shell's blocs.
+class _ToolchainCardState extends State<ToolchainCard>
+    with FeatureView<ToolchainCard> {
   late final DashboardBloc connection;
-  Map<String, dynamic> sdk = const {};
-  bool busy = false;
-  bool refreshing = false;
-  String? requestError;
-  Timer? timer;
-  int pollTick = 0;
-
+  late final ToolchainBloc bloc;
+  Map<String, dynamic> get sdk => bloc.sdk;
+  bool get busy => featureBusy;
+  bool get refreshing => bloc.state.loading;
+  String? get requestError => bloc.state.errors['install'];
+  Map<String, dynamic> get toolchains => bloc.toolchains;
+  bool get queued => bloc.queued;
   @override
   void initState() {
     super.initState();
     connection = BlocScope.get<DashboardBloc>();
+    bindFeature(bloc = ToolchainBloc(connection));
     refresh();
-    timer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (queued || ++pollTick % 6 == 0) refresh();
-    });
   }
 
-  @override
-  void dispose() {
-    timer?.cancel();
-    super.dispose();
-  }
-
-  Future<void> refresh({bool showProgress = false}) async {
-    if (refreshing || !connection.state.connected) return;
-    // Assigned rather than set: initState calls this before the first build,
-    // and marking a widget dirty during build is illegal. The completion below
-    // still repaints, so the indicator is correct once there is a frame.
-    refreshing = true;
-    if (showProgress) setState(() {});
-    final epoch = connection.generation;
-    try {
-      final data = await connection.request('sdk');
-      if (mounted && epoch == connection.generation)
-        setState(() => sdk = Map<String, dynamic>.from(data));
-    } catch (error) {
-      if (mounted && epoch == connection.generation)
-        setState(() => sdk = {'state': 'unavailable', 'error': '$error'});
-    } finally {
-      if (mounted) setState(() => refreshing = false);
-    }
-  }
-
+  Future<void> refresh({bool showProgress = false}) => bloc.refresh();
   Future<void> install(String toolchain) async {
-    if (busy || !connection.state.connected) return;
-    final epoch = connection.generation;
-    setState(() {
-      busy = true;
-      requestError = null;
-    });
-    try {
-      await connection.request('sdk/install', {'toolchain': toolchain});
-      if (mounted && epoch == connection.generation)
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              '$toolchain installation queued. The root service installs the pinned toolchain.',
-            ),
-          ),
-        );
-    } catch (error) {
-      if (mounted && epoch == connection.generation)
-        setState(() => requestError = '$error');
-    } finally {
-      if (mounted) {
-        setState(() => busy = false);
-        await refresh();
-      }
+    if (await bloc.install(toolchain) && mounted && featureMessage != null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(featureMessage!)));
     }
   }
-
-  Map<String, dynamic> get toolchains =>
-      (sdk['toolchains'] as Map?)?.cast<String, dynamic>() ?? const {};
-
-  bool get queued => sdk['state'] == 'queued' || sdk['state'] == 'running';
 
   @override
   Widget build(BuildContext context) {

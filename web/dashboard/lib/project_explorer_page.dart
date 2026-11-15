@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/workspace_blocs.dart';
 import 'package:juice/juice.dart';
 import 'clipboard_copy.dart';
 import 'dashboard_bloc.dart';
@@ -12,55 +13,37 @@ class ProjectExplorerPage extends StatefulWidget {
 }
 
 class _ProjectExplorerPageState extends State<ProjectExplorerPage> {
-  Map<String, dynamic>? directory;
-  Map<String, dynamic>? preview;
-  String path = '';
+  late final ExplorerBloc feature;
+  StreamSubscription? featureSubscription;
+  Map<String, dynamic>? get directory => feature.state.value('directory');
+  Map<String, dynamic>? get preview => feature.state.value('preview');
+  String get path => feature.state.value<String>('path') ?? '';
   String filter = '';
-  String? error;
-  bool busy = false;
-  bool showHidden = false;
-  bool gitView = false;
-  int generation = 0;
-
+  String? get error => feature.state.error;
+  bool get busy => feature.state.loading;
+  bool showHidden = false, gitView = false;
   @override
   void initState() {
     super.initState();
+    feature = ExplorerBloc(BlocScope.get<DashboardBloc>());
+    featureSubscription = feature.stream.listen((_) {
+      if (mounted) setState(() {});
+    });
     // A notice can link straight to one checkout's Git changes.
     if (widget.initialPath.isNotEmpty) gitView = true;
     open(widget.initialPath);
   }
 
+  @override
+  void dispose() {
+    featureSubscription?.cancel();
+    feature.dispose();
+    super.dispose();
+  }
+
   Future<void> open(String selected) async {
-    final connection = BlocScope.get<DashboardBloc>();
-    final epoch = connection.generation;
-    final current = ++generation;
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    try {
-      final data = Map<String, dynamic>.from(
-        await connection.request('projects/browse', {'path': selected}),
-      );
-      if (!mounted || current != generation || epoch != connection.generation)
-        return;
-      setState(() {
-        if (data['kind'] == 'folder') {
-          directory = data;
-          path = selected;
-          preview = null;
-          filter = '';
-        } else {
-          preview = data;
-        }
-      });
-    } catch (exception) {
-      if (mounted && current == generation && epoch == connection.generation)
-        setState(() => error = exception.toString());
-    } finally {
-      if (mounted && current == generation && epoch == connection.generation)
-        setState(() => busy = false);
-    }
+    if (await feature.open(selected) == true && mounted)
+      setState(() => filter = '');
   }
 
   String size(dynamic bytes) {
@@ -108,7 +91,7 @@ class _ProjectExplorerPageState extends State<ProjectExplorerPage> {
               ),
               IconButton(
                 tooltip: 'Close preview',
-                onPressed: () => setState(() => preview = null),
+                onPressed: feature.closePreview,
                 icon: const Icon(Icons.close),
               ),
             ],

@@ -1,7 +1,7 @@
+import 'package:herdr_dashboard_state/planning_blocs.dart';
 import 'dart:convert';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
-import 'request_id.dart';
 
 class OrganizationAutomation extends StatefulWidget {
   const OrganizationAutomation({super.key, required this.organizationId});
@@ -12,111 +12,42 @@ class OrganizationAutomation extends StatefulWidget {
 
 class _OrganizationAutomationState extends State<OrganizationAutomation> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
-  Map<String, dynamic>? policy;
-  Map<String, dynamic>? pending;
-  String? error;
-  bool busy = false;
-  int generation = -1;
+  late final OrganizationAutomationBloc bloc;
   StreamSubscription? subscription;
+  Map<String, dynamic>? get policy => bloc.policy;
+  Map<String, dynamic>? get pending => bloc.pending;
+  String? get error => bloc.pageError;
+  bool get busy => bloc.state.busy || bloc.state.loading;
+
   @override
   void initState() {
     super.initState();
-    generation = connection.generation;
-    subscription = connection.stream.listen((_) {
-      if (!mounted) return;
-      if (generation != connection.generation || !connection.state.connected) {
-        generation = connection.generation;
-        setState(() {
-          policy = null;
-          pending = null;
-          error = null;
-        });
-      }
-      if (policy == null && connection.state.connected) refresh();
+    bloc = OrganizationAutomationBloc(connection, widget.organizationId);
+    subscription = bloc.stream.listen((_) {
+      if (mounted) setState(() {});
     });
-    connection.notificationRevision.addListener(refresh);
     refresh();
   }
 
   @override
   void dispose() {
     subscription?.cancel();
-    connection.notificationRevision.removeListener(refresh);
+    bloc.dispose();
     super.dispose();
   }
 
-  Future<void> refresh() async {
-    if (busy || !connection.state.connected) return;
-    final epoch = connection.generation;
-    setState(() => busy = true);
-    try {
-      final result = await connection.request(
-        'organizations/automation?organization_id=${Uri.encodeQueryComponent(widget.organizationId)}',
-      );
-      if (mounted && epoch == connection.generation)
-        setState(() {
-          policy = Map<String, dynamic>.from(result['policy']);
-          error = null;
-        });
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() => error = '$e');
-    } finally {
-      if (mounted) {
-        setState(() => busy = false);
-        if (epoch != connection.generation && connection.state.connected)
-          refresh();
-      }
-    }
-  }
+  Future<void> refresh() => bloc.refresh();
 
   Future<void> edit() async {
     final epoch = connection.generation;
     final chosen = await editOrganizationAutomation(context, policy!);
     if (!mounted || epoch != connection.generation || chosen == null) return;
-    pending = {
-      'organization_id': widget.organizationId,
-      ...chosen,
-      'request_id': newRequestId(),
-    };
+    bloc.prepare(chosen);
     await save();
   }
 
-  Future<void> save() async {
-    if (busy ||
-        pending == null ||
-        !connection.state.connected ||
-        connection.operator.value['role'] != 'admin')
-      return;
-    final epoch = connection.generation;
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    try {
-      final result = await connection.request('tasks/automation', pending);
-      if (mounted && epoch == connection.generation)
-        setState(() {
-          policy = Map<String, dynamic>.from(result['policy']);
-          pending = null;
-        });
-    } catch (e) {
-      if (mounted && epoch == connection.generation)
-        setState(() {
-          error = '$e';
-          if (e is DashboardRequestException &&
-              e.statusCode >= 400 &&
-              e.statusCode < 500)
-            pending = null;
-        });
-    } finally {
-      if (mounted) {
-        setState(() => busy = false);
-        if (epoch != connection.generation && connection.state.connected)
-          refresh();
-      }
-    }
-  }
+  Future<void> save({bool fromDialog = false}) =>
+      bloc.save(fromDialog: fromDialog);
 
   @override
   Widget build(BuildContext context) {

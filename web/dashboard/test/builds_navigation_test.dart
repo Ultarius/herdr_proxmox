@@ -19,23 +19,34 @@ void main() {
       ),
     );
     BlocScope.register<DashboardBloc>(() => connection);
-    await tester.pumpWidget(
-      MaterialApp(
-        home: AppShell(
-          coordinator: AppCoordinator(),
-          section: 'builds',
-          child: const Text('Build content'),
+    final loaded = connection.stream.firstWhere(
+      (_) => connection.state.refreshed != null,
+    );
+    connection.connect('admin');
+    final coordinator = AppCoordinator();
+    try {
+      await loaded;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: AppShell(
+            coordinator: coordinator,
+            section: 'builds',
+            child: const Text('Build content'),
+          ),
         ),
-      ),
-    );
-    await tester.pumpAndSettle();
-    expect(
-      tester.widget<NavigationBar>(find.byType(NavigationBar)).selectedIndex,
-      4,
-    );
-    expect(find.text('Build content'), findsOneWidget);
-    expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox.shrink());
-    await BlocScope.reset();
+      );
+      await tester.pumpAndSettle();
+      expect(
+        tester.widget<NavigationBar>(find.byType(NavigationBar)).selectedIndex,
+        4,
+      );
+      expect(find.text('Build content'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    } finally {
+      await tester.pumpWidget(const SizedBox.shrink());
+      await connection.disconnect();
+      coordinator.dispose();
+      await BlocScope.reset();
+    }
   });
 }

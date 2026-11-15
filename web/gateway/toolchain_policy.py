@@ -7,7 +7,7 @@ in step. Resolving that declaration into a policy and hashing it gives one value
 — the digest — that a task, a verification run and a publication gate can all
 compare against.
 
-Nothing here trusts a label. A declared `flutter-3.44.8` cannot prove which
+Nothing here trusts a label. A declared `flutter-3.47.9` cannot prove which
 executable ran, so verification probes the real binary and records what it
 actually reported.
 """

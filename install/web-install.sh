@@ -7,6 +7,22 @@ cd /opt/herdr-web
   echo 'Build the pinned Flutter/Jaspr UI first with scripts/build-web.sh.' >&2; exit 1;
 }
 id herdr >/dev/null
+chown root:root /opt/herdr-web /opt/herdr-web/web
+chmod go-w /opt/herdr-web /opt/herdr-web/web
+chown -R root:root web/gateway
+chmod -R go-w web/gateway
+# Deployment policy is operator data, outside the replaceable release tree.
+install -d -o root -g root -m 0755 /etc/herdr
+if [[ ! -e /etc/herdr/publishing-policy.json && ! -L /etc/herdr/publishing-policy.json ]]; then
+  install -o root -g root -m 0444 web/gateway/publishing-policy.json /etc/herdr/publishing-policy.json
+fi
+python3 - <<'PY_POLICY'
+import sys
+from pathlib import Path
+sys.path.insert(0, '/opt/herdr-web/web/gateway')
+from publication_policy import arm
+arm(Path('/etc/herdr/publishing-policy.json'))
+PY_POLICY
 install -d -o root -g root -m 0755 /var/lib/herdr-updater
 install -d -o herdr -g herdr -m 0700 /var/lib/herdr-update-requests
 install -o root -g root -m 0755 install/dashboard-update.py /usr/local/sbin/herdr-dashboard-update

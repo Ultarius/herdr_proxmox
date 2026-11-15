@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/settings_bloc.dart';
 import 'operations_support.dart';
 import 'dashboard_access_controls.dart';
 import 'ops_ui.dart';
@@ -8,38 +9,23 @@ class SshAccessCard extends StatefulComponent {
   State<SshAccessCard> createState() => _SshState();
 }
 
-class _SshState extends OperationsState<SshAccessCard> {
+class _SshState extends FeatureOperationsState<SshAccessCard> {
   String publicKey = '';
-  int? count;
+  late final SshAccessBloc bloc;
+  int? get count => bloc.count;
+  bool get loading => bloc.state.loading;
   @override
   void initState() {
     super.initState();
+    bindFeature(bloc = SshAccessBloc(connection));
     load();
   }
 
-  Future<void> load() async {
-    final epoch = connection.generation;
-    try {
-      final data = await connection.request('ssh-access');
-      if (valid(epoch)) setState(() => count = data['key_count'] as int?);
-    } catch (e) {
-      if (valid(epoch)) setState(() => error = '$e');
-    }
+  Future<void> load() => bloc.refresh();
+  Future<void> add() async {
+    if (await bloc.add(publicKey) && mounted) setState(() => publicKey = '');
   }
 
-  Future<void> add() => perform((epoch) async {
-    final data = await connection.request('ssh-access/add', {
-      'public_key': publicKey,
-    });
-    if (valid(epoch))
-      setState(() {
-        publicKey = '';
-        count = data['key_count'] as int;
-        message = data['added'] == true
-            ? 'Public key added. You can now connect as herdr over SSH.'
-            : 'This public key is already configured.';
-      });
-  });
   @override
   Component build(BuildContext context) => el('div', [
     card(
@@ -53,12 +39,21 @@ class _SshState extends OperationsState<SshAccessCard> {
           (
             'Public keys',
             count == null
-                ? none()
+                ? text(
+                    loading ? 'Loading key status…' : 'Key status unavailable.',
+                  )
                 : text(
                     '$count SSH public key${count == 1 ? '' : 's'} configured',
                   ),
           ),
         ]),
+        if (error != null)
+          button(
+            'Retry key status',
+            load,
+            disabled: loading,
+            iconName: 'refresh-cw',
+          ),
         textarea(
           'SSH public key (.pub)',
           publicKey,
@@ -68,9 +63,14 @@ class _SshState extends OperationsState<SshAccessCard> {
           busy ? 'Adding key…' : 'Add SSH public key',
           add,
           primary: true,
-          disabled: busy,
+          disabled: busy || !admin,
           iconName: 'plus',
         ),
+        if (!admin)
+          meta(
+            'Only an administrator can add an SSH public key.',
+            iconName: 'lock',
+          ),
         feedback(),
       ],
       iconName: 'key-round',

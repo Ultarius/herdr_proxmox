@@ -1,5 +1,7 @@
+import 'package:herdr_dashboard_state/knowledge_bloc.dart';
 import 'native_task_ui.dart';
 import 'package:jaspr/dom.dart' as dom;
+import 'package:web/web.dart' as web;
 import '../services.dart';
 import '../ui.dart' as ui;
 import 'ops_ui.dart' as ops;
@@ -28,103 +30,58 @@ class KnowledgePage extends StatefulComponent {
 class _KnowledgePageState extends State<KnowledgePage> {
   DashboardBloc get connection => dashboardConnection;
   final search = TextEditingController();
-  List<Map<String, dynamic>> organizations = [], records = [];
-  List<String> repositories = [];
+  late final KnowledgeBloc bloc;
+  StreamSubscription? featureSubscription;
+  List<Map<String, dynamic>> get organizations => bloc.state.organizations;
+  List<Map<String, dynamic>> get records => bloc.state.records;
+  List<String> get repositories => bloc.state.repositories;
+  int? get before => bloc.state.before;
+  String? get error => bloc.state.error;
+  bool get loading => bloc.state.loading;
+  bool get mutating => bloc.state.mutating;
+  bool get initializing => bloc.state.initializing;
+  bool get busy => bloc.state.busy;
   String org = '', repository = '', kind = '', status = '';
-  String? error;
-  int? before;
-  int request = 0;
-  bool busy = false;
   Timer? debounce;
   bool get admin => connection.operator.value['role'] == 'admin';
 
   @override
   void initState() {
     super.initState();
-    initialize();
+    bloc = KnowledgeBloc(connection);
+    featureSubscription = bloc.stream.listen((_) {
+      if (!mounted) return;
+      if (org.isEmpty || !organizations.any((item) => item['id'] == org))
+        org = bloc.state.organization;
+      setState(() {});
+    });
+    bloc.initialize(component.organizationId);
   }
 
   @override
   void dispose() {
-    request++;
     debounce?.cancel();
+    featureSubscription?.cancel();
+    bloc.dispose();
     search.dispose();
     super.dispose();
   }
 
-  Future<void> initialize() async {
-    try {
-      final directory = await connection.request('organizations/directory');
-      if (!mounted) return;
-      organizations = List<Map<String, dynamic>>.from(
-        directory['organizations'] ?? [],
-      );
-      org = organizations.any((o) => o['id'] == component.organizationId)
-          ? component.organizationId
-          : '${organizations.firstOrNull?['id'] ?? ''}';
-      if (org.isEmpty) {
-        setState(() {});
-        return;
-      }
-      await load();
-    } catch (e) {
-      if (mounted) setState(() => error = '$e');
-    }
-  }
+  Future<void> load({bool more = false}) => bloc.load(
+    KnowledgeQuery(
+      organization: org,
+      repository: repository,
+      kind: kind,
+      status: status,
+      query: search.text,
+    ),
+    more: more,
+  );
 
-  Future<void> load({bool more = false}) async {
-    if (org.isEmpty) return;
-    final current = ++request, epoch = connection.generation;
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    try {
-      final result = await connection.request('knowledge', {
-        'mode': 'list',
-        'organization_id': org,
-        'repository': repository,
-        'kind': kind,
-        'state': status,
-        'query': search.text,
-        if (more && before != null) 'before': before,
-      });
-      if (!mounted || current != request || epoch != connection.generation)
-        return;
-      setState(() {
-        final incoming = List<Map<String, dynamic>>.from(result['records']);
-        records = more ? [...records, ...incoming] : incoming;
-        repositories = List<String>.from(result['repositories']);
-        before = result['next_before'] as int?;
-      });
-    } catch (e) {
-      if (mounted && current == request) setState(() => error = '$e');
-    } finally {
-      if (mounted && current == request) setState(() => busy = false);
-    }
-  }
-
-  Future<void> mutate(Map<String, dynamic> body) async {
-    final selectedOrg = org, epoch = connection.generation;
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    try {
-      await connection.request('knowledge', {
-        'organization_id': selectedOrg,
-        ...body,
-      });
-      if (mounted && org == selectedOrg && epoch == connection.generation)
-        await load();
-    } catch (e) {
-      if (mounted) setState(() => error = '$e');
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
+  Future<void> mutate(Map<String, dynamic> body) => bloc.mutate(body);
 
   Future<void> create() async {
+    if (busy || org.isEmpty || !admin) return;
     final title = TextEditingController(), body = TextEditingController();
     var selectedKind = 'finding', selectedRepo = repository;
     final form = FormKey();
@@ -232,6 +189,7 @@ class _KnowledgePageState extends State<KnowledgePage> {
     Map<String, dynamic> record, {
     bool supersede = false,
   }) async {
+    if (busy || !admin) return;
     final reason = TextEditingController();
     String? replacement;
     final candidates = records
@@ -361,36 +319,59 @@ class _KnowledgePageState extends State<KnowledgePage> {
           classes: 'search-field__clear',
         ),
     ], classes: 'search-field knowledge-search'),
-    if (organizations.isNotEmpty)
-      ui.select(
-        'Organization',
-        org,
-        {for (final o in organizations) '${o['id']}': '${o['name']}'},
-        (v) {
-          setState(() {
-            org = v;
-            repository = '';
-            records = [];
-          });
-          load();
-        },
-      ),
-    ui.select(
-      'Repositories',
-      repository,
-      {'': 'All repositories', for (final r in repositories) r: r},
-      (v) {
-        repository = v;
-        load();
-      },
-    ),
-    ui.select(
-      'Kinds',
-      kind,
-      {'': 'All kinds', for (final k in knowledgeKinds) k: capitalized(k)},
-      (v) {
-        kind = v;
-        load();
+    ui.el(
+      'details',
+      [
+        ui.el('summary', [
+          ui.icon('filter'),
+          ui.text('Filters'),
+          if ([repository, kind, status].any((value) => value.isNotEmpty))
+            ui.badge(
+              '${[repository, kind, status].where((value) => value.isNotEmpty).length} active',
+            ),
+        ]),
+        ui.el('div', [
+          if (organizations.isNotEmpty)
+            ui.select(
+              'Organization',
+              org,
+              {for (final o in organizations) '${o['id']}': '${o['name']}'},
+              (v) {
+                setState(() {
+                  org = v;
+                  repository = '';
+                  bloc.clearRecords();
+                });
+                load();
+              },
+            ),
+          ui.select(
+            'Repositories',
+            repository,
+            {'': 'All repositories', for (final r in repositories) r: r},
+            (v) {
+              repository = v;
+              load();
+            },
+          ),
+          ui.select(
+            'Kinds',
+            kind,
+            {
+              '': 'All kinds',
+              for (final k in knowledgeKinds) k: capitalized(k),
+            },
+            (v) {
+              kind = v;
+              load();
+            },
+          ),
+          stateChips(),
+        ], classes: 'knowledge-filter-fields'),
+      ],
+      classes: 'knowledge-filters',
+      attributes: {
+        if (!web.window.matchMedia('(max-width: 639.98px)').matches) 'open': '',
       },
     ),
   ], classes: 'knowledge-toolbar');
@@ -444,6 +425,7 @@ class _KnowledgePageState extends State<KnowledgePage> {
           type: dom.ButtonType.button,
           classes: 'knowledge-record__toggle',
           attributes: {
+            'id': 'knowledge-record-toggle-$id',
             'aria-expanded': '$open',
             'aria-controls': 'knowledge-record-$id',
             // Keep the absolute accessible metadata inside its disclosure;
@@ -473,92 +455,93 @@ class _KnowledgePageState extends State<KnowledgePage> {
           ui.el('span', [ui.text(repository)], classes: 'mono-chip'),
         ], classes: 'knowledge-record__tags'),
       ], classes: 'knowledge-record__head'),
-      if (open)
-        ui.el(
-          'div',
-          [
-            ui.el('p', [
-              ui.text(record['body']),
-            ], classes: 'knowledge-record__text'),
-            ops.facts([
-              ('Knowledge ID', ops.mono(record['id'])),
-              ('Captured', ops.mono(record['created_at'])),
-              ('Source', ui.text(source['kind'])),
-              ('Commit', ops.mono(source['source_sha'] ?? 'Not recorded')),
+      ui.el(
+        'div',
+        [
+          ui.el('p', [
+            ui.text(record['body']),
+          ], classes: 'knowledge-record__text'),
+          ops.facts([
+            ('Knowledge ID', ops.mono(record['id'])),
+            ('Captured', ops.mono(record['created_at'])),
+            ('Source', ui.text(source['kind'])),
+            ('Commit', ops.mono(source['source_sha'] ?? 'Not recorded')),
+            (
+              'Exact-commit required checks verified',
+              ops.mono('${source['checks_verified'] == true}'),
+            ),
+            for (final agent in source['agents'] as List? ?? [])
               (
-                'Exact-commit required checks verified',
-                ops.mono('${source['checks_verified'] == true}'),
+                'Agent',
+                ui.text(
+                  '${agent['name'] ?? agent['profile_id']} / ${agent['role'] ?? ''} / ${agent['runtime'] ?? ''}',
+                ),
               ),
-              for (final agent in source['agents'] as List? ?? [])
-                (
-                  'Agent',
-                  ui.text(
-                    '${agent['name'] ?? agent['profile_id']} / ${agent['role'] ?? ''} / ${agent['runtime'] ?? ''}',
-                  ),
+            if (source['run_id'] != null)
+              ('Agent run', ops.mono(source['run_id'])),
+            if (record['replacement_id'] != null)
+              ('Replaced by', ui.text('knowledge ${record['replacement_id']}')),
+          ]),
+          ui.el('div', [
+            if (source['task_id'] != null)
+              ui.button(
+                'Open source task',
+                () => component.coordinator.push(
+                  TaskDetailRoute(source['task_id'] as String),
                 ),
-              if (source['run_id'] != null)
-                ('Agent run', ops.mono(source['run_id'])),
-              if (record['replacement_id'] != null)
-                (
-                  'Replaced by',
-                  ui.text('knowledge ${record['replacement_id']}'),
-                ),
-            ]),
-            ui.el('div', [
-              if (source['task_id'] != null)
-                ui.button(
-                  'Open source task',
-                  () => component.coordinator.push(
-                    TaskDetailRoute(source['task_id'] as String),
-                  ),
-                  small: true,
-                  iconName: 'list-checks',
-                ),
-              if (source['group_id'] != null)
-                ui.button(
-                  'Open source group',
-                  () => component.coordinator.push(
-                    GroupRoute(source['group_id'] as String),
-                  ),
-                  small: true,
-                  iconName: 'users',
-                ),
-              if (admin && record['state'] != 'superseded')
-                ui.button(
-                  'Review record',
-                  busy ? null : () => review(record),
-                  small: true,
-                  iconName: 'circle-check',
-                ),
-              if (admin && record['state'] != 'superseded')
-                ui.button(
-                  'Supersede record',
-                  busy ? null : () => review(record, supersede: true),
-                  small: true,
-                  iconName: 'git-compare',
-                ),
-            ], classes: 'actions'),
-            if ((record['audit'] as List? ?? []).isNotEmpty) ...[
-              ui.el('h3', [ui.text('Audit')], classes: 'overline'),
-              ui.el(
-                'ul',
-                [
-                  for (final audit in record['audit'] as List)
-                    ui.el('li', [
-                      ui.icon('history', classes: 'icon--sm'),
-                      ui.text(
-                        '${audit['action']} by ${audit['actor']} at ${audit['at']}: ${audit['reason']}',
-                      ),
-                    ]),
-                ],
-                classes: 'knowledge-audit',
-                attributes: {'role': 'list'},
+                small: true,
+                iconName: 'list-checks',
               ),
-            ],
+            if (source['group_id'] != null)
+              ui.button(
+                'Open source group',
+                () => component.coordinator.push(
+                  GroupRoute(source['group_id'] as String),
+                ),
+                small: true,
+                iconName: 'users',
+              ),
+            if (admin && record['state'] != 'superseded')
+              ui.button(
+                'Review record',
+                busy ? null : () => review(record),
+                small: true,
+                iconName: 'circle-check',
+              ),
+            if (admin && record['state'] != 'superseded')
+              ui.button(
+                'Supersede record',
+                busy ? null : () => review(record, supersede: true),
+                small: true,
+                iconName: 'git-compare',
+              ),
+          ], classes: 'actions'),
+          if ((record['audit'] as List? ?? []).isNotEmpty) ...[
+            ui.el('h3', [ui.text('Audit')], classes: 'overline'),
+            ui.el(
+              'ul',
+              [
+                for (final audit in record['audit'] as List)
+                  ui.el('li', [
+                    ui.icon('history', classes: 'icon--sm'),
+                    ui.text(
+                      '${audit['action']} by ${audit['actor']} at ${audit['at']}: ${audit['reason']}',
+                    ),
+                  ]),
+              ],
+              classes: 'knowledge-audit',
+              attributes: {'role': 'list'},
+            ),
           ],
-          classes: 'knowledge-record__body',
-          attributes: {'id': 'knowledge-record-$id'},
-        ),
+        ],
+        classes: 'knowledge-record__body',
+        attributes: {
+          'id': 'knowledge-record-$id',
+          'role': 'region',
+          'aria-labelledby': 'knowledge-record-toggle-$id',
+          if (!open) 'hidden': '',
+        },
+      ),
     ], classes: 'knowledge-record');
   }
 
@@ -587,20 +570,23 @@ class _KnowledgePageState extends State<KnowledgePage> {
       'Knowledge records',
       [
         toolbar(),
-        stateChips(),
-        if (busy)
+        if (busy || initializing)
           ui.el(
             'progress',
             [],
             attributes: {'aria-label': 'Loading knowledge'},
           ),
         if (error != null) ui.notice(error, error: true),
-        if (organizations.isEmpty && error == null)
+        if (!initializing && organizations.isEmpty && error == null)
           ui.emptyState(
             'Create an organization to start retaining project knowledge.',
             iconName: 'book-open',
           ),
-        if (!busy && records.isEmpty && org.isNotEmpty)
+        if (!initializing &&
+            !busy &&
+            error == null &&
+            records.isEmpty &&
+            org.isNotEmpty)
           ui.emptyState(
             'No knowledge matches these filters. Outcomes are captured as task candidates and completed work are recorded.',
             iconName: 'book-open',

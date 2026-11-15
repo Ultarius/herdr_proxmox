@@ -46,6 +46,40 @@ OPERATORS = {
     'gomod': ('>=', '<=', '>', '<'),
     'rubygems': ('>=', '<=', '>', '<', '~>'),
 }
+# Version-file requests are families when a patch is omitted, unlike PEP 440.
+OPERATORS['python-version'] = OPERATORS['pep440']
+
+
+def python_family(value):
+    values, wildcard = _partial(value)
+    return values if values and len(values) < 3 and wildcard is None else None
+
+
+def family_verdict(selection, constraint, notation):
+    """Compare a Python family with numeric constraints without choosing a patch."""
+    family = python_family(selection)
+    if not family:
+        return evaluate(constraint, selection, notation)
+    # Predicate truth changes only at stated numeric boundaries. Test those
+    # points and adjacent releases at every component inside the family. Major
+    # requests can overlap a constraint beyond an excluded entire minor family.
+    candidates = {tuple(_floor(family))}
+    for token in re.findall(r'\d+(?:\.\d+)*', str(constraint)):
+        values, _ = _partial(token)
+        if len(values) > 3:
+            return UNDECIDABLE
+        point = _floor(values)
+        for index in range(3):
+            for delta in (-1, 0, 1):
+                adjacent = point[:]
+                adjacent[index] += delta
+                if adjacent[index] >= 0:
+                    candidates.add(tuple(adjacent[:index + 1] + [0] * (2 - index)))
+    results = [evaluate(constraint, '.'.join(map(str, point)), notation)
+               for point in candidates if list(point[:len(family)]) == family]
+    if SATISFIED in results:
+        return SATISFIED
+    return UNDECIDABLE if UNDECIDABLE in results else VIOLATED
 
 TOKEN = re.compile(r'(>=|<=|>|<|==|!=|=|\^|~=|~>|~)?(.+)')
 OPERATOR_ONLY = re.compile(r'(>=|<=|>|<|==|!=|=|\^|~=|~>|~)')
@@ -122,6 +156,8 @@ def _bounds(operator, values, given, notation):
     if operator == '~':
         if notation == 'pep440':
             return None  # PEP 440 spells this `~=`
+        if notation == 'composer':
+            return _floor(values), _ceiling(values, max(given - 2, 0))
         return _floor(values), _ceiling(values, 1 if given >= 2 else 0)
     if operator in ('~=', '~>'):
         expected = ('pep440', 'poetry') if operator == '~=' else ('rubygems',)
@@ -146,9 +182,17 @@ def _clause(operator, bound, measured, notation):
     values, wildcard = _partial(bound)
     if values is None:
         return UNDECIDABLE
-    if notation in ('pep440', 'poetry'):
-        # Python comparisons use zero-padded exact versions. npm's partial
-        # comparator bounds (e.g. <=3.11 meaning <3.12) must not leak here.
+    if notation == 'python-version':
+        if operator is None:
+            if not values or len(values) > 3 or wildcard is not None:
+                return UNDECIDABLE
+        else:
+            # uv also accepts explicit specifiers in version files. Preserve
+            # their Python semantics; only bare numeric requests are families.
+            notation = 'pep440'
+    if notation in ('pep440', 'poetry', 'composer'):
+        # Python and Composer comparisons use zero-padded exact versions.
+        # npm's partial comparator bounds must not leak here.
         if wildcard is not None and operator not in (None, '=', '==', '!='):
             return UNDECIDABLE
         if values and wildcard is None and operator in (None, '=', '==', '!=', '>', '>=', '<', '<='):

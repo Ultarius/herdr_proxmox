@@ -45,7 +45,7 @@ def probe_arguments(name):
 
 # The notations a requirement can be stated in. Shared with the evaluator so an
 # override cannot name one the gateway cannot interpret.
-NOTATIONS = tuple(sorted(dependency_constraints.OPERATORS))
+NOTATIONS = tuple(sorted(set(dependency_constraints.OPERATORS) - {'python-version'}))
 DEFAULT_NOTATION = 'semver'
 ORIGIN = 'operator_override'
 

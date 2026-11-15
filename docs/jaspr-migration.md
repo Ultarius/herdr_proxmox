@@ -9,22 +9,60 @@ suite. The obsolete iframe wrapper has been removed.
 
 ## Business behavior and framework boundary
 
-`web/dashboard_state/lib` contains the original dashboard and organization blocs,
-integration helpers and secure request-ID implementation. Their implementations
-are unchanged. Existing Flutter bloc imports forward to the shared package.
-The gateway and business repositories were not modified by this migration.
+`web/dashboard_state/lib` contains the shared page and management-panel blocs,
+integration helpers and secure request-ID implementation. The complete
+[state ownership map](dashboard-juice-ownership.md) lists the feature used by
+each route and embedded workflow. Both renderers invoke feature events rather
+than calling the dashboard transport directly. Existing Flutter bloc
+imports forward to the shared package. The Juice 2.1 upgrade updates use-case
+registration and runtime contracts as described below; the shared package remains
+the boundary between application behavior and either UI framework.
 
-Juice 1.10.0 imports Flutter foundation and `dart:ui` from its core. The Jaspr
-package uses the private, licensed core adapter under `vendor/juice`, retaining
-its event dispatch, state, lifecycle, concurrency and use-case implementations.
-The adapter replaces Flutter foundation types with browser-compatible notifier
-primitives and excludes Flutter widgets. The original Flutter regression suite
-continues to resolve published Juice.
+The Jaspr package uses the private, MIT-licensed Juice **2.1.0** adapter under
+`vendor/juice`. It retains upstream event dispatch, state, lifecycle, concurrency,
+use-case and typed telemetry logic, replaces Flutter foundation types with a
+small pure-Dart notifier/annotation shim, and excludes Flutter widgets and
+`JuiceWidgetSupport`. The browser build remains independent of Flutter and
+`dart:ui`. The Flutter regression suite resolves the published Juice package.
+The adapter retains upstream `package:juice/testing.dart` and core testing
+helpers, excluding Flutter async/selector/UI widgets. Rebuild-group helpers and
+the framework-independent portion of widget support remain available; Flutter
+widget APIs and tests are outside this adapter's scope.
+
+Juice 2.x requires an explicit `EventConcurrency` on each use-case builder.
+Shared dashboard registrations use `UseCaseBuilder.typed` for checked event and
+use-case pairing. Refreshes and mutations have separate `droppable` handlers:
+polling cannot discard an operator's write, while duplicate writes are still
+suppressed. Mutation revisions prevent older reads from replacing a write's
+state or shared directory observations. Disconnect remains `concurrent`; remote
+CLI setup cleanup runs before credentials are removed, with a bounded wait.
+`DashboardBloc.close()` owns timer and HTTP-client cleanup, including scope
+teardown and calls through `dispose()`.
+The new runtime exposes typed `JuiceTelemetry` records; the obsolete 1.x vendored
+`Bloc`/`BlocBase`/`Emitter`, event-transformer and global resolver APIs are no
+longer included. Keeping upstream implementations does not imply unchanged
+per-event scheduling, cancellation or error behavior across the major upgrade;
+the adapter and both dashboard trees require regression verification.
+
+Juice 2.1 adds bloc-to-bloc `Reaction`s, owned `sendAfter` timers,
+`EventConcurrency.singleflight`, and multi-bloc `juiceFlowTest`; the vendored
+testing API includes all three, while Flutter widget tests remain outside this
+adapter's scope.
+
+The source is the [Juice 2.1.0 pub.dev archive](https://pub.dev/api/archives/juice-2.1.0.tar.gz),
+published **13 November 2026**, verified against SHA-256
+`83b23be59f15648a8e07cfcbde9f2a9a6658cce4edf395d33dd50c4d8e2ac737`.
+The vendored `LICENSE` retains the upstream MIT license; the adapter README
+records its framework boundary and provenance.
 
 Handlers previously embedded in widget state were mechanically ported with their
 API payloads, admin gates, polling, generation guards, idempotency keys, inspection
 steps, retry references and confirmation requirements. UI state is disposed on
 route/account changes; pending dialogs close when the session generation changes.
+The Flutter reference shell also waits for a connected session before mounting
+its route content, and keys that content by connection generation. Restoring a
+session therefore starts each page's initial read with current credentials;
+sign-out disposes its displayed data and owned resources.
 
 ## Completed surfaces
 
@@ -90,7 +128,7 @@ DOM renderer. No Canvas/WebGL terminal addon is included.
 At the initial migration checkpoint, `c721d84` on **13 October 2026**,
 local verification recorded **188 Flutter tests**, **10 Jaspr VM tests** and
 **56 Chrome tests** (run serially for shared browser focus), clean analyzers, optimized compilation, production asset
-packaging, version-guard mock build, and unchanged shared implementation contents.
+packaging and a version-guard mock build.
 Browser inspection includes desktop/mobile layouts and zero iframe/canvas elements.
 The browser suites cover permissions, inspection/approval gates, stale accounts,
 exact build identities, durable retry IDs, dialogs, controlled native fields,

@@ -1,4 +1,4 @@
-import 'dart:async';
+import 'feature_bloc.dart';
 import 'dashboard_bloc.dart';
 
 Map<String, dynamic> storageMap(dynamic value) => value is Map
@@ -17,36 +17,44 @@ String storageBytes(dynamic value) {
 
 /// Cached storage observations are cheap reads. Only an explicit scan walks
 /// registered roots; cleanup always uses the preview's ownership generations.
-class StorageController {
-  StorageController(this.connection, {required this.onUpdate}) {
-    generation = connection.generation;
-    role = '${connection.operator.value['role']}';
-    connected = connection.state.connected;
-    subscription = connection.stream.listen((_) => sessionChanged());
-    connection.operator.addListener(sessionChanged);
+class StorageController extends FeatureBloc {
+  StorageController(DashboardBloc connection, {required this.onUpdate})
+    : super(
+        connection,
+        initial: const {
+          'loaded': false,
+          'data': <String, dynamic>{},
+          'preview': <String, dynamic>{},
+          'legacyPreview': <String, dynamic>{},
+          'repairPreview': <String, dynamic>{},
+        },
+      ) {
+    _generation = connection.generation;
+    _role = '${connection.operator.value['role']}';
+    _connected = connection.state.connected;
+    bindStream(stream, (_) => _updated(), key: 'projection');
     refresh();
   }
-
-  final DashboardBloc connection;
   final void Function() onUpdate;
-  late final StreamSubscription subscription;
-  late int generation;
-  late String role;
-  late bool connected;
-  int revision = 0;
-  bool disposed = false, loaded = false, loading = false, busy = false;
-  Timer? timer;
-  Map<String, dynamic> data = {},
-      preview = {},
-      legacyPreview = {},
-      repairPreview = {};
+  late int _generation;
+  late String _role;
+  late bool _connected;
   String legacyProject = '', legacyExecutionId = '';
   final Set<String> selected = {};
-  String? error, message;
-
-  bool get canManage =>
-      connection.state.connected &&
-      connection.operator.value['role'] == 'admin';
+  bool get disposed => isClosing;
+  int get generation => connection.generation;
+  bool get loaded => state.values['loaded'] == true;
+  bool get loading => state.reading.isNotEmpty;
+  bool get busy => state.busy;
+  Map<String, dynamic> get data => storageMap(state.values['data']);
+  Map<String, dynamic> get preview => storageMap(state.values['preview']);
+  Map<String, dynamic> get legacyPreview =>
+      storageMap(state.values['legacyPreview']);
+  Map<String, dynamic> get repairPreview =>
+      storageMap(state.values['repairPreview']);
+  String? get error => state.values['error'] as String?;
+  String? get message => state.values['notice'] as String?;
+  bool get canManage => available && admin;
   bool get scanning => data['scanning'] == true;
   bool get canPreviewLegacy =>
       legacyProject.trim().isNotEmpty &&
@@ -55,131 +63,112 @@ class StorageController {
   Map<String, dynamic> get policy => storageMap(data['policy']);
   List<Map<String, dynamic>> get entries =>
       storageEntries(inventory['entries']);
-  bool current(int epoch, int version) =>
-      !disposed &&
-      canManage &&
-      generation == epoch &&
-      connection.generation == epoch &&
-      revision == version;
 
-  void sessionChanged() {
-    if (disposed) return;
-    final nextRole = '${connection.operator.value['role']}';
-    if (generation != connection.generation ||
-        role != nextRole ||
-        connected != connection.state.connected) {
-      generation = connection.generation;
-      role = nextRole;
-      connected = connection.state.connected;
-      revision++;
-      timer?.cancel();
-      loaded = loading = busy = false;
-      data = {};
-      preview = {};
-      legacyPreview = {};
-      repairPreview = {};
-      legacyProject = '';
-      legacyExecutionId = '';
+  void _updated() {
+    if (isClosing) return;
+    final role = '${connection.operator.value['role']}';
+    if (_generation != connection.generation ||
+        _role != role ||
+        _connected != connection.state.connected) {
+      _generation = connection.generation;
+      _role = role;
+      _connected = connection.state.connected;
+      stopPolling('scan');
+      legacyProject = legacyExecutionId = '';
       selected.clear();
-      error = message = null;
-      onUpdate();
     }
-    if (canManage && !loaded && !loading) refresh();
+    onUpdate();
+    if (canManage && !loaded && !loading && !busy) refresh();
   }
 
   void select(String id, bool enabled) {
-    if (busy || loading || scanning) return;
-    if (!entries.any((entry) => entry['id'] == id && entry['eligible'] == true))
+    if (busy ||
+        loading ||
+        scanning ||
+        !entries.any((entry) => entry['id'] == id && entry['eligible'] == true))
       return;
     if (enabled) {
       selected.add(id);
     } else {
       selected.remove(id);
     }
-    preview = {};
-    message = null;
-    onUpdate();
+    patch({'preview': <String, dynamic>{}, 'notice': null});
   }
 
   void cancelPreview() {
-    preview = {};
-    onUpdate();
+    patch({'preview': <String, dynamic>{}});
   }
 
   void reviewRepair(Map<String, dynamic>? entry) {
-    if (busy || loading || scanning) return;
-    repairPreview = entry ?? {};
-    onUpdate();
+    if (!busy && !loading && !scanning)
+      patch({'repairPreview': entry ?? <String, dynamic>{}});
   }
 
   void legacyInputs({String? project, String? executionId}) {
     if (busy || loading || scanning) return;
     if (project != null) legacyProject = project;
     if (executionId != null) legacyExecutionId = executionId;
-    legacyPreview = {};
-    message = null;
-    onUpdate();
+    patch({'legacyPreview': <String, dynamic>{}, 'notice': null});
   }
 
   void cancelLegacyPreview() {
-    legacyPreview = {};
-    onUpdate();
+    patch({'legacyPreview': <String, dynamic>{}});
   }
 
-  void accept(dynamic value) {
-    data = storageMap(value);
-    timer?.cancel();
-    if (scanning) {
-      timer = Timer(const Duration(seconds: 2), refresh);
-    }
+  void _schedule(Map<String, dynamic> snapshot) {
+    stopPolling('scan');
+    if (snapshot['scanning'] == true)
+      poll('scan', const Duration(seconds: 2), refresh);
   }
 
   Future<void> refresh() async {
-    if (!canManage || disposed || loading || busy) return;
-    loading = true;
+    if (!canManage || loading || busy) return;
+    final epoch = connection.generation;
     selected.clear();
-    preview = {};
-    repairPreview = {};
-    legacyPreview = {};
-    onUpdate();
-    final epoch = connection.generation, version = revision;
-    try {
-      final result = await connection.request('storage');
-      if (!current(epoch, version)) return;
-      accept(result);
-      error = null;
-    } catch (failure) {
-      if (current(epoch, version)) {
-        timer?.cancel();
-        error = 'Storage status unavailable: $failure';
-        data = {};
-        preview = {};
-        legacyPreview = {};
-        selected.clear();
-      }
-    } finally {
-      if (current(epoch, version)) {
-        loaded = true;
-        loading = false;
-        onUpdate();
-      }
-    }
+    await read<void>(
+      'storage',
+      () async {
+        try {
+          final result = storageMap(await connection.request('storage'));
+          if (!current(epoch) || !canManage) return const FeatureResult();
+          _schedule(result);
+          return FeatureResult(
+            patch: {'data': result, 'loaded': true, 'error': null},
+          );
+        } catch (failure) {
+          if (!current(epoch) || !canManage) return const FeatureResult();
+          stopPolling('scan');
+          return FeatureResult(
+            patch: {
+              'error': 'Storage status unavailable: $failure',
+              'data': <String, dynamic>{},
+              'loaded': true,
+            },
+          );
+        }
+      },
+      replace: false,
+      start: const {
+        'preview': <String, dynamic>{},
+        'repairPreview': <String, dynamic>{},
+        'legacyPreview': <String, dynamic>{},
+      },
+    );
   }
 
   Future<void> action(
     String action, [
     Map<String, dynamic> body = const {},
   ]) async {
-    if (!canManage || disposed || busy || loading || scanning) return;
-    final epoch = connection.generation, version = revision;
+    if (!canManage || busy || loading || scanning) return;
+    final epoch = connection.generation;
     final request = <String, dynamic>{'action': action, ...body};
     if (action == 'preview') {
       if (selected.isEmpty) return;
       request['ids'] = selected.toList();
     }
     if (action == 'reclaim') {
-      final ids = preview['ids'];
-      final expected = storageMap(preview['expected']);
+      final ids = preview['ids'], expected = storageMap(preview['expected']);
       if (ids is! List || ids.isEmpty || expected.isEmpty) return;
       request.addAll({'ids': ids, 'expected': expected});
     }
@@ -202,72 +191,77 @@ class StorageController {
         'reviewed': true,
       });
     }
-    repairPreview = {};
-    legacyPreview = {};
-    if (action != 'preview') {
-      selected.clear();
-      preview = {};
-    }
-    busy = true;
-    error = message = null;
-    onUpdate();
-    try {
-      final result = storageMap(await connection.request('storage', request));
-      if (!current(epoch, version)) return;
-      if (result['snapshot'] is Map) accept(result['snapshot']);
-      if (action == 'preview') {
-        final candidate = storageMap(result['preview']);
-        if (candidate['ids'] is! List ||
-            storageMap(candidate['expected']).isEmpty ||
-            storageEntries(candidate['entries']).length !=
-                (candidate['ids'] as List).length ||
-            storageEntries(candidate['entries']).any(
-              (entry) => entry['path'] is! String || entry['bytes'] is! num,
-            ))
-          throw const FormatException(
-            'No valid storage cleanup preview returned.',
+    if (action != 'preview') selected.clear();
+    await mutate<void>(
+      'storage',
+      () async {
+        try {
+          final result = storageMap(
+            await connection.request('storage', request),
           );
-        preview = candidate;
-      } else if (action == 'legacy-preview') {
-        final candidate = storageMap(result['preview']);
-        if (candidate['path'] is! String ||
-            candidate['fingerprint'] == null ||
-            candidate['execution_id'] != legacyExecutionId.trim())
-          throw const FormatException(
-            'No valid existing-output preview returned.',
+          if (!current(epoch) || !canManage) return const FeatureResult();
+          final update = <String, dynamic>{'error': null};
+          if (result['snapshot'] is Map) {
+            final snapshot = storageMap(result['snapshot']);
+            _schedule(snapshot);
+            update['data'] = snapshot;
+          }
+          if (action == 'preview') {
+            final candidate = storageMap(result['preview']);
+            if (candidate['ids'] is! List ||
+                storageMap(candidate['expected']).isEmpty ||
+                storageEntries(candidate['entries']).length !=
+                    (candidate['ids'] as List).length ||
+                storageEntries(candidate['entries']).any(
+                  (entry) => entry['path'] is! String || entry['bytes'] is! num,
+                )) {
+              throw const FormatException(
+                'No valid storage cleanup preview returned.',
+              );
+            }
+            update['preview'] = candidate;
+          } else if (action == 'legacy-preview') {
+            final candidate = storageMap(result['preview']);
+            if (candidate['path'] is! String ||
+                candidate['fingerprint'] == null ||
+                candidate['execution_id'] != legacyExecutionId.trim()) {
+              throw const FormatException(
+                'No valid existing-output preview returned.',
+              );
+            }
+            update['legacyPreview'] = candidate;
+          } else if (action == 'legacy-adopt') {
+            update['notice'] =
+                'Existing output registered as disposable. Retention cleanup may remove it; select it in the inventory for immediate reviewed cleanup. Source files and files outside the previewed directory are preserved.';
+          } else if (action == 'configure') {
+            update['notice'] =
+                'Build mode saved for future environment plans. Existing sessions keep their approved settings.';
+          } else if (action == 'forget-invalid') {
+            update['notice'] =
+                'Invalid registry metadata archived. No files were deleted.';
+          } else if (action == 'reclaim') {
+            update['notice'] =
+                'Cleanup finished. Active or changed roots are retained; review the updated inventory.';
+          }
+          return FeatureResult(patch: update);
+        } catch (failure) {
+          return FeatureResult(
+            patch: {
+              'preview': <String, dynamic>{},
+              'legacyPreview': <String, dynamic>{},
+              'error': 'Storage action failed: $failure',
+            },
           );
-        legacyPreview = candidate;
-      } else if (action == 'legacy-adopt') {
-        message =
-            'Existing output registered as disposable. Retention cleanup may remove it; select it in the inventory for immediate reviewed cleanup. Source files and files outside the previewed directory are preserved.';
-      } else if (action == 'configure') {
-        message =
-            'Build mode saved for future environment plans. Existing sessions keep their approved settings.';
-      } else if (action == 'forget-invalid') {
-        message = 'Invalid registry metadata archived. No files were deleted.';
-      } else if (action == 'reclaim') {
-        message =
-            'Cleanup finished. Active or changed roots are retained; review the updated inventory.';
-      }
-      error = null;
-    } catch (failure) {
-      if (current(epoch, version)) {
-        preview = {};
-        legacyPreview = {};
-        error = 'Storage action failed: $failure';
-      }
-    } finally {
-      if (current(epoch, version)) {
-        busy = false;
-        onUpdate();
-      }
-    }
-  }
-
-  void dispose() {
-    disposed = true;
-    timer?.cancel();
-    subscription.cancel();
-    connection.operator.removeListener(sessionChanged);
+        }
+      },
+      admin: true,
+      start: {
+        'repairPreview': <String, dynamic>{},
+        'legacyPreview': <String, dynamic>{},
+        if (action != 'preview') 'preview': <String, dynamic>{},
+        'notice': null,
+        'error': null,
+      },
+    );
   }
 }

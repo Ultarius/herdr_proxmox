@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/shell_bloc.dart';
 import 'dart:async';
 import 'dart:js_interop';
 import 'package:web/web.dart' as web;
@@ -26,26 +27,29 @@ class _DashboardAppState extends State<DashboardApp> {
   DashboardBloc get connection => dashboardConnection;
   final subscriptions = <StreamSubscription>[];
   late final JSFunction hashListener;
+  late final web.MediaQueryList drawerMedia;
+  late final JSFunction drawerMediaChanged;
   bool restoring = true;
   bool drawer = false;
+  double navigationScroll = 0;
   bool agentsOpen = true;
   bool sidebarCollapsed = themeStorage.readSidebarCollapsed();
-  bool loadingDirectory = false;
-  bool polling = false;
-  int noticeGeneration = -1;
+  late final ShellBloc shell;
+  int observedNoticeRevision = -1;
   int sessionGeneration = -1;
-  Timer? noticeTimer;
   String token = '';
   String theme = 'system';
   String navSearch = '';
-  String? noticesChecked;
-  List<IntegrationNotice> notices = [];
+  String? get noticesChecked => shell.checked;
+  List<IntegrationNotice> get notices => shell.notices;
   final Set<String> seen = {};
-  final Set<String> asking = {};
+  Set<String> get asking => shell.asking;
 
   @override
   void initState() {
     super.initState();
+    shell = ShellBloc(connection);
+    subscriptions.add(shell.stream.listen((_) => shellChanged()));
     final queryTheme = Uri.base.queryParameters['theme'];
     theme = ['light', 'dark'].contains(queryTheme)
         ? queryTheme!
@@ -55,22 +59,30 @@ class _DashboardAppState extends State<DashboardApp> {
       routeChanged();
     }).toJS;
     web.window.addEventListener('hashchange', hashListener);
+    drawerMedia = web.window.matchMedia('(max-width: 1023.98px)');
+    drawerMediaChanged = ((web.Event _) {
+      final scroller = web.document.querySelector('.sidebar__scroll');
+      navigationScroll = (scroller as web.HTMLElement?)?.scrollTop ?? 0;
+      if (!drawerMedia.matches && drawer) {
+        closeDrawer();
+      } else {
+        rebuild();
+      }
+      restoreNavigationScroll();
+    }).toJS;
+    drawerMedia.addEventListener('change', drawerMediaChanged);
     subscriptions.add(
       connection.stream.listen((_) {
         if (!mounted) return;
         if (sessionGeneration != connection.generation) {
           sessionGeneration = connection.generation;
+          if (drawer) closeDrawer(restoreFocus: false);
           closeDialogs();
           messages.value = null;
-          asking.clear();
-          notices = [];
           seen.clear();
-          noticesChecked = null;
+          observedNoticeRevision = -1;
         }
         setState(() {});
-        loadDirectory();
-        if (noticeGeneration != connection.generation)
-          pollNotices(announce: false);
       }),
     );
     connection.organizationDirectory.addListener(rebuild);
@@ -83,10 +95,6 @@ class _DashboardAppState extends State<DashboardApp> {
     connection.restoreSession().whenComplete(() {
       if (mounted) setState(() => restoring = false);
     });
-    noticeTimer = Timer.periodic(
-      const Duration(seconds: 15),
-      (_) => pollNotices(),
-    );
   }
 
   void rebuild() {
@@ -95,11 +103,65 @@ class _DashboardAppState extends State<DashboardApp> {
 
   void routeChanged() {
     if (!mounted) return;
-    setState(() => drawer = false);
-    scheduleMicrotask(() {
-      (web.document.getElementById('content') as web.HTMLElement?)?.scrollTop =
-          0;
+    if (drawer) closeDrawer(restoreFocus: false);
+    setState(() {});
+    Timer.run(() {
+      if (!mounted) return;
+      final content =
+          web.document.getElementById('content') as web.HTMLElement?;
+      content?.scrollTop = 0;
+      content?.focus();
     });
+  }
+
+  void openDrawer() {
+    if (!drawerMedia.matches) return;
+    final panel = web.document.getElementById('dashboard-navigation');
+    if (panel == null || panel.tagName != 'DIALOG') return;
+    final dialog = panel as web.HTMLDialogElement;
+    if (dialog.open) return;
+    dialog.showModal();
+    setState(() => drawer = true);
+    Timer.run(() {
+      if (!mounted || !drawer) return;
+      (panel.querySelector('.sidebar__close') as web.HTMLElement?)?.focus();
+    });
+  }
+
+  bool get navigationOpen {
+    final panel = web.document.getElementById('dashboard-navigation');
+    return panel?.tagName == 'DIALOG' && (panel as web.HTMLDialogElement).open;
+  }
+
+  void restoreNavigationScroll() {
+    // Crossing the breakpoint changes the semantic element. Restore the reader's
+    // position after Jaspr has replaced that host; search text lives in state.
+    context.binding.addPostFrameCallback(() {
+      if (!mounted) return;
+      final panel = web.document.getElementById('dashboard-navigation');
+      (panel?.querySelector('.sidebar__scroll') as web.HTMLElement?)
+              ?.scrollTop =
+          navigationScroll;
+    });
+  }
+
+  void closeDrawer({bool restoreFocus = true}) {
+    final panel = web.document.getElementById('dashboard-navigation');
+    setState(() => drawer = false);
+    if (panel?.tagName == 'DIALOG') {
+      final dialog = panel as web.HTMLDialogElement;
+      if (dialog.open) dialog.close();
+    }
+    if (restoreFocus)
+      Timer.run(() {
+        if (!mounted) return;
+        final trigger =
+            web.document.querySelector('.drawer-toggle') as web.HTMLElement?;
+        final target = trigger?.getClientRects().length != 0
+            ? trigger
+            : web.document.getElementById('content') as web.HTMLElement?;
+        target?.focus();
+      });
   }
 
   void applyTheme(String value, {bool persist = true}) {
@@ -112,90 +174,36 @@ class _DashboardAppState extends State<DashboardApp> {
     rebuild();
   }
 
-  Future<void> loadDirectory() async {
-    if (loadingDirectory ||
-        !connection.state.connected ||
-        connection.organizationDirectory.value['loaded'] == true)
-      return;
-    loadingDirectory = true;
-    try {
-      await connection.request('organizations/directory');
-    } catch (_) {
-    } finally {
-      loadingDirectory = false;
+  void shellChanged() {
+    if (!mounted) return;
+    final fresh = <IntegrationNotice>[];
+    if (observedNoticeRevision != shell.noticeRevision) {
+      observedNoticeRevision = shell.noticeRevision;
+      seen.removeWhere((key) => !notices.any((notice) => notice.key == key));
+      fresh.addAll(notices.where((notice) => seen.add(notice.key)));
     }
-  }
-
-  Future<void> pollNotices({bool announce = true}) async {
-    if (!connection.state.connected) {
-      if (notices.isNotEmpty || seen.isNotEmpty)
-        setState(() {
-          notices = [];
-          seen.clear();
-          noticesChecked = null;
-        });
-      return;
-    }
-    if (noticeGeneration != connection.generation) {
-      noticeGeneration = connection.generation;
-      setState(() {
-        notices = [];
-        seen.clear();
-        noticesChecked = null;
-      });
-    }
-    if (polling) return;
-    final epoch = connection.generation;
-    polling = true;
-    try {
-      final result = await connection.request('integration');
-      if (!mounted ||
-          epoch != connection.generation ||
-          !connection.state.connected)
-        return;
-      final next = [
-        for (final notice in (result['alerts'] as List? ?? []))
-          if (notice is Map<String, dynamic>)
-            IntegrationNotice.fromJson(notice),
-      ];
-      seen.removeWhere((key) => !next.any((notice) => notice.key == key));
-      final fresh = next.where((notice) => seen.add(notice.key)).toList();
-      setState(() {
-        notices = next;
-        noticesChecked = result['checked'] as String?;
-      });
-      refreshDialogs();
-      if (announce && fresh.isNotEmpty)
-        toast(
-          fresh.length == 1
-              ? 'Integration notice: ${fresh.first.summary}'
-              : '${fresh.length} integration notices need review',
-        );
-    } catch (_) {
-    } finally {
-      polling = false;
-    }
+    setState(() {});
+    refreshDialogs();
+    if (shell.announce && fresh.isNotEmpty)
+      toast(
+        fresh.length == 1
+            ? 'Integration notice: ${fresh.first.summary}'
+            : '${fresh.length} integration notices need review',
+      );
   }
 
   Future<void> askIntegration(IntegrationNotice notice) async {
-    if (asking.contains(notice.profileId)) return;
+    if (shell.state.busy) return;
     final epoch = connection.generation;
-    setState(() => asking.add(notice.profileId));
-    refreshDialogs();
     try {
-      await requestIntegration(connection, notice);
-      if (!mounted || epoch != connection.generation) return;
+      final done = await shell.ask(notice);
+      if (!done || !mounted || epoch != connection.generation) return;
       toast(
         'Asked ${notice.name.isEmpty ? 'the agent' : notice.name} to integrate.',
       );
     } catch (error) {
       if (mounted && epoch == connection.generation)
         toast('Integration request failed: $error');
-    } finally {
-      if (mounted && epoch == connection.generation) {
-        setState(() => asking.remove(notice.profileId));
-        refreshDialogs();
-      }
     }
   }
 
@@ -231,6 +239,7 @@ class _DashboardAppState extends State<DashboardApp> {
                 () => askIntegration(notice),
                 disabled:
                     !agentCanIntegrate(connection, notice.profileId) ||
+                    shell.state.busy ||
                     asking.contains(notice.profileId),
               ),
             button(
@@ -259,7 +268,14 @@ class _DashboardAppState extends State<DashboardApp> {
 
   @override
   void dispose() {
-    noticeTimer?.cancel();
+    drawer = false;
+    final navigation = web.document.getElementById('dashboard-navigation');
+    if (navigation?.tagName == 'DIALOG') {
+      final dialog = navigation as web.HTMLDialogElement;
+      if (dialog.open) dialog.close();
+    }
+    drawerMedia.removeEventListener('change', drawerMediaChanged);
+    shell.dispose();
     for (final sub in subscriptions) unawaited(sub.cancel());
     web.window.removeEventListener('hashchange', hashListener);
     connection.organizationDirectory.removeListener(rebuild);
@@ -406,6 +422,7 @@ class _DashboardAppState extends State<DashboardApp> {
             'type': 'button',
             'role': 'radio',
             'aria-checked': '${theme == mode}',
+            'tabindex': theme == mode ? '0' : '-1',
             'aria-label': label,
             'title': label,
           },
@@ -414,6 +431,34 @@ class _DashboardAppState extends State<DashboardApp> {
     ],
     classes: 'segmented theme-switch',
     attributes: {'role': 'radiogroup', 'aria-label': 'Color theme'},
+    events: {
+      'keydown': (event) {
+        final key = event as web.KeyboardEvent;
+        if (key.defaultPrevented ||
+            key.isComposing ||
+            key.altKey ||
+            key.ctrlKey ||
+            key.metaKey)
+          return;
+        const modes = ['light', 'system', 'dark'];
+        final index = modes.indexOf(theme);
+        final next = switch (key.key) {
+          'ArrowRight' || 'ArrowDown' => (index + 1) % modes.length,
+          'ArrowLeft' || 'ArrowUp' => (index + modes.length - 1) % modes.length,
+          'Home' => 0,
+          'End' => modes.length - 1,
+          _ => null,
+        };
+        if (next == null) return;
+        key.preventDefault();
+        applyTheme(modes[next]);
+        ((event.currentTarget as web.HTMLElement)
+                    .querySelectorAll('button')
+                    .item(next)
+                as web.HTMLElement)
+            .focus();
+      },
+    },
   );
   Component _signIn() => el('div', [
     logo(),
@@ -458,6 +503,7 @@ class _DashboardAppState extends State<DashboardApp> {
   @override
   Component build(BuildContext context) {
     final state = connection.state;
+    final fluidPage = state.connected;
     final directory = connection.organizationDirectory.value;
     final orgs = List<Map<String, dynamic>>.from(
       directory['organizations'] ?? [],
@@ -585,7 +631,7 @@ class _DashboardAppState extends State<DashboardApp> {
         attributes: {'aria-label': 'Organizations'},
       ),
       el(
-        'aside',
+        drawerMedia.matches ? 'dialog' : 'aside',
         [
           el('div', [
             el('span', [logo()], classes: 'sidebar__mark'),
@@ -593,7 +639,7 @@ class _DashboardAppState extends State<DashboardApp> {
             iconButton(
               'Close navigation',
               'x',
-              () => setState(() => drawer = false),
+              closeDrawer,
               small: true,
               classes: 'sidebar__close drawer-close',
             ),
@@ -740,24 +786,56 @@ class _DashboardAppState extends State<DashboardApp> {
             ], classes: 'sidebar__footer'),
         ],
         classes: 'sidebar ${drawer ? 'is-open' : ''}',
-        attributes: {'aria-label': 'Sidebar'},
+        attributes: {
+          'id': 'dashboard-navigation',
+          'aria-label': 'Navigation',
+          'role': drawerMedia.matches ? 'dialog' : 'complementary',
+          // Jaspr reconciles actual DOM attributes. Preserve native open while
+          // it exists, without re-adding it after an external native close.
+          if (navigationOpen) 'open': '',
+          if (drawer) 'aria-modal': 'true',
+        },
+        events: {
+          'cancel': (event) {
+            event.preventDefault();
+            closeDrawer();
+          },
+          'close': (_) {
+            final panel = web.document.getElementById('dashboard-navigation');
+            if (mounted &&
+                drawer &&
+                panel?.tagName == 'DIALOG' &&
+                !(panel as web.HTMLDialogElement).open)
+              closeDrawer();
+          },
+          'click': (event) {
+            if (!drawer) return;
+            final mouse = event as web.MouseEvent;
+            // Keyboard activation has no pointer coordinates. Only pointer
+            // clicks on the native backdrop can dismiss navigation here.
+            if (mouse.detail == 0 || event.target != event.currentTarget)
+              return;
+            final bounds = (event.currentTarget as web.HTMLElement)
+                .getBoundingClientRect();
+            if (mouse.clientX < bounds.left ||
+                mouse.clientX > bounds.right ||
+                mouse.clientY < bounds.top ||
+                mouse.clientY > bounds.bottom)
+              closeDrawer();
+          },
+        },
       ),
-      if (drawer)
-        el(
-          'button',
-          [],
-          classes: 'scrim drawer-scrim',
-          attributes: {'aria-label': 'Close navigation', 'type': 'button'},
-          events: {'click': (_) => setState(() => drawer = false)},
-        ),
       el('div', [
         el('header', [
           iconButton(
             'Open navigation',
             'menu',
-            () => setState(() => drawer = !drawer),
+            openDrawer,
             classes: 'topbar__menu drawer-toggle',
-            attributes: {'aria-expanded': '$drawer'},
+            attributes: {
+              'aria-expanded': '$drawer',
+              'aria-controls': 'dashboard-navigation',
+            },
           ),
           iconButton(
             sidebarCollapsed ? 'Show sidebar' : 'Hide sidebar',
@@ -832,7 +910,7 @@ class _DashboardAppState extends State<DashboardApp> {
                 events: {'click': (_) => showNotices()},
               ),
           ], classes: 'topbar__actions'),
-        ], classes: 'topbar'),
+        ], classes: fluidPage ? 'topbar topbar--fluid' : 'topbar'),
         el(
           'main',
           [
@@ -850,7 +928,9 @@ class _DashboardAppState extends State<DashboardApp> {
               if (state.connected) _page() else _signIn(),
             ], classes: 'page-frame'),
           ],
-          classes: 'main-content',
+          classes: fluidPage
+              ? 'main-content main-content--fluid'
+              : 'main-content',
           attributes: {
             'id': 'content',
             'tabindex': '-1',

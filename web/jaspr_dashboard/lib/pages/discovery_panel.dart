@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/planning_blocs.dart';
 import 'native_task_ui.dart';
 import '../services.dart';
 import 'dart:convert';
@@ -13,89 +14,40 @@ class DiscoveryPanel extends StatefulComponent {
 
 class _DiscoveryPanelState extends State<DiscoveryPanel> {
   DashboardBloc get connection => dashboardConnection;
-  Map<String, dynamic> data = {};
-  String? organization;
-  String? error;
-  bool busy = false;
-  bool expanded = false;
-  Timer? timer;
+  late final ProductDiscoveryBloc bloc;
   StreamSubscription? subscription;
-  int epoch = -1;
+  Map<String, dynamic> get data => bloc.data;
+  String? organization;
+  String? get error => bloc.state.error;
+  bool get busy => bloc.state.busy || bloc.state.loading;
+  bool expanded = false;
   bool get admin => connection.operator.value['role'] == 'admin';
 
   @override
   void initState() {
     super.initState();
-    epoch = connection.generation;
-    subscription = connection.stream.listen((_) {
-      if (mounted && epoch != connection.generation) {
-        epoch = connection.generation;
-        setState(() {
-          data = {};
-          organization = null;
-          error = null;
-        });
-      }
-    });
-    timer = Timer.periodic(const Duration(seconds: 15), (_) {
-      if (expanded && !busy && admin && connection.state.connected) refresh();
+    bloc = ProductDiscoveryBloc(connection);
+    subscription = bloc.stream.listen((_) {
+      if (!mounted) return;
+      final organizations = data['organizations'] as List? ?? [];
+      if (!organizations.any((item) => item['id'] == organization))
+        organization = organizations.isEmpty
+            ? null
+            : '${organizations.first['id']}';
+      setState(() {});
     });
   }
 
   @override
   void dispose() {
-    timer?.cancel();
     subscription?.cancel();
+    bloc.dispose();
     super.dispose();
   }
 
-  Future<void> refresh() async {
-    if (busy || !admin || !connection.state.connected) return;
-    final generation = connection.generation;
-    setState(() => busy = true);
-    try {
-      final snapshot = await connection.request('discovery');
-      if (!mounted || generation != connection.generation) return;
-      setState(() {
-        data = snapshot;
-        final organizations = data['organizations'] as List? ?? [];
-        if (!organizations.any((o) => o['id'] == organization)) {
-          organization = organizations.isEmpty
-              ? null
-              : '${organizations.first['id']}';
-        }
-        error = null;
-      });
-    } catch (e) {
-      if (mounted && generation == connection.generation)
-        setState(() => error = '$e');
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
-
-  Future<void> send(Map<String, dynamic> body) async {
-    if (busy || !admin) return;
-    final generation = connection.generation;
-    setState(() => busy = true);
-    try {
-      await connection.request('tasks/discovery', {
-        'organization_id': organization,
-        ...body,
-      });
-      if (!mounted || generation != connection.generation) return;
-      setState(() {
-        busy = false;
-        error = null;
-      });
-      await refresh();
-    } catch (e) {
-      if (mounted && generation == connection.generation)
-        setState(() => error = '$e');
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
+  Future<void> refresh() => bloc.refresh();
+  Future<void> send(Map<String, dynamic> body) =>
+      bloc.submit(organization, body);
 
   Future<void> configure(Map policy) async {
     final generation = connection.generation;
@@ -595,6 +547,7 @@ class _DiscoveryPanelState extends State<DiscoveryPanel> {
         ),
         onExpansionChanged: (value) {
           expanded = value;
+          bloc.setExpanded(value);
           if (value) refresh();
         },
         childrenPadding: const EdgeInsets.all(16),

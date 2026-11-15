@@ -9,13 +9,33 @@ Jaspr mounts it with the clone card. The collapsed Flutter setup intentionally
 avoids fetching connection configuration. Both populate the clone dropdown when
 their panel loads and refuse retries with an unavailable saved connection.
 
-1. Give the connection a name and enter `owner/repository`.
+1. Give the connection a name and enter `owner/repository`, or use token discovery
+   below to fill both fields from a repository selection.
 2. Choose **SSH deploy key**, **Fine-grained GitHub token (HTTPS)**, or
    **Configured GitHub account (HTTPS)**.
    For a fine-grained token, use the link in this form, choose the correct resource
    owner and **Only select repositories**, then grant **Contents: Read-only**
    (Metadata read access is included). Organization approval may be required.
-   Paste the token into the password field and click **Save token connection**.
+   Paste the token into the password field. **Discover repositories** lists
+   a page of repositories visible to that token using GitHub's authenticated-user repository
+   API (`https://api.github.com/user/repos`). Choose a **Discovered repository**
+   to fill the repository and an empty connection name. **Load more repositories**
+   fetches another page of up to 100 results.
+   GitHub's `Link` header determines whether more pages exist, regardless of page
+   length. The panel explicitly reports when more repositories are available.
+   Listings stop after 1,000 pages (up to 100,000 repositories) and display a
+   listing-limit message if GitHub still reports another page. Manual entry
+   remains available. Pagination is not a snapshot: repository creation, renaming
+   or deletion between requests can shift results and omit a repository. Restart
+   discovery or enter its name manually when needed.
+   Discovery uses the pasted token
+   without saving it or changing the dashboard's publishing credentials. Editing
+   the token clears the results; account changes also discard outstanding results.
+   Metadata visibility does not prove Contents read permission, so test repository
+   access after saving. Empty results suggest checking token repository selection
+   or organization approval. Errors report invalid/expired credentials, denied or
+   rate-limited access, or unavailable responses; manual entry remains available.
+   Click **Save token connection** when the repository selection is ready.
    New connections accept PATs beginning with `github_pat_` (fine-grained) or
    `ghp_` (classic); a recognized prefix does not verify validity or permissions.
    OAuth/App credentials and refresh tokens are not accepted by this PAT form.
@@ -80,11 +100,23 @@ not authorize PR creation, publication, merging, deployment, submodule access or
 Git LFS credentials. Those workflows keep their existing configuration.
 
 The API is `GET /api/projects/connections` and `POST /api/projects/connections`
-with actions `create`, `rotate`, `verify_host`, `test`, `bind`, `unbind`, and `remove`. Listing, configuration and
+with actions `discover`, `create`, `rotate`, `verify_host`, `test`, `bind`, `unbind`, and `remove`. Listing, configuration and
 managed cloning are administrator operations. `projects/clone` accepts optional
 `connection_id`; durable job records retain that identifier, the credential-free
 URL and folder so retries can be reviewed. Requests have existing same-origin
 session checks. The shared client allows time for bounded host/access probes.
+
+`discover` is an administrator-only **POST to the existing connections endpoint**,
+with JSON body `{"action":"discover","token":"<PAT>","page":1}`. The raw PAT
+is sent from the browser to the gateway in this request body, then used by the
+gateway to authenticate a bounded request to `https://api.github.com/user/repos`.
+Use HTTPS for the dashboard connection when sending credentials over a network.
+Discovery does not save the PAT or echo it in its response. It returns
+`repositories` (repository names, private/archive flags), `next_page` (integer or
+null), and `limit_reached` (boolean). Page numbers must be between 1 and 1,000.
+Subsequent pages require resubmitting the PAT. It does not create a connection or
+change GitHub publication settings. This repository listing is unrelated to the
+product-discovery workflow.
 
 `create` accepts `label`, `repository` (`owner/repository`), `kind` (`ssh`,
 `github`, or `token`), and a required `token` only for `kind: token`. Supplying a
@@ -103,6 +135,105 @@ from Git/SSH is not copied into test results. The gateway and agents share the
 Repository connections, private keys and tokens are not part of configuration export/import;
 reconfigure them on a replacement container. Dashboard upgrades preserve the
 configuration directory. No live keys or remote grants are created by tests.
+
+## Removing old clones
+
+Administrators can use **Remove clone** beside a finished, failed, or interrupted
+entry in **Clone a project**. **Remove history entry** clears only that entry;
+the project folder and saved repository connection remain available.
+
+To delete the folder too, select **Also permanently delete the cloned folder**,
+type its exact folder name, then choose **Delete folder and history**. This
+permanently deletes all files in that folder, including local changes. Running
+clones cannot be removed. Folder deletion also refuses projects used by
+workspaces, managed jobs, or configured teams/agents, assigned repository
+connections, linked worktrees, and unsafe paths. Unassign a repository connection
+and close or reconfigure the relevant workspaces and project assignments first.
+The remote repository and GitHub credentials are not deleted or revoked.
+Older clone entries without a recorded original folder identity support
+history-only removal. The dashboard disables their folder-deletion option, and
+the gateway also refuses deletion. Inspect those folders before deleting them
+manually; their current contents may belong to a replacement project.
+
+The administrator-only endpoint is `POST /api/projects/jobs/remove` with `id`,
+optional boolean `delete_folder` (defaults to `false`), and `confirm_folder`
+matching the recorded folder name when deletion is requested. The gateway selects
+the folder from its stored clone job; requests cannot supply an arbitrary path.
+
+## Reusing a token for publishing
+
+To reuse a saved PAT for task publication, open **Tasks → GitHub publishing** and
+select its connection under **Publishing token source**. The selected connection
+must name the branch destination. The browser sends its ID; the gateway reads
+and copies its private token, then independently validates publishing setup.
+Successful cloning proves read access only, and saving a clone connection does
+not enable publishing.
+
+For protected publication, the saved connection must name the operator-configured
+fork and supplies only the **fork push PAT**. Paste the distinct
+**upstream PAT** separately in publishing setup. Both must be fine-grained
+`github_pat_` tokens. The fork token needs Contents read/write and Metadata read,
+plus Workflows read/write only when workflow files may change. The upstream
+PAT selects the upstream with Contents read, Metadata read, Pull requests
+read/write, and available check/status read permissions; do not grant upstream
+Contents write. The backend enforces no upstream writes independently, because
+it cannot inspect the absence of a scope. A prefix proves format only.
+
+The protected deployment policy permits pushes only to its configured fork.
+Root supplies it at `/etc/herdr/publishing-policy.json`, mode `0444` or `0644`,
+under trusted root-owned directories. Every parent must be root-owned and not
+group/other-writable. Each protected entry has exactly this shape (fictional names):
+
+```json
+{"upstream":"SourceOwner/project","fork":"ForkOwner/project","mode":"fork_only","arrangement":"manual_adoption"}
+```
+
+Place entries in `{"version":1,"protected":[...]}`. `mode` and `arrangement` have
+the fixed values shown above; the upstream and fork must differ. Run as root:
+
+```sh
+python3 /opt/herdr-web/web/gateway/publication_policy.py --arm /etc/herdr/publishing-policy.json
+```
+
+This creates `/etc/herdr/publishing-policy.required`. Once enabled, deleting or
+emptying the policy fails closed across restarts. Back up both external files.
+Production ignores `HERDR_PUBLISHING_POLICY`; that override is for development
+and tests. The product example is empty. The installer
+preserves existing contents, and releases/rollbacks never replace this external
+file; root may change it without a release. Browser setup cannot edit or clear it.
+Missing or empty means no protected projects only on a never-enabled deployment.
+Tasks shows the absent/empty policy state to administrators. A present invalid policy refuses gateway
+startup; a live failure disables GitHub writes, reports a policy error, and leaves
+credential reads, clone/fetch and task/release listing available. Two private personal owners cannot be selected by a
+single fine-grained PAT. Herdr pushes the reviewed branch, gives the operator a
+GitHub comparison link, and verifies/adopts the draft PR the operator opens.
+Adoption requires complete head/base repository identities, refs, and the
+approved head SHA. Inaccessible metadata leaves adoption pending; unreadable
+check/status evidence is not a successful check.
+
+Ordinary repository connections still accept `github_pat_` and `ghp_` PATs for
+clone/fetch; protected publishing rejects classic tokens. SSH deploy keys cannot
+authorize the upstream PR API. Unprotected publishing retains its configured
+direct/fork support. A saved connection in direct mode allows only its named
+repository; in fork mode every allowlist entry must target the connection's
+fork. Manual token entry can serve multiple permitted destinations, up to 20
+allowlisted repositories, but cannot bypass the protected write policy.
+
+The root update worker refuses to erase a non-empty release-tree policy until
+all its mappings exist in the enabled external policy. Migrate before upgrading
+and update an older installed root worker first.
+
+The policy schema currently supports manual adoption only. Publishing stores
+one global push/upstream credential pair for the configured projects; policy
+entries do not provide independent credential slots.
+
+Publishing retains its own copy of the fork token. Rotating or removing the
+repository connection does not update it; reopen publishing setup to validate
+and copy a replacement. A preserved upstream credential is revalidated for the
+protected mapping, and protected publishing never falls back to the fork token.
+Both credentials stay in private server-side storage. The isolated Git publisher
+uses a temporary `0600` push-only file and repository-scoped askpass prompts;
+the upstream PAT is not loaded by that helper.
 
 ## Retiring a connection
 

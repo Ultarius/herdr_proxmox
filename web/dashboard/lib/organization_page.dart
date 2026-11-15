@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/organization_tools_bloc.dart';
 import 'organization_automation.dart';
 import 'package:herdr_dashboard_state/team_template_draft.dart';
 import 'package:herdr_dashboard_state/template_library_state.dart';
@@ -31,13 +32,14 @@ class OrganizationPage extends StatefulWidget {
 class _OrganizationPageState extends State<OrganizationPage> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
   late final OrganizationBloc bloc = OrganizationBloc(connection);
-  Timer? timer;
   late String view = widget.initialView;
   bool cleaningSessions = false;
   // Keep the exact request across lost responses so a retried restart or close
   // reconciles instead of repeating the pane operation.
   final Map<String, String> sessionRequests = {};
-  ModelCatalog catalog = const ModelCatalog({});
+  late final OrganizationToolsBloc tools;
+  StreamSubscription? toolsSubscription;
+  ModelCatalog get catalog => ModelCatalog.fromJson(tools.catalog);
   String? get selected => connection.selectedOrganization.value;
   set selected(String? value) => connection.selectedOrganization.value = value;
   void selectionChanged() {
@@ -47,35 +49,30 @@ class _OrganizationPageState extends State<OrganizationPage> {
   /// The model dropdowns need a catalog before a hire form opens. A gateway
   /// without one leaves the manual entry fields in place instead.
   Future<void> loadCatalog() async {
-    final epoch = connection.generation;
     try {
-      final result = await connection.request('models');
-      if (!mounted || epoch != connection.generation) return;
-      setState(
-        () => catalog = ModelCatalog.fromJson(
-          result is Map<String, dynamic> ? result : null,
-        ),
-      );
+      await tools.loadCatalog();
     } catch (_) {
-      // The hire form still works; it falls back to manual entry.
+      /* Manual model entry remains available. */
     }
   }
 
   @override
   void initState() {
     super.initState();
+    tools = OrganizationToolsBloc(connection);
+    toolsSubscription = tools.stream.listen((_) {
+      if (mounted) setState(() {});
+    });
     connection.selectedOrganization.addListener(selectionChanged);
     bloc.send(OrganizationCommand('refresh'));
+    bloc.startPolling();
     loadCatalog();
-    timer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (connection.state.connected && bloc.pending == null)
-        bloc.send(OrganizationCommand('refresh'));
-    });
   }
 
   @override
   void dispose() {
-    timer?.cancel();
+    toolsSubscription?.cancel();
+    tools.dispose();
     connection.selectedOrganization.removeListener(selectionChanged);
     bloc.dispose();
     super.dispose();
@@ -92,7 +89,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
     if (organization == null) {
       try {
         templates = Map<String, dynamic>.from(
-          await connection.request('organizations/templates'),
+          await tools.request('organizations/templates'),
         );
       } catch (e) {
         templates = {'error': 'Role presets could not load: $e'};
@@ -100,7 +97,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
       try {
         projectFolders = projectDirectoryChoices(
           Map<String, dynamic>.from(
-            await connection.request('projects/browse', {'path': ''}),
+            await tools.request('projects/browse', {'path': ''}),
           ),
         );
       } catch (e) {
@@ -117,7 +114,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
         projectFolderError: projectFolderError,
         preview: (body) async {
           final result = Map<String, dynamic>.from(
-            await connection.request('organizations/templates', body),
+            await tools.request('organizations/templates', body),
           );
           if (epoch != connection.generation)
             throw StateError(
@@ -131,7 +128,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
               'Connection changed. Reopen the organization form.',
             );
           final result = Map<String, dynamic>.from(
-            await connection.request('organizations/templates/library', body),
+            await tools.request('organizations/templates/library', body),
           );
           if (epoch != connection.generation)
             throw StateError(
@@ -261,12 +258,14 @@ class _OrganizationPageState extends State<OrganizationPage> {
     if (confirmed != true || !mounted) return;
     setState(() => cleaningSessions = true);
     try {
-      final result = await OrganizationCommand('session', {
-        'organization_id': selected,
-        'mode': 'cleanup',
-        'job_ids': chosen.toList(),
-        'inspected': true,
-      }).execute(connection);
+      final result = await tools.execute(
+        OrganizationCommand('session', {
+          'organization_id': selected,
+          'mode': 'cleanup',
+          'job_ids': chosen.toList(),
+          'inspected': true,
+        }),
+      );
       if (!mounted) return;
       final names = {
         for (final job in obsolete)
@@ -312,7 +311,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
     bool current() =>
         mounted && epoch == connection.generation && selected == organizationId;
     try {
-      final response = await connection.request('organizations/session', {
+      final response = await tools.request('organizations/session', {
         'mode': 'archives',
         'organization_id': organizationId,
       });
@@ -361,7 +360,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
         ),
       );
       if (chosen == null || !current()) return;
-      final data = await connection.request('organizations/session', {
+      final data = await tools.request('organizations/session', {
         'mode': 'view_archive',
         'organization_id': organizationId,
         'archive_id': chosen['id'],
@@ -486,7 +485,7 @@ class _OrganizationPageState extends State<OrganizationPage> {
     final selection = 'session:${job['id']}:$mode';
     final request = sessionRequests.putIfAbsent(selection, newRequestId);
     try {
-      await connection.request('organizations/session', {
+      await tools.request('organizations/session', {
         'organization_id': job['organization_id'],
         'job_id': job['id'],
         'mode': mode,

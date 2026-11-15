@@ -4,9 +4,15 @@ import '../terminal.dart';
 /// A terminal inspection is a complete retained snapshot, not a websocket
 /// output delta. Replace its DOM buffer only when the snapshot changes.
 class SnapshotTerminal extends StatefulComponent {
-  const SnapshotTerminal(this.output, {super.key, this.height = 360});
+  const SnapshotTerminal(
+    this.output, {
+    super.key,
+    this.height = 360,
+    this.fill = false,
+  });
   final String output;
   final int height;
+  final bool fill;
   @override
   State<SnapshotTerminal> createState() => _SnapshotTerminalState();
 }
@@ -16,7 +22,10 @@ class _SnapshotTerminalState extends State<SnapshotTerminal> {
   @override
   void initState() {
     super.initState();
-    terminal = BrowserTerminal();
+    terminal = BrowserTerminal(readOnly: true);
+    terminal.onViewportChange = () {
+      if (mounted) setState(() {});
+    };
     update();
   }
 
@@ -39,10 +48,28 @@ class _SnapshotTerminalState extends State<SnapshotTerminal> {
   }
 
   @override
-  Component build(BuildContext context) => TerminalView(
-    terminal,
-    height: component.height,
-    autofocus: false,
-    label: 'Retained terminal output',
+  Component build(BuildContext context) => el(
+    'div',
+    [
+      TerminalView(
+        terminal,
+        height: component.height,
+        fill: component.fill,
+        autofocus: false,
+        label: 'Retained terminal output',
+      ),
+      if (!terminal.followingOutput)
+        button(
+          'Jump to latest',
+          () {
+            terminal.jumpToLatest();
+            terminal.focus();
+          },
+          small: true,
+          classes: 'snapshot-terminal__follow',
+        ),
+    ],
+    classes:
+        'snapshot-terminal${component.fill ? ' snapshot-terminal--fill' : ''}',
   );
 }

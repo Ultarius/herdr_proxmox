@@ -46,12 +46,9 @@ abstract class UseCaseBuilderBase {
   /// Creates the use case instance that will handle events.
   UseCaseGenerator get generator;
 
-  /// How same-type events are processed relative to one another.
-  ///
-  /// Defaults to [EventConcurrency.concurrent] (events may interleave at awaits).
-  /// Use [EventConcurrency.sequential] for events that mutate shared state, or
-  /// [EventConcurrency.droppable] for exclusive flows.
-  EventConcurrency get concurrency => EventConcurrency.concurrent;
+  /// How same-type events are processed relative to one another. Every
+  /// builder declares it; a mode is a decision, never a default.
+  EventConcurrency get concurrency;
 
   /// Cleanup method called when the use case is disposed.
   ///
@@ -71,11 +68,13 @@ abstract class UseCaseBuilderBase {
 ///     () => UseCaseBuilder(
 ///       typeOfEvent: IncrementEvent,
 ///       useCaseGenerator: () => IncrementUseCase(),
+///       concurrency: EventConcurrency.sequential,
 ///     ),
 ///     () => UseCaseBuilder(
 ///       typeOfEvent: LoadDataEvent,
 ///       useCaseGenerator: () => LoadDataUseCase(),
 ///       initialEventBuilder: () => LoadDataEvent(), // Auto-fires on init
+///       concurrency: EventConcurrency.droppable,
 ///     ),
 ///   ]);
 /// }
@@ -86,31 +85,53 @@ class UseCaseBuilder implements UseCaseBuilderBase {
   /// [typeOfEvent] - The event type this use case handles.
   /// [useCaseGenerator] - Factory function to create use case instances.
   /// [initialEventBuilder] - Optional factory for an initial event.
+  /// [joinKey] - With `EventConcurrency.singleflight` only: two events join
+  /// when the keys this returns for them are `==` (and events with
+  /// different keys run side by side). Without it, events join by type.
   UseCaseBuilder({
     required this.typeOfEvent,
     required this.useCaseGenerator,
     UseCaseEventBuilder? initialEventBuilder,
-    this.concurrency = EventConcurrency.concurrent,
+    required this.concurrency,
+    this.joinKey,
   })  : _initialEventBuilder = initialEventBuilder,
         _acceptsBloc = null,
-        _useCaseBlocType = null;
+        _useCaseBlocType = null {
+    _checkJoinKey();
+  }
 
   UseCaseBuilder._typed({
     required this.typeOfEvent,
     required this.useCaseGenerator,
     required UseCaseEventBuilder? initialEventBuilder,
     required this.concurrency,
+    required this.joinKey,
     required bool Function(JuiceBloc bloc) acceptsBloc,
     required Type useCaseBlocType,
   })  : _initialEventBuilder = initialEventBuilder,
         _acceptsBloc = acceptsBloc,
-        _useCaseBlocType = useCaseBlocType;
+        _useCaseBlocType = useCaseBlocType {
+    _checkJoinKey();
+  }
+
+  /// With `EventConcurrency.singleflight`: what two events must have equal
+  /// to join. Null joins by event type alone.
+  final Object? Function(EventBase event)? joinKey;
+
+  void _checkJoinKey() {
+    if (joinKey != null && concurrency != EventConcurrency.singleflight) {
+      throw ArgumentError('UseCaseBuilder for $typeOfEvent: joinKey only '
+          'means something with EventConcurrency.singleflight, and this '
+          'builder is ${concurrency.name}');
+    }
+  }
 
   /// Type-checked registration: the event type is INFERRED from the use
   /// case, so it cannot disagree with it.
   ///
   /// ```dart
-  /// () => UseCaseBuilder.typed(() => LoadFooUseCase()),
+  /// () => UseCaseBuilder.typed(() => LoadFooUseCase(),
+  ///     concurrency: EventConcurrency.droppable),
   /// () => UseCaseBuilder.typed(() => SaveFooUseCase(),
   ///     concurrency: EventConcurrency.sequential),
   /// ```
@@ -123,19 +144,21 @@ class UseCaseBuilder implements UseCaseBuilderBase {
   /// bloc's constructor, not on the first event.
   ///
   /// The event must be the use case's exact event class (events match by
-  /// runtime type — AGENTS gotcha 2); a use case declared over an abstract
-  /// base event should keep the explicit constructor.
+  /// runtime type); a use case declared over an abstract base event keeps
+  /// the explicit constructor.
   static UseCaseBuilder
       typed<TBloc extends JuiceBloc, TEvent extends EventBase>(
     UseCase<TBloc, TEvent> Function() useCaseGenerator, {
-    EventConcurrency concurrency = EventConcurrency.concurrent,
+    required EventConcurrency concurrency,
     TEvent Function()? initialEventBuilder,
+    Object? Function(TEvent event)? joinKey,
   }) {
     return UseCaseBuilder._typed(
       typeOfEvent: TEvent,
       useCaseGenerator: useCaseGenerator,
       initialEventBuilder: initialEventBuilder,
       concurrency: concurrency,
+      joinKey: joinKey == null ? null : (event) => joinKey(event as TEvent),
       acceptsBloc: (bloc) => bloc is TBloc,
       useCaseBlocType: TBloc,
     );

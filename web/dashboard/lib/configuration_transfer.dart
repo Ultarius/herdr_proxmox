@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/organization_tools_bloc.dart';
 import 'dart:convert';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
@@ -12,17 +13,31 @@ class ConfigurationTransfer extends StatefulWidget {
 }
 
 class _ConfigurationTransferState extends State<ConfigurationTransfer> {
+  late final OrganizationToolsBloc tools;
+  @override
+  void initState() {
+    super.initState();
+    tools = OrganizationToolsBloc(BlocScope.get<DashboardBloc>());
+  }
+
+  @override
+  void dispose() {
+    tools.dispose();
+    super.dispose();
+  }
+
   bool busy = false;
   String? message;
   Future<void> transfer(bool importing) async {
+    final epoch = tools.connection.generation;
     setState(() {
       busy = true;
       message = null;
     });
     try {
-      final connection = BlocScope.get<DashboardBloc>();
       if (!importing) {
-        final data = await connection.request('organizations/export');
+        final data = await tools.request('organizations/export');
+        if (!mounted || !tools.current(epoch)) return;
         // Preserve complete backups even when the destination import limit is
         // exceeded; warn clearly rather than downloading silently truncated data.
         final oversized = data['import_size_supported'] == false;
@@ -35,7 +50,7 @@ class _ConfigurationTransferState extends State<ConfigurationTransfer> {
             : 'Configuration download started. Keep this file before replacing the LXC.';
       } else {
         final content = await readConfigurationFile();
-        if (content == null || !mounted) return;
+        if (content == null || !mounted || !tools.current(epoch)) return;
         final data = jsonDecode(content) as Map<String, dynamic>;
         if (data['format'] != 'herdr-configuration' || data['version'] != 1)
           throw const FormatException('Unsupported configuration format.');
@@ -58,8 +73,9 @@ class _ConfigurationTransferState extends State<ConfigurationTransfer> {
             ],
           ),
         );
-        if (confirmed != true) return;
-        final imported = await connection.request('organizations/import', data);
+        if (confirmed != true || !mounted || !tools.current(epoch)) return;
+        final imported = await tools.request('organizations/import', data);
+        if (!mounted || !tools.current(epoch)) return;
         final counts = imported['imported'] as Map? ?? {};
         await widget.onImported();
         message =

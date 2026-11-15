@@ -34,6 +34,57 @@ class Unprepared:
 
 
 class ClaimTests(unittest.TestCase):
+    def test_component_dispatch_uses_every_verified_rust_command_for_each_version(self):
+        import environment_providers
+        adapter = environment_adapters.get('rust-toolchain')
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            entries = []
+            for component, version in (('first', '1.85.0'), ('second', '1.86.0')):
+                (root / component).mkdir()
+                executable = str(root / ('sdk-' + version) / 'bin/rustc')
+                entries.append(dict(name='rust-toolchain', required=version, component=component,
+                    adapter_version=adapter.version, executables=[executable],
+                    companions=[dict(name='cargo', required=version,
+                                     executables=[adapter.command(executable, 'cargo')])],
+                    artifact_receipt=dict(probe=dict(components={'rustfmt': version, 'clippy-driver': version}))))
+            policy = dict(plan_digest='plan', toolchains=entries)
+            launchers, digest = environment_dispatch.install(policy, root, root / 'cache')
+            for entry in entries:
+                for command in adapter.commands:
+                    with self.subTest(component=entry['component'], command=command), \
+                            patch.object(environment_dispatch.Path, 'cwd', return_value=root / entry['component']), \
+                            patch.object(environment_providers, 'verify_entry') as verify, \
+                            patch.object(environment_dispatch.os, 'execve') as execute:
+                        environment_dispatch.main([str(launchers / 'bindings.json'), digest, command, '--version'])
+                        verify.assert_called_once_with(entry)
+                        executable, arguments, env = execute.call_args.args
+                        self.assertEqual(executable, adapter.command(entry['executables'][0], command))
+                        self.assertEqual(arguments, [executable, '--version'])
+                        self.assertEqual(env['RUSTC'], entry['executables'][0])
+
+            # A receipt for one optional component never authorizes the other.
+            for missing, commands in adapter.component_commands:
+                entry = entries[0]
+                entry['artifact_receipt']['probe']['components'].pop(missing)
+                launchers, digest = environment_dispatch.install(policy, root, root / 'cache')
+                for command in commands:
+                    with self.subTest(missing=missing, command=command), \
+                            patch.object(environment_dispatch.Path, 'cwd', return_value=root / 'first'), \
+                            patch.object(environment_providers, 'verify_entry'), \
+                            patch.object(environment_dispatch.os, 'execve') as execute:
+                        with self.assertRaisesRegex(ValueError, 'no verified companion binding'):
+                            environment_dispatch.main([str(launchers / 'bindings.json'), digest, command])
+                        execute.assert_not_called()
+                entry['artifact_receipt']['probe']['components'][missing] = entry['required']
+
+            with patch.object(environment_dispatch.Path, 'cwd', return_value=root / 'first'), \
+                    patch.object(environment_providers, 'verify_entry', side_effect=ValueError('receipt invalid')), \
+                    patch.object(environment_dispatch.os, 'execve') as execute:
+                with self.assertRaisesRegex(ValueError, 'receipt invalid'):
+                    environment_dispatch.main([str(launchers / 'bindings.json'), digest, 'rustfmt'])
+                execute.assert_not_called()
+
     def test_rust_reuse_requires_the_receipted_cargo_version(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -559,6 +610,31 @@ class GatewayPolicyTests(unittest.TestCase):
         result = subprocess.run([str(launchers / 'dotnet')], cwd=other, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('integrity check', result.stderr)
+
+    def test_rust_dispatcher_executes_all_advertised_tools_across_component_versions(self):
+        adapter = environment_adapters.get('rust-toolchain')
+        entries = []
+        for component, version in (('rust-one', '1.85.0'), ('rust-two', '1.86.0')):
+            (self.repo / component).mkdir()
+            binaries = self.root / ('sdk-' + version) / 'bin'
+            binaries.mkdir(parents=True)
+            for command in adapter.commands:
+                executable = binaries / command
+                executable.write_text('#!/bin/sh\nprintf "%s\\n" "' + command + ' ' + version + '"\n')
+                executable.chmod(0o755)
+            entries.append(dict(name=adapter.capability, required=version, component=component,
+                adapter_version=adapter.version, executables=[str(binaries / 'rustc')],
+                companions=[dict(name='cargo', required=version, executables=[str(binaries / 'cargo')])],
+                artifact_receipt=dict(probe=dict(components={'rustfmt': version, 'clippy-driver': version}))))
+        launchers, _ = environment_dispatch.install(dict(plan_digest='plan', toolchains=entries),
+                                                   self.repo, self.root / 'rust-dispatch')
+        for entry in entries:
+            for command in adapter.commands:
+                with self.subTest(component=entry['component'], command=command):
+                    result = subprocess.run([str(launchers / command), '--version'],
+                        cwd=self.repo / entry['component'], capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), command + ' ' + entry['required'])
 
     def test_candidate_changes_to_global_json_cannot_redefine_the_rules(self):
         self.prepare()

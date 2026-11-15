@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/workspace_blocs.dart';
 import 'package:herdr_dashboard_state/project_environment.dart';
 import 'package:juice/juice.dart';
 import 'package:herdr_dashboard_state/project_analysis.dart';
@@ -13,11 +14,15 @@ class ProjectAnalysisCard extends StatefulWidget {
 
 class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
   late final DashboardBloc connection;
-  ProjectAnalysisLoad? loaded;
-  String? failure;
-  bool refreshing = false;
-  bool saving = false;
-  int requestId = 0;
+  late ProjectAnalysisBloc feature;
+  StreamSubscription? featureSubscription;
+  ProjectAnalysisLoad? get loaded => feature.state.value('loaded');
+  bool editingOverride = false;
+  String? get failure =>
+      feature.state.errors['analysis'] ??
+      (editingOverride ? null : feature.state.errors['override']);
+  bool get refreshing => feature.state.reading.contains('analysis');
+  bool get saving => feature.state.busy;
   final expanded = <String, bool>{};
   int settingsRequest = 0;
   int repositoryRequest = 0;
@@ -30,8 +35,17 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
 
   @override
   void dispose() {
+    featureSubscription?.cancel();
+    feature.dispose();
     environment.dispose();
     super.dispose();
+  }
+
+  void bindFeature() {
+    feature = ProjectAnalysisBloc(connection, widget.path);
+    featureSubscription = feature.stream.listen((_) {
+      if (mounted) setState(() {});
+    });
   }
 
   void initializeEnvironment() {
@@ -63,6 +77,7 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
   void initState() {
     super.initState();
     connection = BlocScope.get<DashboardBloc>();
+    bindFeature();
     initializeEnvironment();
     refresh();
   }
@@ -75,11 +90,9 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
       expanded.clear();
       settingsRequest = 0;
       repositoryRequest = 0;
-      saving = false;
-      requestId++;
-      loaded = null;
-      failure = null;
-      refreshing = false;
+      featureSubscription?.cancel();
+      feature.dispose();
+      bindFeature();
       refresh();
     }
   }
@@ -87,38 +100,21 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
   bool get admin => connection.operator.value['role'] == 'admin';
 
   Future<void> refresh({bool force = false}) async {
-    if (refreshing || !connection.state.connected) return;
-    refreshing = true;
-    final epoch = connection.generation;
-    final id = ++requestId;
+    final currentFeature = feature;
     final path = widget.path;
     unawaited(environment.load(path));
-    try {
-      final result = await loadProjectAnalysis(
-        connection.request,
-        path,
-        force: force,
-      );
-      if (mounted && epoch == connection.generation && id == requestId)
-        setState(() {
-          if (!expanded.containsKey('repository') &&
-              !projectEvidenceNeedsAttention(loaded?.report ?? {}) &&
-              projectEvidenceNeedsAttention(result.report))
-            repositoryRequest++;
-          loaded = result;
-
-          failure = null;
-        });
-    } catch (error) {
-      if (mounted && epoch == connection.generation && id == requestId)
-        setState(() => failure = '$error');
-    } finally {
-      if (mounted && epoch == connection.generation && id == requestId)
-        setState(() => refreshing = false);
-    }
+    final previous = loaded;
+    await currentFeature.refresh(force: force);
+    if (mounted &&
+        identical(currentFeature, feature) &&
+        !expanded.containsKey('repository') &&
+        !projectEvidenceNeedsAttention(previous?.report ?? {}) &&
+        projectEvidenceNeedsAttention(loaded?.report ?? {}))
+      setState(() => repositoryRequest++);
   }
 
   Future<void> editOverride() async {
+    setState(() => editingOverride = true);
     final current = loaded?.override ?? {};
     final tool = TextEditingController(text: '${current['toolchain'] ?? ''}');
     final constraint = TextEditingController(
@@ -219,8 +215,7 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
                             error = null;
                           });
                           try {
-                            await connection.request('projects/toolchain', {
-                              'repository': widget.path,
+                            await feature.saveOverride({
                               'toolchain': tool.text.trim(),
                               'constraint': constraint.text.trim(),
                               'notation': notation,
@@ -243,24 +238,17 @@ class _ProjectAnalysisCardState extends State<ProjectAnalysisCard> {
       },
     );
     await closed;
+    await feature.clearError('override');
+    if (mounted) setState(() => editingOverride = false);
     tool.dispose();
     constraint.dispose();
     await refresh(force: true);
   }
 
   Future<void> removeOverride() async {
-    setState(() => saving = true);
     try {
-      await connection.request('projects/toolchain', {
-        'repository': widget.path,
-        'toolchain': '',
-      });
-      await refresh(force: true);
-    } catch (error) {
-      if (mounted) setState(() => failure = '$error');
-    } finally {
-      if (mounted) setState(() => saving = false);
-    }
+      await feature.saveOverride({'toolchain': ''});
+    } catch (_) {} // The feature retains the backend failure for the card.
   }
 
   Widget requirement(Map item, {bool sourceOnly = false}) {

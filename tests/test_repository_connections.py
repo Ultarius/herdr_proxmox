@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'web/gateway'))
 from github_api import GitHub
@@ -27,6 +27,61 @@ class RepositoryConnectionTests(unittest.TestCase):
         self.projects.mkdir()
         self.github = GitHub(self.root / 'github.json')
         self.service = RepositoryConnections(self.root / 'connections', self.projects, self.github)
+
+    def test_discovery_is_paginated_sanitized_and_does_not_save_the_token(self):
+        token = 'github_pat_' + 'd' * 40
+        results = [dict(full_name=f'owner/repo-{n}', private=True, token=token,
+                        clone_url='https://untrusted.invalid') for n in range(100)]
+        with patch.object(self.github, 'request', return_value=dict(items=results, has_next=True)) as request:
+            result = self.service.action(dict(action='discover', token=token), 'admin')
+        request.assert_called_once_with('/user/repos?per_page=100&page=1&sort=full_name&direction=asc',
+                                        token=token, page_result=True)
+        self.assertEqual(result['next_page'], 2)
+        self.assertEqual(result['repositories'][0],
+                         dict(repository='owner/repo-0', private=True, archived=False))
+        self.assertNotIn(token, json.dumps(result))
+        self.assertFalse(self.service.path.exists())
+        self.assertEqual(list(self.service.directory.iterdir()), [])
+        with patch.object(self.github, 'request', return_value=dict(items=[], has_next=False)):
+            self.assertEqual(self.service.discover_repositories(token, 2), dict(repositories=[], next_page=None, limit_reached=False))
+
+    def test_repository_pagination_uses_actual_link_headers_not_page_length(self):
+        token = 'github_pat_' + 'd' * 40
+        for count, link, page, next_page, limit in (
+                (1, '<https://api.github.com/user/repos?page=2>; rel="next"', 1, 2, False),
+                (100, '', 1, None, False),
+                (1, '<https://api.github.com/user/repos?page=1001>; rel="next"', 1000, None, True)):
+            with self.subTest(count=count, page=page):
+                opener = MagicMock()
+                response = opener.open.return_value.__enter__.return_value
+                response.read.return_value = json.dumps([dict(full_name=f'owner/repo-{n}') for n in range(count)]).encode()
+                response.headers = {'Link': link}
+                with patch('github_api.build_opener', return_value=opener):
+                    result = self.service.discover_repositories(token, page)
+                self.assertEqual(result['next_page'], next_page)
+                self.assertEqual(result['limit_reached'], limit)
+
+    def test_discovery_rejects_non_admin_and_invalid_input_before_api_call(self):
+        with patch.object(self.github, 'request') as request:
+            for body, role in [(dict(action='discover', token='github_pat_' + 'd' * 40), 'member'),
+                               (dict(action='discover', token='invalid'), 'admin'),
+                               (dict(action='discover', token='github_pat_' + 'd' * 40, page=True), 'admin'),
+                               (dict(action='discover', token='github_pat_' + 'd' * 40, page=0), 'admin')]:
+                with self.subTest(body=body, role=role), self.assertRaises(ValueError):
+                    self.service.action(body, role)
+            request.assert_not_called()
+
+    def test_discovery_handles_failures_without_echoing_secrets(self):
+        from github_api import GitHubError
+        token = 'github_pat_' + 'd' * 40
+        with patch.object(self.github, 'request', side_effect=GitHubError(401)):
+            with self.assertRaisesRegex(ValueError, 'invalid or expired') as caught:
+                self.service.discover_repositories(token)
+            self.assertNotIn(token, str(caught.exception))
+        for response in ({}, [dict(full_name='../bad')], [None], [dict(full_name='owner/repo')] * 101):
+            with self.subTest(response=response), patch.object(self.github, 'request', return_value=dict(items=response, has_next=False)):
+                with self.assertRaisesRegex(ValueError, 'Invalid repository discovery response'):
+                    self.service.discover_repositories(token)
 
     def github_connection(self):
         self.github.path.write_text(json.dumps({'token': 'secret_' + 'a' * 30}), encoding='utf-8')

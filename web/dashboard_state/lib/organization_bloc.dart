@@ -23,7 +23,12 @@ class OrganizationState extends BlocState {
 }
 
 class OrganizationCommand extends EventBase {
-  OrganizationCommand(this.action, [Map<String, dynamic>? body])
+  factory OrganizationCommand(String action, [Map<String, dynamic>? body]) =>
+      action == 'refresh'
+      ? _OrganizationRefresh(body)
+      : OrganizationCommand._(action, body);
+
+  OrganizationCommand._(this.action, Map<String, dynamic>? body)
     : body = body == null
           ? null
           : {
@@ -38,27 +43,74 @@ class OrganizationCommand extends EventBase {
       connection.request('organizations/$action', body);
 }
 
+class _OrganizationRefresh extends OrganizationCommand {
+  _OrganizationRefresh(Map<String, dynamic>? body) : super._('refresh', body);
+}
+
 class OrganizationBloc extends JuiceBloc<OrganizationState> {
   OrganizationBloc(this.connection)
     : super(const OrganizationState(), [
-        () => UseCaseBuilder(
-          typeOfEvent: OrganizationCommand,
-          useCaseGenerator: () => OrganizationUseCase(),
+        () => UseCaseBuilder.typed(
+          () => OrganizationUseCase(),
+          concurrency: EventConcurrency.droppable,
+        ),
+        () => UseCaseBuilder.typed(
+          () => _OrganizationRefreshUseCase(),
           concurrency: EventConcurrency.droppable,
         ),
       ]);
   final DashboardBloc connection;
   OrganizationCommand? pending;
+  int _mutationRevision = 0;
+  int? _mutationGeneration;
+  Timer? _polling;
+
+  /// Mounted organization views opt into live observations; the bloc owns
+  /// their cadence and notification subscription until it closes.
+  void startPolling() {
+    if (isClosing || _polling != null) return;
+    connection.notificationRevision.addListener(_refresh);
+    _polling = Timer.periodic(const Duration(seconds: 5), (_) => _refresh());
+  }
+
+  void _refresh() {
+    if (!isClosing && connection.state.connected && pending == null)
+      unawaited(send(OrganizationCommand('refresh')));
+  }
+
+  @override
+  Future<void> close() {
+    _polling?.cancel();
+    connection.notificationRevision.removeListener(_refresh);
+    return super.close();
+  }
 }
 
-class OrganizationUseCase
-    extends BlocUseCase<OrganizationBloc, OrganizationCommand> {
+class OrganizationUseCase extends _OrganizationOperation<OrganizationCommand> {}
+
+class _OrganizationRefreshUseCase
+    extends _OrganizationOperation<_OrganizationRefresh> {}
+
+abstract class _OrganizationOperation<T extends OrganizationCommand>
+    extends BlocUseCase<OrganizationBloc, T> {
   @override
-  Future<void> execute(OrganizationCommand event) async {
-    if (!bloc.connection.state.connected) return;
+  Future<void> execute(T event) async {
+    if (!bloc.connection.state.connected || bloc.connection.disconnecting)
+      return;
     final generation = bloc.connection.generation;
+    final refresh = event.action == 'refresh';
+    if (refresh && bloc._mutationGeneration == generation) return;
+    final revision = refresh
+        ? bloc._mutationRevision
+        : ++bloc._mutationRevision;
+    if (!refresh) bloc._mutationGeneration = generation;
+    bool current() =>
+        generation == bloc.connection.generation &&
+        revision == bloc._mutationRevision &&
+        !bloc.isClosing &&
+        !bloc.connection.disconnecting;
     final old = bloc.state;
-    if (event.action != 'refresh' || !old.loaded)
+    if (!refresh || !old.loaded)
       emitUpdate(
         newState: OrganizationState(
           busy: true,
@@ -70,15 +122,19 @@ class OrganizationUseCase
         ),
       );
     try {
-      if (event.action != 'refresh') {
+      if (!refresh) {
         bloc.pending = event;
         await event.execute(bloc.connection);
+        if (!current()) return;
         bloc.pending = null;
       }
-      if (generation != bloc.connection.generation || bloc.isClosing) return;
-      final data = await bloc.connection.request('organizations/state');
-      if (generation != bloc.connection.generation || bloc.isClosing) return;
-      if (event.action == 'refresh' &&
+      if (!current()) return;
+      final data = await bloc.connection.requestRead(
+        'organizations/state',
+        isCurrent: current,
+      );
+      if (!current()) return;
+      if (refresh &&
           old.loaded &&
           old.error == null &&
           jsonEncode(data['organizations']) == jsonEncode(old.organizations) &&
@@ -96,7 +152,7 @@ class OrganizationUseCase
         ),
       );
     } catch (error) {
-      if (generation != bloc.connection.generation || bloc.isClosing) return;
+      if (!current()) return;
       emitUpdate(
         newState: OrganizationState(
           loaded: old.loaded,
@@ -107,6 +163,9 @@ class OrganizationUseCase
           groups: old.groups,
         ),
       );
+    } finally {
+      if (!refresh && revision == bloc._mutationRevision)
+        bloc._mutationGeneration = null;
     }
   }
 }

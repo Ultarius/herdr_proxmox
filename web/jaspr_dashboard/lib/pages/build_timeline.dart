@@ -419,67 +419,76 @@ Component? cadenceStrip(List<Map<String, dynamic>> runs, DateTime now) {
           attributes: {'role': 'list', 'aria-label': 'Builds by state'},
         ),
       ], classes: 'card__header cadence__header'),
-      el('div', [
-        el(
-          'div',
-          [
-            el(
-              'div',
-              [
-                for (final (at, label) in ticks)
-                  el(
-                    'span',
-                    [
-                      if ((x(at) * width / 100 - todayPx).abs() >
-                          label.length * 3.2 + 17 + gap)
-                        el('span', [
-                          text(label),
-                        ], classes: 'cadence__tick-label'),
-                    ],
-                    classes: 'cadence__tick',
-                    attributes: {'style': '--x: ${pos(x(at))}'},
-                  ),
-              ],
-              classes: 'cadence__ticks',
-              attributes: {'aria-hidden': 'true'},
-            ),
-            el(
-              'span',
-              [],
-              classes: 'cadence__line',
-              attributes: {'aria-hidden': 'true'},
-            ),
-            el(
-              'span',
-              [],
-              classes: 'cadence__line cadence__line--future',
-              attributes: {'aria-hidden': 'true'},
-            ),
-            el(
-              'span',
-              [
-                el('span', [text('Today')], classes: 'cadence__today-label'),
-              ],
-              classes: 'cadence__today',
-              attributes: {'aria-hidden': 'true'},
-            ),
-            el(
-              'ol',
-              marks,
-              classes: 'cadence__marks',
-              attributes: {
-                'role': 'list',
-                'aria-label': 'Builds by start time, oldest first',
-              },
-            ),
-          ],
-          classes: 'cadence__axis',
-          attributes: {
-            'style':
-                '--today: ${pos(x(now))}; --rows: ${rows.isEmpty ? 1 : rows.length}',
-          },
-        ),
-      ], classes: 'cadence__scroll'),
+      el(
+        'div',
+        [
+          el(
+            'div',
+            [
+              el(
+                'div',
+                [
+                  for (final (at, label) in ticks)
+                    el(
+                      'span',
+                      [
+                        if ((x(at) * width / 100 - todayPx).abs() >
+                            label.length * 3.2 + 17 + gap)
+                          el('span', [
+                            text(label),
+                          ], classes: 'cadence__tick-label'),
+                      ],
+                      classes: 'cadence__tick',
+                      attributes: {'style': '--x: ${pos(x(at))}'},
+                    ),
+                ],
+                classes: 'cadence__ticks',
+                attributes: {'aria-hidden': 'true'},
+              ),
+              el(
+                'span',
+                [],
+                classes: 'cadence__line',
+                attributes: {'aria-hidden': 'true'},
+              ),
+              el(
+                'span',
+                [],
+                classes: 'cadence__line cadence__line--future',
+                attributes: {'aria-hidden': 'true'},
+              ),
+              el(
+                'span',
+                [
+                  el('span', [text('Today')], classes: 'cadence__today-label'),
+                ],
+                classes: 'cadence__today',
+                attributes: {'aria-hidden': 'true'},
+              ),
+              el(
+                'ol',
+                marks,
+                classes: 'cadence__marks',
+                attributes: {
+                  'role': 'list',
+                  'aria-label': 'Builds by start time, oldest first',
+                },
+              ),
+            ],
+            classes: 'cadence__axis',
+            attributes: {
+              'style':
+                  '--today: ${pos(x(now))}; --rows: ${rows.isEmpty ? 1 : rows.length}',
+            },
+          ),
+        ],
+        classes: 'cadence__scroll',
+        attributes: {
+          'role': 'region',
+          'aria-label': 'Build cadence timeline',
+          'tabindex': '0',
+        },
+      ),
     ],
     classes: 'card cadence',
     attributes: {'aria-label': 'Build cadence'},

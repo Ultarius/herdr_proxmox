@@ -1,4 +1,8 @@
+import 'package:logger/web.dart' show Level;
+
 import '../../../bloc.dart';
+import '../../core/restartable_run.dart';
+import '../../core/type_names.dart';
 
 /// Callback invoked before each retry attempt.
 ///
@@ -26,6 +30,7 @@ typedef OnRetryCallback = void Function(
 ///       useCaseGenerator: () => FetchDataUseCase(),
 ///       maxRetries: 3,
 ///       backoff: ExponentialBackoff(initial: Duration(seconds: 1)),
+///       concurrency: EventConcurrency.droppable,
 ///     ),
 ///   ], []);
 /// }
@@ -50,6 +55,7 @@ typedef OnRetryCallback = void Function(
 /// RetryableUseCaseBuilder(
 ///   // ...
 ///   retryWhen: (error) => error is NetworkException,
+///   concurrency: EventConcurrency.droppable,
 /// )
 /// ```
 ///
@@ -78,7 +84,7 @@ class RetryableUseCaseBuilder<
     this.retryWhen,
     this.onRetry,
     UseCaseEventBuilder? initialEventBuilder,
-    this.concurrency = EventConcurrency.concurrent,
+    required this.concurrency,
   })  : backoff =
             backoff ?? ExponentialBackoff(initial: const Duration(seconds: 1)),
         _initialEventBuilder = initialEventBuilder;
@@ -164,21 +170,24 @@ class _RetryableUseCase<
     for (var attempt = 0; attempt <= maxRetries; attempt++) {
       // Handle backoff delay for retries
       if (attempt > 0) {
+        // Superseded (restartable): every emission is fenced and every
+        // retry would repeat the side effects for nothing. Checked before
+        // the callback and the delay, and again after the delay.
+        if (RestartableRun.current?.isSuperseded ?? false) return;
+
         final delay = backoff.delay(attempt - 1);
 
         // Invoke retry callback
         onRetry?.call(attempt, lastError!, delay);
 
-        // Log retry attempt
-        JuiceLoggerConfig.logger.log(
-          'Retrying operation',
-          context: {
-            'attempt': attempt,
-            'maxRetries': maxRetries,
-            'error': lastError.toString(),
-            'delayMs': delay.inMilliseconds,
-          },
-        );
+        if (JuiceLoggerConfig.logs(Level.info)) {
+          JuiceLoggerConfig.logger.record(JuiceTelemetry(
+            JuiceTelemetryKind.retryScheduled,
+            attempt: attempt,
+            bloc: typeName(bloc.runtimeType),
+            error: lastError,
+          ));
+        }
 
         // Wait for backoff duration
         await Future.delayed(delay);
@@ -189,17 +198,18 @@ class _RetryableUseCase<
           return;
         }
 
+        if (RestartableRun.current?.isSuperseded ?? false) return;
+
         // The bloc closed during the backoff (the user left): re-running the
         // work against a dead bloc is pointless and has side effects.
-        if (bloc.isClosed || bloc.isClosing) {
-          JuiceLoggerConfig.logger.log(
-            'Retry abandoned: bloc closed',
-            context: {
-              'type': 'retry_abandoned',
-              'attempt': attempt,
-              'bloc': bloc.runtimeType.toString(),
-            },
-          );
+        if (bloc.isClosing) {
+          if (JuiceLoggerConfig.logs(Level.info)) {
+            JuiceLoggerConfig.logger.record(JuiceTelemetry(
+              JuiceTelemetryKind.retryAbandoned,
+              attempt: attempt,
+              bloc: typeName(bloc.runtimeType),
+            ));
+          }
           return;
         }
       }
@@ -283,6 +293,7 @@ class _RetryableUseCase<
       innerUseCase.emitEvent = ({EventBase? event}) {
         emitEvent(event: event);
       };
+      innerUseCase.navigate = navigate;
 
       // Execute the inner use case
       try {
@@ -321,13 +332,14 @@ class _RetryableUseCase<
     }
 
     // All retries exhausted or non-retryable error
-    JuiceLoggerConfig.logger.log(
-      'Retry exhausted, emitting failure',
-      context: {
-        'totalAttempts': maxRetries + 1,
-        'error': lastError?.toString(),
-      },
-    );
+    if (JuiceLoggerConfig.logs(Level.info)) {
+      JuiceLoggerConfig.logger.record(JuiceTelemetry(
+        JuiceTelemetryKind.retryExhausted,
+        attempt: maxRetries + 1,
+        bloc: typeName(bloc.runtimeType),
+        error: lastError,
+      ));
+    }
 
     emitFailure(
       newState: lastFailureState,

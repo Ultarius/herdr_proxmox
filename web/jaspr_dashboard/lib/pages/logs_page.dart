@@ -1,3 +1,4 @@
+import 'package:herdr_dashboard_state/workspace_blocs.dart';
 import 'package:web/web.dart' as web;
 import 'operations_support.dart';
 import 'ops_ui.dart';
@@ -13,45 +14,37 @@ class LogsPage extends StatefulComponent {
 
 class _LogsState extends OperationsState<LogsPage> {
   String pane = '', label = '', source = 'visible';
-  List<Map<String, dynamic>> logs = [];
-  String? preview;
-  int total = 0;
+  late final LogsBloc feature;
+  StreamSubscription? featureSubscription;
+  List<Map<String, dynamic>> get logs =>
+      List<Map<String, dynamic>>.from(feature.state.values['logs']);
+  String? get preview => feature.state.value<String>('preview');
+  String? get error => feature.state.error;
+  bool get busy => feature.state.busy;
+  int get total => feature.state.value<int>('total') ?? 0;
+  bool get refreshing => feature.state.reading.contains('refresh');
+  bool get loaded => feature.state.values['loaded'] == true;
   @override
   void initState() {
     super.initState();
+    feature = LogsBloc(connection);
+    featureSubscription = feature.stream.listen((_) {
+      if (mounted) setState(() {});
+    });
     refresh();
   }
 
-  Future<void> refresh() async {
-    final epoch = connection.generation;
-    if (!connection.state.connected) return;
-    try {
-      final result = await connection.request('logs');
-      if (valid(epoch))
-        setState(() {
-          logs = List<Map<String, dynamic>>.from(result['logs']);
-          total = result['total_bytes'] as int;
-        });
-    } catch (e) {
-      if (valid(epoch)) setState(() => error = '$e');
-    }
+  @override
+  void dispose() {
+    featureSubscription?.cancel();
+    feature.dispose();
+    super.dispose();
   }
 
-  Future<void> action(String name, Map<String, dynamic> body) => perform((
-    epoch,
-  ) async {
-    final result = await connection.request('logs/$name', body);
-    if (!valid(epoch)) return;
-    if (name == 'preview')
-      setState(
-        () => preview =
-            '${result['truncated'] == true ? '[Last 8 KB of saved text]\n' : ''}${result['text']}',
-      );
-    else {
-      setState(() => preview = null);
-      await refresh();
-    }
-  });
+  Future<void> refresh() => feature.refresh();
+  Future<void> action(String name, Map<String, dynamic> body) =>
+      feature.action(name, body);
+
   Future<void> open(Map<String, dynamic> log, String mode) async {
     // Reserve synchronously while the browser still grants user activation.
     final window = web.window.open('about:blank', '_blank');
@@ -61,10 +54,11 @@ class _LogsState extends OperationsState<LogsPage> {
         throw Exception('Allow pop-ups to open the text log.');
       window.opener = null;
       window.document.body?.textContent = 'Opening saved terminal text…';
-      final data = await connection.request('logs/ticket', {
-        'id': log['id'],
-        'mode': mode,
-      });
+      final data = await feature.ticket(log, mode);
+      if (data == null) {
+        window.close();
+        return;
+      }
       if (!valid(epoch)) {
         window.close();
         return;
@@ -76,7 +70,7 @@ class _LogsState extends OperationsState<LogsPage> {
       );
     } catch (e) {
       window?.close();
-      if (valid(epoch)) setState(() => error = '$e');
+      if (valid(epoch)) await feature.reportError('ticket', e);
     }
   }
 
@@ -132,7 +126,12 @@ class _LogsState extends OperationsState<LogsPage> {
       subtitle:
           'Save retained terminal text before closing a pane. These are snapshots, not guaranteed full run transcripts. Setup/login terminals are never archived here.',
       actions: [
-        button('Refresh logs', refresh, disabled: busy, iconName: 'refresh-cw'),
+        button(
+          'Refresh logs',
+          refresh,
+          disabled: busy || refreshing,
+          iconName: 'refresh-cw',
+        ),
       ],
     ),
     el('div', [
@@ -186,7 +185,7 @@ class _LogsState extends OperationsState<LogsPage> {
                 'source': source,
               }),
               primary: true,
-              disabled: busy,
+              disabled: busy || pane.trim().isEmpty,
               iconName: 'download',
             ),
           ], classes: 'logs-save__footer'),
@@ -205,13 +204,17 @@ class _LogsState extends OperationsState<LogsPage> {
       card(
         'Saved snapshots',
         [
-          storage(),
-          if (logs.isEmpty)
+          if (loaded) storage(),
+          if (refreshing && !loaded)
+            meta('Loading saved snapshots…', iconName: 'hourglass'),
+          if (!refreshing && !loaded && error != null)
+            meta('Saved snapshots are unavailable. Refresh logs to try again.'),
+          if (loaded && logs.isEmpty)
             emptyState(
               'No saved snapshots. Save a pane’s text to keep it after the pane closes.',
               iconName: 'archive',
             )
-          else
+          else if (logs.isNotEmpty)
             table(
               ['Snapshot', 'Pane', 'Source', 'Created', 'Size', 'Actions'],
               [
@@ -269,18 +272,18 @@ class _LogsState extends OperationsState<LogsPage> {
             ),
         ],
         iconName: 'archive',
-        count: logs.length,
+        count: loaded ? logs.length : null,
         classes: 'logs-saved',
       ),
       if (preview != null)
         card(
           'Snapshot preview',
-          [codeText(preview)],
+          [codeText(preview, label: 'Saved snapshot preview')],
           iconName: 'scan',
           actions: [
             button(
               'Close preview',
-              () => setState(() => preview = null),
+              feature.closePreview,
               small: true,
               variant: 'ghost',
               iconName: 'x',

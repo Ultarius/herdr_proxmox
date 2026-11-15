@@ -1,3 +1,5 @@
+import 'package:herdr_dashboard_state/settings_bloc.dart';
+import 'feature_view.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 
@@ -9,33 +11,25 @@ class DashboardAccessControls extends StatefulWidget {
       _DashboardAccessControlsState();
 }
 
-class _DashboardAccessControlsState extends State<DashboardAccessControls> {
+class _DashboardAccessControlsState extends State<DashboardAccessControls>
+    with FeatureView<DashboardAccessControls> {
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
-  String? mode, pending, message;
-  bool busy = false;
+  late final DashboardAccessBloc bloc;
+  String? get mode => bloc.mode;
+  String? get pending => bloc.pending;
+  String? get message => featureError ?? featureMessage;
+  bool get busy => featureBusy;
   @override
   void initState() {
     super.initState();
+    bindFeature(bloc = DashboardAccessBloc(connection));
     load();
   }
 
-  Future<void> load() async {
-    final epoch = connection.generation;
-    try {
-      final data = await connection.request('dashboard-access');
-      if (mounted &&
-          connection.state.connected &&
-          epoch == connection.generation)
-        setState(() {
-          mode = data['mode'] as String?;
-          pending = data['pending_mode'] as String?;
-        });
-    } catch (error) {
-      if (mounted) setState(() => message = error.toString());
-    }
-  }
+  Future<void> load() => bloc.refresh();
 
   Future<void> change(String target) async {
+    final epoch = connection.generation;
     bool tested = false;
     final confirmed = await showDialog<bool>(
       context: context,
@@ -91,31 +85,12 @@ class _DashboardAccessControlsState extends State<DashboardAccessControls> {
         ),
       ),
     );
-    if (confirmed != true || !mounted || !connection.state.connected) return;
-    final epoch = connection.generation;
-    setState(() {
-      busy = true;
-      message = null;
-    });
-    try {
-      final data = await connection.request('dashboard-access', {
-        'mode': target,
-        'tunnel_ready': tested,
-      });
-      if (mounted &&
-          connection.state.connected &&
-          epoch == connection.generation)
-        setState(() {
-          pending = data['pending_mode'] as String?;
-          message = target == 'ssh'
-              ? 'SSH-only access applies in 5 seconds. Continue through your tunnel at http://127.0.0.1:8787.'
-              : 'LAN access applies in 5 seconds. Reconnect using the LXC IP.';
-        });
-    } catch (error) {
-      if (mounted) setState(() => message = error.toString());
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
+    if (confirmed != true ||
+        !mounted ||
+        !connection.state.connected ||
+        epoch != connection.generation)
+      return;
+    await bloc.change(target, tunnelReady: tested);
   }
 
   @override

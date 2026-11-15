@@ -1,3 +1,5 @@
+import 'package:herdr_dashboard_state/settings_bloc.dart';
+import 'feature_view.dart';
 import 'package:juice/juice.dart';
 import 'dashboard_bloc.dart';
 
@@ -7,52 +9,32 @@ class UpdateCard extends StatefulWidget {
   State<UpdateCard> createState() => _UpdateCardState();
 }
 
-class _UpdateCardState extends State<UpdateCard> {
-  Map<String, dynamic>? info;
-  String? error;
-  bool busy = false;
-  List<Map<String, dynamic>> alphas = [];
+class _UpdateCardState extends State<UpdateCard> with FeatureView<UpdateCard> {
+  late final DashboardUpdatesBloc bloc;
+  Map<String, dynamic>? get info => bloc.info;
+  List<Map<String, dynamic>> get alphas => bloc.alphas;
   String? alphaVersion;
-  Timer? timer;
+  String? get error =>
+      featureError ??
+      (bloc.state.values['alphasLoaded'] == true && alphas.isEmpty
+          ? 'No installable alpha builds are available.'
+          : null);
+  bool get busy => featureBusy;
   DashboardBloc get connection => BlocScope.get<DashboardBloc>();
-
   @override
   void initState() {
     super.initState();
+    bindFeature(
+      bloc = DashboardUpdatesBloc(connection),
+      onChanged: () {
+        if (!alphas.any((release) => release['version'] == alphaVersion))
+          alphaVersion = null;
+      },
+    );
     check();
   }
 
-  @override
-  void dispose() {
-    timer?.cancel();
-    super.dispose();
-  }
-
-  Future<void> check({bool force = false}) async {
-    if (busy || !connection.state.connected) return;
-    final epoch = connection.generation;
-    setState(() => busy = true);
-    try {
-      final result = await connection.request(
-        force ? 'updates/check' : 'updates',
-        force ? <String, dynamic>{} : null,
-      );
-      if (mounted && epoch == connection.generation) {
-        setState(() {
-          info = result;
-          error = null;
-        });
-        if (!['queued', 'running'].contains(result['state'])) {
-          timer?.cancel();
-          timer = null;
-        }
-      }
-    } catch (exception) {
-      if (mounted) setState(() => error = exception.toString());
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
+  Future<void> check({bool force = false}) => bloc.check(force: force);
 
   Future<void> install({bool alpha = false}) async {
     final version = alpha ? alphaVersion : info?['latest'];
@@ -80,47 +62,12 @@ class _UpdateCardState extends State<UpdateCard> {
       ),
     );
     if (confirmed != true || !mounted || epoch != connection.generation) return;
-    setState(() => busy = true);
-    try {
-      await connection.request('updates/install', {
-        'version': version,
-        if (alpha) 'channel': 'alpha',
-        if (alpha) 'confirm_alpha': true,
-      });
-      if (mounted) {
-        setState(() => info = {...?info, 'state': 'queued'});
-        timer ??= Timer.periodic(const Duration(seconds: 5), (_) => check());
-      }
-    } catch (exception) {
-      if (mounted) setState(() => error = exception.toString());
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
+    await bloc.install('$version', alpha: alpha);
   }
 
   Future<void> loadAlphas() async {
-    if (busy) return;
-    final epoch = connection.generation;
-    setState(() => busy = true);
-    try {
-      final result = await connection.request(
-        'updates/alphas',
-        <String, dynamic>{},
-      );
-      if (mounted && epoch == connection.generation) {
-        setState(() {
-          alphas = (result['releases'] as List).cast<Map<String, dynamic>>();
-          alphaVersion = null;
-          error = alphas.isEmpty
-              ? 'No installable alpha builds are available.'
-              : null;
-        });
-      }
-    } catch (exception) {
-      if (mounted) setState(() => error = exception.toString());
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
+    await bloc.loadAlphas();
+    if (mounted) setState(() => alphaVersion = null);
   }
 
   @override
