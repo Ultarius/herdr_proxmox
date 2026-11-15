@@ -390,10 +390,77 @@ class Contributions:
         self.knowledge.sync_jobs()
         from discovery import Discovery
         self.discovery = Discovery(self)
+        # Optional modules. Each registers its route and advance() here; the
+        # core never names one again (see register_module).
+        self.modules, self.module_faults = {}, {}
+        with closing(self.connect()) as db, db:
+            db.execute('CREATE TABLE IF NOT EXISTS modules (name TEXT PRIMARY KEY, data TEXT NOT NULL)')
+        from ventures import Ventures
+        self.ventures = self.register_module(Ventures(self))
         from release_candidates import ReleaseCandidates
         self.releases = ReleaseCandidates(self)
         from task_commits import TaskCommits
         self.commits = TaskCommits(self)
+
+    def register_module(self, module):
+        """Add an optional module.
+
+        A module has ``name``, ``label``, ``route``, ``enabled()``,
+        ``advance()``, ``read(query)`` and ``action(body, actor, role)``. The
+        server serves ``route`` from this registry (administrators only) and
+        the poll loop calls ``advance()`` through ``advance_modules``.
+        """
+        self.modules[module.route] = module
+        return module
+
+    def module_state(self, name):
+        """Installation-wide switch for one module; modules are on until switched off."""
+        with closing(self.connect()) as db:
+            row = db.execute('SELECT data FROM modules WHERE name=?', (name,)).fetchone()
+        state = dict(dict(enabled=True), **(json.loads(row[0]) if row else {}), name=name)
+        fault = self.module_faults.get(name)
+        if fault:
+            state['fault'] = fault
+        return state
+
+    def module_enabled(self, name):
+        return self.module_state(name)['enabled'] is True
+
+    def set_module(self, name, enabled, actor):
+        if type(enabled) is not bool:
+            raise ValueError('Choose whether the module is on or off.')
+        state = dict(enabled=enabled, updated_by=actor, updated_at=stamp())
+        with closing(self.connect()) as db, db:
+            db.execute('INSERT OR REPLACE INTO modules VALUES (?,?)', (name, json.dumps(state)))
+        self.module_faults.pop(name, None)
+        return self.module_state(name)
+
+    def advance_modules(self):
+        """Run each enabled module's poll step in isolation.
+
+        A module failure of any kind is recorded on the module and never
+        reaches the poll loop: it must not skip the core steps that follow
+        or end the poll thread.
+        """
+        for module in list(self.modules.values()):
+            try:
+                if module.enabled():
+                    module.advance()
+                    self.module_faults.pop(module.name, None)
+            except Exception as error:
+                self.module_faults[module.name] = dict(
+                    at=stamp(), error=(error.__class__.__name__ + ': ' + str(error))[:300])
+
+    def patch_policy(self, organization_id, values, actor):
+        """Merge module-owned keys into an organization's policy record.
+
+        The caller holds the ``policy:<organization>`` operation lock.
+        """
+        policy = self.policy(organization_id)
+        policy.update(values, updated_by=actor, updated_at=stamp())
+        with closing(self.connect()) as db, db:
+            db.execute('INSERT OR REPLACE INTO policies VALUES (?,?)', (organization_id, json.dumps(policy)))
+        return policy
 
     def connect(self):
         from notifications import Connection
@@ -458,6 +525,7 @@ class Contributions:
                     self.dispatch_assignments()
                     self.advance_proposals()
                     self.discovery.advance()
+                    self.advance_modules()
                     self.reconcile_completed(task_ids)
                     self.advance_acceptance(task_ids)
                     self.advance_reviews(task_ids)

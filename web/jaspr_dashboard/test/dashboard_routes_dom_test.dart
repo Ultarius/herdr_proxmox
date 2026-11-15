@@ -121,6 +121,7 @@ void main() {
     ('/tasks?view=list', 'Tasks'),
     ('/tasks/review-dashboard', 'Review dashboard keyboard behavior'),
     ('/builds', 'Builds'),
+    ('/ventures', 'Ventures'),
     ('/knowledge', 'Project knowledge'),
     ('/knowledge/engineering', 'Project knowledge'),
     ('/logs', 'Terminal logs'),

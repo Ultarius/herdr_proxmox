@@ -27,6 +27,7 @@
 - [Session archives](session-archives.md) — preserve and recover session context.
 - [Project knowledge](project-knowledge.md) — retain useful work for later discussions.
 - [Product discovery](product-discovery.md) — discussions and proposed work.
+- [Venture simulation](venture-simulation.md) — news-driven shadow companies, manual ticks and reviewed outreach drafts.
 
 ## Development and execution architecture
 

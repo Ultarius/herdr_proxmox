@@ -321,6 +321,14 @@ class _AppShellState extends State<AppShell> {
             KnowledgeRoute(),
             'knowledge',
           ),
+          // Administrator-only on the gateway; other operators never see it.
+          if (connection.operator.value['role'] == 'admin')
+            nav(
+              'Ventures',
+              Icons.science_outlined,
+              VenturesRoute(),
+              'ventures',
+            ),
           nav('Agent activity', Icons.bolt_outlined, AgentsRoute(), 'agents'),
           heading('WORKSPACE'),
           nav(

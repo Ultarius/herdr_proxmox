@@ -16,6 +16,7 @@ import 'pages/builds_page.dart';
 import 'pages/logs_page.dart';
 import 'pages/cli_setup_page.dart';
 import 'pages/project_explorer_page.dart';
+import 'pages/ventures_page.dart';
 
 class DashboardApp extends StatefulComponent {
   const DashboardApp({super.key});
@@ -304,6 +305,7 @@ class _DashboardAppState extends State<DashboardApp> {
           '/logs': 'Terminal logs',
           '/configuration': 'CLI accounts',
           '/builds': 'Builds & deployments',
+          '/ventures': 'Ventures',
         }[path] ??
         'Page not found';
   }
@@ -339,6 +341,7 @@ class _DashboardAppState extends State<DashboardApp> {
         key: key,
       ),
       '/builds' => BuildsPage(key: key),
+      '/ventures' => VenturesPage(key: key),
       '/logs' => LogsPage(key: key),
       '/configuration' => CliSetupPage(key: key),
       '/explorer' => ProjectExplorerPage(
@@ -663,6 +666,8 @@ class _DashboardAppState extends State<DashboardApp> {
                   _nav('Tasks', 'list-checks', '/tasks'),
                   _nav('Builds & deployments', 'rocket', '/builds'),
                   _nav('Project knowledge', 'book-open', '/knowledge'),
+                  if (connection.operator.value['role'] == 'admin')
+                    _nav('Ventures', 'flask-conical', '/ventures'),
                   _nav('Agent activity', 'activity', '/agents'),
                 ], classes: 'nav'),
                 _section('Workspace'),

@@ -11,6 +11,18 @@ import 'builds_page.dart';
 import 'tasks_page.dart';
 import 'knowledge_page.dart';
 import 'agent_console_page.dart';
+import 'ventures_page.dart';
+
+class VenturesRoute extends AppRoute {
+  @override
+  Uri toUri() => Uri.parse('/ventures');
+  @override
+  Widget build(AppCoordinator coordinator, BuildContext context) => AppShell(
+    coordinator: coordinator,
+    section: 'ventures',
+    child: const VenturesPage(),
+  );
+}
 
 class AgentConsoleRoute extends AppRoute {
   AgentConsoleRoute(this.id);
@@ -224,6 +236,7 @@ class AppCoordinator extends Coordinator<AppRoute> {
       '/builds' => BuildsRoute(),
       '/tasks' => TasksRoute(),
       '/knowledge' => KnowledgeRoute(uri.queryParameters['organization'] ?? ''),
+      '/ventures' => VenturesRoute(),
       '/logs' => LogsRoute(),
       '/explorer' => ExplorerRoute(uri.queryParameters['path'] ?? ''),
       _ => NotFoundRoute(uri),

@@ -543,6 +543,8 @@ void main() {
     await tester.tap(find.byTooltip('Open navigation'));
     await tester.pumpAndSettle();
     expect(shell.isDrawerOpen, isTrue);
+    await tester.ensureVisible(find.text('Deployment review'));
+    await tester.pumpAndSettle();
     await tester.tap(find.text('Deployment review'));
     await tester.pumpAndSettle();
     expect(shell.isDrawerOpen, isFalse);

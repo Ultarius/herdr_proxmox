@@ -342,6 +342,11 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def modules(self):
+        """Optional modules by route, from the contributions registry."""
+        registry = getattr(getattr(self.server, 'contributions', None), 'modules', None)
+        return registry if isinstance(registry, dict) else {}
+
     def do_GET(self):
         with query_measurement('http.read') as self.read_metrics:
             self._do_GET()
@@ -501,6 +506,18 @@ class Handler(BaseHTTPRequestHandler):
                     self.reply(200, service.query(body))
                 except sqlite3.Error:
                     self.reply(503, {'error': 'Repository evidence storage is unavailable.'})
+                except (ValueError, OSError) as error:
+                    self.reply(400, {'error': str(error)[:500]})
+                return
+            module = self.modules().get(urlsplit(self.path).path)
+            if module:
+                if self.operator['role'] != 'admin':
+                    self.reply(403, {'error': 'Only an administrator can view ' + module.label.lower() + '.'})
+                    return
+                try:
+                    self.reply(200, module.read(parse_qs(urlsplit(self.path).query)))
+                except sqlite3.Error:
+                    self.reply(503, {'error': 'Task storage is unavailable.'})
                 except (ValueError, OSError) as error:
                     self.reply(400, {'error': str(error)[:500]})
                 return
@@ -768,7 +785,7 @@ class Handler(BaseHTTPRequestHandler):
         organization_actions = {f'/api/organizations/{name}': name for name in ('save', 'hire', 'launch', 'delegate', 'release', 'report', 'resolve_delegation', 'group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'retry_discussion', 'cancel_discussion', 'remove_agent', 'remove_group', 'session', 'realign_discussion_session')}
         setup_actions = {f'/api/cli-setup/{name}': name for name in ('start', 'poll', 'input', 'resize', 'close', 'verify', 'install_integration')}
         log_actions = {f'/api/logs/{name}': name for name in ('save', 'preview', 'ticket', 'delete')}
-        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/knowledge', '/api/updates/install', '/api/updates/check', '/api/updates/alphas', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/build-service/install', '/api/validation/run', '/api/projects/clone', '/api/projects/connections', '/api/projects/browse', '/api/projects/git', '/api/projects/toolchain', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/guidance', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/start_proposal', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/publication', '/api/tasks/repair', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build', '/api/tasks/policy', '/api/tasks/complete', '/api/tasks/discuss', '/api/tasks/review_policy', '/api/tasks/proposal', '/api/tasks/assignment', '/api/tasks/automation', '/api/tasks/discovery', '/api/tasks/handover', '/api/tasks/consult', '/api/tasks/acceptance', '/api/tasks/validation_environment'):
+        if self.path not in actions and self.path not in organization_actions and self.path not in setup_actions and self.path not in log_actions and self.path not in ('/api/organizations/import', '/api/ssh-access/add', '/api/dashboard-access', '/api/herdr-server/start', '/api/knowledge', '/api/updates/install', '/api/updates/check', '/api/updates/alphas', '/api/updates/promote', '/api/updates/rollback', '/api/updates/provenance', '/api/models', '/api/sdk/install', '/api/build-service/install', '/api/validation/run', '/api/projects/clone', '/api/projects/connections', '/api/projects/browse', '/api/projects/git', '/api/projects/toolchain', '/api/integration/configure', '/api/integration/retry', '/api/integration/blockers', '/api/integration/repair', '/api/integration/guidance', '/api/integration/recover', '/api/organizations/history', '/api/organizations/activity', '/api/github/configure', '/api/tasks/create', '/api/tasks/start_proposal', '/api/tasks/launch', '/api/tasks/candidate', '/api/tasks/publish', '/api/tasks/publication', '/api/tasks/repair', '/api/tasks/pull', '/api/tasks/refresh', '/api/tasks/build', '/api/tasks/policy', '/api/tasks/complete', '/api/tasks/discuss', '/api/tasks/review_policy', '/api/tasks/proposal', '/api/tasks/assignment', '/api/tasks/automation', '/api/tasks/discovery', '/api/tasks/handover', '/api/tasks/consult', '/api/tasks/acceptance', '/api/tasks/validation_environment') and self.path not in self.modules():
             self.reply(404, {'error': 'Unknown endpoint.'})
             return
         try:
@@ -827,6 +844,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.reply(200, self.server.github.configure(body))
             elif self.path == '/api/tasks/discovery':
                 self.reply(200, self.server.contributions.discovery.action(body, actor, role))
+            elif self.path in self.modules():
+                self.reply(200, self.modules()[self.path].action(body, actor, role))
             elif self.path.startswith('/api/tasks/'):
                 task_action = self.path.rsplit('/', 1)[1]
                 result = self.server.contributions.action(task_action, body, actor, role)

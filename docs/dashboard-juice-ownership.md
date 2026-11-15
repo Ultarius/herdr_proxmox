@@ -17,6 +17,7 @@ disposal.
 | Discussion group | `GroupBloc` |
 | Tasks, task detail and release workflows | `TasksBloc` |
 | Project knowledge | `KnowledgeBloc` |
+| Venture simulation | `VenturesBloc` |
 | Builds and deployments | `BuildsBloc` |
 | Project explorer and Git changes | `ExplorerBloc`, `GitBloc` |
 | Saved terminal logs | `LogsBloc` |
