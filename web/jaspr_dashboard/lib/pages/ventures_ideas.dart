@@ -1,0 +1,207 @@
+import 'operations_support.dart';
+import 'ops_ui.dart';
+
+/// Candidate states still waiting for an operator decision.
+const openCandidateStates = {'proposed', 'approved', 'creating', 'failed'};
+
+/// Number of candidates in [candidates] that still need a decision.
+int openCandidateCount(Iterable<Map<String, dynamic>> candidates) => candidates
+    .where((item) => openCandidateStates.contains('${item['state']}'))
+    .length;
+
+const _barLabels = {
+  'survival_threshold': 'Survival threshold',
+  'consecutive_days': 'Qualifying days',
+  'red_team': 'Red Team strictness',
+  'capital': 'Starting capital',
+  'daily_ticks': 'Daily reviews',
+  'tick_hour_utc': 'Review hour (UTC)',
+  'meeting_cadence': 'Meeting cadence',
+};
+
+/// The rules a candidate would run under, so they are visible without opening Edit.
+List<(String, Component)> candidateBar(Map<String, dynamic> item) {
+  final configuration = item['configuration'] as Map? ?? const {};
+  final simulation = configuration['simulation'] as Map? ?? const {};
+  final market = configuration['market'] as Map? ?? const {};
+  final adjusted = item['scout_adjusted'] as Map? ?? const {};
+  String shown(String key) {
+    final value = simulation[key];
+    final label = key == 'daily_ticks'
+        ? (value == true ? 'On' : 'Off until you start them')
+        : key == 'capital'
+        ? '$value ${market['currency'] ?? ''}'.trim()
+        : '$value';
+    final change = adjusted[key];
+    return change is Map
+        ? '$label (scout proposed ${change['proposed']})'
+        : label;
+  }
+
+  final burn = (simulation['burn'] as List? ?? const [])
+      .map(
+        (line) => line is Map
+            ? '${line['label']}: ${line['amount']} ${line['currency']}'
+            : '$line',
+      )
+      .join(', ');
+  return [
+    for (final key in const [
+      'survival_threshold',
+      'consecutive_days',
+      'red_team',
+      'capital',
+      'daily_ticks',
+    ])
+      (_barLabels[key]!, text(shown(key))),
+    if (adjusted['reference_price'] is Map)
+      (
+        'Reference price',
+        text(
+          'The monthly costs (scout proposed '
+          '${(adjusted['reference_price'] as Map)['proposed']})',
+        ),
+      ),
+    ('Monthly costs', text(burn.isEmpty ? 'None' : burn)),
+  ];
+}
+
+/// Reviewed venture candidates produced by the Venture Studio.
+Component venturesIdeas({
+  required List<Map<String, dynamic>> candidates,
+  required String organizationName,
+  required bool busy,
+  required void Function(Map<String, dynamic>) onEdit,
+  required void Function(Map<String, dynamic>) onApprove,
+  required void Function(Map<String, dynamic>) onReject,
+}) {
+  if (candidates.isEmpty) {
+    return card('Ideas', [
+      emptyState(
+        'No venture candidates yet for $organizationName. Set up the Venture Studio and run a scout review.',
+        iconName: 'lightbulb',
+      ),
+    ], subtitle: 'Candidates stay proposals until an administrator creates one.');
+  }
+  final open = candidates
+      .where((item) => openCandidateStates.contains('${item['state']}'))
+      .toList();
+  final closed = candidates
+      .where((item) => !openCandidateStates.contains('${item['state']}'))
+      .toList();
+  return card(
+    'Ideas',
+    [
+      if (open.isEmpty) paragraph('No candidates waiting for a decision.'),
+      for (final item in open)
+        _candidate(item, organizationName, busy, onEdit, onApprove, onReject),
+      if (closed.isNotEmpty)
+        disclosure(
+          'Decided (${closed.length}): created, rejected and excluded',
+          [
+            for (final item in closed)
+              _candidate(
+                item,
+                organizationName,
+                busy,
+                onEdit,
+                onApprove,
+                onReject,
+              ),
+          ],
+        ),
+    ],
+    subtitle:
+        '$organizationName · ${open.length} waiting. Evidence, assumptions and kill criteria are agent opinion until reviewed.',
+  );
+}
+
+Component _candidate(
+  Map<String, dynamic> item,
+  String organizationName,
+  bool busy,
+  void Function(Map<String, dynamic>) onEdit,
+  void Function(Map<String, dynamic>) onApprove,
+  void Function(Map<String, dynamic>) onReject,
+) {
+  final state = '${item['state'] ?? 'proposed'}';
+  final assumptions = (item['assumptions'] as List? ?? const [])
+      .map((value) => '$value')
+      .toList();
+  final kill = (item['kill_criteria'] as List? ?? const [])
+      .map((value) => '$value')
+      .toList();
+  final evidence = (item['evidence'] as List? ?? const [])
+      .map((value) => '$value')
+      .join(', ');
+  final confidence = item['confidence'];
+  final canReview =
+      state == 'proposed' ||
+      state == 'approved' ||
+      state == 'creating' ||
+      state == 'failed';
+  final hasVenture = '${item['venture_id'] ?? ''}'.isNotEmpty;
+  final canEdit = !hasVenture && state != 'creating';
+  return disclosure('${item['name'] ?? 'Untitled candidate'} · $state', [
+    facts([
+      ('Organization', text(organizationName)),
+      (
+        'Confidence',
+        text(confidence == null ? '—' : '$confidence / 100 (agent opinion)'),
+      ),
+      ('Thesis', text('${item['thesis'] ?? ''}')),
+      ('Product', text('${item['product'] ?? ''}')),
+      ('Pricing', text('${item['pricing'] ?? 'Not proposed'}')),
+      ('Evidence', text(evidence.isEmpty ? 'None' : evidence)),
+      if ('${item['duplicate_of'] ?? ''}'.isNotEmpty)
+        ('Duplicate of', text('${item['duplicate_of']}')),
+      if ('${item['excluded_by'] ?? ''}'.isNotEmpty)
+        ('Excluded by', text('"${item['excluded_by']}"')),
+      ...candidateBar(item),
+    ]),
+    if ((item['scout_adjusted'] as Map? ?? const {}).isNotEmpty)
+      paragraph(
+        'The gateway reset the values the scout proposed for the bar, the schedule and capital above a '
+        'year of costs. You can change them with Edit.',
+      ),
+    if (assumptions.isNotEmpty) ...[
+      paragraph('Assumptions'),
+      for (final value in assumptions) paragraph('• $value'),
+    ],
+    if (kill.isNotEmpty) ...[
+      paragraph('Kill criteria'),
+      for (final value in kill) paragraph('• $value'),
+    ],
+    if (item['error'] != null && '${item['error']}'.isNotEmpty)
+      notice('${item['error']}', error: true),
+    if (item['decision'] is Map)
+      paragraph(
+        'Decision: ${(item['decision'] as Map)['decision'] ?? 'recorded'} '
+        '${(item['decision'] as Map)['reason'] ?? ''}',
+      ),
+    if (item['venture_id'] != null)
+      paragraph('Created venture: ${item['venture_id']}'),
+    actions([
+      if (canEdit)
+        button('Edit', busy ? null : () => onEdit(item), small: true),
+      if (canReview &&
+          (state == 'proposed' ||
+              state == 'approved' ||
+              state == 'failed' ||
+              state == 'creating'))
+        button(
+          'Create venture',
+          busy ? null : () => onApprove(item),
+          small: true,
+          primary: true,
+        ),
+      if (canReview && !hasVenture)
+        button(
+          'Reject',
+          busy ? null : () => onReject(item),
+          small: true,
+          variant: 'danger',
+        ),
+    ]),
+  ]);
+}

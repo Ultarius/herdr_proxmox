@@ -1,5 +1,6 @@
 import 'package:herdr_dashboard_state/ventures_bloc.dart';
 import 'package:juice/juice.dart';
+
 import 'dashboard_bloc.dart';
 import 'feature_view.dart';
 
@@ -40,6 +41,31 @@ class _VenturesPageState extends State<VenturesPage>
     } catch (_) {
       // The bloc records the error; the page shows it from feature state.
     }
+  }
+
+  static const openStates = {'proposed', 'approved', 'creating', 'failed'};
+
+  List<Map<String, dynamic>> _open(Object? organization) => bloc.candidates
+      .where(
+        (item) =>
+            item['organization_id'] == organization &&
+            openStates.contains('${item['state']}'),
+      )
+      .toList();
+
+  int _decided(Object? organization) => bloc.candidates
+      .where(
+        (item) =>
+            item['organization_id'] == organization &&
+            !openStates.contains('${item['state']}'),
+      )
+      .length;
+
+  String _organizationName(String identity) {
+    for (final organization in bloc.organizations) {
+      if (organization['id'] == identity) return '${organization['name']}';
+    }
+    return identity;
   }
 
   String score(Map<String, dynamic> venture) {
@@ -104,7 +130,10 @@ class _VenturesPageState extends State<VenturesPage>
         if (error != null)
           Padding(
             padding: const EdgeInsets.only(top: 8),
-            child: Text(error, style: TextStyle(color: theme.colorScheme.error)),
+            child: Text(
+              error,
+              style: TextStyle(color: theme.colorScheme.error),
+            ),
           ),
         const SizedBox(height: 12),
         if (bloc.ventures.isEmpty && !bloc.state.loading)
@@ -132,6 +161,100 @@ class _VenturesPageState extends State<VenturesPage>
         if (selected != null) ...[
           const SizedBox(height: 16),
           detail(context, selected),
+        ],
+        if (bloc.candidates.isNotEmpty) ...[
+          const SizedBox(height: 16),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Venture ideas', style: theme.textTheme.titleMedium),
+                  const SizedBox(height: 8),
+                  // Grouped by organization; only candidates awaiting a
+                  // decision are listed, decided ones are counted.
+                  for (final organization in bloc.organizations)
+                    if (bloc.candidates.any(
+                      (item) => item['organization_id'] == organization['id'],
+                    )) ...[
+                      Text(
+                        '${organization['name']} · '
+                        '${_open(organization['id']).length} waiting, '
+                        '${_decided(organization['id'])} decided',
+                        style: theme.textTheme.labelLarge,
+                      ),
+                      for (final item in _open(organization['id']))
+                        ListTile(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          title: Text('${item['name']} - ${item['state']}'),
+                          subtitle: Text('${item['thesis'] ?? ''}'),
+                        ),
+                    ],
+                ],
+              ),
+            ),
+          ),
+        ],
+        if (bloc.studioFor(
+              bloc.ventures.isEmpty
+                  ? ''
+                  : '${bloc.ventures.first['organization_id']}',
+            ) !=
+            null) ...[
+          const SizedBox(height: 16),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Venture Studio', style: theme.textTheme.titleMedium),
+                  const SizedBox(height: 8),
+                  for (final studio in bloc.studios) ...[
+                    Text(_organizationName('${studio['organization_id']}')),
+                    for (final kind in const ['portfolio', 'scout'])
+                      if ('${((studio['schedule'] as Map?)?[kind] as Map?)?['error'] ?? ''}'
+                          .isNotEmpty)
+                        Text(
+                          '${kind == 'portfolio' ? 'Portfolio review' : 'Scout'} scheduling failed: '
+                          '${((studio['schedule'] as Map)[kind] as Map)['error']}',
+                          style: TextStyle(color: theme.colorScheme.error),
+                        ),
+                    if ((studio['invalid_policy'] as List? ?? const [])
+                        .isNotEmpty)
+                      Text(
+                        'Out-of-range studio settings use defaults: '
+                        '${(studio['invalid_policy'] as List).join(', ')}',
+                        style: TextStyle(color: theme.colorScheme.error),
+                      ),
+                    Text(
+                      'Portfolio cadence: ${(studio['policy'] as Map?)?['studio_portfolio_cadence'] ?? 'off'}',
+                    ),
+                    Text(
+                      'Scout cadence: ${(studio['policy'] as Map?)?['studio_scout_cadence'] ?? 'off'}',
+                    ),
+                    Text(
+                      'Budget: ${(studio['budget'] as Map?)?['daily_meetings'] ?? 0} meetings / '
+                      '${(studio['budget'] as Map?)?['projected_agent_sessions'] ?? 0} sessions per day',
+                    ),
+                    for (final run
+                        in (studio['runs'] as List? ?? const []).take(4))
+                      if (run is Map)
+                        ListTile(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          title: Text('${run['kind']} - ${run['state']}'),
+                          subtitle: Text(
+                            '${run['summary'] ?? run['error'] ?? ''}',
+                          ),
+                        ),
+                  ],
+                ],
+              ),
+            ),
+          ),
         ],
         const SizedBox(height: 16),
         const Text(
@@ -201,6 +324,18 @@ class _VenturesPageState extends State<VenturesPage>
               ],
             ),
             const Divider(height: 24),
+            Text('Reviews', style: theme.textTheme.titleMedium),
+            if (bloc.reviews.isEmpty) const Text('No review records yet.'),
+            for (final review in bloc.reviews)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: Text(
+                  '${review['simulated_date']} - ${review['kind'] ?? review['review_kind']} - ${review['state']}',
+                ),
+                subtitle: Text('${review['reason'] ?? ''}'),
+              ),
+            const Divider(height: 24),
             Text('Ticks', style: theme.textTheme.titleMedium),
             if (bloc.ticks.isEmpty) const Text('No ticks yet.'),
             for (final tick in bloc.ticks)
@@ -217,7 +352,9 @@ class _VenturesPageState extends State<VenturesPage>
             Text('Outreach drafts', style: theme.textTheme.titleMedium),
             if (bloc.outreach.isEmpty) const Text('No drafts yet.'),
             if (bloc.outreach.isNotEmpty && !qualified)
-              const Text('Drafts unlock for approval when the venture qualifies.'),
+              const Text(
+                'Drafts unlock for approval when the venture qualifies.',
+              ),
             for (final draft in bloc.outreach)
               ExpansionTile(
                 tilePadding: EdgeInsets.zero,
@@ -240,7 +377,8 @@ class _VenturesPageState extends State<VenturesPage>
                                 }),
                           child: const Text('Approve'),
                         ),
-                      if (draft['state'] == 'draft' || draft['state'] == 'ready')
+                      if (draft['state'] == 'draft' ||
+                          draft['state'] == 'ready')
                         TextButton(
                           onPressed: busy
                               ? null

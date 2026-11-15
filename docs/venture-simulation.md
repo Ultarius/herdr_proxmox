@@ -1,12 +1,15 @@
 # Venture simulation
 
-Status, 2026-11-15: manual and opt-in daily ticks, the deterministic ledger and
-survival score, role-aware agent meetings, qualification, outreach review,
-charts, promotion to discovery, a confirmed four-agent team action,
-multi-line costs, live ECB FX rates, a per-organization active-venture limit,
-a per-tick score breakdown, a Flutter Ventures page and an installation-wide
-module switch are implemented. The score formula is at version 2.
-Scoring-weight tuning waits for observed ventures; see
+Status, 2026-11-15: manual and opt-in daily ticks, guaranteed news-only or
+every-day reviews, internal-evidence strategy days, per-day review records with
+visible skips, the deterministic ledger and survival score, role-aware agent
+meetings, qualification, outreach review, charts, promotion to discovery, a
+confirmed four-agent team action, multi-line costs, live ECB FX rates, a
+per-organization active-venture limit, a per-tick score breakdown, a Venture
+Studio for portfolio reviews and new-venture candidates, candidate review and
+approval, bounded studio policy and budgets, a Flutter Ventures page and an
+installation-wide module switch are implemented. The score formula is at
+version 2. Scoring-weight tuning waits for observed ventures; see
 [Implementation status](#implementation-status).
 
 Venture simulation runs fictional B2B companies ("shadow companies") against
@@ -298,6 +301,153 @@ pipeline still move. They neither count towards qualification nor reset it:
 the untouched baseline scores above the default threshold, and surviving
 silence proves nothing.
 
+### Review records and skipped days
+
+Every due venture has exactly one review record per calendar day. The record is
+separate from the tick ledger and has one of four kinds:
+
+- `news` - a meeting with filtered external news;
+- `quiet` - no news and `meeting_cadence=news_only`; only burn, revenue and the
+  demand pipeline move;
+- `strategy` - no news and `meeting_cadence=every_day`; the group meets using
+  internal evidence only;
+- `skipped` - no meeting, with a visible reason (paused, no group, active limit,
+  previous tick needs inspection, or a missed gateway slot).
+
+A skipped record can be replaced by a manual review on the same day. It never
+counts as a simulated day. A strategy day does not count toward qualification:
+its demand delta must be zero, and it may cite only `S` (standing), `T` (recent
+ticks), `O` (recorded outreach outcomes) and `R` (open objections) evidence.
+No strategy result may invent news.
+
+## Venture Studio
+
+The studio is a separate read-only group with its own managed notebook. Setup
+creates four studio agents (Portfolio Manager, Venture Scout, Skeptic and
+Research Analyst) from existing individual worktree agents and one read-only
+group. The studio has two run kinds:
+
+- **Portfolio review** returns a summary and exactly one ranked recommendation
+  (`continue`, `pause`, `kill` or `investigate`) for every active venture. The
+  recommendation is inert; the operator may apply pause or archive.
+- **Scout** returns at most the configured number of venture candidates. A
+  candidate includes a name, thesis, product, pricing, a full normalized
+  configuration, assumptions, kill criteria, a confidence opinion and evidence
+  citations. Candidates are stored as proposals, never as ventures. A candidate
+  that fails validation is refused on its own and listed on the run under
+  `refused_candidates`; the valid ones are kept.
+
+A scheduled portfolio review with no active ventures is recorded as `skipped`
+and starts no meeting; a manual one is refused.
+
+Studio policy is organization-scoped: portfolio cadence (`off`, `daily`,
+`weekly`), scout cadence, candidate cap, candidate backlog cap, focus areas,
+permanent exclusions, an allowed source allowlist, and `studio_paused`. Stored
+values are read tolerantly: an out-of-range value (a hand edit, an older limit)
+falls back to its default and is reported as `invalid_policy` on the page
+instead of breaking the snapshot or the scheduler; saving the studio settings
+repairs it. Operator input is validated strictly. Only studio keys leave the
+gateway through this path. The evidence file carries just the focus areas,
+exclusions, candidate cap and sources, never the rest of the organization
+policy.
+
+### Run lifecycle and recovery
+
+Both run kinds share one group, so only a run still **meeting** blocks a new
+one. When both cadences are due, the first starts and the other waits for the
+next poll: waiting is not a failure, so it records no error and no backoff.
+A success resets the kind's failure count and records `last_at`. A `pending`
+run left for more than ten minutes (an interrupted dispatch) is moved to
+needs-attention, so it cannot block the studio.
+
+A run needing attention is listed on the page but never blocks the studio:
+
+- **The prompt never reached the group** (a meeting limit, a restart):
+  **Re-send prompt** sends the frozen prompt again under the same request id
+  `studio-<run id>`. A first attempt that did reach the group therefore
+  returns the same discussion instead of a second meeting.
+- **The agents' result does not validate**: **Recover result** re-parses the
+  saved artifact; if it still fails, **Dismiss run** closes it with a required
+  reason. The discussion and its artifact are left for inspection.
+
+Scheduler errors, failure counts and the last and next run for each kind are
+shown on both dashboards.
+
+### Evidence budget
+
+The studio pack has its own 32 KB file budget (the 8,000-character prompt limit
+is unchanged), because it must cover up to twenty active ventures. It shrinks
+in this order: closed history, lessons, news down to five items, then each
+venture's detail in two steps (shorter thesis and product, one tick; then a
+compact entry of about 700 bytes without product or ticks), then the remaining
+news and open names. Every active venture always stays in, so the portfolio
+review can cover it. The `existing` list is a bounded reminder only: open
+ventures and candidates first, then the newest twenty closed ones, each with a
+120-character thesis. Duplicate detection reads every recorded venture and
+candidate from storage, not this list.
+
+### What a scout may and may not set
+
+A scout proposes the market, product, outreach and costs. It does not set its
+own bar or schedule. Whatever it proposes, a stored candidate gets:
+
+- the module defaults for survival threshold (60), qualifying days (3), Red
+  Team strictness (5), meeting cadence and review hour;
+- the reference price reset to 0, so prices are anchored to its monthly costs
+  (a scout that named a high reference could charge four times it for free);
+- daily reviews **off**;
+- starting capital capped at twelve months of its proposed monthly costs (the
+  runway factor is already at its maximum by then);
+- a refusal if it proposes no monthly costs at all.
+
+Every reset value is kept under `scout_adjusted` (`proposed` and `used`) and
+shown on the Ideas card and in the approval dialog. The operator may change
+the bar with Edit. Editing never turns on daily reviews: only approval's
+**Start daily reviews** does, and only together with **Create team** or for a
+venture that already has a group.
+
+### Exclusions
+
+Exclusions are enforced, not just written into the prompt. A candidate whose
+name, thesis or product contains an excluded term as whole words is stored as
+`excluded` with `excluded_by`: "crypto" excludes "Crypto Treasury Desk" but
+not "Cryptography Audit Desk". Approval checks again against the current list.
+The list holds up to forty terms and is permanent: rejecting with **exclude**
+when it is full is refused, rather than dropping the oldest term.
+
+### Budget
+
+The projection uses the real groups: each meeting counts its members plus the
+facilitator, and a venture without a group counts nothing. `every_day`
+ventures and daily studio runs are guaranteed meetings. `news_only` ventures
+count towards the maximum only, since they meet at most once a day. Weekly
+studio runs count as one seventh of a meeting a day. The page shows the
+guaranteed and maximum meetings and sessions per day and the studio runs per
+week. With a `daily_session_cap` set, a change that would raise the projected
+maximum above the cap is refused: a studio cadence change, an approval with
+**Start daily reviews**, or turning on daily ticks for a venture with a group. A change that lowers it is always allowed, so an organization
+already over its cap can still turn things off.
+
+### Candidate approval
+
+An operator edits a candidate, then explicitly approves it. Approval is a
+resumable sequence: create the venture, optionally create its four-agent team,
+then optionally enable daily reviews. A deterministic `candidate-<id>` request
+identity makes retries idempotent. The candidate records its `venture_id`; the
+venture records `source.candidate_id` and `source.studio_run_id` plus the
+candidate's assumptions and kill criteria. Rejection records a reason and may
+add the direction to permanent exclusions. A candidate linked to a venture
+cannot be rejected; archive the venture instead.
+
+### Lessons
+
+The studio evidence pack includes a bounded lessons list built from completed,
+failed and archived ventures, repeated high-severity objections, dropped
+product changes, outreach outcomes by market and persona, repeated market
+friction, disproved assumptions recorded by the operator, and permanent
+exclusions. Lessons affect recommendations only; they never change the
+deterministic score formula.
+
 ## Venture notebook
 
 Each venture has a managed Git repository under the projects root, created with
@@ -491,14 +641,18 @@ What the module uses from the platform:
 
 Delivered: bounded four-layer configuration, SSRF-safe feeds with UTC
 normalisation, notebooks with per-tick commits, manual and opt-in daily ticks,
-the formula-1 ledger and survival score, role-aware prompts with etiquette,
-persona and stage guidance, strict result checks, qualification and failure,
-outreach approve, reject and outcome actions, recovery without resending,
-inline score and capital charts, promotion to Product Discovery with explicit
-replacement, recorded previous values and one-click restore, a confirmed and
-retry-safe four-agent team action with per-role templates, multi-line costs,
-live ECB FX with fallback, the per-organization active-venture limit editor,
-per-tick score breakdowns, and Ventures pages on both dashboards.
+news-only and every-day review cadence, internal-evidence strategy reviews,
+one review record per day with visible skips, the deterministic ledger and survival
+score, role-aware prompts with etiquette, persona and stage guidance, strict
+result checks, qualification and failure, outreach approve, reject and outcome
+actions, recovery without resending, inline score and capital charts, promotion
+to Product Discovery with explicit replacement, recorded previous values and
+one-click restore, a confirmed and retry-safe four-agent team action with
+per-role templates, multi-line costs, live ECB FX with fallback, the
+per-organization active-venture limit editor, per-tick score breakdowns, a
+Venture Studio with setup, policy, portfolio reviews, scouting, candidate
+review, approval-to-create, lessons and a budget projection, and Ventures pages
+on both dashboards.
 
 Remaining limits:
 
@@ -515,7 +669,14 @@ Remaining limits:
   in `venture_engine.py`.
 - Live FX covers the ECB's currencies only, at daily granularity; other pairs
   use the operator's rate.
-- The Flutter page does not create or configure ventures.
+- Auto-create is not implemented; every candidate needs an explicit operator approval.
+- The Flutter page does not create, configure or approve ventures.
+- Dismissing a studio run closes it in the studio only. The group discussion
+  itself stays in the organization history for inspection.
+- The budget check estimates a new venture team as five sessions (four agents
+  and a facilitator) until the team exists.
+- Assumption outcomes and dropped product changes are recorded only when the
+  agents or the operator report them; the gateway does not infer them.
 
 ## Open questions
 

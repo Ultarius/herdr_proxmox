@@ -47,6 +47,40 @@ def _write(path, content):
         Path(temporary).unlink(missing_ok=True)
 
 
+def provision_studio(root, relative, organization_id):
+    """Create the managed checkout used by a Venture Studio group."""
+    root = Path(root).resolve()
+    target = _relative(root, relative)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    created = False
+    if target.exists():
+        if target.is_symlink() or not target.is_dir():
+            raise ValueError('Venture studio path must be a regular directory.')
+        if (target / 'studio.md').is_file() and (target / '.git').exists():
+            return target
+        if any(target.iterdir()):
+            raise ValueError('Venture studio notebook already contains files.')
+    else:
+        target.mkdir(mode=0o700)
+        created = True
+    try:
+        project_git.git(target, 'init', '-b', 'main')
+        with repository_lock(target):
+            _write(target / 'studio.md',
+                   '# Venture Studio\n\n'
+                   '- Organization: ' + str(organization_id) + '\n'
+                   '- Purpose: portfolio review and new-venture scouting.\n'
+                   '- Created: ' + now().isoformat() + '\n')
+            _write(target / '.gitignore', '.ci-cache/\n')
+            project_git.git(target, 'add', '-A')
+            project_git.git(target, 'commit', '-m', 'initialize venture studio')
+    except Exception:
+        if created:
+            shutil.rmtree(target, ignore_errors=True)
+        raise
+    return target
+
+
 def provision(root, relative, venture):
     """Create an empty managed notebook; refuse any pre-existing content."""
     root = Path(root).resolve()

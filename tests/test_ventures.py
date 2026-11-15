@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / 'web/gateway'))
 from contributions import Contributions
 import project_git
 import venture_feeds
+import venture_notebook
 import ventures
 
 
@@ -43,6 +44,37 @@ def result(citation='N1'):
     }
 
 
+
+def strategy_result(citation='S1'):
+    return {
+        'events': [],
+        'product_changes': [],
+        'pricing': {},
+        'deltas': {'demand': 0, 'competition': 0, 'regulatory': 0, 'delivery_risk': 0},
+        'red_team': [],
+        'outreach': [],
+    }
+
+
+def candidate(name='Carrier Desk'):
+    return {
+        'name': name,
+        'thesis': 'Freight forwarders lose margin on invoice exceptions and carrier overcharges.',
+        'product': 'Invoice reconciliation for mid-market freight forwarders.',
+        'pricing': '$600 per site per month',
+        'configuration': {
+            'sources': {'feeds': ['https://news.example/feed']},
+            'market': {'geography': 'United States', 'currency': 'USD', 'fx_pair': 'USD/USD', 'fx_rate': 1},
+            'simulation': {'capital': 250000, 'burn': [{'label': 'hosting', 'amount': 3000, 'currency': 'USD'}],
+                           'architecture': 'saas', 'icp_size': '100-1000 employees',
+                           'icp_sector': 'freight forwarding'},
+            'outreach': {'stage': 'survey', 'tone': 'direct', 'language': 'en', 'persona': 'cfo'},
+        },
+        'assumptions': ['Carriers will share invoice data.'],
+        'kill_criteria': ['No pilot after 90 days.'],
+        'confidence': 70,
+        'evidence': ['V1'],
+    }
 @unittest.skipUnless(shutil.which('git'), 'Git required')
 class VentureTests(unittest.TestCase):
     def setUp(self):
@@ -156,6 +188,32 @@ class VentureTests(unittest.TestCase):
         with closing(self.service.connect()) as db:
             return json.loads(db.execute('SELECT data FROM venture_ticks WHERE id=?', (tick['id'],)).fetchone()[0])
 
+    def add_venture_group(self, record):
+        notebook = self.projects / record['notebook']
+        self.profiles.extend([
+            dict(id='u' * 32, name='Analyst', organization_id='org', project=str(notebook), use_worktree=True),
+            dict(id='v' * 32, name='Founder', organization_id='org', project=str(notebook), use_worktree=True),
+            dict(id='w' * 32, name='Red Team', organization_id='org', project=str(notebook), use_worktree=True),
+        ])
+        self.groups.append(dict(id='b1' * 16, name='Venture team', organization_id='org',
+                                facilitator_id='u' * 32, members=['v' * 32, 'w' * 32], read_only=True))
+        return self.ventures.action(dict(mode='configure', organization_id='org', venture_id=record['id'],
+                                         group_id='b1' * 16), 'admin', 'admin')
+    def setup_studio_manual(self):
+        notebook = self.projects / 'ventures' / 'studio-org'
+        venture_notebook.provision_studio(self.projects, 'ventures/studio-org', 'org')
+        self.profiles[:] = [
+            dict(id='p' * 32, name='Portfolio Manager', organization_id='org', project=str(notebook), use_worktree=True),
+            dict(id='q' * 32, name='Venture Scout', organization_id='org', project=str(notebook), use_worktree=True),
+            dict(id='r' * 32, name='Skeptic', organization_id='org', project=str(notebook), use_worktree=True),
+            dict(id='s' * 32, name='Research Analyst', organization_id='org', project=str(notebook), use_worktree=True),
+            dict(id='t' * 32, name='Studio facilitator', organization_id='org', project=str(notebook), use_worktree=True),
+        ]
+        self.groups[:] = [dict(id='a1' * 16, name='Venture Studio', organization_id='org',
+                               facilitator_id='t' * 32, members=['p' * 32, 'q' * 32, 'r' * 32, 's' * 32],
+                               read_only=True)]
+        return self.ventures.save_studio('org', dict(notebook='ventures/studio-org', group_id='a1' * 16,
+                                                     team={}, created_at=ventures.now().isoformat()))
     def test_create_is_bounded_replayable_and_provisions_a_notebook(self):
         record = self.create()
         self.assertEqual(record['state'], 'draft')
@@ -176,6 +234,7 @@ class VentureTests(unittest.TestCase):
             dict(market=dict(sales_cycle=6)),
             dict(simulation=dict(capital=-1)),
             dict(simulation=dict(architecture='desktop')),
+            dict(simulation=dict(meeting_cadence='weekly')),
             dict(outreach=dict(persona='ceo')),
         ):
             with self.subTest(changes=changes):
@@ -700,12 +759,483 @@ class VentureTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'qualified under'):
                 change(**layers)
 
+    def complete_studio(self, run, value):
+        job = next(job for job in self.jobs if job['id'] == run['job_id'])
+        job.update(state='artifact_ready', result='```json\n' + json.dumps(value) + '\n```')
+        self.ventures.advance()
+        with closing(self.service.connect()) as db:
+            return json.loads(db.execute('SELECT data FROM venture_studio_runs WHERE id=?',
+                                         (run['id'],)).fetchone()[0])
+    def test_every_day_strategy_review_uses_internal_evidence_and_is_not_judged(self):
+        record = self.attach_group(self.create())
+        self.configure(record, meeting_cadence='every_day')
+        with patch.object(venture_feeds, 'fetch', return_value=dict(
+                status=200, source='https://news.example/feed', fetched_at=venture_feeds.now().isoformat(),
+                items=[], etag='', modified='')):
+            tick = self.ventures.action(dict(mode='run', organization_id='org', venture_id=record['id']),
+                                        'admin', 'admin')
+        self.assertEqual(tick['review_kind'], 'strategy')
+        prompt = next(job for job in self.jobs if job['id'] == tick['job_id'])['prompt']
+        self.assertIn('VENTURE STRATEGY REVIEW', prompt)
+        self.assertIn('S1', prompt)
+        review = self.ventures.review_for(record['id'], 'org', ventures.now().date().isoformat())
+        self.assertEqual(review['state'], 'meeting')
+        completed = self.complete(record, strategy_result())
+        self.assertEqual(completed['state'], 'ready')
+        self.assertFalse(completed['judged'])
+        review = self.ventures.review_for(record['id'], 'org', ventures.now().date().isoformat())
+        self.assertEqual(review['state'], 'ready')
+
+    def test_a_skipped_review_can_be_retried_on_the_same_day(self):
+        record = self.create()
+        with patch.object(venture_feeds, 'fetch', return_value=dict(
+                status=200, source='https://news.example/feed', fetched_at=venture_feeds.now().isoformat(),
+                items=[feed_item(venture_feeds.now().isoformat())], etag='', modified='')):
+            with self.assertRaisesRegex(ValueError, 'group'):
+                self.ventures.action(dict(mode='run', organization_id='org', venture_id=record['id']),
+                                     'admin', 'admin')
+        skipped = self.ventures.review_for(record['id'], 'org', ventures.now().date().isoformat())
+        self.assertEqual(skipped['state'], 'skipped')
+        self.assertIn('group', skipped['reason'].lower())
+        self.attach_group(record)
+        self.configure(record, meeting_cadence='every_day')
+        with patch.object(venture_feeds, 'fetch', return_value=dict(
+                status=200, source='https://news.example/feed', fetched_at=venture_feeds.now().isoformat(),
+                items=[], etag='', modified='')):
+            tick = self.ventures.action(dict(mode='run', organization_id='org', venture_id=record['id']),
+                                        'admin', 'admin')
+        self.assertIn(tick['review_kind'], ('news', 'strategy'))
+        review = self.ventures.review_for(record['id'], 'org', ventures.now().date().isoformat())
+        self.assertEqual(review['state'], 'meeting')
+        self.assertEqual(review['tick_id'], tick['id'])
+
+    def test_studio_setup_provisions_a_notebook_and_group(self):
+        self.profiles[:] = [dict(id='z' * 32, name='Template', organization_id='org',
+                                 project=str(self.projects), use_worktree=True, runtime='codex', model='m')]
+        studio = self.ventures.action(dict(mode='studio_setup', organization_id='org', confirmed=True),
+                                      'admin', 'admin')
+        self.assertTrue(studio['group_id'])
+        self.assertTrue((self.projects / studio['notebook'] / 'studio.md').is_file())
+        self.assertEqual(len(self.groups), 1)
+        self.assertEqual(len(self.groups[0]['members']), 4)
+
+    def test_scout_candidate_approval_creates_one_linked_venture(self):
+        self.setup_studio_manual()
+        record = self.add_venture_group(self.create())
+        self.ventures.action(dict(mode='studio_policy', organization_id='org',
+                                  studio_sources=['https://news.example/feed'],
+                                  studio_max_candidates=2), 'admin', 'admin')
+        with patch.object(venture_feeds, 'fetch', return_value=dict(
+                status=200, source='https://news.example/feed', fetched_at=venture_feeds.now().isoformat(),
+                items=[feed_item(venture_feeds.now().isoformat())], etag='', modified='')):
+            run = self.ventures.action(dict(mode='studio_run', organization_id='org', kind='scout'),
+                                       'admin', 'admin')
+        completed = self.complete_studio(run, {'candidates': [candidate()]})
+        self.assertEqual(completed['state'], 'ready', completed.get('error'))
+        with closing(self.service.connect()) as db:
+            row = db.execute('SELECT data FROM venture_candidates').fetchone()
+        stored = json.loads(row[0])
+        self.assertEqual(stored['state'], 'proposed')
+        approved = self.ventures.action(dict(mode='candidate_decide', organization_id='org',
+                                             candidate_id=stored['id'], decision='approve', confirmed=True),
+                                        'admin', 'admin')
+        self.assertEqual(approved['state'], 'created')
+        created = self.ventures.get(approved['venture_id'], 'org')
+        self.assertEqual(created['source']['candidate_id'], stored['id'])
+        self.assertTrue((self.projects / created['notebook'] / 'venture.md').is_file())
+
+    def test_portfolio_review_requires_every_active_venture(self):
+        self.setup_studio_manual()
+        record = self.add_venture_group(self.create())
+        run = self.ventures.action(dict(mode='studio_run', organization_id='org', kind='portfolio'),
+                                   'admin', 'admin')
+        completed = self.complete_studio(run, {
+            'summary': 'Keep building.',
+            'recommendations': [dict(venture_id=record['id'], rank=1, recommendation='continue',
+                                     reason='Evidence is thin but the thesis is coherent.', evidence=['V1'])],
+        })
+        self.assertEqual(completed['state'], 'ready', completed.get('error'))
+        self.assertEqual(completed['recommendations'][0]['venture_id'], record['id'])
+        with self.assertRaisesRegex(ValueError, 'every active venture'):
+            self.ventures._studio_parse(dict(run, active_venture_ids=[record['id']]),
+                                        {'result': '```json\n' + json.dumps({'summary': 'x', 'recommendations': []}) + '\n```'})
+
+    def test_studio_policy_is_bounded_and_reports_projection(self):
+        with self.assertRaisesRegex(ValueError, 'cadence'):
+            self.ventures.action(dict(mode='studio_policy', organization_id='org',
+                                      studio_portfolio_cadence='hourly'), 'admin', 'admin')
+        with self.assertRaises(ValueError):
+            self.ventures.action(dict(mode='studio_policy', organization_id='org',
+                                      studio_sources=['http://news.example/feed']), 'admin', 'admin')
+        policy = self.ventures.action(dict(mode='studio_policy', organization_id='org',
+                                           studio_portfolio_cadence='daily',
+                                           studio_max_candidates=3,
+                                           studio_candidate_backlog=5), 'admin', 'admin')
+        self.assertEqual(policy['studio_portfolio_cadence'], 'daily')
+        summary = self.ventures._studio_summary('org')
+        self.assertIn('daily_meetings', summary['budget'])
+    def test_studio_schedule_starts_one_due_run_and_advances_the_window(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.ventures.action(dict(mode='studio_policy', organization_id='org',
+                                  studio_portfolio_cadence='daily'), 'admin', 'admin')
+        saved = self.ventures._studio_policy('org')
+        saved['studio_next_portfolio_at'] = (ventures.now() - timedelta(minutes=1)).isoformat()
+        self.service.patch_policy('org', {'studio_next_portfolio_at': saved['studio_next_portfolio_at']}, 'test')
+        self.ventures.advance()
+        with closing(self.service.connect()) as db:
+            run = json.loads(db.execute('SELECT data FROM venture_studio_runs').fetchone()[0])
+        self.assertEqual(run['kind'], 'portfolio')
+        self.assertEqual(run['state'], 'meeting')
+        self.assertGreater(ventures.moment(self.ventures._studio_policy('org')['studio_next_portfolio_at']),
+                           ventures.now())
+
+    def test_candidate_duplicates_are_excluded(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.ventures.action(dict(mode='studio_policy', organization_id='org',
+                                  studio_sources=['https://news.example/feed']), 'admin', 'admin')
+        run = self.ventures.action(dict(mode='studio_run', organization_id='org', kind='scout'),
+                                   'admin', 'admin')
+        completed = self.complete_studio(run, {'candidates': [candidate('Settlement Desk')]})
+        self.assertEqual(completed['state'], 'ready')
+        with closing(self.service.connect()) as db:
+            saved = json.loads(db.execute('SELECT data FROM venture_candidates').fetchone()[0])
+        self.assertEqual(saved['state'], 'excluded')
+        self.assertTrue(saved['duplicate_of'])
+    def test_strategy_result_rejects_news_or_demand(self):
+        record = self.attach_group(self.create())
+        self.configure(record, meeting_cadence='every_day')
+        with patch.object(venture_feeds, 'fetch', return_value=dict(
+                status=200, source='https://news.example/feed', fetched_at=venture_feeds.now().isoformat(),
+                items=[], etag='', modified='')):
+            tick = self.ventures.action(dict(mode='run', organization_id='org', venture_id=record['id']),
+                                        'admin', 'admin')
+        with self.assertRaisesRegex(ValueError, 'invent news'):
+            self.ventures.parse(dict(tick, result=json.dumps(dict(
+                strategy_result(), events=[{'evidence': ['S1'], 'summary': 'invented', 'direction': 'tailwind'}]))))
+        with self.assertRaisesRegex(ValueError, 'demand'):
+            self.ventures.parse(dict(tick, result=json.dumps(dict(
+                strategy_result(), deltas={'demand': 1, 'competition': 0, 'regulatory': 0, 'delivery_risk': 0}))))
+
+    def test_strategy_outreach_requires_a_recorded_outcome(self):
+        record = self.attach_group(self.create())
+        self.configure(record, meeting_cadence='every_day')
+        with patch.object(venture_feeds, 'fetch', return_value=dict(
+                status=200, source='https://news.example/feed', fetched_at=venture_feeds.now().isoformat(),
+                items=[], etag='', modified='')):
+            tick = self.ventures.action(dict(mode='run', organization_id='org', venture_id=record['id']),
+                                        'admin', 'admin')
+        bad = strategy_result()
+        bad['outreach'] = [{'persona': 'cfo', 'language': 'ja', 'subject': 'x', 'body': 'y', 'evidence': ['S1']}]
+        with self.assertRaisesRegex(ValueError, 'wrong kind'):
+            self.ventures.parse(dict(tick, result=json.dumps(bad)))
+    def test_operator_can_record_a_disproved_assumption(self):
+        record = self.create(assumptions=['Carriers share invoice data.'])
+        saved = self.ventures.action(dict(mode='assumptions', organization_id='org', venture_id=record['id'],
+                                          failed=['Carriers share invoice data.'], note='Two pilots refused.'),
+                                     'admin', 'admin')
+        self.assertEqual(saved['assumption_outcomes'][0]['failed'], ['Carriers share invoice data.'])
+    def test_scheduler_starts_a_strategy_review_on_a_quiet_every_day_venture(self):
+        record = self.attach_group(self.create())
+        self.configure(record, daily_ticks=True, meeting_cadence='every_day',
+                       tick_hour_utc=(ventures.now().hour + 1) % 24)
+        saved = self.ventures.get(record['id'], 'org')
+        saved['next_at'] = (ventures.now() - timedelta(minutes=1)).isoformat()
+        self.ventures.save(saved)
+        with patch.object(venture_feeds, 'fetch', return_value=dict(
+                status=200, source='https://news.example/feed', fetched_at=venture_feeds.now().isoformat(),
+                items=[], etag='', modified='')):
+            self.ventures.advance()
+        tick = self.ventures.tick_for(record['id'], 'org', ventures.now().date().isoformat())
+        self.assertEqual(tick['review_kind'], 'strategy')
+        review = self.ventures.review_for(record['id'], 'org', ventures.now().date().isoformat())
+        self.assertEqual(review['state'], 'meeting')
     def test_create_and_configure_are_admin_only(self):
         with self.assertRaisesRegex(ValueError, 'administrator'):
             self.ventures.action(dict(mode='create', organization_id='org', name='x'), 'viewer', 'operator')
         record = self.create()
         with self.assertRaisesRegex(ValueError, 'administrator'):
             self.ventures.action(dict(mode='pause', organization_id='org', venture_id=record['id']), 'viewer', 'operator')
+
+    # -- Studio resilience -------------------------------------------------
+
+    def studio(self, **body):
+        return self.ventures.action(dict(organization_id='org', **body), 'admin', 'admin')
+
+    def studio_runs(self):
+        with closing(self.service.connect()) as db:
+            return [json.loads(row[0]) for row in db.execute('SELECT data FROM venture_studio_runs ORDER BY rowid')]
+
+    def due(self, *kinds):
+        self.service.patch_policy('org', {'studio_next_' + kind + '_at':
+                                          (ventures.now() - timedelta(minutes=1)).isoformat() for kind in kinds}, 'test')
+
+    def scout_with(self, *proposals):
+        self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'], studio_max_candidates=3)
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            run = self.studio(mode='studio_run', kind='scout')
+        return self.complete_studio(run, {'candidates': list(proposals)})
+
+    def stored_candidates(self):
+        with closing(self.service.connect()) as db:
+            return [json.loads(row[0]) for row in db.execute('SELECT data FROM venture_candidates ORDER BY rowid')]
+
+    def test_a_rejected_studio_result_can_be_dismissed_and_never_blocks_new_runs(self):
+        self.setup_studio_manual()
+        record = self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='portfolio')
+        bad = self.complete_studio(run, {'summary': 'x', 'recommendations': []})
+        self.assertEqual(bad['state'], 'needs_attention')
+        with self.assertRaisesRegex(ValueError, 'dismiss'):
+            self.studio(mode='studio_recover', run_id=run['id'], inspected=True)
+        # A run needing attention no longer blocks the studio.
+        second = self.studio(mode='studio_run', kind='portfolio')
+        self.assertEqual(second['state'], 'meeting')
+        with self.assertRaisesRegex(ValueError, 'reason'):
+            self.studio(mode='studio_dismiss', run_id=run['id'])
+        dismissed = self.studio(mode='studio_dismiss', run_id=run['id'], reason='Agents skipped a venture.')
+        self.assertEqual((dismissed['state'], dismissed['dismissed']['reason']),
+                         ('dismissed', 'Agents skipped a venture.'))
+        self.assertEqual(self.studio(mode='studio_dismiss', run_id=run['id'], reason='again')['state'], 'dismissed')
+        good = self.complete_studio(second, {'summary': 'ok', 'recommendations': [dict(
+            venture_id=record['id'], rank=1, recommendation='continue', reason='Fine.', evidence=['V1'])]})
+        self.assertEqual(good['state'], 'ready')
+        self.assertEqual(good['recommendations'][0]['venture_name'], 'Settlement Desk')
+
+    def test_a_failed_dispatch_is_recovered_with_the_same_request_id(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        requests = []
+        original = self.store.action.side_effect
+        def limited(action, body):
+            if action == 'discuss':
+                requests.append(body['request_id'])
+                if len(requests) == 1:
+                    raise ValueError('Meeting limit reached.')
+            return original(action, body)
+        self.store.action.side_effect = limited
+        with self.assertRaisesRegex(ValueError, 'Meeting limit'):
+            self.studio(mode='studio_run', kind='portfolio')
+        failed = self.studio_runs()[-1]
+        self.assertEqual((failed['state'], failed.get('job_id'), failed['dispatch_failed']),
+                         ('needs_attention', None, True))
+        recovered = self.studio(mode='studio_recover', run_id=failed['id'], inspected=True)
+        self.assertEqual(recovered['state'], 'meeting')
+        self.assertEqual(requests, ['studio-' + failed['id']] * 2)  # Same request: no second meeting.
+        self.assertEqual(recovered['prompt'], failed['prompt'])
+
+    def test_an_interrupted_pending_run_stops_blocking_after_ten_minutes(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        stale = self.ventures.save_studio_run(dict(
+            id='c' * 32, organization_id='org', kind='portfolio', state='pending', created_at='2026-01-01T00:00:00+00:00'))
+        with closing(self.service.connect()) as db, db:
+            stale['updated_at'] = (ventures.now() - timedelta(minutes=11)).isoformat()
+            db.execute('UPDATE venture_studio_runs SET data=? WHERE id=?', (json.dumps(stale), stale['id']))
+        self.assertEqual(self.studio(mode='studio_run', kind='portfolio')['state'], 'meeting')
+        self.assertEqual(self.studio_runs()[0]['state'], 'needs_attention')
+
+    def test_two_daily_cadences_wait_for_each_other_without_backoff(self):
+        self.setup_studio_manual()
+        record = self.add_venture_group(self.create())
+        self.studio(mode='studio_policy', studio_portfolio_cadence='daily', studio_scout_cadence='daily')
+        self.due('portfolio', 'scout')
+        for _ in range(3):
+            self.ventures.advance()
+            policy = self.ventures._studio_policy('org')
+            self.assertFalse(policy.get('studio_scout_error'))
+            self.assertFalse(policy.get('studio_scout_failures'))
+            self.assertLessEqual(ventures.moment(policy['studio_next_scout_at']), ventures.now())
+        self.assertEqual([(run['kind'], run['state']) for run in self.studio_runs()], [('portfolio', 'meeting')])
+        self.complete_studio(self.studio_runs()[0], {'summary': 'ok', 'recommendations': [dict(
+            venture_id=record['id'], rank=1, recommendation='continue', reason='Fine.', evidence=['V1'])]})
+        self.ventures.advance()
+        self.assertEqual([run['kind'] for run in self.studio_runs()], ['portfolio', 'scout'])
+        schedule = self.ventures._studio_summary('org')['schedule']['scout']
+        self.assertEqual((schedule['error'], schedule['failures']), ('', 0))
+        self.assertTrue(schedule['last_at'])
+
+    def test_scheduler_failures_reset_after_a_success(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.studio(mode='studio_policy', studio_portfolio_cadence='daily')
+        self.service.patch_policy('org', dict(studio_portfolio_failures=4, studio_portfolio_error='old'), 'test')
+        self.due('portfolio')
+        self.ventures.advance()
+        schedule = self.ventures._studio_summary('org')['schedule']['portfolio']
+        self.assertEqual((schedule['failures'], schedule['error']), (0, ''))
+
+    def test_studio_evidence_keeps_twenty_long_ventures_and_long_history_in_budget(self):
+        self.studio(mode='limits', max_active_ventures=20)
+        long = 'Thesis ' + 'word ' * 290
+        for number in range(20):
+            record = self.create(request_id='bulk-' + str(number), name='Venture number ' + str(number), thesis=long,
+                                 product='Product ' + 'feature ' * 180)
+            saved = self.ventures.get(record['id'], 'org')
+            saved['state'] = 'running'
+            saved['configuration']['market']['regulatory'] = 'Rule ' * 290
+            self.ventures.save(saved)
+        for number in range(40):
+            self.ventures.save_candidate(dict(id=uuid.uuid4().hex, organization_id='org', state='rejected',
+                                              name='Old idea ' + str(number), thesis=long))
+        policy = self.ventures._studio_policy('org')
+        evidence, active, _ = self.ventures._studio_evidence('org', 'portfolio', policy)
+        self.assertEqual(len(evidence['ventures']), 20)
+        self.assertEqual(len(active), 20)
+        self.assertLessEqual(len(json.dumps(evidence, ensure_ascii=False).encode()), ventures.STUDIO_EVIDENCE_LIMIT)
+        self.assertTrue(all(len(item['thesis']) <= 120 for item in evidence['existing']))
+        self.assertLessEqual(len(evidence['existing']), 80)
+        # Only studio settings reach the agents, never the rest of the organization policy.
+        self.assertEqual(set(evidence['policy']), {'focus', 'exclusions', 'max_candidates', 'sources'})
+
+    def test_duplicates_are_found_beyond_the_bounded_evidence_list(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.ventures.save_candidate(dict(id='d' * 32, organization_id='org', state='rejected',
+                                          name='Carrier Desk', thesis='An old rejected idea.'))
+        for number in range(30):  # Pushes the old idea out of the 20 newest closed entries.
+            self.ventures.save_candidate(dict(id=uuid.uuid4().hex, organization_id='org', state='rejected',
+                                              name='Filler ' + str(number), thesis='Unrelated filler.'))
+        run = self.scout_with(candidate('Carrier Desk'))
+        self.assertEqual(run['state'], 'ready')
+        fresh = self.stored_candidates()[-1]
+        self.assertEqual((fresh['state'], fresh['duplicate_of']), ('excluded', 'd' * 32))
+
+    def test_a_scout_cannot_set_its_own_bar_schedule_or_unlimited_capital(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        proposal = candidate()
+        proposal['configuration']['simulation'].update(daily_ticks=True, survival_threshold=0, consecutive_days=1,
+                                                       red_team=1, meeting_cadence='every_day',
+                                                       capital=1_000_000_000, reference_price=900_000)
+        free = candidate('Free Desk')
+        free['thesis'] = 'A different idea with no costs at all for municipal libraries.'
+        free['configuration']['simulation']['burn'] = []
+        run = self.scout_with(proposal, free)
+        self.assertEqual(run['state'], 'ready')
+        self.assertEqual([item['name'] for item in run['refused_candidates']], ['Free Desk'])
+        stored = self.stored_candidates()[0]
+        simulation = stored['configuration']['simulation']
+        self.assertEqual((simulation['daily_ticks'], simulation['survival_threshold'], simulation['consecutive_days'],
+                          simulation['red_team'], simulation['meeting_cadence'], simulation['capital']),
+                         (False, 60, 3, 5, 'news_only', 36000))  # 3000 a month x 12 months.
+        self.assertEqual(stored['scout_adjusted']['survival_threshold'], dict(proposed=0, used=60))
+        self.assertEqual(stored['scout_adjusted']['capital'], dict(proposed=1_000_000_000, used=36000))
+        # The price anchor is part of the bar: it goes back to the monthly costs.
+        self.assertEqual(simulation['reference_price'], 0)
+        self.assertEqual(stored['scout_adjusted']['reference_price'], dict(proposed=900_000, used=0))
+        created = self.ventures.get(self.studio(mode='candidate_decide', candidate_id=stored['id'],
+                                                decision='approve', confirmed=True)['venture_id'], 'org')
+        self.assertEqual((created['configuration']['simulation']['daily_ticks'], created['next_at']), (False, None))
+
+    def test_operator_edits_cannot_schedule_a_candidate(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.scout_with(candidate())
+        stored = self.stored_candidates()[0]
+        configuration = json.loads(json.dumps(stored['configuration']))
+        configuration['simulation'].update(daily_ticks=True, survival_threshold=40)
+        edited = self.studio(mode='candidate_update', candidate_id=stored['id'], configuration=configuration)
+        self.assertEqual((edited['configuration']['simulation']['daily_ticks'],
+                          edited['configuration']['simulation']['survival_threshold']), (False, 40))
+
+    def test_daily_reviews_need_a_team_and_nothing_is_created_without_one(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.scout_with(candidate())
+        stored = self.stored_candidates()[0]
+        with self.assertRaisesRegex(ValueError, 'need a team'):
+            self.studio(mode='candidate_decide', candidate_id=stored['id'], decision='approve', confirmed=True,
+                        start_daily=True)
+        self.assertEqual(self.stored_candidates()[0]['state'], 'proposed')
+        self.assertFalse(self.stored_candidates()[0].get('venture_id'))
+
+    def test_exclusions_are_enforced_by_whole_word_and_never_dropped(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.studio(mode='studio_policy', studio_exclude=['crypto', 'gambling'])
+        topical = candidate('Crypto Treasury Desk')
+        topical['thesis'] = 'Treasury reporting for online operators holding digital assets.'
+        cryptography = candidate('Cryptography Audit Desk')
+        cryptography['thesis'] = 'Certificate inventory audits for regional hospitals and clinics.'
+        self.scout_with(topical, cryptography)
+        stored = {item['name']: item for item in self.stored_candidates()}
+        self.assertEqual((stored['Crypto Treasury Desk']['state'], stored['Crypto Treasury Desk']['excluded_by']),
+                         ('excluded', 'crypto'))
+        self.assertEqual(stored['Cryptography Audit Desk']['state'], 'proposed')  # A word, not a substring.
+        self.studio(mode='studio_policy', studio_exclude=['topic ' + str(number) for number in range(40)])
+        with self.assertRaisesRegex(ValueError, 'exclusion list is full'):
+            self.studio(mode='candidate_decide', candidate_id=stored['Cryptography Audit Desk']['id'],
+                        decision='reject', reason='Not for us.', exclude=True)
+        self.assertEqual(len(self.ventures._studio_policy('org')['studio_exclude']), 40)
+        self.studio(mode='studio_policy', studio_exclude=['cryptography'])
+        with self.assertRaisesRegex(ValueError, 'exclusion "cryptography"'):
+            self.studio(mode='candidate_decide', candidate_id=stored['Cryptography Audit Desk']['id'],
+                        decision='approve', confirmed=True)
+
+    def test_an_empty_portfolio_records_a_skip_instead_of_a_meeting(self):
+        self.setup_studio_manual()
+        with self.assertRaisesRegex(ValueError, 'no active ventures'):
+            self.studio(mode='studio_run', kind='portfolio')
+        self.studio(mode='studio_policy', studio_portfolio_cadence='daily')
+        self.due('portfolio')
+        self.ventures.advance()
+        self.assertEqual([(run['state'], run['reason'][:9]) for run in self.studio_runs()], [('skipped', 'No active')])
+        self.assertEqual(self.jobs, [])
+        self.assertGreater(ventures.moment(self.ventures._studio_policy('org')['studio_next_portfolio_at']),
+                           ventures.now())
+
+    def test_an_invalid_stored_policy_value_falls_back_without_breaking_anything(self):
+        self.setup_studio_manual()
+        self.service.patch_policy('org', dict(studio_max_candidates=9, studio_scout_cadence='hourly'), 'test')
+        self.service.advance_modules()
+        self.assertNotIn('fault', self.service.module_state('ventures'))
+        summary = self.ventures.snapshot()['studios'][0]
+        self.assertEqual(sorted(summary['invalid_policy']), ['studio_max_candidates', 'studio_scout_cadence'])
+        self.assertEqual((summary['policy']['studio_max_candidates'], summary['policy']['studio_scout_cadence']),
+                         (2, 'off'))
+        self.assertNotIn('max_active_meetings', summary['policy'])
+        repaired = self.studio(mode='studio_policy', studio_focus=['logistics'])
+        self.assertEqual(repaired['invalid'], [])
+        self.assertEqual(self.ventures._studio_summary('org')['invalid_policy'], [])
+        with self.assertRaisesRegex(ValueError, 'candidate cap'):
+            self.studio(mode='studio_policy', studio_max_candidates=9)
+
+    def test_budget_counts_real_participants_and_refuses_going_over_the_cap(self):
+        self.setup_studio_manual()
+        record = self.add_venture_group(self.create())
+        self.configure(record, daily_ticks=True, meeting_cadence='news_only')
+        self.studio(mode='studio_policy', studio_scout_cadence='weekly')
+        budget = self.ventures._studio_summary('org')['budget']
+        # news_only: possible, not guaranteed (3 people). Weekly scout: 1/7 of 5 people.
+        self.assertEqual((budget['daily_meetings'], budget['max_daily_meetings']), (0.1, 1.1))
+        self.assertEqual((budget['projected_agent_sessions'], budget['max_agent_sessions']), (0.7, 3.7))
+        self.assertEqual(budget['studio_runs_per_week'], 1)
+        self.service.patch_policy('org', dict(daily_session_cap=5), 'test')
+        with self.assertRaisesRegex(ValueError, 'above the organization cap of 5'):
+            self.studio(mode='studio_policy', studio_portfolio_cadence='daily')
+        self.service.patch_policy('org', dict(daily_session_cap=2), 'test')  # Already over: off still works.
+        self.assertEqual(self.studio(mode='studio_policy', studio_scout_cadence='off')['studio_scout_cadence'], 'off')
+        other = self.create(request_id='second-desk', name='Second Desk')
+        saved = self.ventures.get(other['id'], 'org')
+        saved['group_id'] = 'b1' * 16
+        self.ventures.save(saved)
+        with self.assertRaisesRegex(ValueError, 'above the organization cap'):
+            self.configure(saved, daily_ticks=True)
+
+    def test_studio_summary_shows_lessons_and_scheduler_errors(self):
+        self.setup_studio_manual()
+        record = self.create()
+        saved = self.ventures.get(record['id'], 'org')
+        saved.update(state='failed', outcome_reason='Capital reached zero.')
+        self.ventures.save(saved)
+        self.service.patch_policy('org', dict(studio_scout_error='The venture candidate backlog is full.',
+                                              studio_scout_failures=2), 'test')
+        summary = self.ventures._studio_summary('org')
+        self.assertEqual(summary['lessons'][0]['title'], 'Settlement Desk')
+        self.assertEqual(summary['schedule']['scout']['error'], 'The venture candidate backlog is full.')
+        self.assertEqual(summary['schedule']['scout']['failures'], 2)
 
 
 if __name__ == '__main__':
