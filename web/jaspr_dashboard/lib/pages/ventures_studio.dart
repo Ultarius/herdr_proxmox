@@ -43,6 +43,7 @@ Component venturesStudio({
   void Function(String action, Map<String, dynamic>? run)? onAction,
   void Function()? onRunScoutAnyway,
   void Function()? onStartTeam,
+  void Function(String url)? onAddSource,
   String herdr = '',
   List<Map<String, dynamic>> runtimes = const [],
   Map<String, String> ventureNames = const {},
@@ -248,6 +249,11 @@ Component venturesStudio({
           '${(coverage['focus'] ?? 0) == 0 ? 'no focus' : '${coverage['focus']} focus area(s)'}. '
           'A scout without market evidence proposes weak ideas; add sources and a focus in the studio settings.',
           error: true,
+        )
+      else if (coverage['web_research'] == true)
+        notice(
+          'No readable source: the next scout researches the web itself, lists every page it relies on and '
+          'suggests feeds you can add. Its pages are agent-reported, not verified by the gateway.',
         ),
       if (mode == 'autonomous')
         notice(
@@ -335,6 +341,38 @@ Component venturesStudio({
             paragraph(
               'Refused by the gateway: ${refused['name'] ?? 'unnamed'}: ${refused['error'] ?? ''}',
             ),
+          if (latestScout['web_research'] == true)
+            paragraph(
+              'This scout researched the web because no source gave items. '
+              '${latestScout['research_note'] ?? ''}',
+            ),
+          for (final page in List<Map<String, dynamic>>.from(
+            latestScout['research'] as List? ?? const [],
+          ))
+            paragraph(
+              '${page['id']}: ${page['title'] ?? ''} · ${page['url'] ?? ''}'
+              '${'${page['published'] ?? ''}'.isEmpty ? '' : ' · ${page['published']}'} '
+              '(agent-reported, not verified)',
+            ),
+          for (final source in List<Map<String, dynamic>>.from(
+            latestScout['suggested_sources'] as List? ?? const [],
+          ))
+            el('div', [
+              text(
+                'Suggested source: ${source['title'] ?? ''} · ${source['url'] ?? ''}'
+                '${'${source['reason'] ?? ''}'.isEmpty ? '' : ' · ${source['reason']}'} ',
+              ),
+              if ((policy['studio_sources'] as List? ?? const []).contains(
+                source['url'],
+              ))
+                pill('Added', tone: 'success')
+              else if (onAddSource != null)
+                button(
+                  'Add source',
+                  busy ? null : () => onAddSource('${source['url']}'),
+                  small: true,
+                ),
+            ], classes: 'actions'),
           for (final item in List<Map<String, dynamic>>.from(
             latestScout['auto'] as List? ?? const [],
           ))

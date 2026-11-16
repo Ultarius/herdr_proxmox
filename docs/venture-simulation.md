@@ -419,6 +419,33 @@ studio meeting needs. `studio_limits` raises `max_active_sessions` and
 `daily_session_cap` to that minimum; it never lowers a limit and never touches
 one that is off (0).
 
+### Web research and suggested sources
+
+A scout whose sources give no items (none configured, or none that is a
+readable feed) no longer returns nothing. With `studio_web_research` on (the
+default) it runs as a **web-research** scout: the prompt tells the agents to
+search the web themselves for the focus areas, read-only, and to report every
+page they rely on under `research` (`W1`...`W12`: URL, title, date, claim).
+Candidates cite those ids; a page that was not reported cannot be cited. The
+pages are stored on the run and on the candidate as `evidence_links` and are
+always labelled agent-reported: the gateway does not fetch them. A focus area
+is still required. A scout that does have source items may not cite the web.
+
+Because those pages are unverified, **autonomous mode never creates a venture
+from web research alone**; such a candidate waits for the operator.
+
+Every scout may also return `suggested_sources`: up to eight feed URLs for the
+focus. They are advisory, an unusable entry is dropped, and nothing is added
+by itself. **Add source** (`studio_source_add`) fetches the URL first and adds
+it only when it is a feed that parses and has items, so a page that is not a
+feed (a search engine's home page, for example) cannot become a source that
+way. The readiness checklist names each configured source whose last fetch
+failed, with the error.
+
+Whether the agents can search depends on the agent CLI and its permissions;
+a CLI without a web tool is told to return no candidates and say so in
+`research_note`.
+
 ### Where the evidence file goes
 
 The facilitator runs in its own worktree, so a file written into the source
@@ -652,7 +679,8 @@ formula.
   Studio modes run under the organization's `studio:` lock: `studio_setup`,
   `studio_run` (`kind`, optional `override`), `studio_recover`,
   `studio_dismiss`, `studio_repair` (optional `confirmed`) and `studio_team`.
-  `studio_policy` and `studio_limits` run under the `policy:` lock.
+  `studio_policy`, `studio_limits` and `studio_source_add` (`url`) run under
+  the `policy:` lock.
   `studio_start` (the one-call setup) and `herdr_start` need no organization.
   `limits` (organization-level, `max_active_ventures` 1–20) runs under the
   organization's `policy:` lock instead. `module` (`enabled: true|false`,

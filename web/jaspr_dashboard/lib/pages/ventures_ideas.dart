@@ -153,6 +153,17 @@ Component _candidate(
       ('Product', text('${item['product'] ?? ''}')),
       ('Pricing', text('${item['pricing'] ?? 'Not proposed'}')),
       ('Evidence', text(evidence.isEmpty ? 'None' : evidence)),
+      // Pages a web-researching scout reported; the gateway did not fetch them.
+      for (final link in List<Map<String, dynamic>>.from(
+        item['evidence_links'] as List? ?? const [],
+      ))
+        (
+          '${link['id']} (web, not verified)',
+          text(
+            '${link['title'] ?? ''} · ${link['url'] ?? ''}'
+            '${'${link['claim'] ?? ''}'.isEmpty ? '' : ' · ${link['claim']}'}',
+          ),
+        ),
       if ('${item['duplicate_of'] ?? ''}'.isNotEmpty)
         ('Duplicate of', text('${item['duplicate_of']}')),
       if ('${item['excluded_by'] ?? ''}'.isNotEmpty)

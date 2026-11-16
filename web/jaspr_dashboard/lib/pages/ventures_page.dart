@@ -198,6 +198,10 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
             }, organization: _studioOrganization),
             onStartTeam: () =>
                 _submit('studio_team', {}, organization: _studioOrganization),
+            // The gateway fetches the URL first and adds only a readable feed.
+            onAddSource: (url) => _submit('studio_source_add', {
+              'url': url,
+            }, organization: _studioOrganization),
             herdr: bloc.herdr,
             runtimes: bloc.runtimes,
           ),
@@ -1558,6 +1562,7 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
   late String _mode = '${component.policy['studio_mode'] ?? 'proposal'}';
   late String _confidence =
       '${component.policy['studio_auto_min_confidence'] ?? 70}';
+  late bool _web = component.policy['studio_web_research'] != false;
   String? _error;
   List<String> _lines(String value) => value
       .split(RegExp(r'[\r\n]+'))
@@ -1597,6 +1602,7 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
       'studio_paused': _paused,
       'studio_mode': _mode,
       'studio_auto_min_confidence': confidence,
+      'studio_web_research': _web,
     });
   }
 
@@ -1660,6 +1666,16 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
         'reviews. It never sends mail, spends or publishes.',
       ),
     ],
+    switchField(
+      'Research the web when no source gives items',
+      _web,
+      (value) => setState(() => _web = value),
+    ),
+    paragraph(
+      'With this on, a scout whose sources are missing or unreadable searches the web itself, lists every '
+      'page it relies on and suggests feeds you can add. Those pages are agent-reported and never create a '
+      'venture by themselves in autonomous mode.',
+    ),
     switchField(
       'Pause the studio only',
       _paused,

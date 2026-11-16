@@ -358,17 +358,63 @@ class StudioOperations:
             ('; '.join(limits).capitalize() + '.') if limits else
             'A studio meeting uses ' + str(people) + ' sessions.', 'limits')
         sources, focus = policy['studio_sources'], policy['studio_focus']
-        add('sources', 'Scouting sources', bool(sources),
-            str(len(sources)) + ' source(s).' if sources else
-            'None: the scout would have no market evidence to cite.', 'configure')
+        health = self._source_health(organization, sources)
+        broken = [item for item in health if item['error']]
+        web = policy.get('studio_web_research') is True
+        usable = bool(sources) and len(broken) < len(sources)
+        detail = (str(len(sources)) + ' source(s).' if sources else 'None.')
+        if broken:
+            detail += ' Not a readable feed: ' + '; '.join(
+                item['url'] + ' (' + item['error'] + ')' for item in broken[:3]) + '.'
+        if not usable:
+            detail += (' The scout researches the web instead and suggests feeds you can add.' if web else
+                       ' The scout would have no market evidence to cite.')
+        add('sources', 'Scouting sources', usable, detail, 'configure')
         add('focus', 'Focus areas', bool(focus),
             ', '.join(focus) if focus else 'None: the scout would not know where to look.', 'configure')
         failing = {check['id'] for check in checks if not check['ok']}
         blocking = [identity for identity in ('herdr', 'provider', 'team', 'sessions', 'limits') if identity in failing]
         return dict(herdr=herdr, checks=checks, blocking=blocking, can_run=not blocking,
-                    can_scout=not blocking and not failing & {'sources', 'focus'},
-                    coverage=dict(sources=len(sources), focus=len(focus)),
+                    can_scout=not blocking and 'focus' not in failing and (usable or web),
+                    coverage=dict(sources=len(sources), focus=len(focus), readable=len(sources) - len(broken),
+                                  web_research=web and not usable),
+                    sources=health,
                     team=bindings, participants=people)
+
+    def _source_health(self, organization, sources):
+        """Each scouting source with what its last fetch returned."""
+        result = []
+        for url in sources:
+            state = self._feed_state(organization, url)
+            result.append(dict(url=url, last_fetch=state.get('last_fetch'),
+                               error=redact(' '.join(str(state.get('last_error') or '').split()))[:200],
+                               item_count=state.get('item_count', 0)))
+        return result
+
+    def studio_source_add(self, organization, body, actor):
+        """Add one scouting source, for example one the scout suggested.
+
+        The URL is fetched first: only a feed that parses and has items is
+        added, so a page that is not a feed cannot become a source again."""
+        import ventures as core
+        import venture_feeds
+        url = venture_feeds.validate_url(body.get('url'), resolve=None)
+        policy = self._studio_policy(organization)
+        sources = list(policy['studio_sources'])
+        if url in sources:
+            return dict(organization_id=organization, url=url, added=False, sources=sources)
+        if len(sources) >= core.MAX_STUDIO_SOURCES:
+            raise ValueError('The studio already has ' + str(core.MAX_STUDIO_SOURCES)
+                             + ' scouting sources; remove one first.')
+        try:
+            result = venture_feeds.fetch(url)
+        except (ValueError, OSError) as error:
+            raise ValueError('This URL is not a readable RSS or Atom feed: ' + redact(str(error))[:200]) from error
+        if result.get('status') != 304 and not result.get('items'):
+            raise ValueError('This feed has no items, so it would give the scout nothing to cite.')
+        self.service.patch_policy(organization, dict(studio_sources=sources + [url]), actor)
+        return dict(organization_id=organization, url=url, added=True, sources=sources + [url],
+                    items=len(result.get('items') or []))
 
     def _studio_preflight(self, organization, kind, manual, override, policy, studio):
         """Refuse a run that cannot work, before anything is recorded or started."""
@@ -382,8 +428,11 @@ class StudioOperations:
         if limits:
             raise StudioWaiting('A studio meeting cannot start: ' + '; '.join(limits) + '.', 'limits')
         if kind == 'scout' and not override:
-            missing = [label for label, value in (('a scouting source', policy['studio_sources']),
-                                                  ('a focus area', policy['studio_focus'])) if not value]
+            # With web research on, missing or unreadable sources are not a
+            # reason to wait: the scout searches and suggests feeds instead.
+            missing = [label for label, value in (
+                ('a scouting source', policy['studio_sources'] or policy.get('studio_web_research')),
+                ('a focus area', policy['studio_focus'])) if not value]
             if missing:
                 raise StudioWaiting('The scout has no market evidence to work from: add ' + ' and '.join(missing)
                                     + ' in the studio settings'
@@ -742,7 +791,11 @@ class StudioOperations:
                 reason = ('Confidence ' + str(candidate.get('confidence')) + ' is below the minimum of '
                           + str(minimum) + '.')
             elif not any(str(item).startswith('N') for item in candidate.get('evidence') or []):
-                reason = 'It cites no outside source item, only internal history.'
+                # Pages found by web research are what the agents report; the
+                # gateway did not fetch them, so they never create a venture alone.
+                reason = ('Its sources were found by web research and are not verified by the gateway; '
+                          'approve it yourself.' if candidate.get('evidence_links') else
+                          'It cites no outside source item, only internal history.')
             elif created >= AUTO_CREATE_PER_RUN:
                 reason = 'Only ' + str(AUTO_CREATE_PER_RUN) + ' venture is created per scout run.'
             elif len(self._studio_ventures(organization)) >= self.limit(organization):

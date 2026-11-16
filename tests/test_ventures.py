@@ -1309,13 +1309,13 @@ class VentureTests(unittest.TestCase):
 
     def test_setup_starts_the_first_scout_and_reports_why_it_could_not(self):
         self.store.runtime_ready = lambda runtime: None
-        # No sources yet: the studio is created, the scout says what it needs.
-        result = self.ventures.action(dict(mode='studio_start', confirmed=True, first_scout=True,
-                                           studio_focus=['freight']), 'admin', 'admin')
+        # No focus yet: the studio is created, the scout says what it needs.
+        result = self.ventures.action(dict(mode='studio_start', confirmed=True, first_scout=True),
+                                      'admin', 'admin')
         self.assertTrue(result['studio']['group_id'])  # The studio exists; only the run did not start.
         self.assertEqual((result['first_scout']['state'], result['first_scout']['category']), ('not_started', 'inputs'))
         self.assertEqual(self.studio_runs(), [])
-        self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'])
+        self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'], studio_focus=['freight'])
         with self.news(feed_item(venture_feeds.now().isoformat())):
             result = self.ventures.action(dict(mode='studio_start', confirmed=True, first_scout=True), 'admin', 'admin')
         self.assertEqual(result['first_scout']['state'], 'meeting')
@@ -1435,13 +1435,13 @@ class VentureTests(unittest.TestCase):
     def test_a_scout_needs_sources_and_focus_unless_the_operator_overrides(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())
-        self.service.patch_policy('org', dict(studio_focus=[]), 'test')
+        self.service.patch_policy('org', dict(studio_focus=[], studio_web_research=False), 'test')
         with self.assertRaisesRegex(ValueError, 'add a scouting source and a focus area'):
             self.studio(mode='studio_run', kind='scout')
         self.assertEqual(self.studio_runs(), [])
         readiness = self.readiness()
-        self.assertEqual((readiness['can_run'], readiness['can_scout'], readiness['coverage']),
-                         (True, False, dict(sources=0, focus=0)))
+        self.assertEqual((readiness['can_run'], readiness['can_scout'], readiness['coverage']['sources'],
+                          readiness['coverage']['focus']), (True, False, 0, 0))
         self.assertEqual(self.check('sources')['action'], 'configure')
         self.studio(mode='studio_policy', studio_scout_cadence='daily')
         self.due('scout')
@@ -1450,6 +1450,98 @@ class VentureTests(unittest.TestCase):
         self.assertIn('no market evidence', schedule['waiting'])
         self.assertEqual((schedule['failures'], self.studio_runs()), (0, []))
         self.assertEqual(self.studio(mode='studio_run', kind='scout', override=True)['state'], 'meeting')
+
+    def web_candidate(self, name='Carrier Desk', evidence=('W1',)):
+        proposal = candidate(name)
+        proposal['configuration']['sources']['feeds'] = []
+        proposal['evidence'] = list(evidence)
+        return proposal
+
+    RESEARCH = [dict(id='W1', url='https://trade.example/report', title='Forwarders dispute one invoice in nine',
+                     published='2026-11-02', claim='Mid-market forwarders report frequent carrier overcharges.')]
+
+    def test_without_sources_the_scout_researches_the_web_and_suggests_feeds(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.assertTrue(self.readiness()['can_scout'])  # A focus is enough; sources are suggested later.
+        self.assertIn('researches the web instead', self.check('sources')['detail'])
+        run = self.studio(mode='studio_run', kind='scout')
+        self.assertTrue(run['web_research'])
+        self.assertIn('RESEARCH THE WEB YOURSELF', run['prompt'])
+        self.assertIn('suggested_sources', run['prompt'])
+        self.assertTrue(json.loads(Path(run['evidence_file']).read_text(encoding='utf-8'))['web_research'])
+        unlisted = self.web_candidate('Dock Ledger', evidence=['W2'])
+        unlisted['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
+        done = self.complete_studio(run, {
+            'candidates': [self.web_candidate(), unlisted], 'research': self.RESEARCH,
+            'research_note': 'Searched trade press for freight invoice disputes.',
+            'suggested_sources': [
+                dict(url='https://trade.example/feed.xml', title='Trade press', reason='Weekly freight pricing news.'),
+                dict(url='http://insecure.example/feed', title='Dropped', reason='Not https.'),
+                dict(url='https://trade.example/feed.xml', title='Repeated', reason='Same feed twice.')]})
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        # A page that was not reported cannot be cited; the listed one can.
+        self.assertEqual([item['name'] for item in done['refused_candidates']], ['Dock Ledger'])
+        stored = self.stored_candidates()[0]
+        self.assertEqual((stored['state'], stored['evidence']), ('proposed', ['W1']))
+        self.assertEqual(stored['evidence_links'][0]['url'], 'https://trade.example/report')
+        shown = self.ventures._studio_summary('org')['runs'][0]
+        self.assertEqual([item['url'] for item in shown['suggested_sources']], ['https://trade.example/feed.xml'])
+        self.assertEqual((shown['research'][0]['id'], shown['research_note']),
+                         ('W1', 'Searched trade press for freight invoice disputes.'))
+        # Nothing was added by itself.
+        self.assertEqual(self.ventures._studio_policy('org')['studio_sources'], [])
+
+    def test_an_unreadable_source_falls_back_to_web_research_and_is_named(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.studio(mode='studio_policy', studio_sources=['https://www.google.com/'])
+        with patch.object(venture_feeds, 'fetch', side_effect=ValueError('Feed is not valid XML.')):
+            run = self.studio(mode='studio_run', kind='scout')
+        self.assertTrue(run['web_research'])  # A page that is not a feed gives no items.
+        check = self.check('sources')
+        self.assertFalse(check['ok'])
+        self.assertIn('Not a readable feed: https://www.google.com/ (Feed is not valid XML.)', check['detail'])
+        self.assertTrue(self.readiness()['can_scout'])
+        self.assertEqual(self.readiness()['sources'][0]['error'], 'Feed is not valid XML.')
+
+    def test_a_scout_with_source_items_may_not_cite_the_web(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        proposal = candidate()
+        proposal['evidence'] = ['W1']
+        done = self.scout_with(proposal)
+        self.assertFalse(done['web_research'])
+        self.assertNotIn('RESEARCH THE WEB', done['prompt'])
+        self.assertEqual((done['candidates'], [item['name'] for item in done['refused_candidates']]),
+                         ([], ['Carrier Desk']))
+
+    def test_a_suggested_source_is_added_only_when_it_is_a_readable_feed(self):
+        self.setup_studio_manual()
+        with patch.object(venture_feeds, 'fetch', side_effect=ValueError('Feed is not valid XML.')):
+            with self.assertRaisesRegex(ValueError, 'not a readable RSS or Atom feed: Feed is not valid XML'):
+                self.studio(mode='studio_source_add', url='https://www.google.com/')
+        with self.news():
+            with self.assertRaisesRegex(ValueError, 'has no items'):
+                self.studio(mode='studio_source_add', url='https://empty.example/feed')
+        with self.assertRaisesRegex(ValueError, 'https'):
+            self.studio(mode='studio_source_add', url='http://trade.example/feed.xml')
+        self.assertEqual(self.ventures._studio_policy('org')['studio_sources'], [])
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            added = self.studio(mode='studio_source_add', url='https://trade.example/feed.xml')
+            again = self.studio(mode='studio_source_add', url='https://trade.example/feed.xml')
+        self.assertEqual((added['added'], again['added']), (True, False))
+        self.assertEqual(self.ventures._studio_policy('org')['studio_sources'], ['https://trade.example/feed.xml'])
+
+    def test_autonomous_mode_never_creates_from_web_research_alone(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.studio(mode='studio_policy', studio_mode='autonomous', studio_auto_min_confidence=0)
+        run = self.studio(mode='studio_run', kind='scout')
+        self.complete_studio(run, {'candidates': [self.web_candidate()], 'research': self.RESEARCH})
+        stored = self.stored_candidates()[0]
+        self.assertEqual(stored['state'], 'proposed')
+        self.assertIn('not verified by the gateway', stored['auto']['reason'])
 
     def test_evidence_is_written_inside_the_facilitator_worktree(self):
         self.setup_studio_manual()
