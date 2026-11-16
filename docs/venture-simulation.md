@@ -1,14 +1,16 @@
 # Venture simulation
 
-Status, 2026-11-15: manual and opt-in daily ticks, guaranteed news-only or
+Status, 2026-11-16: manual and opt-in daily ticks, guaranteed news-only or
 every-day reviews, internal-evidence strategy days, per-day review records with
 visible skips, the deterministic ledger and survival score, role-aware agent
 meetings, qualification, outreach review, charts, promotion to discovery, a
 confirmed four-agent team action, multi-line costs, live ECB FX rates, a
 per-organization active-venture limit, a per-tick score breakdown, a Venture
 Studio for portfolio reviews and new-venture candidates, candidate review and
-approval, bounded studio policy and budgets, a Flutter Ventures page and an
-installation-wide module switch are implemented. The score formula is at
+approval, bounded studio policy and budgets, a self-starting studio (one-call
+setup, readiness checklist, Herdr preflight, named failures, guided repair and
+an explicit creation mode), a Flutter Ventures page and an installation-wide
+module switch are implemented. The score formula is at
 version 2. Scoring-weight tuning waits for observed ventures; see
 [Implementation status](#implementation-status).
 
@@ -324,8 +326,8 @@ No strategy result may invent news.
 
 The studio is a separate read-only group with its own managed notebook. Setup
 creates four studio agents (Portfolio Manager, Venture Scout, Skeptic and
-Research Analyst) from existing individual worktree agents and one read-only
-group. The studio has two run kinds:
+Research Analyst) and one read-only group; see
+[Getting started](#getting-started). The studio has two run kinds:
 
 - **Portfolio review** returns a summary and exactly one ranked recommendation
   (`continue`, `pause`, `kill` or `investigate`) for every active venture. The
@@ -350,6 +352,145 @@ repairs it. Operator input is validated strictly. Only studio keys leave the
 gateway through this path. The evidence file carries just the focus areas,
 exclusions, candidate cap and sources, never the rest of the organization
 policy.
+
+### Getting started
+
+A new operator needs a connected agent CLI and nothing else: no organization,
+no existing agent and no project folder.
+
+`studio_start` (the **Set up Venture Studio** form) does all of it in one call.
+It is refused while Herdr is stopped, before anything is created: creating a
+group starts its facilitator, and that launch would fail and leave a stuck
+session. The same check guards a venture's own team.
+
+1. **Organization.** The named one, the only one, or a new one called after the
+   studio. An organization is only the container for the studio's agents,
+   limits and audit history; the operator never has to create it first.
+2. **Notebook, four agents and the group**, as before, but the agents' CLI,
+   provider and model no longer have to be copied from an existing agent. A
+   role uses, in order: the individual agent named for it; the operator's
+   explicit CLI, provider and model; the first individual agent of the
+   organization; and otherwise the first CLI that is ready, on its own default
+   model. An explicit choice is checked (CLI ready, account signed in, model
+   offered) before any agent is hired. With no ready CLI the setup stops with
+   each CLI's reason and hires nobody; a later attempt continues from the
+   notebook it already created. The same order applies to a venture's own
+   team, which additionally falls back to the studio's settings.
+3. **Starter policy.** Sources, focus areas, cadences and the creation mode.
+   For a new studio a cadence that is not given is **weekly**: "manual only"
+   is a choice the operator makes, not what silence means. Session limits of
+   an existing organization that are too small for one studio meeting are
+   raised and reported as `limits_raised`. Calling it again on an existing
+   studio changes only what the call names: it never re-enables a cadence the
+   operator turned off and never raises a limit again.
+4. **First scout**, when asked. If it cannot start (Herdr stopped, no sources)
+   the studio still exists and the answer says why.
+
+### Readiness
+
+Every studio summary carries `readiness`: a checklist the Studio tab shows
+with one action per failing item.
+
+| Check | Blocks | Action |
+| --- | --- | --- |
+| Herdr is running | every run | Start Herdr |
+| The agent CLI is ready | every run | Open CLI accounts |
+| The studio team exists | every run | Set up, or Repair |
+| No agent session is stuck | every run | Repair studio |
+| The organization limits allow a studio meeting (five sessions) | every run | Raise limits for the studio |
+| Scouting sources | the scout | Configure studio |
+| Focus areas | the scout | Configure studio |
+
+The same checks run as a **preflight** before a run is recorded, so the studio
+never starts a meeting that cannot work:
+
+- A manual run is refused with the reason; nothing is recorded.
+- A scheduled run waits. The reason is shown as `waiting` on the schedule
+  line, it is not an error, it adds no failure and no backoff, and the same
+  due window runs on the first pass after the cause clears.
+- A scout needs at least one source and one focus area. A manual scout may
+  run without them only with an explicit override (**Run scout without
+  sources**); a scheduled one never does.
+- A venture's own meeting tick has the Herdr check too: it is skipped with a
+  review record, and the news items it was offered are offered again.
+
+Enabling a cadence is refused while the session limits are below what one
+studio meeting needs. `studio_limits` raises `max_active_sessions` and
+`daily_session_cap` to that minimum; it never lowers a limit and never touches
+one that is off (0).
+
+### Where the evidence file goes
+
+The facilitator runs in its own worktree, so a file written into the source
+notebook is outside its checkout and every run stopped on a permission prompt.
+The gateway now prepares the facilitator session first and writes the file
+inside that worktree, next to its guidance bundle
+(`.ci-cache/herdr-guidance/studio-<run id>/evidence.json`, already ignored by
+Git). Product Discovery does the same. Venture ticks use
+`venture-<tick id>` in their own facilitator's worktree. If a prompt was never
+accepted and its file is gone (the facilitator has a new worktree), the file
+and the prompt are written again.
+
+### Failures name their cause
+
+A run that stops carries `failure`: a category, the phase it stopped in
+(`dispatch`, `preparation`, `meeting` or `validation`), the discussion's own
+error text, the agent it names and one recovery action.
+
+| Category | Meaning | Action |
+| --- | --- | --- |
+| `herdr` | Herdr is stopped | Start Herdr |
+| `permission` | An agent waits for a decision | Open the studio group |
+| `provider` | The CLI account is not ready | Open CLI accounts |
+| `model` | The model is not offered | Open CLI accounts |
+| `team` | An agent session did not start | Repair studio |
+| `limits` | An organization limit blocks the meeting | Raise limits |
+| `evidence` | The evidence file could not be prepared | Repair studio |
+| `result` | The answer did not validate | Dismiss run |
+| `meeting` | The meeting stopped for another reason | Open the studio group |
+
+The category is derived from the error text, so an unusual message falls back
+to `meeting`. A meeting that is still running but waits (a member blocked on a
+decision, a session budget) shows that as `waiting` on the run instead of
+looking like progress.
+
+### Repair
+
+`studio_repair` is one guided action. Without `confirmed` it returns the plan,
+which the dashboard shows first. With it, the steps run in order and each
+reports what happened:
+
+1. Start Herdr when it is stopped.
+2. Release agent session bindings that failed or were left uncertain.
+3. Start the studio facilitator.
+4. For each run needing attention, newest first: read a saved result again;
+   send a prompt that never arrived; retry a meeting that stopped before its
+   prompt was sent; recover the saved output of one that stopped after; or
+   close a run that cannot be used (a result that does not validate, an older
+   run superseded by the retried one).
+
+A step that fails stops the steps that depend on it. `studio_team` starts the
+facilitator and every agent that has no session yet, for an operator who wants
+the team live before a run.
+
+### Creation mode
+
+`studio_mode` is explicit and shown on the Studio tab.
+
+- **`proposal`** (default): the scout proposes, the operator approves.
+- **`autonomous`**: after a scout, the studio creates ventures itself within
+  hard caps: at most one per run; only a candidate at or above
+  `studio_auto_min_confidence` (default 70); only one that cites at least one
+  outside source item, not just internal history; never above the active
+  venture limit; never an excluded or duplicate idea. Creating means hiring
+  that venture's four agents and starting its news-only daily reviews, under
+  the same budget check as a manual approval.
+
+Every decision is recorded: `auto` on the candidate (created or not, the
+reason, the run and the minimum used), `auto` on the run, and the approval is
+signed `venture_studio_auto`. A candidate that was not created stays a
+proposal. The scout's bar is still fixed by the gateway, and nothing in either
+mode sends mail, spends or publishes.
 
 ### Run lifecycle and recovery
 
@@ -502,11 +643,17 @@ formula.
 
 - `GET /api/ventures` — administrator-only snapshot: ventures with their ledger
   summaries, the latest thirty ticks per selected venture, eligible groups,
-  feed health, the fixed `options` and the `module` state. While the module is
+  feed health, the fixed `options`, the Herdr state, each agent CLI's
+  readiness and the `module` state. While the module is
   switched off it returns only `enabled: false` and `module`.
 - `POST /api/ventures` — one action endpoint with `mode`: `create`,
   `configure`, `run`, `pause`, `resume`, `recover`, `outreach`, `team`,
   `promote`, `restore_promotion`, `archive`. Each runs under a `venture:<id>` operation lock.
+  Studio modes run under the organization's `studio:` lock: `studio_setup`,
+  `studio_run` (`kind`, optional `override`), `studio_recover`,
+  `studio_dismiss`, `studio_repair` (optional `confirmed`) and `studio_team`.
+  `studio_policy` and `studio_limits` run under the `policy:` lock.
+  `studio_start` (the one-call setup) and `herdr_start` need no organization.
   `limits` (organization-level, `max_active_ventures` 1–20) runs under the
   organization's `policy:` lock instead. `module` (`enabled: true|false`,
   installation-wide, no organization) is the only mode accepted while the
@@ -651,8 +798,11 @@ one-click restore, a confirmed and retry-safe four-agent team action with
 per-role templates, multi-line costs, live ECB FX with fallback, the
 per-organization active-venture limit editor, per-tick score breakdowns, a
 Venture Studio with setup, policy, portfolio reviews, scouting, candidate
-review, approval-to-create, lessons and a budget projection, and Ventures pages
-on both dashboards.
+review, approval-to-create, lessons and a budget projection, a one-call studio
+setup that needs no organization or template agent, a readiness checklist and
+preflight, evidence written into the facilitator's worktree, named failure
+categories, a guided repair, proposal and autonomous creation modes, and
+Ventures pages on both dashboards.
 
 Remaining limits:
 
@@ -669,7 +819,25 @@ Remaining limits:
   in `venture_engine.py`.
 - Live FX covers the ECB's currencies only, at daily granularity; other pairs
   use the operator's rate.
-- Auto-create is not implemented; every candidate needs an explicit operator approval.
+- The first-run path is covered by gateway tests against a stand-in store.
+  The facilitator preparation, session release and discussion retry it calls
+  are the organization store's own actions and have not been exercised
+  against a live Herdr from these tests.
+- Failure categories are matched from error text. A message the rules do not
+  know is filed as `meeting`.
+- A permission prompt is shown on the run and linked to the group; it is
+  answered in the group discussion, not from the Studio tab.
+- A scheduled run that waits on a stuck agent session does not repair it by
+  itself; the operator runs Repair.
+- The studio still lives inside an organization. A first-class studio object
+  without one is not implemented.
+- Automatic CLI selection uses the platform's account catalog: Codex and
+  Claude must be signed in and OpenCode's configured providers must return a
+  model. The agents still run on the CLI's default model, which is not checked
+  individually; an explicitly chosen model is. Antigravity's sign-in cannot be
+  verified from outside, so it is chosen last.
+- Repair starts the facilitator only. The other agents start when the next
+  meeting needs them, so repair does not spend session starts on them.
 - The Flutter page does not create, configure or approve ventures.
 - Dismissing a studio run closes it in the studio only. The group discussion
   itself stays in the organization history for inspection.

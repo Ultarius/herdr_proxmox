@@ -88,9 +88,10 @@ class VentureTests(unittest.TestCase):
         self.fail_next = None
         self.profiles = []
         self.groups = []
+        self.organizations = [dict(id='org', name='Product organization')]
         self.store = MagicMock()
         self.store.snapshot.side_effect = lambda **kw: dict(
-            organizations=[dict(id='org', name='Product organization')],
+            organizations=self.organizations,
             profiles=self.profiles, groups=self.groups, jobs=self.jobs)
         self.store.action.side_effect = self.store_action
         self.store.update_job.side_effect = self.update_job
@@ -155,6 +156,27 @@ class VentureTests(unittest.TestCase):
                          members=body['members'], read_only=True, facilitator_id=facilitator['id'])
             self.groups.append(group)
             return group
+        # The session and organization actions the studio's setup and repair use.
+        if action == 'save':
+            organization = dict(id=uuid.uuid4().hex, name=body['name'])
+            self.organizations.append(organization)
+            return organization
+        if action == 'release':
+            next(job for job in self.jobs if job['id'] == body['job_id'])['state'] = 'released'
+            return {'id': body['job_id']}
+        if action == 'retry_discussion':
+            job = next(job for job in self.jobs if job['id'] == body['job_id'])
+            if body.get('inspected') is not True or job['state'] not in ('needs_attention', 'uncertain'):
+                raise ValueError('Only a preparation needing attention can be retried.')
+            job.update(state='queued', error='')
+            return {'id': job['id']}
+        if action == 'recover':
+            return {'id': body['job_id']}
+        if action == 'launch':
+            job = dict(id=uuid.uuid4().hex, kind='launch', state='queued', profile_id=body['profile_id'],
+                       organization_id=body['organization_id'])
+            self.jobs.append(job)
+            return {'id': job['id']}
         raise AssertionError('Unexpected store action: ' + action)
 
     def update_job(self, identity, **fields):
@@ -212,6 +234,8 @@ class VentureTests(unittest.TestCase):
         self.groups[:] = [dict(id='a1' * 16, name='Venture Studio', organization_id='org',
                                facilitator_id='t' * 32, members=['p' * 32, 'q' * 32, 'r' * 32, 's' * 32],
                                read_only=True)]
+        # A scout needs a focus area; tests that check the rule clear it again.
+        self.service.patch_policy('org', dict(studio_focus=['freight forwarding']), 'test')
         return self.ventures.save_studio('org', dict(notebook='ventures/studio-org', group_id='a1' * 16,
                                                      team={}, created_at=ventures.now().isoformat()))
     def test_create_is_bounded_replayable_and_provisions_a_notebook(self):
@@ -1039,8 +1063,13 @@ class VentureTests(unittest.TestCase):
     def test_two_daily_cadences_wait_for_each_other_without_backoff(self):
         self.setup_studio_manual()
         record = self.add_venture_group(self.create())
-        self.studio(mode='studio_policy', studio_portfolio_cadence='daily', studio_scout_cadence='daily')
+        self.studio(mode='studio_policy', studio_portfolio_cadence='daily', studio_scout_cadence='daily',
+                    studio_sources=['https://news.example/feed'])
         self.due('portfolio', 'scout')
+        feeds = self.news(feed_item(venture_feeds.now().isoformat()))
+        feeds.start()
+        self.addCleanup(feeds.stop)
+        self.ventures._fetch_urls('org', ['https://news.example/feed'])  # Fresh: no refresh pass first.
         for _ in range(3):
             self.ventures.advance()
             policy = self.ventures._studio_policy('org')
@@ -1236,6 +1265,380 @@ class VentureTests(unittest.TestCase):
         self.assertEqual(summary['lessons'][0]['title'], 'Settlement Desk')
         self.assertEqual(summary['schedule']['scout']['error'], 'The venture candidate backlog is full.')
         self.assertEqual(summary['schedule']['scout']['failures'], 2)
+
+    # --- The first-run path: what a new operator meets, and each way it used to fail.
+
+    def herdr(self, state='stopped'):
+        self.ventures.herdr = FakeHerdr(state)
+        self.ventures._herdr_cache = None
+        return self.ventures.herdr
+
+    def readiness(self):
+        return self.ventures._studio_summary('org')['readiness']
+
+    def check(self, identity):
+        return next(item for item in self.readiness()['checks'] if item['id'] == identity)
+
+    def portfolio_answer(self, record):
+        return {'summary': 'ok', 'recommendations': [dict(venture_id=record['id'], rank=1, recommendation='continue',
+                                                          reason='Fine.', evidence=['V1'])]}
+
+    def test_a_fresh_installation_gets_a_studio_without_an_organization_or_agent(self):
+        self.organizations.clear()
+        self.store.runtime_ready = lambda runtime: None if runtime == 'codex' else runtime + ' is not installed.'
+        self.store.runtime_status = lambda runtime: dict(installed=True, status='configured')
+        body = dict(mode='studio_start', confirmed=True, name='My Studio',
+                    studio_sources=['https://news.example/feed'], studio_focus=['freight'])
+        result = self.ventures.action(dict(body), 'admin', 'admin')
+        organization = result['organization_id']
+        self.assertEqual([item['name'] for item in self.organizations], ['My Studio'])
+        self.assertTrue(result['studio']['group_id'])
+        self.assertEqual(result['studio']['team']['settings_source'], 'automatic')
+        hired = [profile for profile in self.profiles if profile.get('role') in ventures.STUDIO_ROLES]
+        self.assertEqual(len(hired), 4)
+        # The first ready CLI on its own default model: nothing was guessed.
+        self.assertEqual({(profile['runtime'], profile['model']) for profile in hired}, {('codex', '')})
+        self.assertEqual((result['policy']['studio_scout_cadence'], result['policy']['studio_portfolio_cadence']),
+                         ('weekly', 'weekly'))
+        self.assertTrue(result['readiness']['can_scout'])
+        # Asking again is safe: same organization, no second team.
+        again = self.ventures.action(dict(body), 'admin', 'admin')
+        self.assertEqual(again['organization_id'], organization)
+        self.assertEqual((len(self.organizations), len(self.groups)), (1, 1))
+        self.assertEqual(len([profile for profile in self.profiles if profile.get('role') in ventures.STUDIO_ROLES]), 4)
+
+    def test_setup_starts_the_first_scout_and_reports_why_it_could_not(self):
+        self.store.runtime_ready = lambda runtime: None
+        # No sources yet: the studio is created, the scout says what it needs.
+        result = self.ventures.action(dict(mode='studio_start', confirmed=True, first_scout=True,
+                                           studio_focus=['freight']), 'admin', 'admin')
+        self.assertTrue(result['studio']['group_id'])  # The studio exists; only the run did not start.
+        self.assertEqual((result['first_scout']['state'], result['first_scout']['category']), ('not_started', 'inputs'))
+        self.assertEqual(self.studio_runs(), [])
+        self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'])
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            result = self.ventures.action(dict(mode='studio_start', confirmed=True, first_scout=True), 'admin', 'admin')
+        self.assertEqual(result['first_scout']['state'], 'meeting')
+
+    def test_setup_is_refused_while_herdr_is_stopped_and_leaves_nothing_behind(self):
+        # Creating a group starts its facilitator; with Herdr stopped that
+        # launch would fail and leave a stuck session.
+        self.organizations.clear()
+        self.store.runtime_ready = lambda runtime: None
+        self.herdr('stopped')
+        with self.assertRaisesRegex(ValueError, 'Herdr is stopped. Start Herdr to set up'):
+            self.ventures.action(dict(mode='studio_start', confirmed=True), 'admin', 'admin')
+        self.assertEqual((self.organizations, self.profiles, self.groups), ([], [], []))
+        self.organizations.append(dict(id='org', name='Product organization'))
+        with self.assertRaisesRegex(ValueError, 'Herdr is stopped'):
+            self.studio(mode='studio_setup', confirmed=True)
+        record = self.create()
+        with self.assertRaisesRegex(ValueError, 'Herdr is stopped. Start Herdr to create the venture team'):
+            self.ventures.action(dict(mode='team', organization_id='org', venture_id=record['id'],
+                                      confirmed=True), 'admin', 'admin')
+        self.assertEqual((self.profiles, self.groups), ([], []))
+        self.assertFalse((self.projects / 'ventures' / 'studio-org').exists())
+
+    def test_one_call_setup_raises_limits_once_and_never_overrides_a_later_choice(self):
+        self.store.runtime_ready = lambda runtime: None
+        self.service.patch_policy('org', dict(max_active_sessions=4, daily_session_cap=3), 'test')
+        result = self.ventures.action(dict(mode='studio_start', confirmed=True), 'admin', 'admin')
+        # An existing organization's limits no longer stop the one call.
+        self.assertEqual((result['created'], result['limits_raised']),
+                         (True, dict(max_active_sessions=5, daily_session_cap=5)))
+        self.assertEqual(result['policy']['studio_scout_cadence'], 'weekly')
+        # The operator then chooses manual only and a lower limit.
+        self.studio(mode='studio_policy', studio_scout_cadence='off', studio_portfolio_cadence='off')
+        self.service.patch_policy('org', dict(max_active_sessions=2), 'test')
+        again = self.ventures.action(dict(mode='studio_start', confirmed=True), 'admin', 'admin')
+        self.assertEqual((again['created'], again['limits_raised']), (False, {}))
+        self.assertEqual((again['policy']['studio_scout_cadence'], again['policy']['studio_portfolio_cadence']),
+                         ('off', 'off'))
+        self.assertEqual(self.service.policy('org')['max_active_sessions'], 2)
+
+    def test_automatic_selection_skips_a_cli_whose_account_offers_no_model(self):
+        self.store.runtime_ready = lambda runtime: None if runtime in ('opencode', 'agy') else 'not installed'
+        self.store.template_catalog = lambda project: dict(accounts=[
+            dict(runtime='opencode', available=False, reason='No models were returned for the configured providers.'),
+            dict(runtime='agy', available=True)])
+        studio = self.studio(mode='studio_setup', confirmed=True)
+        self.assertEqual(studio['team']['settings_by_role']['scout']['runtime'], 'agy')
+        self.store.template_catalog = lambda project: dict(accounts=[
+            dict(runtime='opencode', available=False, reason='No models were returned for the configured providers.'),
+            dict(runtime='agy', available=False, reason='Not signed in.')])
+        record = self.create()
+        self.profiles.clear()  # No agent to copy and no studio settings to fall back on.
+        self.ventures.save_studio('org', {})
+        with self.assertRaisesRegex(ValueError, 'No agent CLI is ready.*No models were returned'):
+            self.ventures.action(dict(mode='team', organization_id='org', venture_id=record['id'],
+                                      confirmed=True), 'admin', 'admin')
+
+    def test_no_ready_cli_refuses_setup_with_the_reason_and_hires_nobody(self):
+        self.store.runtime_ready = lambda runtime: runtime + ' has no Herdr integration.'
+        with self.assertRaisesRegex(ValueError, 'No agent CLI is ready.*has no Herdr integration'):
+            self.studio(mode='studio_setup', confirmed=True)
+        self.assertEqual((self.profiles, self.groups), ([], []))
+        self.assertFalse(self.check('provider')['ok'])
+        self.assertEqual(self.check('provider')['action'], 'cli_accounts')
+        # Partial setup continues from where it stopped once a CLI is ready.
+        self.ventures._runtime_cache = None
+        self.store.runtime_ready = lambda runtime: None
+        self.assertTrue(self.studio(mode='studio_setup', confirmed=True)['group_id'])
+
+    def test_a_signed_out_cli_is_skipped_and_a_chosen_model_is_checked_first(self):
+        self.store.runtime_ready = lambda runtime: None
+        self.store.runtime_status = lambda runtime: dict(status='not_configured' if runtime == 'claude' else 'configured')
+        self.store.model_validator = MagicMock(side_effect=ValueError('Selected OpenCode provider/model is unavailable: x/y.'))
+        with self.assertRaisesRegex(ValueError, 'unavailable'):
+            self.studio(mode='studio_setup', confirmed=True, settings=dict(runtime='opencode', provider='x', model='y'))
+        with self.assertRaisesRegex(ValueError, 'not signed in'):
+            self.studio(mode='studio_setup', confirmed=True, settings=dict(runtime='claude'))
+        self.assertEqual(self.profiles, [])
+        studio = self.studio(mode='studio_setup', confirmed=True)  # Automatic: skips the signed-out Claude.
+        self.assertEqual(studio['team']['settings_by_role']['scout']['runtime'], 'codex')
+
+    def test_herdr_stopped_refuses_a_run_and_the_scheduler_waits_without_a_failure(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        fake = self.herdr('stopped')
+        with self.assertRaisesRegex(ValueError, 'Herdr is stopped'):
+            self.studio(mode='studio_run', kind='portfolio')
+        self.assertEqual((self.studio_runs(), self.jobs), ([], []))  # No doomed run, no meeting.
+        self.assertEqual((self.readiness()['herdr'], self.check('herdr')['action']), ('stopped', 'start_herdr'))
+        self.assertFalse(self.readiness()['can_run'])
+        self.studio(mode='studio_policy', studio_portfolio_cadence='daily')
+        self.due('portfolio')
+        self.ventures.advance()
+        schedule = self.ventures._studio_summary('org')['schedule']['portfolio']
+        self.assertIn('Herdr is stopped', schedule['waiting'])
+        self.assertEqual((schedule['error'], schedule['failures'], self.studio_runs()), ('', 0, []))
+        started = self.ventures.action(dict(mode='herdr_start'), 'admin', 'admin')
+        self.assertEqual((started['state'], fake.starts), ('running', 1))
+        self.ventures.advance()  # The same due window runs as soon as Herdr is back.
+        self.assertEqual([run['state'] for run in self.studio_runs()], ['meeting'])
+        self.assertEqual(self.ventures._studio_summary('org')['schedule']['portfolio']['waiting'], '')
+
+    def test_a_meeting_tick_is_not_started_while_herdr_is_stopped(self):
+        record = self.attach_group(self.create())
+        self.herdr('stopped')
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            with self.assertRaisesRegex(ValueError, 'Herdr is stopped'):
+                self.run_tick(record)
+        self.assertEqual(self.jobs, [])
+        review = self.ventures.review_for(record['id'], 'org', ventures.now().date().isoformat())
+        self.assertEqual(review['state'], 'skipped')
+        self.assertIn('Herdr is stopped', review['reason'])
+        self.herdr('running')
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            self.assertEqual(self.run_tick(record)['state'], 'meeting')
+
+    def test_a_scout_needs_sources_and_focus_unless_the_operator_overrides(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.service.patch_policy('org', dict(studio_focus=[]), 'test')
+        with self.assertRaisesRegex(ValueError, 'add a scouting source and a focus area'):
+            self.studio(mode='studio_run', kind='scout')
+        self.assertEqual(self.studio_runs(), [])
+        readiness = self.readiness()
+        self.assertEqual((readiness['can_run'], readiness['can_scout'], readiness['coverage']),
+                         (True, False, dict(sources=0, focus=0)))
+        self.assertEqual(self.check('sources')['action'], 'configure')
+        self.studio(mode='studio_policy', studio_scout_cadence='daily')
+        self.due('scout')
+        self.ventures.advance()
+        schedule = self.ventures._studio_summary('org')['schedule']['scout']
+        self.assertIn('no market evidence', schedule['waiting'])
+        self.assertEqual((schedule['failures'], self.studio_runs()), (0, []))
+        self.assertEqual(self.studio(mode='studio_run', kind='scout', override=True)['state'], 'meeting')
+
+    def test_evidence_is_written_inside_the_facilitator_worktree(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        worktree = self.projects / '.herdr-worktrees' / 'studio-facilitator'
+        worktree.mkdir(parents=True)
+        project_git.git(worktree, 'init', '-b', 'main')
+        self.store.supports_discussion_preparation = True
+        import discussion_scheduler
+        with patch.object(discussion_scheduler, 'ensure_facilitator',
+                          return_value=dict(worktree_path=str(worktree))) as prepared:
+            run = self.studio(mode='studio_run', kind='portfolio')
+        prepared.assert_called_once_with(self.store, 'a1' * 16, 'org')  # The facilitator is started first.
+        target = Path(run['evidence_file']).resolve()
+        self.assertTrue(target.is_file())
+        self.assertTrue(target.is_relative_to(worktree.resolve()))
+        self.assertIn(run['evidence_file'], run['prompt'])
+        self.assertEqual(json.loads(target.read_text(encoding='utf-8'))['kind'], 'portfolio')
+        # Nothing is left in the source notebook, which the facilitator cannot read.
+        self.assertFalse((self.projects / 'ventures' / 'studio-org' / '.ci-cache' / 'herdr-studio').exists())
+
+    def test_a_stopped_meeting_names_its_failure_and_repair_brings_the_studio_back(self):
+        self.setup_studio_manual()
+        record = self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='portfolio')
+        # One agent failed to launch while Herdr was down; the meeting stopped in preparation.
+        self.jobs.append(dict(id='c' * 32, kind='launch', state='needs_attention', profile_id='q' * 32,
+                              organization_id='org', error='server_not_running: nothing at herdr.sock'))
+        job = next(item for item in self.jobs if item['id'] == run['job_id'])
+        job.update(state='needs_attention', error='Venture Scout: session preparation failed; inspect its run')
+        self.ventures.advance()
+        failed = self.studio_runs()[0]
+        failure = failed['failure']
+        self.assertEqual((failed['state'], failure['category'], failure['phase'], failure['action'], failure['agent'],
+                          failure['job_id']),
+                         ('needs_attention', 'team', 'preparation', 'repair', 'Venture Scout', run['job_id']))
+        self.assertIn('Venture Scout: session preparation failed', failed['error'])  # Not a generic message.
+        self.assertEqual((self.check('sessions')['ok'], self.check('sessions')['action']), (False, 'repair'))
+        with self.assertRaisesRegex(ValueError, 'Venture Scout did not start'):
+            self.studio(mode='studio_run', kind='portfolio')
+        preview = self.studio(mode='studio_repair')
+        self.assertTrue(preview['preview'])
+        steps = {item['step']: item for item in preview['steps']}
+        self.assertEqual((steps['herdr']['needed'], steps['sessions']['needed'], steps['run']['action']),
+                         (False, True, 'retry'))
+        self.assertEqual(job['state'], 'needs_attention')  # A preview changes nothing.
+        result = self.studio(mode='studio_repair', confirmed=True)
+        self.assertTrue(result['healthy'], result['steps'])
+        launch = next(item for item in self.jobs if item['id'] == 'c' * 32)
+        self.assertEqual((launch['state'], job['state'], self.studio_runs()[0]['state']), ('released', 'queued', 'meeting'))
+        self.assertTrue(result['readiness']['can_run'])
+        self.assertEqual(self.complete_studio(run, self.portfolio_answer(record))['state'], 'ready')
+
+    def test_repair_starts_herdr_and_sends_a_prompt_that_never_arrived(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        original = self.store.action.side_effect
+        attempts = []
+
+        def stopped(action, body):
+            if action == 'discuss':
+                attempts.append(body['request_id'])
+                if len(attempts) == 1:
+                    raise ValueError('server_not_running: start Herdr over SSH first.')
+            return original(action, body)
+        self.store.action.side_effect = stopped
+        with self.assertRaisesRegex(ValueError, 'server_not_running'):
+            self.studio(mode='studio_run', kind='portfolio')
+        failure = self.studio_runs()[0]['failure']
+        self.assertEqual((failure['category'], failure['phase'], failure['action']), ('herdr', 'dispatch', 'start_herdr'))
+        fake = self.herdr('stopped')
+        result = self.studio(mode='studio_repair', confirmed=True)
+        self.assertTrue(result['healthy'], result['steps'])
+        self.assertEqual([item['step'] for item in result['steps']], ['herdr', 'run'])
+        self.assertEqual((fake.starts, self.studio_runs()[0]['state'], len(self.jobs)), (1, 'meeting', 1))
+        self.assertEqual(len(set(attempts)), 1)  # The same request: never two meetings.
+
+    def test_repair_closes_a_result_that_cannot_validate(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='portfolio')
+        failed = self.complete_studio(run, {'summary': 'x', 'recommendations': []})
+        self.assertEqual((failed['failure']['category'], failed['failure']['phase'], failed['failure']['action']),
+                         ('result', 'validation', 'dismiss'))
+        result = self.studio(mode='studio_repair', confirmed=True)
+        self.assertTrue(result['healthy'], result['steps'])
+        closed = self.studio_runs()[0]
+        self.assertEqual(closed['state'], 'dismissed')
+        self.assertIn('did not validate', closed['dismissed']['reason'])
+
+    def test_a_blocked_agent_is_shown_on_the_run_while_it_meets(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='portfolio')
+        job = next(item for item in self.jobs if item['id'] == run['job_id'])
+        job.update(state='waiting_for_input', progress='Studio facilitator asks to read evidence.json outside its checkout')
+        self.ventures.advance()
+        shown = self.ventures._studio_summary('org')['runs'][0]
+        self.assertEqual((shown['state'], shown['waiting']['category'], shown['waiting']['action'],
+                          shown['waiting']['job_id']), ('meeting', 'permission', 'open_group', run['job_id']))
+        self.assertIn('evidence.json', shown['waiting']['message'])
+        job.update(state='running', progress='')
+        self.ventures.advance()
+        self.assertIsNone(self.studio_runs()[0]['waiting'])
+
+    def test_limits_too_small_for_a_studio_meeting_are_named_and_raised_in_one_action(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.service.patch_policy('org', dict(max_active_sessions=2), 'test')
+        with self.assertRaisesRegex(ValueError, 'limit of 2 concurrent sessions is below the 5'):
+            self.studio(mode='studio_run', kind='portfolio')
+        with self.assertRaisesRegex(ValueError, 'Raise the limits'):
+            self.studio(mode='studio_policy', studio_portfolio_cadence='daily')
+        self.assertEqual((self.check('limits')['ok'], self.check('limits')['action']), (False, 'limits'))
+        self.assertEqual(self.studio(mode='studio_limits')['changed'], dict(max_active_sessions=5))
+        self.assertEqual(self.studio(mode='studio_limits')['changed'], {})  # Never lowers, never repeats.
+        self.assertEqual(self.studio(mode='studio_run', kind='portfolio')['state'], 'meeting')
+
+    def test_a_venture_team_needs_no_template_agent(self):
+        self.store.runtime_ready = lambda runtime: None if runtime == 'opencode' else 'not ready'
+        record = self.create()
+        teamed = self.ventures.action(dict(mode='team', organization_id='org', venture_id=record['id'],
+                                           confirmed=True), 'admin', 'admin')
+        self.assertTrue(teamed['group_id'])
+        self.assertEqual(teamed['team']['settings_source'], 'automatic')
+        self.assertEqual({profile['runtime'] for profile in self.profiles if profile.get('role') in engine_roles()},
+                         {'opencode'})
+
+    def test_proposal_mode_is_the_default_and_autonomous_mode_creates_within_its_caps(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.profiles.append(dict(id='z' * 32, name='AAA template', organization_id='org', project=str(self.projects),
+                                  use_worktree=True, runtime='codex', model='m'))
+        self.assertEqual(self.ventures._studio_summary('org')['mode'], 'proposal')
+        with self.assertRaisesRegex(ValueError, 'studio mode'):
+            self.studio(mode='studio_policy', studio_mode='unattended')
+        self.studio(mode='studio_policy', studio_mode='autonomous', studio_auto_min_confidence=60)
+        strong = candidate('Carrier Desk')
+        strong.update(confidence=80, evidence=['N1'])
+        weak = candidate('Dock Ledger')
+        weak.update(confidence=40, evidence=['N1'],
+                    thesis='Warehouse docks double-book trailers because yard schedules live in spreadsheets.')
+        internal = candidate('Clinic Rota')
+        internal.update(confidence=95, evidence=['V1'],
+                        thesis='Small clinics lose appointment revenue to unfilled last-minute cancellations.')
+        run = self.scout_with(strong, weak, internal)
+        self.assertEqual(run['state'], 'ready', run.get('error'))
+        stored = {item['name']: item for item in self.stored_candidates()}
+        created = stored['Carrier Desk']
+        self.assertEqual((created['state'], created['decision']['by'], created['auto']['created']),
+                         ('created', 'venture_studio_auto', True))
+        venture = self.ventures.get(created['venture_id'], 'org')
+        self.assertTrue(venture['group_id'])
+        self.assertEqual((venture['configuration']['simulation']['daily_ticks'],
+                          venture['configuration']['simulation']['meeting_cadence']), (True, 'news_only'))
+        # The others stay proposals, each with the cap that stopped it.
+        self.assertEqual((stored['Dock Ledger']['state'], stored['Clinic Rota']['state']), ('proposed', 'proposed'))
+        self.assertIn('below the minimum of 60', stored['Dock Ledger']['auto']['reason'])
+        self.assertIn('no outside source', stored['Clinic Rota']['auto']['reason'])
+        self.assertEqual(sorted((item['name'], item['created']) for item in self.studio_runs()[-1]['auto']),
+                         [('Carrier Desk', True), ('Clinic Rota', False), ('Dock Ledger', False)])
+
+    def test_autonomous_mode_respects_the_active_venture_limit(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.studio(mode='limits', max_active_ventures=1)
+        self.studio(mode='studio_policy', studio_mode='autonomous', studio_auto_min_confidence=0)
+        proposal = candidate('Carrier Desk')
+        proposal.update(evidence=['N1'])
+        self.scout_with(proposal)
+        stored = self.stored_candidates()[0]
+        self.assertEqual(stored['state'], 'proposed')
+        self.assertIn('active venture limit of 1', stored['auto']['reason'])
+
+
+class FakeHerdr:
+    """Herdr status and start without a server."""
+
+    def __init__(self, state='stopped'):
+        self.state = state
+        self.starts = 0
+
+    def status(self):
+        return {'state': self.state}
+
+    def start(self, body):
+        self.starts += 1
+        self.state = 'running'
+        return {'state': 'running', 'already_running': False}
 
 
 if __name__ == '__main__':

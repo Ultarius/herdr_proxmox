@@ -53,6 +53,28 @@ class VenturesBloc extends FeatureBloc {
       '${entry.key}': '${entry.value}',
   };
 
+  /// `running`, `stopped` or `unknown`; empty when the gateway sent none.
+  String get herdr => '${data['herdr'] ?? ''}';
+
+  /// Each agent CLI with whether it can run agents now, and why not.
+  List<Map<String, dynamic>> get runtimes => _rows('runtimes');
+
+  /// One administrator request whose answer the page needs: a repair plan,
+  /// its result, or what the one-call setup did. Callers refresh afterwards.
+  Future<Map<String, dynamic>> ask(
+    String mode,
+    Map<String, dynamic> body,
+  ) async {
+    final result = await connection.request('ventures', {
+      'mode': mode,
+      'request_id': newRequestId(),
+      ...body,
+    });
+    return result is Map
+        ? Map<String, dynamic>.from(result)
+        : <String, dynamic>{};
+  }
+
   List<Map<String, dynamic>> _rows(String key) =>
       List<Map<String, dynamic>>.from(data[key] as List? ?? const []);
 

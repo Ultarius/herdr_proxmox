@@ -30,6 +30,7 @@ import threading
 import uuid
 
 from discovery import redact
+from herdr_server import HerdrServer
 from notifications import record as notify
 from project_files import project_directory
 import project_git
@@ -38,6 +39,7 @@ import venture_engine as engine
 import venture_feeds
 import venture_fx
 import venture_notebook
+from venture_studio import STUDIO_MODES, StudioOperations, StudioWaiting, classify
 
 EVIDENCE_LIMIT = 14000
 PROMPT_LIMIT = 8000
@@ -63,8 +65,8 @@ STUDIO_ROLE_LABELS = dict(portfolio='Portfolio Manager', scout='Venture Scout',
 STUDIO_DEFAULTS = dict(studio_portfolio_cadence='off', studio_scout_cadence='off',
                        studio_max_candidates=2, studio_candidate_backlog=6,
                        studio_focus=[], studio_exclude=[], studio_sources=[],
-                       studio_paused=False, studio_next_portfolio_at=None,
-                       studio_next_scout_at=None)
+                       studio_paused=False, studio_mode='proposal', studio_auto_min_confidence=70,
+                       studio_next_portfolio_at=None, studio_next_scout_at=None)
 MAX_STUDIO_SOURCES = 10
 MAX_STUDIO_CANDIDATES = 3
 MAX_STUDIO_BACKLOG = 20
@@ -245,7 +247,7 @@ def options():
                 etiquette_languages=sorted(engine.ETIQUETTE), outcomes=list(OUTCOMES),
                 meeting_cadences=dict(news_only='Only when news arrives', every_day='Every day'),
                 studio_cadences=dict(off='Off', daily='Daily', weekly='Weekly'),
-                studio_roles=STUDIO_ROLE_LABELS)
+                studio_roles=STUDIO_ROLE_LABELS, studio_modes=STUDIO_MODES)
 
 
 def _roles(value):
@@ -325,10 +327,14 @@ STUDIO_VALIDATORS = dict(
     studio_exclude=lambda value: _strings(value or [], 80, MAX_STUDIO_EXCLUDE, 'studio exclusions'),
     studio_sources=lambda value: _studio_sources(value or []),
     studio_paused=lambda value: _switch(value, 'studio paused'),
+    # Proposal: every candidate waits for the operator. Autonomous: the
+    # studio creates ventures itself, within the caps in ``_studio_autocreate``.
+    studio_mode=lambda value: _choice(value, tuple(STUDIO_MODES), 'studio mode'),
+    studio_auto_min_confidence=lambda value: _integer(value, 0, 100, 'studio minimum confidence'),
 )
 # Scheduler bookkeeping kept beside the settings; read, never set by an operator.
 STUDIO_STATE_KEYS = tuple('studio_' + kind + suffix for kind in ('portfolio', 'scout')
-                          for suffix in ('_error', '_failures', '_last_at')) + (
+                          for suffix in ('_error', '_failures', '_last_at', '_waiting')) + (
     'studio_next_portfolio_at', 'studio_next_scout_at')
 
 
@@ -380,7 +386,7 @@ def _summary(record):
     return value
 
 
-class Ventures:
+class Ventures(StudioOperations):
     # Module protocol, read by ``Contributions.register_module`` and the server.
     name = 'ventures'
     label = 'Venture simulation'
@@ -394,6 +400,9 @@ class Ventures:
         self._refreshing = set()
         self._studio_refreshing = set()
         self._refresh_lock = threading.Lock()
+        # Herdr status and start, for the preflight and the guided repair.
+        # Tests replace this with a fake that reports a stopped server.
+        self.herdr = HerdrServer(service.store.command)
         with closing(service.connect()) as db, db:
             db.execute('CREATE TABLE IF NOT EXISTS ventures (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS venture_feed_items (organization_id TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (organization_id, id))')
@@ -577,6 +586,7 @@ class Ventures:
         if studio.get('group_id'):
             self._studio_group(organization, studio)
             return studio
+        self._require_herdr('set up the Venture Studio')
         relative = studio.get('notebook') or ('ventures/studio-' + venture_notebook.slug(organization))
         if not studio.get('notebook'):
             venture_notebook.provision_studio(self.service.projects, relative, organization)
@@ -584,41 +594,14 @@ class Ventures:
             studio.update(created_at=now().isoformat(), team={}, group_id='')
             self.save_studio(organization, studio)
         team = dict(studio.get('team') or {})
-        requested = body.get('templates') or {}
-        if not isinstance(requested, dict):
-            raise ValueError('Studio templates must map each role to an individual agent.')
-        if any(role not in STUDIO_ROLES for role in requested):
-            raise ValueError('Studio templates can only name the studio roles.')
-        snapshot = self.service.store.snapshot(live_status=False)
-        profiles = {profile['id']: profile for profile in snapshot.get('profiles', [])
-                    if profile.get('organization_id') == organization
-                    and profile['id'] not in set((team.get('members') or {}).values())
-                    and not profile.get('group_id') and not profile.get('removed_at')
-                    and not profile.get('archived') and profile.get('use_worktree', True)}
-        if not profiles:
-            raise ValueError('Add an individual worktree agent to this organization first; the studio '
-                             'copies its runtime, provider and model.')
-        default = sorted(profiles.values(), key=lambda profile: (str(profile.get('name', '')), profile['id']))[0]
         if not team.get('settings_by_role'):
-            chosen = {}
-            for role in STUDIO_ROLES:
-                identity = requested.get(role)
-                if identity in (None, '', 'auto'):
-                    chosen[role] = default
-                elif isinstance(identity, str) and identity in profiles:
-                    chosen[role] = profiles[identity]
-                else:
-                    raise ValueError('Selected studio template is not an individual worktree agent in this organization.')
-            team['settings_by_role'] = {
-                role: dict(runtime=chosen[role]['runtime'], provider=chosen[role].get('provider', ''),
-                           model=chosen[role].get('model', ''), reasoning=chosen[role].get('reasoning', ''),
-                           permission_mode=chosen[role].get('permission_mode') or 'default',
-                           accessible_paths=chosen[role].get('accessible_paths') or [])
-                for role in STUDIO_ROLES
-            }
-            team['template_ids'] = {role: chosen[role]['id'] for role in STUDIO_ROLES}
-            team['members'] = {}
-            team['group_name'] = ('Venture Studio ' + organization)[:120]
+            # No existing agent is required: the settings come from a chosen
+            # template agent, the operator's CLI choice, or the first ready CLI.
+            chosen, templates, source = self._agent_settings(
+                organization, STUDIO_ROLES, body, hired=(team.get('members') or {}).values(),
+                project=str(self._studio_notebook(studio)))
+            team.update(settings_by_role=chosen, template_ids=templates, settings_source=source, members={},
+                        group_name=('Venture Studio ' + organization)[:120])
             studio['team'] = team
             self.save_studio(organization, studio)
         notebook = str(self._studio_notebook(studio))
@@ -672,13 +655,20 @@ class Ventures:
             elif before.get(key) == 'off' or not policy.get(next_key):
                 policy[next_key] = now().isoformat()
         self._check_budget(organization, policy=policy)
+        enabled = [kind for kind in ('portfolio', 'scout')
+                   if policy['studio_' + kind + '_cadence'] != 'off' and before.get('studio_' + kind + '_cadence') == 'off']
+        if enabled:
+            problems = self._limit_problems(organization, len(self._studio_bindings(organization)) or 5)
+            if problems:
+                raise ValueError('A scheduled studio meeting could not start: ' + '; '.join(problems)
+                                 + '. Raise the limits for the studio first.')
         self.service.patch_policy(organization, {key: policy[key] for key in
                                                  tuple(STUDIO_VALIDATORS) + ('studio_next_portfolio_at',
                                                                              'studio_next_scout_at')}, actor)
         policy['invalid'] = []
         return policy
 
-    def studio_run(self, organization, kind, actor, manual=True):
+    def studio_run(self, organization, kind, actor, manual=True, override=False):
         if kind not in ('portfolio', 'scout'):
             raise ValueError('Choose a portfolio or scout studio run.')
         policy = self._studio_policy(organization)
@@ -693,6 +683,9 @@ class Ventures:
         if busy:
             raise StudioBusy('A ' + busy['kind'] + ' studio run is still in its meeting; the next run starts '
                              'after it finishes.')
+        # Nothing is recorded or started for a run that cannot work: Herdr
+        # stopped, a stuck agent session, a limit, or a scout with no inputs.
+        self._studio_preflight(organization, kind, manual, override, policy, studio)
         if kind == 'scout':
             open_count = self._candidate_backlog(organization)
             if open_count >= policy['studio_candidate_backlog']:
@@ -727,7 +720,8 @@ class Ventures:
         except (ValueError, OSError) as error:
             # The prompt is frozen on the run; recover re-sends it under the
             # same request id, so a lost response cannot become two meetings.
-            run.update(state='needs_attention', error=redact(str(error))[:500], dispatch_failed=True)
+            run.update(state='needs_attention', error=redact(str(error))[:500], dispatch_failed=True,
+                       failure=self._failure(str(error), 'dispatch', organization=organization))
             self.save_studio_run(run)
             raise
 
@@ -823,47 +817,24 @@ class Ventures:
 
     def _studio_dispatch(self, organization, run):
         studio = self._studio(organization)
-        target = self._write_studio_evidence(studio, run)
-        run['evidence_file'] = str(target)
-        prompt = run.get('prompt') or self._studio_prompt(organization, run, target)
-        run['prompt'] = prompt
-        self.save_studio_run(run)
+        if run.get('prompt') and not run.get('job_id') and not Path(run.get('evidence_file') or '-').is_file():
+            # The prompt was never accepted and its file is gone (the
+            # facilitator has a new checkout): write both again.
+            run.pop('prompt')
+        if not run.get('prompt'):
+            checkout, prepared = self._evidence_checkout(organization, studio['group_id'],
+                                                         self._studio_notebook(studio))
+            target = self._write_pack(checkout, prepared, 'studio', run['id'], run['evidence'],
+                                      STUDIO_EVIDENCE_LIMIT, 'Venture Studio')
+            run['evidence_file'] = str(target)
+            run['prompt'] = self._studio_prompt(organization, run, target)
+        self.save_studio_run(run)  # Frozen: a retry or recovery reuses the exact request.
         response = self.service.store.action('discuss', dict(
             request_id='studio-' + run['id'], organization_id=organization,
-            group_id=studio['group_id'], prompt=prompt))
+            group_id=studio['group_id'], prompt=run['prompt']))
         self.service.store.update_job(response['id'], studio_run_id=run['id'])
-        run.update(job_id=response['id'], state='meeting', error='')
+        run.update(job_id=response['id'], state='meeting', error='', failure=None, waiting=None)
         return self.save_studio_run(run)
-
-    def _write_studio_evidence(self, studio, run):
-        notebook = self._studio_notebook(studio)
-        with repository_lock(notebook):
-            cache = notebook / '.ci-cache'
-            if cache.is_symlink():
-                raise ValueError('Venture Studio evidence cache must be a regular directory.')
-            cache.mkdir(exist_ok=True)
-            destination = cache / 'herdr-studio' / run['id']
-            if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
-                raise ValueError('Venture Studio evidence directory must be a regular directory.')
-            destination.mkdir(parents=True, exist_ok=True)
-            target = destination / 'evidence.json'
-            data = json.dumps(run['evidence'], ensure_ascii=False).encode()
-            if len(data) > STUDIO_EVIDENCE_LIMIT:
-                raise ValueError('Venture Studio evidence exceeds its byte budget.')
-            if target.exists() or target.is_symlink():
-                if target.is_symlink() or not target.is_file() or target.read_bytes() != data:
-                    raise ValueError('Venture Studio evidence copy changed; inspect its cache before retrying.')
-            else:
-                descriptor, temporary = tempfile.mkstemp(prefix='.evidence-', dir=destination)
-                try:
-                    with os.fdopen(descriptor, 'wb') as stream:
-                        stream.write(data)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    os.replace(temporary, target)
-                finally:
-                    Path(temporary).unlink(missing_ok=True)
-            return target
 
     def _studio_ventures(self, organization):
         with closing(self.service.connect()) as db:
@@ -1239,7 +1210,7 @@ class Ventures:
         return ''
 
     def _studio_settle(self, run, parsed):
-        run.update(state='ready', processed_at=now().isoformat(), error='', **parsed)
+        run.update(state='ready', processed_at=now().isoformat(), error='', failure=None, waiting=None, **parsed)
         with closing(self.service.connect()) as db, db:
             for candidate in run.get('candidates') or []:
                 db.execute('INSERT OR REPLACE INTO venture_candidates VALUES (?,?,?)',
@@ -1248,6 +1219,14 @@ class Ventures:
                        (run['id'], run['organization_id'], run['kind'], json.dumps(run)))
             notify(db, 'job', run['id'], run['organization_id'])
             db.commit()
+        try:
+            created = self._studio_autocreate(run)
+        except Exception as error:  # Creation is extra: the settled result stays.
+            created = []
+            run['auto_error'] = redact(str(error) or error.__class__.__name__)[:300]
+        if created or run.get('auto_error'):
+            run['auto'] = created
+            self.save_studio_run(run)
         return run
 
     def advance_studio(self):
@@ -1267,17 +1246,44 @@ class Ventures:
                     job = next((item for item in self.service.store.snapshot(live_status=False).get('jobs', [])
                                 if item.get('id') == run.get('job_id')), None)
                 if not job:
-                    run.update(state='needs_attention', error='Studio discussion record unavailable.')
+                    run.update(state='needs_attention', error='Studio discussion record unavailable.',
+                               failure=self._failure('The studio discussion record is gone.', 'meeting'))
                     self.save_studio_run(run)
                 elif job.get('state') == 'artifact_ready':
                     try:
                         self._studio_settle(run, self._studio_parse(run, job))
                     except Exception as error:
-                        run.update(state='needs_attention', error=redact(str(error) or error.__class__.__name__)[:500])
+                        message = str(error) or error.__class__.__name__
+                        run.update(state='needs_attention', error=redact(message)[:500],
+                                   failure=self._failure(message, 'validation', job, category='result'))
                         self.save_studio_run(run)
                 elif job.get('state') in ('error', 'needs_attention', 'uncertain'):
-                    run.update(state='needs_attention', error='Inspect the studio group meeting; it will not resend.')
+                    # The discussion's own error says what happened; the phase
+                    # says whether a prompt was sent before it stopped.
+                    message = str(job.get('error') or '') or 'The studio group meeting stopped.'
+                    phase = 'meeting' if job.get('discussion_submitted_at') else 'preparation'
+                    run.update(state='needs_attention', error=redact(message)[:500], waiting=None,
+                               failure=self._failure(message, phase, job, saved['organization_id']))
                     self.save_studio_run(run)
+                else:
+                    # Still meeting. Say what it waits on, so a blocked agent
+                    # is visible in the studio instead of looking like progress.
+                    waiting = None
+                    if job.get('state') == 'waiting_for_input':
+                        waiting = self._failure(str(job.get('progress') or job.get('error') or '')
+                                                or 'An agent stopped on a decision.', 'meeting', job,
+                                                saved['organization_id'], category='permission')
+                    elif job.get('state') == 'waiting_for_members' and job.get('progress'):
+                        message = str(job['progress'])
+                        category = classify(message)
+                        waiting = dict(category=category if category in ('limits', 'herdr') else 'waiting',
+                                       phase='preparation', title='Waiting to start', action='',
+                                       help='The meeting starts by itself when this clears.',
+                                       message=redact(message)[:300], job_id=job.get('id', ''),
+                                       group_id=job.get('group_id', ''), agent='')
+                    if (waiting or {}).get('message') != (run.get('waiting') or {}).get('message'):
+                        run['waiting'] = waiting
+                        self.save_studio_run(run)
 
     def _studio_stale(self, organization, urls):
         for url in urls:
@@ -1329,9 +1335,19 @@ class Ventures:
                         self.service.patch_policy(organization, {
                             next_key: (now() + interval).isoformat(),
                             'studio_' + kind + '_error': '',
-                            'studio_' + kind + '_failures': 0,
+                            'studio_' + kind + '_failures': 0, 'studio_' + kind + '_waiting': '',
                             'studio_' + kind + '_last_at': now().isoformat()}, 'venture_studio_scheduler')
                         break  # One studio run per organization per pass: both kinds share one group.
+                except StudioWaiting as error:
+                    # Herdr stopped, a stuck session, a limit or no scouting
+                    # inputs: nothing was started. Show why and try again next
+                    # pass; none of these is a failure of the run.
+                    message = redact(str(error))[:300]
+                    if policy.get('studio_' + kind + '_waiting') != message:
+                        self.service.patch_policy(organization, {'studio_' + kind + '_waiting': message,
+                                                                 'studio_' + kind + '_error': ''},
+                                                  'venture_studio_scheduler')
+                    continue
                 except (Busy, StudioBusy):
                     # The other kind is meeting (or an operator holds the lock).
                     # Waiting is not a failure: no error, no backoff.
@@ -1427,7 +1443,7 @@ class Ventures:
             item = {key: run.get(key) for key in
                     ('id', 'kind', 'state', 'summary', 'recommendations', 'error', 'reason',
                      'created_at', 'processed_at', 'job_id', 'dispatch_failed', 'dismissed',
-                     'refused_candidates')}
+                     'refused_candidates', 'failure', 'waiting', 'auto', 'auto_error', 'manual')}
             item['candidates'] = [{key: candidate.get(key) for key in ('id', 'name', 'state', 'confidence')}
                                   for candidate in run.get('candidates') or []]
             run_summaries.append(item)
@@ -1435,11 +1451,13 @@ class Ventures:
                                next_at=policy.get('studio_next_' + kind + '_at'),
                                last_at=policy.get('studio_' + kind + '_last_at'),
                                error=policy.get('studio_' + kind + '_error') or '',
+                               waiting=policy.get('studio_' + kind + '_waiting') or '',
                                failures=int(policy.get('studio_' + kind + '_failures') or 0))
                     for kind in ('portfolio', 'scout')}
         return dict(organization_id=organization, policy=policy, studio=studio, schedule=schedule,
                     runs=run_summaries, candidates=summaries, lessons=self._studio_lessons_summary(organization),
-                    invalid_policy=policy.get('invalid') or [],
+                    invalid_policy=policy.get('invalid') or [], mode=policy['studio_mode'],
+                    readiness=self._studio_readiness(organization, policy, studio),
                     budget=self._studio_budget(organization, policy))
 
     def _studio_lessons_summary(self, organization):
@@ -1626,6 +1644,7 @@ class Ventures:
                 {key: value for key, value in json.loads(row[0]).items() if key != 'revisions'}
                 for row in db.execute('SELECT data FROM venture_candidates ORDER BY rowid DESC LIMIT 100')]
         payload['fx'] = self._fx_status()
+        payload.update(herdr=self._herdr_state(), runtimes=self._runtimes())
         payload.update(enabled=True, module=module, options=options())
         return payload
 
@@ -1655,6 +1674,11 @@ class Ventures:
             return self.service.set_module(self.name, _switch(body.get('enabled'), 'module switch'), actor)
         if not self.enabled():
             raise ValueError('Venture simulation is switched off for this installation.')
+        if isinstance(body, dict) and body.get('mode') == 'herdr_start':
+            return self.herdr_start()
+        if isinstance(body, dict) and body.get('mode') == 'studio_start':
+            # Creates or selects the organization itself.
+            return self.studio_start(body, actor)
         if not isinstance(body, dict) or not isinstance(body.get('organization_id'), str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', body['organization_id']):
             raise ValueError('Choose an organization.')
         organization = body['organization_id']
@@ -1674,7 +1698,17 @@ class Ventures:
                 return self.setup_studio(organization, body, actor)
         if mode == 'studio_run':
             with self.service.operation('studio:' + organization):
-                return self.studio_run(organization, body.get('kind'), actor)
+                return self.studio_run(organization, body.get('kind'), actor,
+                                       override=body.get('override') is True)
+        if mode == 'studio_repair':
+            with self.service.operation('studio:' + organization):
+                return self.studio_repair(organization, body, actor)
+        if mode == 'studio_team':
+            with self.service.operation('studio:' + organization):
+                return self.studio_team_start(organization, actor)
+        if mode == 'studio_limits':
+            with self.service.operation('policy:' + organization):
+                return self.studio_limits(organization, actor)
         if mode == 'studio_recover':
             with self.service.operation('studio:' + organization):
                 return self.studio_recover(organization, body, actor)
@@ -1906,6 +1940,7 @@ class Ventures:
                                            record.get('feed_cursor') or 0)
         # Everything stored up to here has now been offered to this venture;
         # rows stored later (a late fetch, another venture's feed) come next tick.
+        offered_from = record.get('feed_cursor') or 0
         record['feed_cursor'] = cursor
         cadence = configuration['simulation'].get('meeting_cadence', 'news_only')
         base = dict(venture_id=record['id'], organization_id=record['organization_id'], actor=actor,
@@ -1923,6 +1958,13 @@ class Ventures:
             self._touch_review(tick, 'pending')
             return self._settle(record, tick, self._quiet_result())
         review_kind = 'news' if items else 'strategy'
+        if self._herdr_state(fresh=actor != 'venture_scheduler') == 'stopped':
+            # A doomed meeting would end as a generic needs-attention tick.
+            reason = 'Herdr is stopped. Start Herdr, then run the review.'
+            self._skip_review(record, date, review_kind, reason, actor)
+            record['feed_cursor'] = offered_from  # These items were not used; offer them again.
+            self.save(record)
+            raise ValueError(reason)
         try:
             group = self._group(record)
             if items:
@@ -2225,34 +2267,9 @@ class Ventures:
                     demand_in_pipeline=sum(sim['demand_pipeline']))
 
     def _write_evidence(self, record, tick, content):
-        notebook = self._notebook(record)
-        with repository_lock(notebook):
-            cache = notebook / '.ci-cache'
-            if cache.is_symlink():
-                raise ValueError('Venture evidence cache must be a regular directory.')
-            cache.mkdir(exist_ok=True)
-            destination = cache / 'herdr-venture' / tick['id']
-            if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
-                raise ValueError('Venture evidence directory must be a regular directory.')
-            destination.mkdir(parents=True, exist_ok=True)
-            target = destination / 'evidence.json'
-            data = json.dumps(content, ensure_ascii=False).encode()
-            if len(data) > EVIDENCE_LIMIT:
-                raise ValueError('Venture evidence exceeds its byte budget.')
-            if target.exists() or target.is_symlink():
-                if target.is_symlink() or not target.is_file() or target.read_bytes() != data:
-                    raise ValueError('Venture evidence copy changed; inspect its cache before retrying.')
-            else:
-                descriptor, temporary = tempfile.mkstemp(prefix='.evidence-', dir=destination)
-                try:
-                    with os.fdopen(descriptor, 'wb') as stream:
-                        stream.write(data)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    os.replace(temporary, target)
-                finally:
-                    Path(temporary).unlink(missing_ok=True)
-            return target
+        checkout, prepared = self._evidence_checkout(record['organization_id'], tick['group_id'],
+                                                     self._notebook(record))
+        return self._write_pack(checkout, prepared, 'venture', tick['id'], content, EVIDENCE_LIMIT, 'Venture')
 
     def _prompt(self, record, tick, target):
         configuration = tick['configuration']
@@ -2323,10 +2340,13 @@ class Ventures:
         return prompt
 
     def _dispatch(self, record, tick, actor):
-        target = self._write_evidence(record, tick, tick['evidence'])
-        tick['evidence_file'] = str(target)
-        prompt = tick.get('prompt') or self._prompt(record, tick, target)
-        tick['prompt'] = prompt  # Frozen: a retry or recovery reuses the exact request.
+        if tick.get('prompt') and not tick.get('job_id') and not Path(tick.get('evidence_file') or '-').is_file():
+            tick.pop('prompt')  # Never accepted and its file is gone: write both again.
+        if not tick.get('prompt'):
+            target = self._write_evidence(record, tick, tick['evidence'])
+            tick['evidence_file'] = str(target)
+            tick['prompt'] = self._prompt(record, tick, target)
+        prompt = tick['prompt']  # Frozen: a retry or recovery reuses the exact request.
         self.save_tick(tick)
         response = self.service.store.action('discuss', dict(request_id='venture-' + tick['id'],
             organization_id=record['organization_id'], group_id=tick['group_id'], prompt=prompt))
@@ -2551,8 +2571,9 @@ class Ventures:
 
         The operator confirms because this adds four agents and starts the
         group facilitator's session; members start when a meeting needs them.
-        Runtime, provider and model are copied from an existing individual
-        agent; the gateway never guesses a model or account.
+        Runtime, provider and model come from a named template agent, else
+        any individual agent, else the studio's own settings, else the first
+        ready CLI on its default model; no existing agent is required.
 
         Idempotent: the copied settings are frozen on the venture before the
         first request, and every store request has a deterministic request ID,
@@ -2563,47 +2584,23 @@ class Ventures:
             raise ValueError('Confirm adding four venture agents and starting the group facilitator session.')
         if record.get('group_id'):
             raise ValueError('This venture already has a group.')
+        self._require_herdr('create the venture team')
         team = dict(record.get('team') or {})
         if not team.get('settings_by_role'):
-            requested = body.get('templates') or {}
-            if not isinstance(requested, dict):
-                raise ValueError('Team templates must map each role to an individual agent.')
-            if any(role not in engine.ROLES for role in requested):
-                raise ValueError('Team templates can only name Analyst, Founder, Red Team and Outreach writer.')
-            hired = set((team.get('members') or {}).values())
-            snapshot = self.service.store.snapshot(live_status=False)
-            profiles = {profile['id']: profile for profile in snapshot.get('profiles', [])
-                        if profile.get('organization_id') == record['organization_id']
-                        and profile['id'] not in hired
-                        and not profile.get('group_id') and not profile.get('removed_at')
-                        and not profile.get('archived') and profile.get('use_worktree', True)}
-            if not profiles:
-                raise ValueError('Add an individual worktree agent to this organization first; the venture team '
-                                 'copies its runtime, provider and model.')
-            default = sorted(profiles.values(), key=lambda profile: (str(profile.get('name', '')), profile['id']))[0]
-            chosen = {}
-            for role in engine.ROLES:
-                identity = requested.get(role)
-                if identity in (None, '', 'auto'):
-                    chosen[role] = default
-                elif isinstance(identity, str) and identity in profiles:
-                    chosen[role] = profiles[identity]
-                else:
-                    raise ValueError('Selected team template is not an individual worktree agent in this organization.')
             if team.get('settings'):
                 # Older partial records keep their single frozen template.
                 team['settings_by_role'] = {role: dict(team['settings']) for role in engine.ROLES}
+                templates, source = dict(team.get('template_ids') or {}), 'frozen'
             else:
-                team['settings_by_role'] = {
-                    role: dict(runtime=chosen[role]['runtime'],
-                               provider=chosen[role].get('provider', ''),
-                               model=chosen[role].get('model', ''),
-                               reasoning=chosen[role].get('reasoning', ''),
-                               permission_mode=chosen[role].get('permission_mode') or 'default',
-                               accessible_paths=chosen[role].get('accessible_paths') or [])
-                    for role in engine.ROLES}
+                # A named template agent, else any individual agent, else the
+                # studio's own settings, else the first ready CLI.
+                studio_settings = ((self._studio(record['organization_id']).get('team') or {})
+                                   .get('settings_by_role') or {}).get('analyst')
+                team['settings_by_role'], templates, source = self._agent_settings(
+                    record['organization_id'], engine.ROLES, body, hired=(team.get('members') or {}).values(),
+                    fallback=studio_settings, project=str(self._notebook(record)))
             team.update(group_name=(record['name'] + ' team')[:120], members={},
-                        template_ids={role: chosen[role]['id'] for role in engine.ROLES})
+                        template_ids=templates, settings_source=source)
             team.pop('settings', None)
             record['team'] = team
             self.save(record)  # Freeze before any external request so retries send identical bodies.

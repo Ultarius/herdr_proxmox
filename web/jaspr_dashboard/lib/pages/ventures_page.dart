@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:herdr_dashboard_state/ventures_bloc.dart';
 
+import '../navigation.dart';
 import 'operations_support.dart';
 import 'ops_ui.dart';
 import 'ventures_ideas.dart';
@@ -92,10 +93,32 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
             busy ? null : () => unawaited(bloc.refresh()),
             iconName: 'refresh-cw',
           ),
+          if (_studioReady && _canScout)
+            button(
+              'Run scout',
+              busy ? null : () => _toStudio(scout: true),
+              primary: true,
+              iconName: 'search',
+            )
+          else if (_studioReady)
+            // Something on the checklist is missing: go there instead of
+            // offering a run that would only be refused.
+            button(
+              'Finish studio setup',
+              busy ? null : () => _toStudio(),
+              primary: true,
+              iconName: 'search',
+            )
+          else
+            button(
+              'Set up Venture Studio',
+              busy ? null : () => _toStudio(setup: true),
+              primary: true,
+              iconName: 'search',
+            ),
           button(
-            'Create venture',
+            'Create venture manually',
             busy ? null : _openCreate,
-            primary: true,
             iconName: 'plus',
           ),
         ],
@@ -168,6 +191,15 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
             onPause: (paused) => _pauseStudio(_studioOrganization, paused),
             onRecover: _recoverStudio,
             onRecommendation: _applyRecommendation,
+            onAction: _studioAction,
+            onRunScoutAnyway: () => _submit('studio_run', {
+              'kind': 'scout',
+              'override': true,
+            }, organization: _studioOrganization),
+            onStartTeam: () =>
+                _submit('studio_team', {}, organization: _studioOrganization),
+            herdr: bloc.herdr,
+            runtimes: bloc.runtimes,
           ),
       ],
       callout(
@@ -189,9 +221,30 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
     if (ventures.isEmpty) {
       return card('Portfolio', [
         emptyState(
-          'No ventures yet. Create a notebook, assign a read-only group and run a manual tick.',
+          _studioReady && !_canScout
+              ? 'No ventures yet. The Venture Studio is set up but cannot scout yet: finish its '
+                    'checklist on the Studio tab. You can also write a venture yourself.'
+              : _studioReady
+              ? 'No ventures yet. The Venture Studio scouts businesses for you: run a scout, then '
+                    'approve an idea. You can also write a venture yourself.'
+              : 'No AI venture proposals yet. Set up the studio to scout businesses, or write a '
+                    'venture yourself.',
           iconName: 'flask-conical',
-          actions: [button('Create venture', _openCreate, primary: true)],
+          actions: [
+            button(
+              !_studioReady
+                  ? 'Set up Venture Studio'
+                  : _canScout
+                  ? 'Run scout'
+                  : 'Finish studio setup',
+              () => _toStudio(
+                scout: _studioReady && _canScout,
+                setup: !_studioReady,
+              ),
+              primary: true,
+            ),
+            button('Create venture manually', _openCreate),
+          ],
         ),
       ], subtitle: 'One row per simulated company.');
     }
@@ -991,20 +1044,131 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
     await _submit('configure', value, ventureId: '${venture['id']}');
   }
 
+  /// One form and one request: organization (when none exists), notebook,
+  /// agents, group, starter policy and the first scout.
   Future<void> _setupStudio(String organization) async {
     final value = await showDialog<Map<String, dynamic>>(
       'Set up the Venture Studio',
-      (close) => _StudioTeamForm(
-        agents: bloc.agents,
+      (close) => _StudioSetupForm(
+        agents: bloc.agents
+            .where((agent) => agent['organization_id'] == organization)
+            .toList(),
+        runtimes: bloc.runtimes,
+        hasOrganization: organization.isNotEmpty,
         onCancel: () => close(null),
         onSave: (body) => close(body),
       ),
     );
     if (value == null || !mounted) return;
-    await _submit('studio_setup', {
-      'confirmed': true,
-      ...value,
-    }, organization: organization);
+    await perform((epoch) async {
+      final result = await bloc.ask('studio_start', {
+        'confirmed': true,
+        if (organization.isNotEmpty) 'organization_id': organization,
+        ...value,
+      });
+      await bloc.refresh();
+      if (!valid(epoch)) return;
+      final first = result['first_scout'] as Map?;
+      setState(() {
+        _studioOrg = '${result['organization_id'] ?? organization}';
+        message = first == null
+            ? 'The Venture Studio is ready.'
+            : '${first['error'] ?? ''}'.isEmpty
+            ? 'The Venture Studio is ready and its first scout is meeting.'
+            : 'The Venture Studio is ready. The first scout did not start: ${first['error']}';
+      });
+    });
+  }
+
+  bool get _studioReady =>
+      '${(bloc.studioFor(_studioOrganization)?['studio'] as Map?)?['group_id'] ?? ''}'
+          .isNotEmpty;
+
+  /// Whether a scout would be accepted now. A snapshot without readiness
+  /// (an older gateway) blocks nothing.
+  bool get _canScout =>
+      (bloc.studioFor(_studioOrganization)?['readiness'] as Map?)?['can_scout'] !=
+      false;
+
+  /// The AI path from anywhere on the page: open the Studio tab and either
+  /// start the setup or run a scout.
+  void _toStudio({bool setup = false, bool scout = false}) {
+    setState(() => _tab = 'studio');
+    if (setup) unawaited(_setupStudio(_studioOrganization));
+    if (scout) unawaited(_runStudio(_studioOrganization, 'scout'));
+  }
+
+  /// The one recovery action the gateway named for a check or a failure.
+  Future<void> _studioAction(String action, Map<String, dynamic>? run) async {
+    final organization = _studioOrganization;
+    switch (action) {
+      case 'start_herdr':
+        await _submit('herdr_start', {});
+      case 'repair':
+        await _repairStudio(organization);
+      case 'limits':
+        await _submit('studio_limits', {}, organization: organization);
+      case 'cli_accounts':
+        navigate('/configuration');
+      case 'open_group':
+        // The exact group discussion when the failure names one.
+        final failure = (run?['failure'] ?? run?['waiting']) as Map?;
+        final named = '${failure?['group_id'] ?? ''}';
+        final group = named.isNotEmpty
+            ? named
+            : '${(bloc.studioFor(organization)?['studio'] as Map?)?['group_id'] ?? ''}';
+        navigate(group.isEmpty ? '/organization' : '/groups/$group');
+    }
+  }
+
+  /// Shows what repair will do, then runs it and reports each step.
+  Future<void> _repairStudio(String organization) async {
+    Map<String, dynamic> plan;
+    try {
+      plan = await bloc.ask('studio_repair', {'organization_id': organization});
+    } catch (e) {
+      if (mounted) {
+        setState(() => error = e.toString().replaceFirst('Exception: ', ''));
+      }
+      return;
+    }
+    if (!mounted) return;
+    final steps = List<Map<String, dynamic>>.from(
+      plan['steps'] as List? ?? const [],
+    ).where((step) => step['needed'] == true).toList();
+    if (steps.isEmpty) {
+      setState(() => message = 'Nothing to repair: the studio is healthy.');
+      return;
+    }
+    if (!await confirm(
+      'Repair the Venture Studio?',
+      'These steps run in order: '
+          '${steps.map((step) => '${step['label']}${'${step['detail'] ?? ''}'.isEmpty ? '' : ' (${step['detail']})'}').join('; ')}.',
+      confirmLabel: 'Repair studio',
+    )) {
+      return;
+    }
+    await perform((epoch) async {
+      final result = await bloc.ask('studio_repair', {
+        'organization_id': organization,
+        'confirmed': true,
+      });
+      final done = List<Map<String, dynamic>>.from(
+        result['steps'] as List? ?? const [],
+      );
+      final failed = done.where((step) => step['ok'] != true).toList();
+      await bloc.refresh();
+      if (!valid(epoch)) return;
+      setState(() {
+        if (failed.isEmpty) {
+          message =
+              'The studio is repaired. ${done.map((step) => step['detail']).join(' ')}';
+        } else {
+          error =
+              'Repair stopped: ${failed.map((step) => step['detail']).join(' ')}';
+        }
+      });
+    });
   }
 
   Future<void> _configureStudio(String organization) async {
@@ -1391,6 +1555,9 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
   late String _sources =
       (component.policy['studio_sources'] as List? ?? const []).join('\n');
   late bool _paused = component.policy['studio_paused'] == true;
+  late String _mode = '${component.policy['studio_mode'] ?? 'proposal'}';
+  late String _confidence =
+      '${component.policy['studio_auto_min_confidence'] ?? 70}';
   String? _error;
   List<String> _lines(String value) => value
       .split(RegExp(r'[\r\n]+'))
@@ -1414,6 +1581,11 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
       setState(() => _error = 'Candidate cap must be 1-3 and backlog 1-20.');
       return;
     }
+    final confidence = int.tryParse(_confidence);
+    if (confidence == null || confidence < 0 || confidence > 100) {
+      setState(() => _error = 'Minimum confidence must be 0-100.');
+      return;
+    }
     component.onSave({
       'studio_portfolio_cadence': _portfolio,
       'studio_scout_cadence': _scout,
@@ -1423,6 +1595,8 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
       'studio_exclude': _commas(_exclude),
       'studio_sources': _lines(_sources),
       'studio_paused': _paused,
+      'studio_mode': _mode,
+      'studio_auto_min_confidence': confidence,
     });
   }
 
@@ -1469,6 +1643,23 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
       (value) => setState(() => _sources = value),
       rows: 4,
     ),
+    select('What the studio may do with an idea', _mode, const {
+      'proposal': 'Proposal: it suggests, you approve',
+      'autonomous': 'Autonomous: it creates ventures within the caps',
+    }, (value) => setState(() => _mode = value)),
+    if (_mode == 'autonomous') ...[
+      field(
+        'Minimum confidence to create a venture (0-100)',
+        _confidence,
+        (value) => setState(() => _confidence = value),
+        required: true,
+      ),
+      notice(
+        'At most one venture per scout run, only from an idea that cites an outside source, never above '
+        'the active venture limit. The studio hires that venture\'s four agents and starts its daily '
+        'reviews. It never sends mail, spends or publishes.',
+      ),
+    ],
     switchField(
       'Pause the studio only',
       _paused,
@@ -1481,66 +1672,187 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
   ]);
 }
 
-class _StudioTeamForm extends StatefulComponent {
-  const _StudioTeamForm({
+class _StudioSetupForm extends StatefulComponent {
+  const _StudioSetupForm({
     required this.agents,
+    required this.runtimes,
+    required this.hasOrganization,
     required this.onSave,
     required this.onCancel,
   });
   final List<Map<String, dynamic>> agents;
+  final List<Map<String, dynamic>> runtimes;
+  final bool hasOrganization;
   final void Function(Map<String, dynamic>) onSave;
   final void Function() onCancel;
   @override
-  State<_StudioTeamForm> createState() => _StudioTeamFormState();
+  State<_StudioSetupForm> createState() => _StudioSetupFormState();
 }
 
-class _StudioTeamFormState extends State<_StudioTeamForm> {
-  static const roles = {
-    'portfolio': 'Portfolio Manager',
-    'scout': 'Venture Scout',
-    'critic': 'Skeptic',
-    'analyst': 'Research Analyst',
-  };
-  late Map<String, String> _templates = {
-    for (final role in roles.keys) role: '',
-  };
+/// One form from nothing to a working studio: the agents' CLI, what the scout
+/// reads, how often it runs and whether it may create ventures itself.
+class _StudioSetupFormState extends State<_StudioSetupForm> {
+  static const roles = ['portfolio', 'scout', 'critic', 'analyst'];
+  String _name = 'Venture Studio';
+  String _cli = '';
+  String _provider = '';
+  String _model = '';
+  String _sources = '';
+  String _focus = '';
+  String _scout = 'weekly';
+  String _portfolio = 'weekly';
+  String _mode = 'proposal';
+  bool _first = true;
+  String? _error;
+
+  List<Map<String, dynamic>> get _ready =>
+      component.runtimes.where((item) => item['ready'] == true).toList();
+  List<String> _split(String value, Pattern separator) => value
+      .split(separator)
+      .map((item) => item.trim())
+      .where((item) => item.isNotEmpty)
+      .toList();
+
+  void _save() {
+    final sources = _split(_sources, RegExp(r'[\r\n]+'));
+    final focus = _split(_focus, ',');
+    if (sources.any((item) => !item.startsWith('https://'))) {
+      setState(() => _error = 'Scouting sources must be https feed URLs.');
+      return;
+    }
+    component.onSave({
+      if (!component.hasOrganization) 'name': _name.trim(),
+      if (_cli.startsWith('agent:'))
+        'templates': {for (final role in roles) role: _cli.substring(6)}
+      else if (_cli.isNotEmpty)
+        'settings': {
+          'runtime': _cli,
+          if (_provider.trim().isNotEmpty) 'provider': _provider.trim(),
+          if (_model.trim().isNotEmpty) 'model': _model.trim(),
+        },
+      'studio_sources': sources,
+      'studio_focus': focus,
+      'studio_scout_cadence': _scout,
+      'studio_portfolio_cadence': _portfolio,
+      'studio_mode': _mode,
+      'first_scout': _first && sources.isNotEmpty && focus.isNotEmpty,
+    });
+  }
+
   @override
   Component build(BuildContext context) {
-    if (component.agents.isEmpty) {
+    final ready = _ready;
+    final blocked = component.runtimes
+        .where((item) => item['ready'] != true)
+        .toList();
+    if (component.runtimes.isNotEmpty &&
+        ready.isEmpty &&
+        component.agents.isEmpty) {
       return stack([
         notice(
-          'Add an individual worktree agent to this organization first; the studio copies its runtime, '
-          'provider and model.',
+          'No agent CLI is ready, so the studio agents cannot be created. Connect one on the CLI accounts '
+          'page, then come back.',
           error: true,
         ),
+        for (final item in blocked)
+          paragraph('${item['name']}: ${item['reason']}'),
         actions([button('Close', component.onCancel)]),
       ]);
     }
     return stack([
+      if (_error != null) notice(_error!, error: true),
       paragraph(
-        'Each studio role copies the selected individual agent\'s runtime, provider and model. '
-        'The notebook is managed by the gateway. The group is read-only.',
+        'This creates one managed notebook, four agents (Portfolio Manager, Venture Scout, Skeptic, '
+        'Research Analyst) and one read-only group. You do not need an existing agent or project folder.'
+        '${component.hasOrganization ? '' : ' An organization is created too: it is only the container for the studio\'s agents, limits and history.'}',
       ),
-      for (final entry in roles.entries)
-        select(entry.value, _templates[entry.key]!, {
-          '': 'First available agent',
-          for (final agent in component.agents)
-            '${agent['id']}':
-                '${agent['name']} (${agent['runtime']}'
-                '${'${agent['model'] ?? ''}'.isEmpty ? '' : '/' + '${agent['model']}'})',
-        }, (value) => setState(() => _templates[entry.key] = value)),
+      if (!component.hasOrganization)
+        field(
+          'Studio name',
+          _name,
+          (value) => setState(() => _name = value),
+          required: true,
+        ),
+      select('Agent CLI for the four agents', _cli, {
+        '':
+            'Automatic: ${ready.isEmpty ? 'the first ready CLI' : ready.first['name']} on its default model',
+        for (final item in ready) '${item['runtime']}': '${item['name']}',
+        for (final agent in component.agents)
+          'agent:${agent['id']}':
+              'Copy from ${agent['name']} (${agent['runtime']}'
+              '${'${agent['model'] ?? ''}'.isEmpty ? '' : '/${agent['model']}'})',
+      }, (value) => setState(() => _cli = value)),
+      if (_cli.isNotEmpty && !_cli.startsWith('agent:')) ...[
+        field(
+          'Provider (optional)',
+          _provider,
+          (value) => setState(() => _provider = value),
+        ),
+        field(
+          'Model (optional; empty uses the CLI default)',
+          _model,
+          (value) => setState(() => _model = value),
+        ),
+        paragraph(
+          'The account and model are checked before any agent is created.',
+        ),
+      ],
+      for (final item in blocked)
+        paragraph('Not ready: ${item['name']}: ${item['reason']}'),
+      textarea(
+        'Scouting sources (one https feed URL per line)',
+        _sources,
+        (value) => setState(() => _sources = value),
+        rows: 3,
+        placeholder:
+            'Industry news, regulator announcements, trade press or funding feeds',
+      ),
+      textarea(
+        'Focus areas (comma separated)',
+        _focus,
+        (value) => setState(() => _focus = value),
+        rows: 2,
+        placeholder:
+            'A sector, a buyer and a region, for example: freight forwarding, mid-market finance teams, Benelux',
+      ),
+      paragraph(
+        'The scout cites these sources. Without a source and a focus it has no market evidence and will not '
+        'run on schedule.',
+      ),
+      select('Scout', _scout, const {
+        'weekly': 'Weekly',
+        'daily': 'Daily',
+        'off': 'Manual only',
+      }, (value) => setState(() => _scout = value)),
+      select('Portfolio review', _portfolio, const {
+        'weekly': 'Weekly',
+        'daily': 'Daily',
+        'off': 'Manual only',
+      }, (value) => setState(() => _portfolio = value)),
+      select('What the studio may do with an idea', _mode, const {
+        'proposal': 'Proposal: it suggests, you approve',
+        'autonomous': 'Autonomous: it creates ventures within the caps',
+      }, (value) => setState(() => _mode = value)),
+      if (_mode == 'autonomous')
+        notice(
+          'Autonomous mode creates at most one venture per scout run, only from an idea that cites an outside '
+          'source and reaches the minimum confidence, and never above the active venture limit. It hires that '
+          'venture\'s four agents and starts its daily reviews. It never sends mail, spends or publishes.',
+        ),
+      if (_sources.trim().isEmpty || _focus.trim().isEmpty)
+        paragraph(
+          'Add a scouting source and a focus area to run the first scout right after setup. '
+          'Without them the studio is created and waits for you to add them.',
+        )
+      else
+        switchField(
+          'Run the first scout right after setup',
+          _first,
+          (value) => setState(() => _first = value),
+        ),
       actions([
         button('Cancel', component.onCancel),
-        button(
-          'Create studio',
-          () => component.onSave({
-            'templates': {
-              for (final entry in _templates.entries)
-                if (entry.value.isNotEmpty) entry.key: entry.value,
-            },
-          }),
-          primary: true,
-        ),
+        button('Create studio', _save, primary: true),
       ]),
     ]);
   }

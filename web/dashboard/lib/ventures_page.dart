@@ -236,6 +236,18 @@ class _VenturesPageState extends State<VenturesPage>
                       'Scout cadence: ${(studio['policy'] as Map?)?['studio_scout_cadence'] ?? 'off'}',
                     ),
                     Text(
+                      'Mode: ${studio['mode'] == 'autonomous' ? 'autonomous (creates ventures within its caps)' : 'proposal (you approve each idea)'}',
+                    ),
+                    // What stops the studio from running, in the gateway's words.
+                    for (final check
+                        in ((studio['readiness'] as Map?)?['checks'] as List? ??
+                            const []))
+                      if (check is Map && check['ok'] != true)
+                        Text(
+                          'Not ready: ${check['label']}: ${check['detail']}',
+                          style: TextStyle(color: theme.colorScheme.error),
+                        ),
+                    Text(
                       'Budget: ${(studio['budget'] as Map?)?['daily_meetings'] ?? 0} meetings / '
                       '${(studio['budget'] as Map?)?['projected_agent_sessions'] ?? 0} sessions per day',
                     ),
@@ -247,7 +259,9 @@ class _VenturesPageState extends State<VenturesPage>
                           contentPadding: EdgeInsets.zero,
                           title: Text('${run['kind']} - ${run['state']}'),
                           subtitle: Text(
-                            '${run['summary'] ?? run['error'] ?? ''}',
+                            run['failure'] is Map
+                                ? '${(run['failure'] as Map)['title']}: ${run['error'] ?? ''}'
+                                : '${run['summary'] ?? run['error'] ?? ''}',
                           ),
                         ),
                   ],
