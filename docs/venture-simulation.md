@@ -442,6 +442,15 @@ feed (a search engine's home page, for example) cannot become a source that
 way. The readiness checklist names each configured source whose last fetch
 failed, with the error.
 
+A web-researched candidate names no feeds, and a venture without feeds only
+has quiet days: it spends money and never holds a judged review. Approval
+therefore accepts `attach_sources`: when the candidate has no feeds, the
+studio's current sources become the venture's feeds and the choice is recorded
+on the candidate as `feeds_attached`. A candidate that names its own feeds is
+left alone. The approval dialog offers this by default and warns when the
+venture would still have no feeds. The Ideas card shows the market, outreach
+settings and feeds, the research pages as links, and the scout's own note.
+
 Whether the agents can search depends on the agent CLI and its permissions;
 a CLI without a web tool is told to return no candidates and say so in
 `research_note`.

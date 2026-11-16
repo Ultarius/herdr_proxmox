@@ -100,6 +100,37 @@ List<Component> _refusals(Map<String, dynamic>? scout) {
   ];
 }
 
+/// One page a web-researching scout relied on: a link to open, where it is
+/// hosted, and the claim the scout takes from it.
+Component _researchPage(Map<String, dynamic> link) {
+  final url = '${link['url'] ?? ''}';
+  final host = Uri.tryParse(url)?.host ?? '';
+  final published = '${link['published'] ?? ''}';
+  final title = '${link['title'] ?? ''}'.isEmpty ? url : '${link['title']}';
+  return el('article', [
+    el('p', [
+      text('${link['id'] ?? ''} · '),
+      // Only an https page becomes a link; anything else stays text.
+      if (url.startsWith('https://'))
+        el(
+          'a',
+          [text(title)],
+          attributes: {
+            'href': url,
+            'target': '_blank',
+            'rel': 'noopener noreferrer',
+          },
+        )
+      else
+        text(title),
+      text(
+        '${host.isEmpty ? '' : ' · $host'}${published.isEmpty ? '' : ' · $published'}',
+      ),
+    ]),
+    if ('${link['claim'] ?? ''}'.isNotEmpty) paragraph('${link['claim']}'),
+  ], classes: 'stack');
+}
+
 /// Reviewed venture candidates produced by the Venture Studio.
 Component venturesIdeas({
   required List<Map<String, dynamic>> candidates,
@@ -134,7 +165,15 @@ Component venturesIdeas({
       ...refusals,
       if (open.isEmpty) paragraph('No candidates waiting for a decision.'),
       for (final item in open)
-        _candidate(item, organizationName, busy, onEdit, onApprove, onReject),
+        _candidate(
+          item,
+          organizationName,
+          busy,
+          onEdit,
+          onApprove,
+          onReject,
+          scout: latestScout,
+        ),
       if (closed.isNotEmpty)
         disclosure(
           'Decided (${closed.length}): created, rejected and excluded',
@@ -162,9 +201,24 @@ Component _candidate(
   bool busy,
   void Function(Map<String, dynamic>) onEdit,
   void Function(Map<String, dynamic>) onApprove,
-  void Function(Map<String, dynamic>) onReject,
-) {
+  void Function(Map<String, dynamic>) onReject, {
+  Map<String, dynamic>? scout,
+}) {
   final state = '${item['state'] ?? 'proposed'}';
+  final configuration = item['configuration'] as Map? ?? const {};
+  final market = configuration['market'] as Map? ?? const {};
+  final outreach = configuration['outreach'] as Map? ?? const {};
+  final feeds =
+      (configuration['sources'] as Map?)?['feeds'] as List? ?? const [];
+  final research = List<Map<String, dynamic>>.from(
+    item['evidence_links'] as List? ?? const [],
+  );
+  // The scout's own note and suggestions belong to the run that proposed this idea.
+  final own = scout != null && '${scout['id']}' == '${item['run_id']}';
+  final note = own ? '${scout['research_note'] ?? ''}' : '';
+  final suggested = own
+      ? (scout['suggested_sources'] as List? ?? const []).length
+      : 0;
   final assumptions = (item['assumptions'] as List? ?? const [])
       .map((value) => '$value')
       .toList();
@@ -193,23 +247,47 @@ Component _candidate(
       ('Product', text('${item['product'] ?? ''}')),
       ('Pricing', text('${item['pricing'] ?? 'Not proposed'}')),
       ('Evidence', text(evidence.isEmpty ? 'None' : evidence)),
-      // Pages a web-researching scout reported; the gateway did not fetch them.
-      for (final link in List<Map<String, dynamic>>.from(
-        item['evidence_links'] as List? ?? const [],
-      ))
+      // What you would check before approving, without opening Edit.
+      if (market.isNotEmpty)
         (
-          '${link['id']} (web, not verified)',
+          'Market',
           text(
-            '${link['title'] ?? ''} · ${link['url'] ?? ''}'
-            '${'${link['claim'] ?? ''}'.isEmpty ? '' : ' · ${link['claim']}'}',
+            '${'${market['geography'] ?? ''}'.isEmpty ? 'No geography' : market['geography']} · '
+            '${market['currency'] ?? ''}',
           ),
         ),
+      if (outreach.isNotEmpty)
+        (
+          'Outreach',
+          text(
+            '${outreach['persona'] ?? ''} · language ${outreach['language'] ?? ''} · '
+            '${outreach['stage'] ?? ''} · tone ${outreach['tone'] ?? ''}',
+          ),
+        ),
+      (
+        'News feeds',
+        text(
+          feeds.isEmpty
+              ? 'None: without feeds the venture only has quiet days. Attach the studio sources when you create it.'
+              : '${feeds.length}: ${feeds.join(', ')}',
+        ),
+      ),
       if ('${item['duplicate_of'] ?? ''}'.isNotEmpty)
         ('Duplicate of', text('${item['duplicate_of']}')),
       if ('${item['excluded_by'] ?? ''}'.isNotEmpty)
         ('Excluded by', text('"${item['excluded_by']}"')),
       ...candidateBar(item),
     ]),
+    if (research.isNotEmpty)
+      disclosure(
+        'Research (${research.length} page${research.length == 1 ? '' : 's'}, agent-reported, not verified)',
+        [for (final link in research) _researchPage(link)],
+      ),
+    if (note.isNotEmpty) paragraph('Scout\'s note: $note'),
+    if (suggested > 0)
+      paragraph(
+        'The scout suggested $suggested source${suggested == 1 ? '' : 's'} for this focus. Add them on the Studio tab.',
+      ),
     if ((item['scout_adjusted'] as Map? ?? const {}).isNotEmpty)
       paragraph(
         'The gateway reset the values the scout proposed for the bar, the schedule and capital above a '

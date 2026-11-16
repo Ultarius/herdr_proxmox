@@ -1265,6 +1265,13 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
       (close) => _CandidateApprovalForm(
         candidate: candidate,
         agents: bloc.agents,
+        sources:
+            ((bloc.studioFor('${candidate['organization_id']}')?['policy']
+                            as Map?)?['studio_sources']
+                        as List? ??
+                    const [])
+                .map((value) => '$value')
+                .toList(),
         onCancel: () => close(null),
         onSave: (body) => close(body),
       ),
@@ -1394,9 +1401,13 @@ class _CandidateApprovalForm extends StatefulComponent {
     required this.agents,
     required this.onSave,
     required this.onCancel,
+    this.sources = const [],
   });
   final Map<String, dynamic> candidate;
   final List<Map<String, dynamic>> agents;
+
+  /// The studio's scouting sources, offered as feeds for an idea that names none.
+  final List<String> sources;
   final void Function(Map<String, dynamic>) onSave;
   final void Function() onCancel;
   @override
@@ -1412,7 +1423,13 @@ class _CandidateApprovalFormState extends State<_CandidateApprovalForm> {
   };
   bool _team = false;
   bool _daily = false;
+  bool _attach = true;
   String _cadence = 'every_day';
+  bool get _noFeeds =>
+      (((component.candidate['configuration'] as Map?)?['sources'] as Map?)?['feeds']
+                  as List? ??
+              const [])
+          .isEmpty;
   late Map<String, String> _templates = {
     for (final role in roles.keys) role: '',
   };
@@ -1424,6 +1441,20 @@ class _CandidateApprovalFormState extends State<_CandidateApprovalForm> {
     ),
     // The rules it will run under, shown before creation rather than only in Edit.
     facts(candidateBar(component.candidate)),
+    // A web-researched idea names no feeds; without any, every day is quiet.
+    if (_noFeeds && component.sources.isNotEmpty)
+      switchField(
+        'Use the studio\'s ${component.sources.length} scouting source${component.sources.length == 1 ? '' : 's'} as this venture\'s news feeds',
+        _attach,
+        (value) => setState(() => _attach = value),
+      ),
+    if (_noFeeds && (component.sources.isEmpty || !_attach))
+      notice(
+        'This venture would have no news feeds, so it only has quiet days: it spends money and never '
+        'holds a judged review. '
+        '${component.sources.isEmpty ? 'Add sources on the Studio tab first, or add feeds with Edit.' : 'Attach the studio sources, or add feeds with Edit.'}',
+        error: true,
+      ),
     switchField(
       'Create the four-agent venture team',
       _team,
@@ -1463,6 +1494,8 @@ class _CandidateApprovalFormState extends State<_CandidateApprovalForm> {
             : () => component.onSave({
                 'create_team': _team,
                 'start_daily': _daily,
+                if (_noFeeds && _attach && component.sources.isNotEmpty)
+                  'attach_sources': true,
                 if (_daily) 'meeting_cadence': _cadence,
                 if (_team)
                   'templates': {

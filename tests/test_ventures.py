@@ -1569,6 +1569,35 @@ class VentureTests(unittest.TestCase):
         self.assertEqual((added['added'], again['added']), (True, False))
         self.assertEqual(self.ventures._studio_policy('org')['studio_sources'], ['https://trade.example/feed.xml'])
 
+    def test_approval_can_attach_the_studio_sources_to_an_idea_without_feeds(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='scout')
+        self.complete_studio(run, {'candidates': [self.web_candidate()], 'research': self.RESEARCH})
+        stored = self.stored_candidates()[0]
+        self.assertEqual(stored['configuration']['sources']['feeds'], [])
+        # The operator adds a suggested source, then creates the venture with it.
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            self.studio(mode='studio_source_add', url='https://trade.example/feed.xml')
+        approved = self.studio(mode='candidate_decide', candidate_id=stored['id'], decision='approve',
+                               confirmed=True, attach_sources=True)
+        venture = self.ventures.get(approved['venture_id'], 'org')
+        self.assertEqual(venture['configuration']['sources']['feeds'], ['https://trade.example/feed.xml'])
+        self.assertEqual(approved['feeds_attached']['feeds'], ['https://trade.example/feed.xml'])
+
+    def test_approval_without_attaching_leaves_an_idea_s_feeds_alone(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        done = self.scout_with(candidate())  # Names its own feed from the allowlist.
+        stored = self.stored_candidates()[0]
+        self.studio(mode='studio_policy', studio_sources=['https://news.example/feed', 'https://other.example/feed'])
+        approved = self.studio(mode='candidate_decide', candidate_id=stored['id'], decision='approve',
+                               confirmed=True, attach_sources=True)
+        venture = self.ventures.get(approved['venture_id'], 'org')
+        self.assertEqual(done['state'], 'ready')
+        self.assertEqual(venture['configuration']['sources']['feeds'], ['https://news.example/feed'])
+        self.assertNotIn('feeds_attached', approved)
+
     def test_autonomous_mode_never_creates_from_web_research_alone(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())

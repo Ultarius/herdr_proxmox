@@ -1692,6 +1692,14 @@ class Ventures(StudioOperations):
             raise ValueError('Daily reviews need a team: choose Create team too, or start daily reviews later.')
         if body.get('start_daily') is True:
             self._check_budget(organization, extra_daily=1)
+        if (body.get('attach_sources') is True and not linked
+                and not candidate['configuration']['sources']['feeds'] and policy['studio_sources']):
+            # A web-researched idea names no feeds, and a venture without feeds
+            # only ever has quiet days. The studio's sources are the allowlist
+            # its feeds must come from anyway; the choice is recorded.
+            candidate['configuration']['sources']['feeds'] = list(policy['studio_sources'])[:MAX_FEEDS]
+            candidate['feeds_attached'] = dict(by=actor, at=now().isoformat(),
+                                               feeds=candidate['configuration']['sources']['feeds'])
         configuration = json.loads(json.dumps(candidate['configuration']))
         configuration['simulation']['daily_ticks'] = False  # Only "Start daily reviews" schedules it.
         candidate.update(state='creating', error='')
