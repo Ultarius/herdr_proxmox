@@ -88,6 +88,11 @@ SCOUT_FIXED_SIMULATION = ('survival_threshold', 'consecutive_days', 'red_team', 
 # Starting capital is bounded by the proposed costs: above a year of burn the
 # runway factor is already at its maximum, so more capital only games the score.
 SCOUT_MAX_RUNWAY_MONTHS = 12
+# What one scout candidate may carry. The research list holds at most twelve
+# pages, so a candidate may cite all of them.
+SCOUT_MAX_EVIDENCE = 12
+SCOUT_MAX_POINTS = 8
+SCOUT_POINT_LENGTH = 300
 
 
 def now():
@@ -285,7 +290,22 @@ def scout_configuration(value):
     starting capital is capped at a year of the proposed monthly costs, which
     must not be zero. ``adjusted`` records each value the scout proposed and
     the value used, so the Ideas queue can show both.
+
+    Keys the venture schema does not have (a scout's planning notes such as
+    ``segment`` or ``horizon_months``) are dropped rather than stored, and a
+    list of places for ``market.geography`` is joined into the one line the
+    schema holds.
     """
+    if not isinstance(value, dict):
+        raise ValueError('Venture configuration must be an object.')
+    schema = defaults()
+    value = {layer: ({key: item for key, item in value[layer].items() if key in schema[layer]}
+                     if isinstance(value[layer], dict) else value[layer])
+             for layer in LAYERS if layer in value}
+    market = value.get('market')
+    if isinstance(market, dict) and isinstance(market.get('geography'), list) and all(
+            isinstance(place, str) for place in market['geography']):
+        market['geography'] = ', '.join(place.strip() for place in market['geography'] if place.strip())
     proposed = normalize_config(value)
     simulation = proposed['simulation']
     baseline = defaults()['simulation']
@@ -1096,7 +1116,12 @@ class Ventures(StudioOperations):
                     'Focus: ' + focus + '. Permanent exclusions: ' + exclusions + '. '
                     'Return one fenced json object: '
                     '{"candidates":[{"name":"...","thesis":"...","product":"...","pricing":"...",'
-                    '"configuration":{"sources":{"feeds":[]},"market":{...},"simulation":{...},"outreach":{...}},'
+                    '"configuration":{"sources":{"feeds":[]},'
+                    '"market":{"geography":"BE, NL, DE","currency":"EUR","sales_cycle":3,"legacy_bias":3,'
+                    '"regulatory":"..."},'
+                    '"simulation":{"capital":90000,"burn":[{"label":"hosting","amount":2000,"currency":"EUR"}],'
+                    '"architecture":"saas","icp_size":"10-200 employees","icp_sector":"..."},'
+                    '"outreach":{"stage":"survey","tone":"direct","language":"en","persona":"cfo"}},'
                     '"assumptions":["..."],"kill_criteria":["..."],"confidence":0,"evidence":["'
                     + ('W1' if web else 'L1","N1') + '"]}]'
                     + (',"research":[{"id":"W1","url":"https://...","title":"...","published":"YYYY-MM-DD or empty",'
@@ -1107,8 +1132,18 @@ class Ventures(StudioOperations):
                     'Under suggested_sources name up to 8 RSS or Atom feed URLs (https) that would supply '
                     'dated items for this focus; the operator decides whether to add them. '
                     'Use only allowed studio source URLs in configuration.sources.feeds. '
-                    'Configuration is validated by the same rules as a manually created venture; it must include '
-                    'at least one monthly cost. The bar, thresholds, reference price and schedule are set by the '
+                    'Configuration is validated by the same rules as a manually created venture and holds only '
+                    'the keys shown; other keys are dropped. market.geography is one line of text (at most 100 '
+                    'characters). sales_cycle and legacy_bias are whole numbers 1-5. simulation.burn lists the '
+                    'monthly costs, each {"label","amount" (whole number),"currency"}, in the market currency, and '
+                    'must not be empty; capital is a whole number, capped at 12 months of burn. architecture is '
+                    + '|'.join(engine.ARCHITECTURES) + '; outreach.stage is ' + '|'.join(engine.STAGE)
+                    + '; outreach.persona is ' + '|'.join(engine.PERSONA) + '. '
+                    'Give 1-' + str(SCOUT_MAX_POINTS) + ' assumptions and 1-' + str(SCOUT_MAX_POINTS)
+                    + ' kill_criteria per candidate, each at most ' + str(SCOUT_POINT_LENGTH) + ' characters, and '
+                    'cite 1-' + str(SCOUT_MAX_EVIDENCE) + ' supplied evidence ids. A candidate breaking any of '
+                    'these rules is refused whole. '
+                    'The bar, thresholds, reference price and schedule are set by the '
                     'gateway, not by the scout. '
                     'A candidate is a proposal, not a venture. Maximum candidates: '
                     + str(run['policy']['studio_max_candidates']) + '. Empty candidates is valid.\n'
@@ -1189,7 +1224,7 @@ class Ventures(StudioOperations):
                 parsed.append(self._scout_candidate(run, item, cited, allowed_sources, known + parsed, exclusions))
             except ValueError as error:
                 label = item.get('name') if isinstance(item, dict) and isinstance(item.get('name'), str) else ''
-                refused.append(dict(name=label[:120], error=redact(str(error))[:300]))
+                refused.append(dict(name=label[:120], error=redact(str(error))[:800]))
         for candidate in parsed:
             # The pages behind a web-researched idea travel with it, marked as unverified.
             candidate['evidence_links'] = [research[item] for item in candidate['evidence'] if item in research]
@@ -1245,20 +1280,47 @@ class Ventures(StudioOperations):
     def _scout_candidate(self, run, item, cited, allowed_sources, known, exclusions):
         if not isinstance(item, dict):
             raise ValueError('Malformed venture candidate.')
-        name = _value(item.get('name'), 120, 'candidate name', required=True)
-        thesis = _value(item.get('thesis'), 1500, 'candidate thesis', required=True)
-        product = _value(item.get('product'), 1500, 'candidate product', required=True)
-        pricing = _value(item.get('pricing'), 500, 'candidate pricing')
-        configuration, adjusted = scout_configuration(item.get('configuration') or {})
-        feeds = configuration['sources']['feeds']
-        if any(feed not in allowed_sources for feed in feeds):
-            raise ValueError('Candidate uses a feed outside the studio source allowlist.')
-        assumptions = _strings(item.get('assumptions'), 300, 8, 'candidate assumptions')
-        kill = _strings(item.get('kill_criteria'), 300, 8, 'candidate kill criteria')
-        if not assumptions or not kill:
-            raise ValueError('Every candidate needs assumptions and kill criteria.')
-        confidence = _integer(item.get('confidence'), 0, 100, 'candidate confidence')
-        evidence = cited(item.get('evidence'))
+        # Every field is checked, so a refusal names all of its problems at
+        # once instead of one per scout run.
+        problems = []
+        def check(label, read):
+            try:
+                return read()
+            except ValueError as error:
+                message = str(error)
+                problems.append(message if message.startswith(label) else label + ': ' + message)
+                return None
+        def points(field, label):
+            value = item.get(field)
+            if not isinstance(value, list) or not 1 <= len(value) <= SCOUT_MAX_POINTS:
+                count = len(value) if isinstance(value, list) else 'none'
+                raise ValueError(f'{label}: 1 to {SCOUT_MAX_POINTS} items needed, got {count}')
+            if any(not isinstance(point, str) or len(point.strip()) > SCOUT_POINT_LENGTH for point in value):
+                raise ValueError(f'{label}: each item must be text of at most {SCOUT_POINT_LENGTH} characters')
+            return _strings(value, SCOUT_POINT_LENGTH, SCOUT_MAX_POINTS, label)
+        def evidence():
+            value = item.get('evidence')
+            if not isinstance(value, list) or not 1 <= len(value) <= SCOUT_MAX_EVIDENCE:
+                count = len(value) if isinstance(value, list) else 'none'
+                raise ValueError(f'evidence: 1 to {SCOUT_MAX_EVIDENCE} ids needed, got {count}')
+            return cited(value, SCOUT_MAX_EVIDENCE)
+        def configuration():
+            configuration, adjusted = scout_configuration(item.get('configuration') or {})
+            if any(feed not in allowed_sources for feed in configuration['sources']['feeds']):
+                raise ValueError('Candidate uses a feed outside the studio source allowlist.')
+            return configuration, adjusted
+        name = check('name', lambda: _value(item.get('name'), 120, 'candidate name', required=True))
+        thesis = check('thesis', lambda: _value(item.get('thesis'), 1500, 'candidate thesis', required=True))
+        product = check('product', lambda: _value(item.get('product'), 1500, 'candidate product', required=True))
+        pricing = check('pricing', lambda: _value(item.get('pricing'), 500, 'candidate pricing'))
+        configured = check('configuration', configuration)
+        assumptions = check('assumptions', lambda: points('assumptions', 'assumptions'))
+        kill = check('kill criteria', lambda: points('kill_criteria', 'kill criteria'))
+        confidence = check('confidence', lambda: _integer(item.get('confidence'), 0, 100, 'candidate confidence'))
+        evidence = check('evidence', evidence)
+        if problems:
+            raise ValueError('; '.join(problems))
+        configuration, adjusted = configured
         excluded_by = excluded_term(' '.join((name, thesis, product)), exclusions)
         duplicate = '' if excluded_by else self._candidate_duplicate(name, thesis, known)
         return dict(id=uuid.uuid4().hex, organization_id=run['organization_id'], run_id=run['id'],

@@ -568,6 +568,17 @@ own bar or schedule. Whatever it proposes, a stored candidate gets:
   runway factor is already at its maximum by then);
 - a refusal if it proposes no monthly costs at all.
 
+The prompt states the configuration schema and limits outright: the keys a
+venture has, `market.geography` as one line, monthly costs under
+`simulation.burn`, 1–8 assumptions and 1–8 kill criteria of at most 300
+characters, and 1–12 cited evidence ids (the research list holds at most
+twelve pages). Keys the schema does not have, such as planning notes, are
+dropped instead of stored, and a list of places is joined into the geography
+line. A candidate that still breaks a rule is refused whole, and its reason
+names every problem at once. The Ideas tab lists the newest scout run's
+refused ideas with those reasons, so an empty queue is not mistaken for a
+scout that found nothing.
+
 Every reset value is kept under `scout_adjusted` (`proposed` and `used`) and
 shown on the Ideas card and in the approval dialog. The operator may change
 the bar with Edit. Editing never turns on daily reviews: only approval's

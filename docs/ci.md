@@ -11,7 +11,17 @@ Run the Jaspr browser suite from `web/jaspr_dashboard` with
 `dart test --platform chrome --concurrency=1`, matching CI. Focus and animation
 checks share a browser viewport and can fail nondeterministically with default
 parallelism, including in unrelated test files. `scripts/build-web.sh` runs the
-VM tests; CI runs the browser suite separately. Before merging gateway changes,
+VM tests; CI runs the browser suite separately. With one suite at a time,
+`dart test` also compiles one suite at a time, so CI runs only the
+`@TestOn('browser')` files in Chrome (the others already run on the VM), split
+across shard jobs that run beside the build. `scripts/ci.py browser-shards`
+plans the split: it discovers the suites, places the largest first on the
+lightest shard so no shard gets all the long suites, gives the first shard a
+lighter share because it also runs the keyboard-navigation check, and fails on
+any other `@TestOn` selector, since that suite would run in no job. The shard
+count is the `shard` list in the workflow and nowhere else. To run one shard
+locally from `web/jaspr_dashboard`:
+`dart test --platform chrome --concurrency=1 $(python3 ../../scripts/ci.py browser-shards --directory test --index 0 --total 3)`. Before merging gateway changes,
 also run `python3 scripts/test-project-discovery.py --all` on native Linux; the
 runner refuses unsupported filesystem capabilities and fails on any skipped test.
 
@@ -24,7 +34,8 @@ features. New regression tests belong in the existing discovered suites:
 | --- | --- | --- |
 | Installer and gateway checks | Every push and PR | Shell syntax/fixtures, complete Python discovery on the pinned primary Python, workflow lint |
 | Minimum supported Python checks | Every push and PR | The same complete Linux Python suite on the floor declared in `pyproject.toml` |
-| Web build and browser checks | Every push and PR | Existing Flutter/Jaspr analysis, VM/browser tests and one reusable release build |
+| Web build checks | Every push and PR | Existing Flutter/Jaspr analysis, VM tests and one reusable release build |
+| Jaspr browser checks (one job per shard) | Every push and PR, beside the web build | The `@TestOn('browser')` suites in Chrome, split by size, plus keyboard navigation on the first shard |
 | Real project SDK preparation | Release pushes or explicit manual selection, after Python checks pass | Publisher downloads, actual builds and live daemon qualification on x64/ARM |
 | Debian provisioning | Trusted default-branch pushes/manual runs, after Python/web checks pass | Fresh installation and service smoke checks |
 | Proxmox LXC | Explicit manual selection on the trusted default branch | The actual lab host and container lifecycle |

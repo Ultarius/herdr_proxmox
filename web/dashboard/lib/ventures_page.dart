@@ -61,6 +61,20 @@ class _VenturesPageState extends State<VenturesPage>
       )
       .length;
 
+  /// Ideas the newest scout of [organization] proposed that the gateway
+  /// refused. They never become candidates, so they are listed apart.
+  List<Map<String, dynamic>> _refused(Object? organization) {
+    for (final run in bloc.studioFor('$organization')?['runs'] as List? ??
+        const []) {
+      if (run is Map && run['kind'] == 'scout') {
+        return List<Map<String, dynamic>>.from(
+          run['refused_candidates'] as List? ?? const [],
+        );
+      }
+    }
+    return const [];
+  }
+
   String _organizationName(String identity) {
     for (final organization in bloc.organizations) {
       if (organization['id'] == identity) return '${organization['name']}';
@@ -162,7 +176,10 @@ class _VenturesPageState extends State<VenturesPage>
           const SizedBox(height: 16),
           detail(context, selected),
         ],
-        if (bloc.candidates.isNotEmpty) ...[
+        if (bloc.candidates.isNotEmpty ||
+            bloc.organizations.any(
+              (organization) => _refused(organization['id']).isNotEmpty,
+            )) ...[
           const SizedBox(height: 16),
           Card(
             child: Padding(
@@ -176,8 +193,10 @@ class _VenturesPageState extends State<VenturesPage>
                   // decision are listed, decided ones are counted.
                   for (final organization in bloc.organizations)
                     if (bloc.candidates.any(
-                      (item) => item['organization_id'] == organization['id'],
-                    )) ...[
+                          (item) =>
+                              item['organization_id'] == organization['id'],
+                        ) ||
+                        _refused(organization['id']).isNotEmpty) ...[
                       Text(
                         '${organization['name']} · '
                         '${_open(organization['id']).length} waiting, '
@@ -190,6 +209,19 @@ class _VenturesPageState extends State<VenturesPage>
                           contentPadding: EdgeInsets.zero,
                           title: Text('${item['name']} - ${item['state']}'),
                           subtitle: Text('${item['thesis'] ?? ''}'),
+                        ),
+                      for (final item in _refused(organization['id']))
+                        ListTile(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          title: Text(
+                            '${item['name'] ?? 'Unnamed'} - refused by the '
+                            'gateway in the last scout review',
+                          ),
+                          subtitle: Text(
+                            '${item['error'] ?? 'No reason recorded.'}',
+                            style: TextStyle(color: theme.colorScheme.error),
+                          ),
                         ),
                     ],
                 ],

@@ -66,6 +66,40 @@ List<(String, Component)> candidateBar(Map<String, dynamic> item) {
   ];
 }
 
+/// The newest scout run in a studio summary (runs arrive newest first).
+Map<String, dynamic>? latestScoutRun(Map<String, dynamic>? studio) {
+  for (final run in studio?['runs'] as List? ?? const []) {
+    if (run is Map && run['kind'] == 'scout') {
+      return Map<String, dynamic>.from(run);
+    }
+  }
+  return null;
+}
+
+/// Ideas the latest scout proposed that the gateway refused, with why.
+///
+/// A refused idea never becomes a candidate, so without this the queue
+/// would look as if the scout found nothing.
+List<Component> _refusals(Map<String, dynamic>? scout) {
+  final refused = List<Map<String, dynamic>>.from(
+    scout?['refused_candidates'] as List? ?? const [],
+  );
+  if (refused.isEmpty) return const [];
+  final one = refused.length == 1;
+  return [
+    notice(
+      'The last scout review proposed ${refused.length} ${one ? 'idea' : 'ideas'} '
+      'the gateway refused, so ${one ? 'it is' : 'they are'} not in this queue. '
+      'Run the scout again; its prompt states the rules that were broken.',
+      error: true,
+    ),
+    for (final item in refused)
+      paragraph(
+        '${item['name'] ?? 'Unnamed'}: ${item['error'] ?? 'no reason recorded'}',
+      ),
+  ];
+}
+
 /// Reviewed venture candidates produced by the Venture Studio.
 Component venturesIdeas({
   required List<Map<String, dynamic>> candidates,
@@ -74,11 +108,16 @@ Component venturesIdeas({
   required void Function(Map<String, dynamic>) onEdit,
   required void Function(Map<String, dynamic>) onApprove,
   required void Function(Map<String, dynamic>) onReject,
+  Map<String, dynamic>? latestScout,
 }) {
+  final refusals = _refusals(latestScout);
   if (candidates.isEmpty) {
     return card('Ideas', [
+      ...refusals,
       emptyState(
-        'No venture candidates yet for $organizationName. Set up the Venture Studio and run a scout review.',
+        refusals.isEmpty
+            ? 'No venture candidates yet for $organizationName. Set up the Venture Studio and run a scout review.'
+            : 'No venture candidates waiting for $organizationName.',
         iconName: 'lightbulb',
       ),
     ], subtitle: 'Candidates stay proposals until an administrator creates one.');
@@ -92,6 +131,7 @@ Component venturesIdeas({
   return card(
     'Ideas',
     [
+      ...refusals,
       if (open.isEmpty) paragraph('No candidates waiting for a decision.'),
       for (final item in open)
         _candidate(item, organizationName, busy, onEdit, onApprove, onReject),

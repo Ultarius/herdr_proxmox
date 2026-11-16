@@ -87,3 +87,55 @@ class CIPolicyTests(unittest.TestCase):
         report.write_text(json.dumps(dict(id='check', status='waived', duration_ms=0)), encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'status'):
             ci.summarize(report, self.root / 'summary', 'Core')
+
+    def suite(self, name, size, annotation="@TestOn('browser')"):
+        directory = self.root / 'test'
+        directory.mkdir(exist_ok=True)
+        (directory / name).write_text((annotation + '\n' if annotation else '') + 'x' * size, encoding='utf-8')
+
+    def test_browser_shards_cover_every_browser_suite_once_and_balance_by_size(self):
+        sizes = dict(a_dom_test=90_000, b_dom_test=60_000, c_dom_test=50_000, d_dom_test=5_000,
+                     e_dom_test=4_000, f_dom_test=3_000)
+        for name, size in sizes.items():
+            self.suite(name + '.dart', size)
+        self.suite('state_test.dart', 80_000, annotation='')  # A VM suite: the web build runs it.
+        self.suite('helper.dart', 10)                         # Not a suite at all.
+        plan = ci.browser_shards(self.root / 'test', 3)
+        self.assertEqual(sorted(name for shard in plan for name in shard), sorted(name + '.dart' for name in sizes))
+        # The largest suites land on different shards, not together.
+        owners = [next(index for index, shard in enumerate(plan) if name in shard)
+                  for name in ('a_dom_test.dart', 'b_dom_test.dart', 'c_dom_test.dart')]
+        self.assertEqual(len(set(owners)), 3)
+        # The first shard also runs the navigation check, so it gets the lightest share.
+        weight = lambda shard: sum(sizes[name[:-5]] for name in shard)
+        self.assertEqual(min(plan, key=weight), plan[0])
+        self.assertEqual(plan, ci.browser_shards(self.root / 'test', 3))  # Every shard job sees the same plan.
+
+    def test_browser_shards_refuse_a_suite_that_would_run_nowhere(self):
+        self.suite('a_dom_test.dart', 10)
+        self.suite('b_dom_test.dart', 10, annotation="@TestOn('chrome')")
+        with self.assertRaisesRegex(ValueError, 'b_dom_test.dart.*run in no CI job'):
+            ci.browser_shards(self.root / 'test', 1)
+
+    def test_browser_shards_refuse_more_shards_than_suites(self):
+        self.suite('a_dom_test.dart', 10)
+        with self.assertRaisesRegex(ValueError, 'cannot fill 2 shards'):
+            ci.browser_shards(self.root / 'test', 2)
+        with self.assertRaisesRegex(ValueError, 'positive'):
+            ci.browser_shards(self.root / 'test', 0)
+
+    def test_the_workflow_shards_plan_every_real_browser_suite(self):
+        root = Path(__file__).parents[1]
+        workflow = (root / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        shards = json.loads(workflow.split('shard: ', 1)[1].split('\n', 1)[0])
+        tests = root / 'web/jaspr_dashboard/test'
+        plan = ci.browser_shards(tests, len(shards))
+        browser = sorted(path.name for path in tests.glob('*_test.dart')
+                         if '@TestOn(' in path.read_text(encoding='utf-8'))
+        self.assertEqual(sorted(name for shard in plan for name in shard), browser)
+        self.assertIn('ci.py browser-shards', workflow)
+        with patch('builtins.print') as shown:
+            self.assertEqual(ci.main(['browser-shards', '--directory', str(tests), '--index', '0',
+                                      '--total', str(len(shards))]), 0)
+        self.assertEqual(shown.call_args.args[0].splitlines(),
+                         [(tests / name).as_posix() for name in plan[0]])

@@ -1492,6 +1492,42 @@ class VentureTests(unittest.TestCase):
         # Nothing was added by itself.
         self.assertEqual(self.ventures._studio_policy('org')['studio_sources'], [])
 
+    def test_a_web_scout_candidate_keeps_the_schema_and_a_refusal_names_every_problem(self):
+        # The shape a real web-researching scout returned: planning notes in
+        # the configuration, a list of countries, twelve cited pages, and one
+        # kill criterion too many.
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='scout')
+        for rule in ('simulation.burn', 'at most 100', '1-8 assumptions', 'cite 1-12', 'refused whole'):
+            self.assertIn(rule, run['prompt'])
+        research = [dict(id='W' + str(number), url='https://trade.example/page' + str(number),
+                         title='Page ' + str(number), published='', claim='A reported finding.')
+                    for number in range(1, 13)]
+        rich = self.web_candidate('Ledger Lane', evidence=[item['id'] for item in research])
+        rich['configuration']['market'].update(geography=['BE', 'NL', 'DE'], segment='forwarders',
+                                               employee_range='10-200')
+        rich['configuration']['simulation'].update(horizon_months=12, gross_margin_target=0.65)
+        over = self.web_candidate('Dock Ledger', evidence=['W1'])
+        over['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
+        over['kill_criteria'] = ['Criterion ' + str(number) for number in range(9)]
+        over['configuration']['simulation']['burn'] = []
+        over['configuration']['simulation']['monthly_costs'] = [dict(label='hosting', amount=900, currency='USD')]
+        over['evidence'] = ['W99']
+        done = self.complete_studio(run, {'candidates': [rich, over], 'research': research})
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        stored = self.stored_candidates()[0]
+        self.assertEqual((stored['name'], stored['state'], len(stored['evidence'])), ('Ledger Lane', 'proposed', 12))
+        self.assertEqual(stored['configuration']['market']['geography'], 'BE, NL, DE')
+        self.assertNotIn('segment', stored['configuration']['market'])
+        self.assertNotIn('horizon_months', stored['configuration']['simulation'])
+        self.assertEqual(len(stored['evidence_links']), 12)
+        [refused] = done['refused_candidates']
+        self.assertEqual(refused['name'], 'Dock Ledger')
+        for problem in ('configuration: A candidate needs at least one monthly cost',
+                        'kill criteria: 1 to 8 items needed, got 9', 'evidence:'):
+            self.assertIn(problem, refused['error'])
+
     def test_an_unreadable_source_falls_back_to_web_research_and_is_named(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())

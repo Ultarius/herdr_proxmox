@@ -162,13 +162,7 @@ jobs:
         run: bash scripts/build-web.sh
       - name: Analyze all repository package contexts
         run: python3 scripts/check-evidence.py repository-analysis dart analyze
-      - name: Verify native DOM workflows in Chrome
-        working-directory: web/jaspr_dashboard
-        # Focus and requestAnimationFrame checks share one browser viewport.
-        run: python3 ../../scripts/check-evidence.py browser-tests dart test --platform chrome --concurrency=1
-      - name: Verify trusted keyboard navigation and responsive native dialogs
-        working-directory: web/jaspr_dashboard
-        run: python3 ../../scripts/check-evidence.py native-navigation dart run tool/check_native_navigation.dart
+      # Chrome checks run in the web-browser job, in parallel with this build.
       - name: Verify request IDs in compiled JavaScript
         working-directory: web/dashboard
         run: |
@@ -176,7 +170,7 @@ jobs:
           python3 ../../scripts/check-evidence.py request-id-runtime node -e 'globalThis.self=globalThis; globalThis.crypto=require("node:crypto").webcrypto; require(process.argv[1])' "$RUNNER_TEMP/request-id-check.js"
       - name: Summarize measured web check times
         if: always()
-        run: python3 scripts/ci.py summarize --report "$HERDR_CHECK_REPORT" --summary "$GITHUB_STEP_SUMMARY" --label 'Web build and browser checks'
+        run: python3 scripts/ci.py summarize --report "$HERDR_CHECK_REPORT" --summary "$GITHUB_STEP_SUMMARY" --label 'Web build checks'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -191,9 +185,76 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  web-browser:
+    # A separate runtime (Chrome): runs beside the build instead of after it.
+    name: Jaspr browser checks (${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The only place the shard count lives: add a number to add a shard.
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the project's declared Flutter from its official repository
+        shell: bash
+        run: |
+          echo "HERDR_CHECK_REPORT=$RUNNER_TEMP/ci-checks.jsonl" >> "$GITHUB_ENV"
+          version=$(python3 -c 'import json; print(json.load(open(".fvmrc"))["flutter"])')
+          echo "FLUTTER_VERSION=$version" >> "$GITHUB_ENV"
+          git clone --depth 1 --branch "$version" https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+      - name: Cache Dart package downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pub-cache
+          key: dart-linux-${{ runner.arch }}-${{ env.FLUTTER_VERSION }}-${{ hashFiles('web/**/pubspec.lock') }}
+          restore-keys: dart-linux-${{ runner.arch }}-${{ env.FLUTTER_VERSION }}-
+      - name: Fetch Jaspr dependencies
+        working-directory: web/jaspr_dashboard
+        run: python3 ../../scripts/check-evidence.py jaspr-dependencies dart pub get
+      - name: Verify native DOM workflows in Chrome
+        working-directory: web/jaspr_dashboard
+        shell: bash
+        env:
+          SHARD_INDEX: ${{ strategy.job-index }}
+          SHARD_TOTAL: ${{ strategy.job-total }}
+        # Focus and requestAnimationFrame checks share one browser viewport, so
+        # suites run one at a time. That also serializes dart2js, so only the
+        # browser-only suites run here (the rest run on the VM in build-web.sh).
+        # scripts/ci.py splits them by size, so no shard gets all the large
+        # suites, and refuses a suite it would otherwise silently leave out.
+        run: |
+          plan=$(python3 ../../scripts/ci.py browser-shards --directory test --index "$SHARD_INDEX" --total "$SHARD_TOTAL")
+          mapfile -t suites <<<"$plan"
+          printf 'Shard %s of %s runs %d suites:\n' "$((SHARD_INDEX + 1))" "$SHARD_TOTAL" "${#suites[@]}"
+          printf '  %s\n' "${suites[@]}"
+          python3 ../../scripts/check-evidence.py browser-tests dart test --platform chrome --concurrency=1 "${suites[@]}"
+      - name: Verify trusted keyboard navigation and responsive native dialogs
+        # One shard is enough; the planner gives the first shard a lighter
+        # share of suites to make room for it.
+        if: strategy.job-index == 0
+        working-directory: web/jaspr_dashboard
+        run: python3 ../../scripts/check-evidence.py native-navigation dart run tool/check_native_navigation.dart
+      - name: Summarize measured browser check times
+        if: always()
+        env:
+          SHARD_LABEL: Browser checks ${{ matrix.shard }}/${{ strategy.job-total }}
+        run: python3 scripts/ci.py summarize --report "$HERDR_CHECK_REPORT" --summary "$GITHUB_STEP_SUMMARY" --label "$SHARD_LABEL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: web-browser-check-timings-${{ matrix.shard }}
+          path: ${{ env.HERDR_CHECK_REPORT }}
+          if-no-files-found: warn
+          retention-days: 7
+
   release:
     name: Publish installable dashboard release
-    needs: [checks, python-compatibility, web, project-environments]
+    needs: [checks, python-compatibility, web, web-browser, project-environments]
     if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || (startsWith(github.ref, 'refs/heads/alpha/') && startsWith(github.event.head_commit.message, 'alpha:')))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -250,7 +311,7 @@ jobs:
 
   debian-install:
     name: Real Debian provisioning smoke
-    needs: [checks, python-compatibility, web]
+    needs: [checks, python-compatibility, web, web-browser]
     # Execute vendor installers on the trusted default branch, never on PR jobs.
     if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-24.04
@@ -300,7 +361,7 @@ jobs:
 
   proxmox-lxc:
     name: Real Proxmox LXC install and smoke
-    needs: [checks, web, debian-install]
+    needs: [checks, web, web-browser, debian-install]
     if: github.event_name == 'workflow_dispatch' && inputs.run_lxc && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: [self-hosted, linux, x64, proxmox-ci]
     environment: proxmox-ci

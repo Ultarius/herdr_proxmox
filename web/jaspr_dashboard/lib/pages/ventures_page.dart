@@ -168,6 +168,7 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
             onEdit: _editCandidate,
             onApprove: _approveCandidate,
             onReject: _rejectCandidate,
+            latestScout: latestScoutRun(bloc.studioFor(_studioOrganization)),
           )
         else
           venturesStudio(

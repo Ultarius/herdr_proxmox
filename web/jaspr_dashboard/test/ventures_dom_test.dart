@@ -251,6 +251,19 @@ void main() {
             ],
           },
           {
+            // The newest scout: its one idea was refused, so it is no candidate.
+            'id': '44444444444444444444444444444444',
+            'kind': 'scout',
+            'state': 'ready',
+            'candidates': [],
+            'refused_candidates': [
+              {
+                'name': 'LedgerLane',
+                'error': 'kill criteria: 1 to 8 items needed, got 9',
+              },
+            ],
+          },
+          {
             'id': '33333333333333333333333333333333',
             'kind': 'scout',
             'state': 'needs_attention',
@@ -428,6 +441,12 @@ void main() {
     // Another organization's candidate is not listed; a decided one is filed apart.
     expect(page, isNot(contains('Foreign Desk')));
     expect(page, contains('Decided (1)'));
+    // An idea the gateway refused is named with its reason, not silently lost.
+    expect(page, contains('proposed 1 idea the gateway refused'));
+    expect(
+      page,
+      contains('LedgerLane: kill criteria: 1 to 8 items needed, got 9'),
+    );
   });
 
   test(
