@@ -849,6 +849,15 @@ class StudioOperations:
             if int(candidate.get('confidence') or 0) < minimum:
                 reason = ('Confidence ' + str(candidate.get('confidence')) + ' is below the minimum of '
                           + str(minimum) + '.')
+            elif (isinstance(candidate.get('dissent'), dict)
+                  and candidate['dissent'].get('verdict') in ('hold', 'reject')):
+                # Only an idea the Skeptic would advance is created unattended.
+                reason = ('The Skeptic would ' + candidate['dissent']['verdict'] + ' this idea; approve it '
+                          'yourself if you disagree.')
+            elif (candidate.get('economics') if isinstance(candidate.get('economics'), dict) else {}).get(
+                    'warnings'):
+                reason = ('The gateway economics flag a problem: '
+                          + '; '.join(str(item) for item in candidate['economics']['warnings']))
             elif not any(str(item).startswith('N') for item in candidate.get('evidence') or []):
                 # Pages found by web research are what the agents report; the
                 # gateway did not fetch them, so they never create a venture alone.

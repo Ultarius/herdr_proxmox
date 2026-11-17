@@ -56,7 +56,7 @@ def strategy_result(citation='S1'):
     }
 
 
-def candidate(name='Carrier Desk'):
+def candidate(name='Carrier Desk', evidence='V1'):
     return {
         'name': name,
         'thesis': 'Freight forwarders lose margin on invoice exceptions and carrier overcharges.',
@@ -70,10 +70,40 @@ def candidate(name='Carrier Desk'):
                            'icp_sector': 'freight forwarding'},
             'outreach': {'stage': 'survey', 'tone': 'direct', 'language': 'en', 'persona': 'cfo'},
         },
+        'prior_state': {'previous': 'Forwarders reconcile exceptions manually today.',
+                        'change': 'The new filing requires a documented exception trail.',
+                        'evidence': [evidence]},
+        'alternatives': [
+            {'name': 'Manual reconciliation', 'kind': 'in_house', 'price': None, 'evidence': [evidence]},
+            {'name': 'Safexpert', 'kind': 'software',
+             'price': {'amount': 600, 'currency': 'USD'}, 'evidence': [evidence]},
+            {'name': 'Consultancy review', 'kind': 'service',
+             'price': {'amount': 5000, 'currency': 'USD'}, 'evidence': [evidence]},
+        ],
+        'buyer': {'role': 'CFO', 'budget': 'finance operations', 'evidence': [evidence]},
+        'reachable_accounts': {'count': 300, 'segment': 'US mid-market freight forwarders',
+                               'evidence': [evidence]},
+        'business_model': {'type': 'saas',
+                           'revenue_lines': [{'kind': 'recurring', 'label': 'site subscription',
+                                              'amount': 600, 'currency': 'USD', 'period': 'month'}]},
+        'delivery_effort': {'expert_days': 2, 'day_rate': {'amount': 900, 'currency': 'USD'}},
+        'evidence_against': [{'claim': 'Small forwarders may keep a manual review for low volumes.',
+                              'evidence': [evidence]}],
+        'dissent': {'verdict': 'advance', 'summary': 'Worth a paid pilot; the workflow may still be too small.',
+                    'evidence': [evidence]},
+        'confidence_dimensions': {
+            'regulatory_driver': {'rating': 'medium', 'evidence': [evidence]},
+            'paid_demand': {'rating': 'medium', 'evidence': [evidence]},
+            'technical_feasibility': {'rating': 'strong', 'evidence': [evidence]},
+            'differentiation': {'rating': 'medium', 'evidence': [evidence]},
+            'recurring_potential': {'rating': 'strong', 'evidence': [evidence]},
+        },
+        'first_offer': 'Fixed-fee invoice reconciliation pilot',
+        'time_to_first_payment_days': 30,
         'assumptions': ['Carriers will share invoice data.'],
-        'kill_criteria': ['No pilot after 90 days.'],
+        'kill_criteria': ['No paid pilot signed within 90 days.'],
         'confidence': 70,
-        'evidence': ['V1'],
+        'evidence': [evidence],
     }
 @unittest.skipUnless(shutil.which('git'), 'Git required')
 class VentureTests(unittest.TestCase):
@@ -1174,6 +1204,21 @@ class VentureTests(unittest.TestCase):
         self.assertEqual((edited['configuration']['simulation']['daily_ticks'],
                           edited['configuration']['simulation']['survival_threshold']), (False, 40))
 
+    def test_operator_edits_recompute_economics_and_reject_unpaid_kill_criteria(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.scout_with(candidate())
+        stored = self.stored_candidates()[0]
+        configuration = json.loads(json.dumps(stored['configuration']))
+        configuration['simulation']['burn'] = [dict(label='hosting', amount=6000, currency='USD')]
+        edited = self.studio(mode='candidate_update', candidate_id=stored['id'], configuration=configuration)
+        self.assertEqual(edited['economics']['monthly_burn'], 6000)
+        with self.assertRaisesRegex(ValueError, 'must use a paid'):
+            self.studio(mode='candidate_update', candidate_id=stored['id'],
+                        kill_criteria=['No pilot after 90 days.'])
+        self.assertEqual(self.stored_candidates()[0]['kill_criteria'],
+                         ['No paid pilot signed within 90 days.'])
+
     def test_daily_reviews_need_a_team_and_nothing_is_created_without_one(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())
@@ -1457,7 +1502,7 @@ class VentureTests(unittest.TestCase):
         self.assertEqual(self.studio(mode='studio_run', kind='scout', override=True)['state'], 'meeting')
 
     def web_candidate(self, name='Carrier Desk', evidence=('W1',)):
-        proposal = candidate(name)
+        proposal = candidate(name, evidence[0])
         proposal['configuration']['sources']['feeds'] = []
         proposal['evidence'] = list(evidence)
         return proposal
@@ -1691,13 +1736,130 @@ class VentureTests(unittest.TestCase):
             self.ventures.action(dict(mode='dismiss_tick', organization_id='org', venture_id=record['id'],
                                       reason='Nothing left.'), 'admin', 'admin')
 
+    def test_a_scout_candidate_carries_diligence_and_gateway_economics(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        proposal = candidate('Machinery TechFile')
+        proposal.pop('confidence', None)  # Dimensions, not a single opinion, drive the summary.
+        # The review's case: a pilot credited to an annual subscription.
+        proposal['business_model'] = {
+            'type': 'hybrid',
+            'revenue_lines': [
+                dict(kind='one_off', label='technical-file pilot', amount=1900, currency='USD'),
+                dict(kind='recurring', label='annual subscription', amount=5400, currency='USD', period='year'),
+                dict(kind='credit', label='pilot credited to annual contract', amount=1900, currency='USD'),
+            ],
+        }
+        proposal['delivery_effort'] = dict(expert_days=3, day_rate=dict(amount=500, currency='USD'))
+        proposal['reachable_accounts']['count'] = 25
+        proposal['time_to_first_payment_days'] = 45
+        done = self.scout_with(proposal)
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        stored = self.stored_candidates()[0]
+        self.assertEqual((stored['state'], stored['confidence']), ('proposed', 68))
+        self.assertEqual((stored['prior_state']['change'], stored['buyer']['role']),
+                         ('The new filing requires a documented exception trail.', 'CFO'))
+        self.assertEqual(stored['confidence_dimensions']['paid_demand']['rating'], 'medium')
+        economics = stored['economics']
+        # Per month throughout: 5,400 a year is 450 a month, so 3,000 of costs
+        # needs 7 customers, not one per 5,400.
+        self.assertEqual((economics['basis'], economics['recurring_monthly'], economics['break_even_customers'],
+                          economics['break_even_unit'], economics['runway_months']),
+                         ('recurring', 450.0, 7, 'paying customers', 12.0))
+        # The credit lowers the first year, not the pilot: 5,400, not 7,300.
+        self.assertEqual((economics['first_year_revenue'], economics['first_year_contribution'],
+                          economics['project_contribution'], economics['pilot_break_even_days']),
+                         (5400.0, 3900.0, 400.0, 3.8))
+        self.assertEqual((economics['break_even_share'], economics['customers_per_month']), (0.28, 1))
+        self.assertEqual(economics['warnings'], [])
+        self.assertEqual(stored['kill_criteria_notes'], [])
+
+    def test_economics_flag_a_losing_pilot_and_a_service_that_outgrows_its_market(self):
+        configuration = ventures.normalize_config(candidate()['configuration'])
+        hybrid = ventures.scout_business_model(dict(type='hybrid', revenue_lines=[
+            dict(kind='one_off', label='pilot', amount=1900, currency='USD'),
+            dict(kind='recurring', label='annual', amount=5400, currency='USD', period='year')]))
+        slow = ventures.scout_delivery_effort(dict(expert_days=6, day_rate=dict(amount=500, currency='USD')))
+        losing = ventures.candidate_economics(configuration, hybrid, slow, dict(count=400), 30)
+        self.assertIn('The first offer loses money', losing['warnings'][0])
+        self.assertIn('break-even at 3.8 days', losing['warnings'][0])
+        service = ventures.scout_business_model(dict(type='productised_service', revenue_lines=[
+            dict(kind='one_off', label='file build', amount=1000, currency='USD')]))
+        fast = ventures.scout_delivery_effort(dict(expert_days=1, day_rate=dict(amount=500, currency='USD')))
+        outgrown = ventures.candidate_economics(configuration, service, fast, dict(count=30), 30)
+        # 3,000 of costs at 500 contribution: 6 projects a month, about 72 a year.
+        self.assertEqual((outgrown['break_even_customers'], outgrown['break_even_unit'], outgrown['accounts_needed']),
+                         (6, 'projects a month', 72))
+        self.assertIn('only 30 accounts are cited as reachable', outgrown['warnings'][0])
+        # A recurring line without a period, or a credit with nothing to credit, is refused.
+        with self.assertRaisesRegex(ValueError, 'period'):
+            ventures.scout_business_model(dict(type='saas', revenue_lines=[
+                dict(kind='recurring', label='plan', amount=600, currency='USD')]))
+        with self.assertRaisesRegex(ValueError, 'credit'):
+            ventures.scout_business_model(dict(type='productised_service', revenue_lines=[
+                dict(kind='one_off', label='pilot', amount=1900, currency='USD'),
+                dict(kind='credit', label='credited', amount=1900, currency='USD')]))
+
+    def test_kill_criteria_refuse_only_what_can_be_checked(self):
+        economics = dict(runway_months=8.2)
+        real = [  # From a real Machinery scout answer.
+            'Fewer than 8 of 40 interviewed machine builders rank Annex IV technical-file work a top-3 2027 cost.',
+            'Average contract value below EUR 3,000, or customer acquisition cost above 12 months of contract value.',
+            'A notified body releases a free Annex IV template covering the core scope.',
+        ]
+        # Not every item needs money, only one; wording problems are notes.
+        self.assertEqual(ventures.scout_kill_criteria(real, economics), real)
+        notes = ventures.kill_criteria_notes(real)
+        self.assertEqual(len(notes), 2)
+        self.assertTrue(notes[0].startswith('Item 1 rests on a proxy'))
+        with self.assertRaisesRegex(ValueError, 'at least one must use a paid'):
+            ventures.scout_kill_criteria([real[0], real[2]], economics)
+        # Dates in words count as dates, and a date past the runway is refused.
+        late = ventures.now().date() + timedelta(days=200)
+        with self.assertRaisesRegex(ValueError, 'beyond the first gate'):
+            ventures.scout_kill_criteria(['Fewer than 3 paid pilots before ' + late.strftime('%d %b %Y') + '.'],
+                                         economics)
+        with self.assertRaisesRegex(ValueError, 'beyond the first gate'):
+            ventures.scout_kill_criteria(['No signed contract by ' + late.strftime('%B %Y') + '.'], economics)
+        soon = ventures.now().date() + timedelta(days=40)
+        self.assertEqual(len(ventures.scout_kill_criteria(
+            ['Fewer than 3 paid pilots by ' + soon.strftime('%d %B %Y') + '.'], economics)), 1)
+        with self.assertRaisesRegex(ValueError, 'in the past'):
+            ventures.scout_kill_criteria(['No paid pilot by 2020-01-01.'], economics)
+
+    def test_a_missing_diligence_field_or_unpaid_kill_criterion_refuses_the_idea(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        incomplete = candidate('Incomplete')
+        for key in ('prior_state', 'buyer', 'reachable_accounts', 'business_model',
+                    'delivery_effort', 'evidence_against', 'dissent', 'confidence_dimensions'):
+            incomplete.pop(key)
+        incomplete['alternatives'] = [
+            dict(name='A', kind='software', evidence=['V1']),
+            dict(name='B', kind='software', evidence=['V1']),
+            dict(name='C', kind='software', evidence=['V1']),
+        ]
+        incomplete['kill_criteria'] = ['No pilot after 90 days.']
+        done = self.scout_with(incomplete)
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        [refused] = done['refused_candidates']
+        for field in ('prior_state', 'buyer', 'reachable_accounts', 'business_model', 'delivery_effort',
+                      'evidence_against', 'dissent', 'confidence_dimensions', 'kill criteria'):
+            self.assertIn(field, refused['error'])
+
+        dated = candidate('Dated Idea')
+        dated['kill_criteria'] = ['No paid pilot signed by 2030-01-01.']
+        done = self.scout_with(dated)
+        self.assertIn('beyond the first gate', done['refused_candidates'][0]['error'])
+
     def test_a_fractional_confidence_and_a_bad_research_page_do_not_lose_the_ideas(self):
         # The shape a real scout returned: confidence as a fraction, five
         # citations, and one reported page that is not usable.
         self.setup_studio_manual()
         self.add_venture_group(self.create())
         run = self.studio(mode='studio_run', kind='scout')
-        self.assertIn('not a fraction', run['prompt'])
+        self.assertIn('confidence_dimensions', run['prompt'])
+        self.assertIn('do not return one confidence', run['prompt'])
         research = [dict(id='W' + str(number), url='https://eur-lex.example/page-' + str(number),
                          title='Page ' + str(number), published='', claim='Claim ' + str(number) + '. ' + 'x' * 500)
                     for number in range(1, 6)]
@@ -1711,7 +1873,7 @@ class VentureTests(unittest.TestCase):
         done = self.complete_studio(run, {'candidates': [machinery, cites_dropped], 'research': research})
         self.assertEqual(done['state'], 'ready', done.get('error'))
         stored = self.stored_candidates()
-        self.assertEqual([(item['name'], item['confidence']) for item in stored], [('Machinery TechFile', 42)])
+        self.assertEqual([(item['name'], item['confidence']) for item in stored], [('Machinery TechFile', 68)])
         self.assertEqual(len(done['research']), 5)  # The insecure page was left out, not the run.
         self.assertLessEqual(len(done['research'][0]['claim']), 600)
         refused = done['refused_candidates'][0]
@@ -1783,6 +1945,35 @@ class VentureTests(unittest.TestCase):
         stored = self.stored_candidates()[0]
         self.assertEqual(stored['state'], 'proposed')
         self.assertIn('not verified by the gateway', stored['auto']['reason'])
+
+    def test_autonomous_mode_holds_a_rejected_or_economically_unsound_candidate(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.studio(mode='studio_policy', studio_mode='autonomous', studio_auto_min_confidence=0)
+        rejected = candidate('Carrier Desk')
+        rejected.update(evidence=['N1'], confidence=90)
+        rejected['dissent']['verdict'] = 'reject'
+        self.scout_with(rejected)
+        stored = self.stored_candidates()[0]
+        self.assertEqual(stored['state'], 'proposed')
+        self.assertIn('Skeptic would reject', stored['auto']['reason'])
+
+        held = candidate('Clinic Rota')
+        held.update(evidence=['N1'], thesis='Small clinics lose appointment revenue to unfilled cancellations.')
+        held['dissent']['verdict'] = 'hold'
+        self.scout_with(held)
+        stored = {item['name']: item for item in self.stored_candidates()}['Clinic Rota']
+        self.assertEqual(stored['state'], 'proposed')
+        self.assertIn('Skeptic would hold', stored['auto']['reason'])
+
+        unsound = candidate('Dock Ledger')
+        unsound.update(evidence=['N1'], confidence=90,
+                       thesis='Warehouse docks double-book trailers because yard schedules live in spreadsheets.')
+        unsound['reachable_accounts']['count'] = 1
+        self.scout_with(unsound)
+        stored = {item['name']: item for item in self.stored_candidates()}['Dock Ledger']
+        self.assertEqual(stored['state'], 'proposed')
+        self.assertIn('gateway economics flag', stored['auto']['reason'])
 
     def test_evidence_is_written_inside_the_facilitator_worktree(self):
         self.setup_studio_manual()
@@ -1921,10 +2112,14 @@ class VentureTests(unittest.TestCase):
             self.studio(mode='studio_policy', studio_mode='unattended')
         self.studio(mode='studio_policy', studio_mode='autonomous', studio_auto_min_confidence=60)
         strong = candidate('Carrier Desk')
-        strong.update(confidence=80, evidence=['N1'])
+        strong.update(evidence=['N1'])
+        for factor in strong['confidence_dimensions'].values():
+            factor['rating'] = 'strong'
         weak = candidate('Dock Ledger')
-        weak.update(confidence=40, evidence=['N1'],
+        weak.update(evidence=['N1'],
                     thesis='Warehouse docks double-book trailers because yard schedules live in spreadsheets.')
+        for factor in weak['confidence_dimensions'].values():
+            factor['rating'] = 'weak'
         internal = candidate('Clinic Rota')
         internal.update(confidence=95, evidence=['V1'],
                         thesis='Small clinics lose appointment revenue to unfilled last-minute cancellations.')

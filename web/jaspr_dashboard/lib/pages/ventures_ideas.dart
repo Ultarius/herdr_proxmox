@@ -256,6 +256,185 @@ Component venturesIdeas({
   );
 }
 
+String _moneyText(Object? value, Object? currency) {
+  final amount = value is num ? value.toStringAsFixed(0) : '${value ?? 0}';
+  final code = '${currency ?? ''}';
+  return '$amount${code.isEmpty ? '' : ' $code'}';
+}
+
+String _priceText(Map? price) {
+  if (price == null) return 'price not public';
+  return _moneyText(price['amount'], price['currency']);
+}
+
+/// The scout's diligence case and the gateway's unit economics.
+///
+/// The numbers are computed by the gateway and cannot be overridden by the
+/// agents. This is deliberately shown before approval, not only after a
+/// venture exists.
+Component candidateDiligence(Map<String, dynamic> item) {
+  final prior = item['prior_state'] as Map?;
+  final alternatives = List<Map<String, dynamic>>.from(
+    (item['alternatives'] as List? ?? const []).whereType<Map>(),
+  );
+  final buyer = item['buyer'] as Map?;
+  final reachable = item['reachable_accounts'] as Map?;
+  final business = item['business_model'] as Map?;
+  final delivery = item['delivery_effort'] as Map?;
+  final against = List<Map<String, dynamic>>.from(
+    (item['evidence_against'] as List? ?? const []).whereType<Map>(),
+  );
+  final dissent = item['dissent'] as Map?;
+  final dimensions = item['confidence_dimensions'] as Map?;
+  final economics = item['economics'] as Map?;
+  final firstOffer = '${item['first_offer'] ?? ''}';
+  final firstPayment = item['time_to_first_payment_days'];
+  final warnings = (economics?['warnings'] as List? ?? const [])
+      .map((value) => '$value')
+      .where((value) => value.isNotEmpty)
+      .toList();
+  // Wording a reviewer would question; advisory, so shown but not blocking.
+  final notes = (item['kill_criteria_notes'] as List? ?? const [])
+      .map((value) => '$value')
+      .where((value) => value.isNotEmpty)
+      .toList();
+  final rows = <(String, Component)>[
+    if (firstOffer.isNotEmpty) ('First offer', text(firstOffer)),
+    if (prior != null)
+      (
+        'Prior state',
+        text(
+          '${prior['previous'] ?? ''} → ${prior['change'] ?? ''}',
+        ),
+      ),
+    if (buyer != null)
+      ('Buyer', text('${buyer['role'] ?? ''} · ${buyer['budget'] ?? ''}')),
+    if (reachable != null)
+      (
+        'Reachable market',
+        text('${reachable['count'] ?? 0} · ${reachable['segment'] ?? ''}'),
+      ),
+    if (business != null)
+      (
+        'Business model',
+        text(
+          '${business['type'] ?? ''}: '
+          '${(business['revenue_lines'] as List? ?? const []).map((line) => line is Map ? '${line['kind']} ${_moneyText(line['amount'], line['currency'])}' : '$line').join(', ')}',
+        ),
+      ),
+    if (delivery != null)
+      (
+        'Delivery',
+        text(
+          '${delivery['expert_days'] ?? 0} expert days at '
+          '${_priceText(delivery['day_rate'] as Map?)}',
+        ),
+      ),
+    if (economics != null)
+      (
+        'Runway',
+        text(
+          '${economics['runway_months'] ?? '-'} months · burn '
+          '${_moneyText(economics['monthly_burn'], economics['currency'])}/month',
+        ),
+      ),
+    if (economics != null && economics['break_even_customers'] != null)
+      (
+        'Break-even',
+        text(
+          '${economics['break_even_customers']} '
+          '${economics['break_even_unit'] ?? '${economics['basis']} customers'}'
+          '${economics['break_even_share'] == null ? '' : ' · ${((economics['break_even_share'] as num) * 100).round()}% of the cited reachable accounts'}'
+          '${economics['customers_per_month'] == null ? '' : ' · about ${economics['customers_per_month']} new a month to get there before the money runs out'}'
+          ' (a floor: variable costs beyond delivery are not counted)',
+        ),
+      ),
+    if (economics != null)
+      (
+        'Contribution',
+        text(
+          economics['basis'] == 'project'
+              ? '${_moneyText(economics['contribution'], economics['currency'])} per project after delivery'
+              : '${_moneyText(economics['contribution'], economics['currency'])} per customer a month',
+        ),
+      ),
+    if (economics != null && economics['first_year_revenue'] != null && economics['basis'] != 'project')
+      (
+        'First year per customer',
+        text(
+          '${_moneyText(economics['first_year_revenue'], economics['currency'])} revenue, '
+          '${_moneyText(economics['first_year_contribution'], economics['currency'])} after delivery and credits',
+        ),
+      ),
+    if (economics != null && economics['project_contribution'] != null)
+      (
+        'First offer margin',
+        text(
+          '${_moneyText(economics['project_contribution'], economics['currency'])} per pilot'
+          '${economics['pilot_break_even_days'] == null ? '' : ' · loses money above ${economics['pilot_break_even_days']} expert days'}',
+        ),
+      ),
+    if (firstPayment != null)
+      ('First payment', text('$firstPayment days')),
+  ];
+  if (rows.isEmpty &&
+      alternatives.isEmpty &&
+      against.isEmpty &&
+      dissent == null &&
+      dimensions == null &&
+      warnings.isEmpty &&
+      notes.isEmpty) {
+    return el('span', []);
+  }
+  return el('section', [
+    if (rows.isNotEmpty) facts(rows),
+    for (final warning in warnings)
+      notice(warning, error: true),
+    if (notes.isNotEmpty)
+      disclosure('Kill criteria to tighten (${notes.length})', [
+        for (final note in notes) paragraph(note),
+      ]),
+    if (alternatives.isNotEmpty)
+      disclosure(
+        'Alternatives (${alternatives.length})',
+        [
+          for (final alternative in alternatives)
+            paragraph(
+              '${alternative['name'] ?? 'Unnamed'} · '
+              '${alternative['kind'] ?? ''} · '
+              '${_priceText(alternative['price'] as Map?)}',
+            ),
+        ],
+      ),
+    if (against.isNotEmpty)
+      disclosure(
+        'Case against (${against.length})',
+        [
+          for (final entry in against)
+            paragraph(
+              '${entry['claim'] ?? ''}'
+              '${'${entry['reason'] ?? ''}'.isEmpty ? '' : ' — ${entry['reason']}'}',
+            ),
+        ],
+      ),
+    if (dissent != null)
+      paragraph(
+        'Skeptic: ${dissent['verdict'] ?? ''} — ${dissent['summary'] ?? ''}',
+      ),
+    if (dimensions != null)
+      disclosure(
+        'Confidence dimensions',
+        [
+          for (final entry in dimensions.entries)
+            paragraph(
+              '${entry.key.toString().replaceAll('_', ' ')}: '
+              '${entry.value is Map ? (entry.value as Map)['rating'] ?? '' : ''}',
+            ),
+        ],
+      ),
+  ], classes: 'stack');
+}
+
 Component _candidate(
   Map<String, dynamic> item,
   String organizationName,
@@ -339,6 +518,7 @@ Component _candidate(
         ('Excluded by', text('"${item['excluded_by']}"')),
       ...candidateBar(item),
     ]),
+    candidateDiligence(item),
     if (research.isNotEmpty)
       disclosure(
         'Research (${research.length} page${research.length == 1 ? '' : 's'}, agent-reported, not verified)',

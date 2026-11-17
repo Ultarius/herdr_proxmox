@@ -21,6 +21,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -96,6 +97,26 @@ SCOUT_MAX_RUNWAY_MONTHS = 12
 SCOUT_MAX_EVIDENCE = 12
 SCOUT_MAX_POINTS = 8
 SCOUT_POINT_LENGTH = 300
+# A scout proposal has to state the case against itself as well as the case for
+# it. These are the checkable parts of that brief; the gateway derives the
+# economics instead of trusting a summary number.
+SCOUT_ALTERNATIVE_KINDS = ('software', 'service', 'in_house', 'do_nothing', 'other')
+SCOUT_BUSINESS_MODELS = ('saas', 'service', 'productised_service', 'hybrid')
+SCOUT_REVENUE_KINDS = ('one_off', 'recurring', 'credit')
+# A recurring line is a price per period; the economics work per month.
+SCOUT_PERIODS = dict(month=1, year=12)
+# Alternatives that need no page to exist: the buyer's own fallback.
+SCOUT_UNCITED_ALTERNATIVES = ('in_house', 'do_nothing')
+SCOUT_CONFIDENCE = (
+    ('regulatory_driver', 'regulatory driver', 0.15),
+    ('paid_demand', 'paid demand', 0.30),
+    ('technical_feasibility', 'technical feasibility', 0.20),
+    ('differentiation', 'differentiation', 0.20),
+    ('recurring_potential', 'recurring potential', 0.15),
+)
+# Points per rating. Weak counts nothing, so an idea rated weak everywhere
+# summarises to 0, not to a third.
+SCOUT_RATINGS = dict(weak=0, medium=50, strong=100)
 
 
 def now():
@@ -297,6 +318,310 @@ def _confidence(value):
     if type(value) is float and 1 < value <= 100:
         return int(round(value))
     raise ValueError('confidence: a whole number 0-100 is needed')
+
+
+def _scout_money(value, label):
+    if not isinstance(value, dict):
+        raise ValueError(label + ' must be an amount and three-letter currency')
+    amount = _integer(value.get('amount'), 0, 1_000_000_000, label + ' amount')
+    currency = _value(value.get('currency'), 3, label + ' currency', required=True).upper()
+    if not CURRENCY.fullmatch(currency):
+        raise ValueError('Invalid venture field: ' + label + ' currency')
+    return dict(amount=amount, currency=currency)
+
+
+def scout_prior_state(value, cite):
+    if not isinstance(value, dict):
+        raise ValueError('prior_state must state what was required before and what is new')
+    return dict(previous=_value(value.get('previous'), 500, 'prior_state previous', required=True),
+                change=_value(value.get('change'), 500, 'prior_state change', required=True),
+                evidence=cite(value.get('evidence'), 3))
+
+
+def scout_alternatives(value, cite):
+    if not isinstance(value, list) or not 3 <= len(value) <= 6:
+        raise ValueError('alternatives must list 3-6 competing ways to solve the problem')
+    result, kinds = [], set()
+    for index, item in enumerate(value, 1):
+        if not isinstance(item, dict):
+            raise ValueError('alternatives: item ' + str(index) + ' must be an object')
+        kind = _choice(item.get('kind'), SCOUT_ALTERNATIVE_KINDS, 'alternative ' + str(index) + ' kind')
+        # Doing nothing or doing it in-house has no page to cite; a product or
+        # service does.
+        evidence = (cite(item.get('evidence'), 3) if item.get('evidence') or kind not in SCOUT_UNCITED_ALTERNATIVES
+                    else [])
+        entry = dict(name=_value(item.get('name'), 120, 'alternative ' + str(index) + ' name', required=True),
+                     kind=kind, price=None, evidence=evidence)
+        if item.get('price') is not None:
+            entry['price'] = _scout_money(item.get('price'), 'alternative ' + str(index) + ' price')
+        result.append(entry)
+        kinds.add(kind)
+    if not {'software', 'service'} <= kinds or not ({'do_nothing', 'in_house'} & kinds):
+        raise ValueError('alternatives must include software, a service, and doing nothing or in-house work')
+    return result
+
+
+def scout_buyer(value, cite):
+    if not isinstance(value, dict):
+        raise ValueError('buyer must name the signing role and its budget')
+    return dict(role=_value(value.get('role'), 120, 'buyer role', required=True),
+                budget=_value(value.get('budget'), 200, 'buyer budget', required=True),
+                evidence=cite(value.get('evidence'), 3))
+
+
+def scout_reachable_accounts(value, cite):
+    if not isinstance(value, dict):
+        raise ValueError('reachable_accounts must give a count, segment and evidence')
+    return dict(count=_integer(value.get('count'), 1, 1_000_000, 'reachable accounts count'),
+                segment=_value(value.get('segment'), 200, 'reachable accounts segment', required=True),
+                evidence=cite(value.get('evidence'), 3))
+
+
+def scout_business_model(value):
+    if not isinstance(value, dict):
+        raise ValueError('business_model must name its type and revenue lines')
+    model = _choice(value.get('type'), SCOUT_BUSINESS_MODELS, 'business model type')
+    lines = value.get('revenue_lines')
+    if not isinstance(lines, list) or not 1 <= len(lines) <= 4:
+        raise ValueError('business_model.revenue_lines must list 1-4 revenue lines')
+    parsed = []
+    for index, line in enumerate(lines, 1):
+        if not isinstance(line, dict):
+            raise ValueError('business_model.revenue_lines: item ' + str(index) + ' must be an object')
+        kind = _choice(line.get('kind'), SCOUT_REVENUE_KINDS, 'revenue line ' + str(index) + ' kind')
+        parsed.append(dict(kind=kind,
+                           label=_value(line.get('label'), 120, 'revenue line ' + str(index) + ' label',
+                                        required=True),
+                           amount=_integer(line.get('amount'), 0, 1_000_000_000,
+                                           'revenue line ' + str(index) + ' amount'),
+                           currency=_value(line.get('currency'), 3, 'revenue line ' + str(index) + ' currency',
+                                           required=True).upper()))
+        if not CURRENCY.fullmatch(parsed[-1]['currency']):
+            raise ValueError('Invalid venture field: revenue line currency')
+        if kind == 'recurring':
+            # Without a period an annual fee reads as a monthly one, which is
+            # twelve times the revenue.
+            parsed[-1]['period'] = _choice(line.get('period'), tuple(SCOUT_PERIODS),
+                                           'revenue line ' + str(index) + ' period (month or year)')
+    kinds = {line['kind'] for line in parsed}
+    if 'credit' in kinds and 'recurring' not in kinds:
+        raise ValueError('A credit reduces a recurring contract, so it needs a recurring revenue line')
+    if model == 'saas' and 'recurring' not in kinds:
+        raise ValueError('A SaaS business model needs a recurring revenue line')
+    if model in ('service', 'productised_service') and 'one_off' not in kinds:
+        raise ValueError('A service business model needs a one-off revenue line')
+    if model == 'hybrid' and not {'one_off', 'recurring'} <= kinds:
+        raise ValueError('A hybrid business model needs one-off and recurring revenue lines')
+    return dict(type=model, revenue_lines=parsed)
+
+
+def scout_delivery_effort(value):
+    if not isinstance(value, dict):
+        raise ValueError('delivery_effort must give expert days and a day rate')
+    day_rate = _scout_money(value.get('day_rate'), 'delivery day rate')
+    if day_rate['amount'] <= 0:
+        raise ValueError('delivery day rate must be greater than zero')
+    return dict(expert_days=_integer(value.get('expert_days'), 1, 60, 'delivery expert days'),
+                day_rate=day_rate)
+
+
+def scout_evidence_against(value, cite):
+    if not isinstance(value, list) or not 1 <= len(value) <= 5:
+        raise ValueError('evidence_against must list 1-5 reasons that weaken the idea')
+    result = []
+    for index, item in enumerate(value, 1):
+        if not isinstance(item, dict):
+            raise ValueError('evidence_against: item ' + str(index) + ' must be an object')
+        claim = _value(item.get('claim'), 500, 'evidence_against claim', required=True)
+        reason = _value(item.get('reason'), 400, 'evidence_against reason')
+        evidence = cite(item.get('evidence'), 3) if item.get('evidence') else []
+        if not reason and not evidence:
+            raise ValueError('evidence_against: item ' + str(index) + ' needs a citation or a reason')
+        result.append(dict(claim=claim, reason=reason, evidence=evidence))
+    return result
+
+
+def scout_dissent(value, cite):
+    if not isinstance(value, dict):
+        raise ValueError('dissent must state the Skeptic position')
+    return dict(verdict=_choice(value.get('verdict'), ('advance', 'hold', 'reject'), 'dissent verdict'),
+                summary=_value(value.get('summary'), 800, 'dissent summary', required=True),
+                evidence=cite(value.get('evidence'), 3) if value.get('evidence') else [])
+
+
+def scout_confidence(value, cite):
+    if not isinstance(value, dict):
+        raise ValueError('confidence must rate each of the five dimensions')
+    result, total, weight_total = {}, 0.0, 0.0
+    for key, label, weight in SCOUT_CONFIDENCE:
+        item = value.get(key)
+        if not isinstance(item, dict):
+            raise ValueError('confidence.' + key + ' is required')
+        rating = _choice(item.get('rating'), tuple(SCOUT_RATINGS), 'confidence ' + label + ' rating')
+        result[key] = dict(rating=rating, evidence=cite(item.get('evidence'), 3))
+        total += weight * SCOUT_RATINGS[rating]
+        weight_total += weight
+    return result, int(round(total / weight_total))
+
+
+_MONTHS = dict(jan=1, feb=2, mar=3, apr=4, may=5, jun=6, jul=7, aug=8, sep=9, oct=10, nov=11, dec=12)
+_PAID = re.compile(r'\b(paid|pay|pays|signed|sign|signs|contract|contracts|purchase|purchases|order|orders|'
+                   r'revenue|deposit|invoiced|eur|usd|gbp|chf|euros?|dollars?)\b|[€$£]')
+_EFFORT = re.compile(r'\b(hours?|effort|workload|takes?|spend|spent|saves?|reduction)\b')
+_BASELINE = re.compile(r'\b(current|currently|today|baseline|existing|compared|versus|vs|than)\b')
+_PROXY = re.compile(r'\b(guidance|template|templates|rank|ranks|ranking|survey|interest|say|says)\b')
+_EXPLANATION = re.compile(r'\b(because|means|would|lose|loses|cannot|so that|which means|why|leaves?)\b')
+
+
+def _kill_dates(text):
+    """Every date in a criterion: ISO, ``31 Mar 2027``, ``31 March 2027`` or
+    ``March 2027`` (the end of that month). Raises on an impossible date."""
+    from calendar import monthrange
+    found = []
+    for match in re.finditer(r'\b(20\d{2})-(\d{2})-(\d{2})\b', text):
+        found.append(datetime(int(match[1]), int(match[2]), int(match[3])).date())
+    for match in re.finditer(r'\b(?:(\d{1,2})\s+)?([A-Za-z]{3,9})\.?\s+(20\d{2})\b', text):
+        month = _MONTHS.get(match[2][:3].lower())
+        if not month or (len(match[2]) > 3 and not datetime(2000, month, 1).strftime('%B').lower()
+                         .startswith(match[2].lower())):
+            continue
+        year = int(match[3])
+        day = int(match[1]) if match[1] else monthrange(year, month)[1]
+        found.append(datetime(year, month, day).date())
+    return found
+
+
+def scout_kill_criteria(value, economics):
+    """Kill criteria, refused only on what the gateway can check.
+
+    Hard rules: 1-8 short items, at least one of them a paid signal (money, a
+    signed agreement, a paid project), and every date in the future, inside
+    the first 120-day gate and inside the computed runway. Wording rules are
+    heuristics, so they become notes (``kill_criteria_notes``) instead of
+    refusing an otherwise sound idea.
+    """
+    if not isinstance(value, list) or not 1 <= len(value) <= SCOUT_MAX_POINTS:
+        count = len(value) if isinstance(value, list) else 'none'
+        raise ValueError(f'kill criteria: 1 to {SCOUT_MAX_POINTS} items needed, got {count}')
+    if any(not isinstance(item, str) or not item.strip() or len(item.strip()) > SCOUT_POINT_LENGTH
+           for item in value):
+        raise ValueError('kill criteria: each item must be text of at most ' + str(SCOUT_POINT_LENGTH)
+                         + ' characters')
+    today = now().date()
+    limit = today + timedelta(days=120)
+    runway = (economics or {}).get('runway_months')
+    if isinstance(runway, (int, float)) and runway > 0:
+        limit = min(limit, today + timedelta(days=max(1, int(runway * 30))))
+    for index, criterion in enumerate(value, 1):
+        try:
+            dates = _kill_dates(criterion)
+        except ValueError as error:
+            raise ValueError('kill criteria: item ' + str(index) + ' has an invalid date') from error
+        for date in dates:
+            if date < today:
+                raise ValueError('kill criteria: item ' + str(index) + ' names a date in the past')
+            if date > limit:
+                raise ValueError('kill criteria: item ' + str(index) + ' names ' + date.isoformat()
+                                 + ', beyond the first gate or the computed runway (' + limit.isoformat() + ')')
+    if not any(_PAID.search(item.lower()) for item in value):
+        raise ValueError('kill criteria: at least one must use a paid project, signed agreement or money')
+    return _strings(value, SCOUT_POINT_LENGTH, SCOUT_MAX_POINTS, 'kill criteria')
+
+
+def kill_criteria_notes(value):
+    """Wording a reviewer would question, one note per criterion. Advisory."""
+    notes = []
+    for index, criterion in enumerate(value or [], 1):
+        lower = str(criterion).lower()
+        if _EFFORT.search(lower) and not _BASELINE.search(lower):
+            notes.append('Item ' + str(index) + ' measures effort without the customer\'s current baseline.')
+        if _PROXY.search(lower) and not _PAID.search(lower) and not _EXPLANATION.search(lower):
+            notes.append('Item ' + str(index) + ' rests on a proxy (stated interest, guidance or a template) '
+                         'without saying why it would kill the business.')
+    return notes
+
+
+def candidate_economics(configuration, business_model, delivery_effort, reachable_accounts,
+                        time_to_first_payment_days):
+    """Gateway-owned unit economics for one scout proposal.
+
+    Agents provide prices, costs and reach, but not the arithmetic. Everything
+    is per month in the market currency (converted through the configured FX
+    rule; an unsupported currency refuses the proposal rather than producing a
+    misleading margin). The delivery effort is spent once per project, or once
+    per new customer as onboarding. A credit (a pilot credited to the annual
+    contract) reduces the first year's recurring revenue, not the pilot price.
+
+    The basis is ``project`` for service models (break-even counts projects a
+    month) and ``recurring`` otherwise (break-even counts paying customers).
+    Variable costs beyond the stated delivery effort are not modelled, so the
+    break-even is a floor.
+    """
+    market = configuration['market']
+    base = market['currency']
+    def convert(amount, currency):
+        return engine.convert(amount, currency, market)
+    lines = business_model['revenue_lines']
+    one_off = sum(convert(line['amount'], line['currency']) for line in lines if line['kind'] == 'one_off')
+    recurring_monthly = sum(convert(line['amount'], line['currency']) / SCOUT_PERIODS[line.get('period', 'month')]
+                            for line in lines if line['kind'] == 'recurring')
+    credits = sum(convert(line['amount'], line['currency']) for line in lines if line['kind'] == 'credit')
+    day_rate = convert(delivery_effort['day_rate']['amount'], delivery_effort['day_rate']['currency'])
+    delivery_cost = delivery_effort['expert_days'] * day_rate
+    project_contribution = one_off - delivery_cost if one_off > 0 else None
+    first_year_revenue = one_off + 12 * recurring_monthly - credits
+    first_year_contribution = first_year_revenue - delivery_cost
+    model = business_model['type']
+    basis = 'project' if model in ('service', 'productised_service') else 'recurring'
+    price = one_off if basis == 'project' else recurring_monthly
+    contribution = (project_contribution or 0) if basis == 'project' else recurring_monthly
+    monthly_burn = engine.daily_burn(configuration) * 30
+    capital = configuration['simulation']['capital']
+    runway_months = round(capital / monthly_burn, 2) if monthly_burn > 0 else None
+    reachable = reachable_accounts['count']
+    # Projects a month, or paying customers, that cover the monthly costs.
+    break_even = math.ceil(monthly_burn / contribution) if contribution > 0 and monthly_burn > 0 else None
+    # Accounts needed: a service sells one project per account a year at most
+    # as a working assumption; a subscription keeps each customer.
+    accounts_needed = (break_even * 12 if basis == 'project' else break_even) if break_even else None
+    selling_months = (runway_months - time_to_first_payment_days / 30) if runway_months is not None else None
+    per_month = (math.ceil(break_even / selling_months) if break_even and basis == 'recurring'
+                 and selling_months and selling_months > 0 else None)
+    pilot_days = round(one_off / day_rate, 2) if day_rate > 0 and one_off > 0 else None
+    warnings = []
+    if project_contribution is not None and project_contribution <= 0:
+        warnings.append('The first offer loses money: ' + str(delivery_effort['expert_days']) + ' expert days cost '
+                        + str(round(delivery_cost)) + ' ' + base + ' against ' + str(round(one_off)) + ' ' + base
+                        + ' (break-even at ' + str(pilot_days) + ' days).')
+    if basis == 'recurring' and first_year_contribution <= 0:
+        warnings.append('A customer contributes nothing in its first year after delivery cost and credits.')
+    if basis == 'recurring' and credits > 12 * recurring_monthly:
+        warnings.append('The credits exceed a full year of recurring revenue.')
+    if accounts_needed is not None and accounts_needed > reachable:
+        warnings.append('Break-even needs ' + str(break_even)
+                        + (' projects a month (about ' + str(accounts_needed) + ' a year)' if basis == 'project'
+                           else ' paying customers')
+                        + ' but only ' + str(reachable) + ' accounts are cited as reachable.')
+    if contribution <= 0 and basis == 'recurring':
+        warnings.append('There is no recurring revenue to cover the monthly costs.')
+    if runway_months is not None and time_to_first_payment_days > runway_months * 30:
+        warnings.append('The first payment is expected after the money runs out.')
+    return dict(currency=base, monthly_burn=monthly_burn, capital=capital,
+                runway_months=runway_months, delivery_cost=round(delivery_cost, 2),
+                one_off_revenue=round(one_off, 2), credits=round(credits, 2),
+                recurring_monthly=round(recurring_monthly, 2), recurring_revenue=round(recurring_monthly, 2),
+                first_year_revenue=round(first_year_revenue, 2),
+                first_year_contribution=round(first_year_contribution, 2),
+                project_price=round(one_off, 2),
+                project_contribution=(round(project_contribution, 2) if project_contribution is not None else None),
+                project_margin=(round(project_contribution / one_off, 2) if project_contribution is not None else None),
+                basis=basis, price=round(price, 2), contribution=round(contribution, 2),
+                break_even_customers=break_even,
+                break_even_unit='projects a month' if basis == 'project' else 'paying customers',
+                accounts_needed=accounts_needed, reachable_accounts=reachable,
+                break_even_share=(round(accounts_needed / reachable, 3) if accounts_needed is not None else None),
+                customers_per_month=per_month, pilot_break_even_days=pilot_days,
+                time_to_first_payment_days=time_to_first_payment_days, warnings=warnings)
 
 
 def scout_configuration(value):
@@ -1228,14 +1553,45 @@ class Ventures(StudioOperations):
                     '"simulation":{"capital":90000,"burn":[{"label":"hosting","amount":2000,"currency":"EUR"}],'
                     '"architecture":"saas","icp_size":"10-200 employees","icp_sector":"..."},'
                     '"outreach":{"stage":"survey","tone":"direct","language":"en","persona":"cfo"}},'
-                    '"assumptions":["..."],"kill_criteria":["..."],"confidence":40,"evidence":["'
-                    + ('W1' if web else 'L1","N1') + '"]}]'
+                    '"prior_state":{"previous":"...","change":"...","evidence":["W1"]},'
+                    '"alternatives":[{"name":"...","kind":"software|service|in_house|do_nothing",'
+                    '"price":{"amount":0,"currency":"EUR"},"evidence":["W1"]}],'
+                    '"buyer":{"role":"...","budget":"...","evidence":["W1"]},'
+                    '"reachable_accounts":{"count":25,"segment":"...","evidence":["W1"]},'
+                    '"business_model":{"type":"saas|service|productised_service|hybrid",'
+                    '"revenue_lines":[{"kind":"one_off|recurring|credit","label":"...",'
+                    '"amount":0,"currency":"EUR","period":"month|year (recurring only)"}]},'
+                    '"delivery_effort":{"expert_days":2,"day_rate":{"amount":0,"currency":"EUR"}},'
+                    '"evidence_against":[{"claim":"...","evidence":["W1"]}],'
+                    '"dissent":{"verdict":"advance|hold|reject","summary":"..."},'
+                    '"first_offer":"...","time_to_first_payment_days":30,'
+                    '"confidence_dimensions":{"regulatory_driver":{"rating":"medium","evidence":["W1"]},'
+                    '"paid_demand":{"rating":"medium","evidence":["W1"]},'
+                    '"technical_feasibility":{"rating":"strong","evidence":["W1"]},'
+                    '"differentiation":{"rating":"medium","evidence":["W1"]},'
+                    '"recurring_potential":{"rating":"strong","evidence":["W1"]}},'
+                    '"assumptions":["..."],"kill_criteria":["No paid pilot signed within 90 days."],'
+                    '"evidence":["' + ('W1' if web else 'L1","N1') + '"]}]'
                     + (',"research":[{"id":"W1","url":"https://...","title":"...","published":"YYYY-MM-DD or empty",'
                        '"claim":"what this page shows"}],"research_note":"..."' if web else '') +
                     ',"suggested_sources":[{"url":"https://...","title":"...","reason":"..."}]}. '
                     + ('List every page you rely on under research (at most 12, one W id each) and cite those '
                        'ids; a claim without a listed page is rejected. ' if web else '') +
-                    'confidence is a whole number 0-100, not a fraction. '
+                    'Every field above is required. Alternatives: 3-6 ways to solve it, including software, '
+                    'a service, and doing nothing or in-house, each with a price when public, searched for '
+                    'independently with the same scrutiny for every idea. buyer names the '
+                    'signing role and its budget. reachable_accounts cites a count and segment. business_model '
+                    'names its revenue lines; delivery_effort gives expert days and a day rate. evidence_against '
+                    'needs at least one cited page or reason. dissent is the Skeptic verdict. Rate the five '
+                    'confidence dimensions weak, medium or strong and cite each; do not return one confidence '
+                    'number or a fraction. Time to first payment is in days. '
+                    'Prefer the smallest sellable fixed-fee first offer over the eventual product. '
+                    'A recurring line states its period (month or year); a credit reduces the first year of a '
+                    'recurring contract. delivery_effort is spent once per project or new customer. '
+                    'At least one kill criterion must use a paid project, signed agreement or money; effort is '
+                    'measured against the customer\'s current baseline; every date must fall within 120 days '
+                    'and inside the runway; and a proxy such as stated interest, guidance or a template must say '
+                    'why it kills the business. Alternatives that are software or a service need a cited page. '
                     'Under suggested_sources name up to 8 RSS or Atom feed URLs (https) that would supply '
                     'dated items for this focus; the operator decides whether to add them. '
                     'Use only allowed studio source URLs in configuration.sources.feeds. '
@@ -1434,9 +1790,33 @@ class Ventures(StudioOperations):
         pricing = check('pricing', lambda: _value(item.get('pricing'), 500, 'candidate pricing'))
         configured = check('configuration', configuration)
         assumptions = check('assumptions', lambda: points('assumptions', 'assumptions'))
-        kill = check('kill criteria', lambda: points('kill_criteria', 'kill criteria'))
-        confidence = check('confidence', lambda: _confidence(item.get('confidence')))
+        prior = check('prior_state', lambda: scout_prior_state(item.get('prior_state'), cited))
+        alternatives = check('alternatives', lambda: scout_alternatives(item.get('alternatives'), cited))
+        buyer = check('buyer', lambda: scout_buyer(item.get('buyer'), cited))
+        reachable = check('reachable_accounts',
+                          lambda: scout_reachable_accounts(item.get('reachable_accounts'), cited))
+        business = check('business_model', lambda: scout_business_model(item.get('business_model')))
+        delivery = check('delivery_effort', lambda: scout_delivery_effort(item.get('delivery_effort')))
+        against = check('evidence_against', lambda: scout_evidence_against(item.get('evidence_against'), cited))
+        dissent = check('dissent', lambda: scout_dissent(item.get('dissent'), cited))
+        dimensions = check('confidence_dimensions',
+                           lambda: scout_confidence(item.get('confidence_dimensions'), cited))
+        legacy = (check('confidence', lambda: _confidence(item.get('confidence')))
+                  if item.get('confidence') is not None else None)
+        # Dimensions are the opinion; a legacy number is checked for old
+        # clients but cannot override the derived summary.
+        confidence = dimensions[1] if dimensions else legacy
+        first_offer = check('first_offer', lambda: _value(item.get('first_offer'), 500, 'first offer',
+                                                          required=True))
+        first_payment = check('time_to_first_payment_days',
+                              lambda: _integer(item.get('time_to_first_payment_days'), 1, 365,
+                                               'time to first payment'))
         evidence = check('evidence', evidence)
+        economics = None
+        if configured and business and delivery and reachable and first_payment is not None:
+            economics = check('economics', lambda: candidate_economics(
+                configured[0], business, delivery, reachable, first_payment))
+        kill = check('kill criteria', lambda: scout_kill_criteria(item.get('kill_criteria'), economics))
         if problems:
             raise ValueError('; '.join(problems))
         configuration, adjusted = configured
@@ -1446,8 +1826,13 @@ class Ventures(StudioOperations):
                     state='excluded' if (duplicate or excluded_by) else 'proposed', name=name,
                     thesis=thesis, product=product, pricing=pricing, configuration=configuration,
                     scout_adjusted=adjusted, assumptions=assumptions, kill_criteria=kill,
-                    confidence=confidence, evidence=evidence, duplicate_of=duplicate or '',
-                    excluded_by=excluded_by, decision=None,
+                    confidence=confidence, confidence_dimensions=dimensions[0] if dimensions else None,
+                    evidence=evidence, prior_state=prior, alternatives=alternatives, buyer=buyer,
+                    reachable_accounts=reachable, business_model=business, delivery_effort=delivery,
+                    evidence_against=against, dissent=dissent, first_offer=first_offer,
+                    time_to_first_payment_days=first_payment, economics=economics,
+                    kill_criteria_notes=kill_criteria_notes(kill),
+                    duplicate_of=duplicate or '', excluded_by=excluded_by, decision=None,
                     created_at=now().isoformat(), actor=run.get('actor', 'venture_studio'))
 
     def _candidate_duplicate(self, name, thesis, known):
@@ -1768,6 +2153,16 @@ class Ventures(StudioOperations):
             candidate['kill_criteria'] = _strings(body.get('kill_criteria'), 300, 8, 'candidate kill criteria')
         if not candidate.get('assumptions') or not candidate.get('kill_criteria'):
             raise ValueError('Every candidate needs assumptions and kill criteria.')
+        if (candidate.get('business_model') and candidate.get('delivery_effort')
+                and candidate.get('reachable_accounts')
+                and candidate.get('time_to_first_payment_days') is not None):
+            candidate['economics'] = candidate_economics(
+                candidate['configuration'], candidate['business_model'], candidate['delivery_effort'],
+                candidate['reachable_accounts'], candidate['time_to_first_payment_days'])
+        if 'kill_criteria' in body:
+            candidate['kill_criteria'] = scout_kill_criteria(candidate['kill_criteria'],
+                                                             candidate.get('economics'))
+            candidate['kill_criteria_notes'] = kill_criteria_notes(candidate['kill_criteria'])
         candidate.setdefault('revisions', []).append(dict(at=now().isoformat(), by=actor, before=before))
         candidate['revisions'] = candidate['revisions'][-20:]
         return self.save_candidate(candidate)

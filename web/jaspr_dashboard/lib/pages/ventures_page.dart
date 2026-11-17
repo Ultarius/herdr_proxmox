@@ -1478,6 +1478,7 @@ class _CandidateApprovalFormState extends State<_CandidateApprovalForm> {
     ),
     // The rules it will run under, shown before creation rather than only in Edit.
     facts(candidateBar(component.candidate)),
+    candidateDiligence(component.candidate),
     // A web-researched idea names no feeds; without any, every day is quiet.
     if (_noFeeds && component.sources.isNotEmpty)
       switchField(

@@ -156,8 +156,9 @@ from `contributions.poll` after `discovery.advance()`.
    (they stay `draft` until an administrator approves each one). If capital
    reaches zero, set it to `failed`.
 
-Only one tick per venture is in flight. A venture whose previous tick is still
-in a meeting or needs attention does not start another.
+Only one tick per venture is in flight. A tick still in a meeting holds the
+next one back. A tick left needing attention is superseded when the next day's
+tick starts; the same day can be run again after `dismiss_tick` (see below).
 
 ### Scheduling
 
@@ -433,10 +434,10 @@ never starts a meeting that cannot work:
   due window runs on the first pass after the cause clears.
 - A scout needs at least one source and one focus area. A manual scout may
   run without sources only with an explicit override (**Run scout without
-  sources**); a scheduled one never does. The override never skips the focus
-  area: a scout without readable sources researches the web, and without a
-  focus it would not know where to look, so that run is refused and the
-  button is only offered when a focus is set (`can_scout_override`).
+  sources**); a scheduled one never does. When web research would run, the
+  override cannot skip the focus area: the scout would not know where to look,
+  so that run is refused and the button is only offered when a focus is set
+  (`can_scout_override`).
 - Session limits of 0 mean no limit and are shown that way.
 - A venture's own meeting tick has the Herdr check too: it is skipped with a
   review record, and the news items it was offered are offered again.
@@ -461,8 +462,8 @@ is still required. A scout that does have source items may not cite the web.
 A reported page that cannot be used (no `W` id, not https, no title or claim)
 is left out rather than failing the run, so one bad page costs only the ideas
 that cite it, and the refusal names the id. Long titles and claims are
-shortened. Confidence written as a fraction (`0.42`) is read as the same
-opinion on the 0-100 scale.
+shortened. A legacy numeric confidence is still validated for older clients,
+but it cannot override the summary derived from the five dimensions.
 
 A settled scout whose ideas were refused can be read again with
 `studio_recover` (**Read the answer again** on the Ideas tab). The saved answer
@@ -470,6 +471,66 @@ is parsed under the current rules, ideas that now pass become candidates,
 ideas already accepted from that run keep their stored state, and no prompt is
 sent. The Ideas tab also says when the latest scout is still meeting, has
 stopped, or proposed nothing, instead of showing an empty queue.
+
+### Candidate diligence and economics
+
+A scout candidate now carries the case against itself as well as the case for
+it. The gateway refuses a candidate that omits any of these fields:
+
+- `prior_state`: what was required before and what is new, with citations;
+- `alternatives`: 3-6 alternatives, including software, a service and either
+  doing nothing or in-house work, with a public price where available. A
+  software or service alternative needs a cited page; doing nothing or
+  in-house work does not;
+- `buyer`: the role that signs and the budget it comes from;
+- `reachable_accounts`: a cited count and the segment it covers;
+- `business_model`: `saas`, `service`, `productised_service` or `hybrid`, with
+  one-off, recurring and credit revenue lines. A recurring line states its
+  `period` (`month` or `year`); a credit reduces the first year of a recurring
+  contract, so it needs a recurring line;
+- `delivery_effort`: expert days and a day rate;
+- `evidence_against`: at least one cited page or reason that weakens the idea;
+- `dissent`: the Skeptic's structured `advance`, `hold` or `reject` verdict;
+- `confidence_dimensions`: regulatory driver, paid demand, technical
+  feasibility, differentiation and recurring potential, each rated weak,
+  medium or strong and cited;
+- `first_offer` and `time_to_first_payment_days`: the smallest sellable first
+  offer and how long the first payment takes.
+
+The gateway, not the agent, derives the summary confidence from the dimensions
+(weak 0, medium 50, strong 100, weighted) and computes the unit economics, per
+month in the market currency:
+
+- runway: capital over the monthly burn;
+- the first offer's margin: one-off price minus expert days at the day rate,
+  and the day count at which it starts losing money;
+- for a service model, break-even in projects a month (and about twelve times
+  that a year, compared with the cited reachable accounts on the working
+  assumption of one project per account a year);
+- for SaaS and hybrid models, break-even in paying customers at the monthly
+  recurring price (an annual fee counts as a twelfth), the share of the cited
+  reachable accounts that is, and roughly how many new customers a month are
+  needed to get there between the first payment and the end of the runway;
+- first-year revenue and contribution per customer: one-off fees plus twelve
+  months of recurring revenue, minus credits, minus the delivery effort.
+
+Variable costs beyond the stated delivery effort are not modelled, so the
+break-even is a floor. These figures are stored on the candidate, shown on the
+Ideas card and in the approval dialog, and recomputed if the operator edits the
+configuration. Warnings (a losing first offer, a break-even above the reachable
+accounts, a first payment after the money runs out) cannot be overridden by the
+scout. Autonomous mode creates only an idea the Skeptic would `advance` and
+whose economics carry no warning; the operator can still approve the others.
+
+Kill criteria are refused only on what the gateway can check: 1-8 items, at
+least one of them a paid signal (money, a signed agreement or a paid project),
+and every date (ISO, `31 Mar 2027`, `31 March 2027` or `March 2027`) in the
+future, within the first 120-day gate and inside the computed runway. Wording
+problems that are a matter of judgement (effort without the customer's current
+baseline, a proxy such as stated interest, guidance or a template without
+saying why it would kill the business) are stored as `kill_criteria_notes` and
+shown on the card as criteria to tighten, so they do not cost an otherwise
+sound idea. Operator edits are checked the same way.
 
 Because those pages are unverified, **autonomous mode never creates a venture
 from web research alone**; such a candidate waits for the operator.
@@ -753,7 +814,7 @@ formula.
   readiness and the `module` state. While the module is
   switched off it returns only `enabled: false` and `module`.
 - `POST /api/ventures` — one action endpoint with `mode`: `create`,
-  `configure`, `run`, `pause`, `resume`, `recover`, `outreach`, `team`,
+  `configure`, `run`, `pause`, `resume`, `recover`, `dismiss_tick`, `outreach`, `team`,
   `promote`, `restore_promotion`, `archive`. Each runs under a `venture:<id>` operation lock.
   Studio modes run under the organization's `studio:` lock: `studio_setup`,
   `studio_run` (`kind`, optional `override`), `studio_recover`,

@@ -170,6 +170,33 @@ void main() {
         'assumptions': ['Carriers share invoice data.'],
         'kill_criteria': ['No pilot after 90 days.'],
         'evidence': ['V1'],
+        'first_offer': 'Fixed-fee invoice reconciliation pilot',
+        'prior_state': {
+          'previous': 'Manual reconciliation.',
+          'change': 'A documented exception trail is now required.',
+        },
+        'dissent': {
+          'verdict': 'hold',
+          'summary': 'The workflow may not be painful enough to pay for.',
+        },
+        'evidence_against': [
+          {
+            'claim': 'Small forwarders may keep manual review.',
+            'reason': 'Low volumes do not justify a subscription.',
+          },
+        ],
+        'economics': {
+          'currency': 'USD',
+          'runway_months': 8.2,
+          'monthly_burn': 3000,
+          'break_even_customers': 31,
+          'basis': 'recurring',
+          'break_even_share': 1.24,
+          'contribution': 600,
+          'warnings': [
+            'Break-even needs 31 customers but only 25 are reachable.',
+          ],
+        },
         'configuration': {
           'market': {'currency': 'USD'},
           'simulation': {
@@ -459,6 +486,12 @@ void main() {
     // The bar is visible on the card, with what the scout had proposed.
     expect(page, contains('60 (scout proposed 0)'));
     expect(page, contains('Off until you start them'));
+    expect(page, contains('Fixed-fee invoice reconciliation pilot'));
+    expect(page, contains('Runway'));
+    expect(page, contains('8.2 months'));
+    expect(page, contains('Break-even needs 31 customers'));
+    expect(page, contains('Case against (1)'));
+    expect(page, contains('Skeptic: hold'));
     // Another organization's candidate is not listed; a decided one is filed apart.
     expect(page, isNot(contains('Foreign Desk')));
     expect(page, contains('Decided (1)'));
