@@ -179,6 +179,8 @@ Component venturesStudio({
       facts([
         ('Mode', text(_modeLabels[mode] ?? mode)),
         ('Group', text(groupId)),
+        if (_agentSettings(record).isNotEmpty)
+          ('Agents run on', text(_agentSettings(record))),
         ('Notebook', mono('${record['notebook'] ?? ''}')),
         (
           'Portfolio cadence',
@@ -420,6 +422,28 @@ Component venturesStudio({
         ? 'The studio creates ventures within its caps. It never spends, publishes or sends mail.'
         : 'Recommended actions are inert until you click them. The studio never spends, publishes or sends mail.',
   );
+}
+
+/// The CLI and model the studio agents were created with, and how it was chosen.
+String _agentSettings(Map<String, dynamic> record) {
+  final team = record['team'] as Map? ?? const {};
+  final roles = team['settings_by_role'] as Map? ?? const {};
+  final shown = <String>{
+    for (final settings in roles.values)
+      if (settings is Map)
+        '${settings['runtime'] ?? ''} · '
+            '${'${settings['model'] ?? ''}'.isEmpty ? 'CLI default model' : [if ('${settings['provider'] ?? ''}'.isNotEmpty) settings['provider'], settings['model']].join('/')}',
+  };
+  if (shown.isEmpty) return '';
+  const sources = {
+    'detected': 'detected from the account',
+    'automatic': 'first ready CLI',
+    'settings': 'chosen at setup',
+    'agent': 'copied from an agent',
+    'templates': 'copied from agents',
+  };
+  final source = sources['${team['settings_source'] ?? ''}'];
+  return '${shown.join('; ')}${source == null ? '' : ' ($source)'}';
 }
 
 /// The setup checklist: one line per requirement, with the action that fixes it.

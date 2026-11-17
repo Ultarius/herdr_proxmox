@@ -1569,6 +1569,73 @@ class VentureTests(unittest.TestCase):
         self.assertEqual((added['added'], again['added']), (True, False))
         self.assertEqual(self.ventures._studio_policy('org')['studio_sources'], ['https://trade.example/feed.xml'])
 
+    def test_automatic_setup_detects_a_concrete_model_from_the_account(self):
+        # The account catalog the team presets use: OpenCode offers two models.
+        models = [dict(provider='opencode-go', id='glm-5-coder', name='GLM 5 Coder', reasoning=[], tool_call=True,
+                       context=200000),
+                  dict(provider='opencode-go', id='tiny-nano', name='Tiny Nano', reasoning=[], tool_call=True,
+                       context=8000)]
+        self.store.runtime_ready = lambda runtime: None if runtime == 'opencode' else 'not installed'
+        self.store.template_catalog = lambda project: dict(
+            runtimes=dict(opencode=dict(models=models, supports_variants=False)),
+            accounts=[dict(runtime='opencode', available=True)])
+        checked = []
+        self.store.model_validator = checked.append
+        studio = self.studio(mode='studio_setup', confirmed=True)
+        settings = studio['team']['settings_by_role']['scout']
+        # A model that meets the capability floor, not the CLI default and not the tiny one.
+        self.assertEqual((settings['runtime'], settings['provider'], settings['model']),
+                         ('opencode', 'opencode-go', 'glm-5-coder'))
+        self.assertEqual(studio['team']['settings_source'], 'detected')
+        self.assertNotIn('detected', settings)  # Only real agent settings are sent to the store.
+        self.assertEqual((checked[0]['provider'], checked[0]['model']), ('opencode-go', 'glm-5-coder'))
+        hired = [profile for profile in self.profiles if profile.get('role') in ventures.STUDIO_ROLES]
+        self.assertEqual({(profile['provider'], profile['model']) for profile in hired}, {('opencode-go', 'glm-5-coder')})
+
+    def test_automatic_setup_falls_back_to_the_cli_default_when_no_model_is_suitable(self):
+        self.store.runtime_ready = lambda runtime: None if runtime == 'opencode' else 'not installed'
+        self.store.template_catalog = lambda project: dict(
+            runtimes=dict(opencode=dict(models=[dict(provider='x', id='tiny-nano', name='Tiny', reasoning=[],
+                                                     tool_call=True, context=8000)])),
+            accounts=[dict(runtime='opencode', available=True)])
+        studio = self.studio(mode='studio_setup', confirmed=True)
+        settings = studio['team']['settings_by_role']['scout']
+        self.assertEqual((settings['runtime'], settings['model'], studio['team']['settings_source']),
+                         ('opencode', '', 'automatic'))
+
+    def test_a_stuck_tick_no_longer_blocks_the_next_day_and_can_be_dismissed(self):
+        record = self.attach_group(self.create())
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            tick = self.run_tick(record)
+        failed = self.complete(record, {'events': 'not a list'})
+        self.assertEqual(failed['state'], 'needs_attention')
+        # The same day: dismissing closes it so the day can be run again.
+        with self.assertRaisesRegex(ValueError, 'reason'):
+            self.ventures.action(dict(mode='dismiss_tick', organization_id='org', venture_id=record['id']),
+                                 'admin', 'admin')
+        closed = self.ventures.action(dict(mode='dismiss_tick', organization_id='org', venture_id=record['id'],
+                                           reason='Bad answer.'), 'admin', 'admin')
+        self.assertEqual((closed['state'], closed['id']), ('skipped', tick['id']))
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            again = self.run_tick(self.ventures.get(record['id'], 'org'))
+        self.assertNotEqual(again['id'], tick['id'])
+        # A stuck tick from an earlier day is superseded when the next day starts.
+        again.update(state='needs_attention', error='Venture result is not valid JSON.',
+                     simulated_date='2026-01-01')
+        self.ventures.save_tick(again)
+        with closing(self.service.connect()) as db, db:  # That day's review record moves with it.
+            db.execute('DELETE FROM venture_reviews WHERE venture_id=?', (record['id'],))
+        with self.news():
+            later = self.run_tick(self.ventures.get(record['id'], 'org'))
+        self.assertIn(later['state'], ('ready', 'meeting'))
+        with closing(self.service.connect()) as db:
+            old = json.loads(db.execute('SELECT data FROM venture_ticks WHERE id=?', (again['id'],)).fetchone()[0])
+        self.assertEqual(old['state'], 'superseded')
+        self.assertIn('not valid JSON', old['superseded']['reason'])
+        with self.assertRaisesRegex(ValueError, 'no tick needing attention'):
+            self.ventures.action(dict(mode='dismiss_tick', organization_id='org', venture_id=record['id'],
+                                      reason='Nothing left.'), 'admin', 'admin')
+
     def test_approval_can_attach_the_studio_sources_to_an_idea_without_feeds(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())

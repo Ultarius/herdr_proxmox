@@ -129,18 +129,31 @@ class StudioOperations:
         self._herdr_cache = None
         return dict(state=result.get('state', 'unknown'), already_running=result.get('already_running') is True)
 
+    def _account_catalog(self, project):
+        """The platform's account catalog for ``project``: which CLI accounts
+        are usable and which models each offers. The same catalog the team
+        presets use. ``None`` when it is unavailable. Building it runs the
+        CLIs, so one setup reuses it for a short while."""
+        catalog = getattr(self.service.store, 'template_catalog', None)
+        if not callable(catalog) or not project:
+            return None
+        cached = getattr(self, '_catalog_cache', None)
+        if cached and cached[0] == project and time.monotonic() - cached[1] < 30:
+            return cached[2]
+        try:
+            available = catalog(project)
+        except (ValueError, OSError):
+            return None
+        available = available if isinstance(available, dict) else None
+        self._catalog_cache = (project, time.monotonic(), available)
+        return available
+
     def _account_problems(self, project):
         """Why each CLI account cannot be used, from the platform's account
         catalog: not signed in, or (OpenCode) no model returned for the
         configured providers. Empty when the catalog is unavailable."""
-        catalog = getattr(self.service.store, 'template_catalog', None)
-        if not callable(catalog) or not project:
-            return {}
-        try:
-            available = catalog(project)
-        except (ValueError, OSError):
-            return {}
-        accounts = available.get('accounts') if isinstance(available, dict) else None
+        available = self._account_catalog(project)
+        accounts = available.get('accounts') if available else None
         return {item['runtime']: str(item.get('reason') or 'The account is not available.')
                 for item in accounts or [] if isinstance(item, dict) and item.get('runtime')
                 and item.get('available') is not True}
@@ -206,16 +219,39 @@ class StudioOperations:
         return dict(runtime=runtime, **settings, permission_mode=mode, accessible_paths=[])
 
     def _automatic_settings(self, project=''):
-        """The first CLI whose account is usable, on its own default model.
+        """A usable CLI account and a concrete model on it, detected.
 
-        Antigravity is last: its sign-in cannot be verified from outside."""
+        Uses the routine the team presets use: among the models the ready
+        accounts actually offer, pick one that meets the capability floor of
+        an independent reviewer (the studio's work is analysis and critique),
+        free or cheaper first. The pick is then checked like a hand-made
+        choice. When the catalog is unavailable or offers no suitable model,
+        fall back to the first ready CLI on its own default model.
+        Antigravity is last either way: its sign-in cannot be verified."""
         runtimes = self._runtimes(deep=True, project=project)
-        entry = next((item for item in runtimes if item['ready']), None)
-        if not entry:
+        ready = [item['runtime'] for item in runtimes if item['ready']]
+        if not ready:
             reasons = '; '.join(item['name'] + ': ' + item['reason'] for item in runtimes if item['reason'])
             raise ValueError('No agent CLI is ready, so the agents cannot be created. Connect one on the CLI '
                              'accounts page first.' + (' ' + reasons if reasons else ''))
-        return dict(runtime=entry['runtime'], provider='', model='', reasoning='',
+        available = self._account_catalog(project)
+        offered = {runtime: entry for runtime, entry in ((available or {}).get('runtimes') or {}).items()
+                   if runtime in ready and isinstance(entry, dict) and entry.get('models')}
+        if offered:
+            try:
+                import team_templates
+                choice = team_templates.selection(team_templates.BY_ID['reviewer'], 'balanced',
+                                                  dict(runtimes=offered), tuple(ready))
+                settings = dict(runtime=choice['runtime'], provider=choice.get('provider', ''),
+                                model=choice.get('model', ''), reasoning=choice.get('reasoning', ''))
+                validator = getattr(self.service.store, 'model_validator', None)
+                if callable(validator):
+                    validator(dict(settings, project=project))
+                return dict(settings, permission_mode='default', accessible_paths=[],
+                            detected=redact(str(choice.get('selection_note') or ''))[:300])
+            except (ValueError, KeyError):
+                pass  # No suitable or valid model: the CLI's own default is still a working choice.
+        return dict(runtime=ready[0], provider='', model='', reasoning='',
                     permission_mode='default', accessible_paths=[])
 
     def _agent_settings(self, organization, roles, body, hired=(), fallback=None, project=''):
@@ -258,7 +294,10 @@ class StudioOperations:
             elif fallback:
                 base, source = dict(fallback), 'studio'
             else:
-                base, source = self._automatic_settings(project), 'automatic'
+                base = self._automatic_settings(project)
+                # 'detected': a concrete model was picked from the account's own
+                # list; 'automatic': the CLI runs on its default model.
+                source = 'detected' if base.pop('detected', None) is not None else 'automatic'
             for role in missing:
                 chosen[role] = dict(base)
         return chosen, templates, source

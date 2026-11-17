@@ -179,6 +179,14 @@ Missed days are not backfilled. A simulated day is a real day of news, so
 inventing ticks for a day the gateway was down would only replay stale
 headlines.
 
+One bad day does not stop the days after it. A tick left needing attention
+(an answer that does not validate, a meeting that stopped) is closed as
+`superseded` when the next day's tick starts: its day stays unsettled, with no
+costs and no result, it can no longer be recovered, and its review record says
+why. Only a tick that is still meeting holds the next one back. On the same
+day, `dismiss_tick` (with a reason) closes the stuck tick so the day can be run
+again; **Recover artifact** still re-reads the saved answer.
+
 ### Agent roles
 
 The group is read-only and its members keep their own personas; the venture
@@ -370,8 +378,16 @@ session. The same check guards a venture's own team.
    provider and model no longer have to be copied from an existing agent. A
    role uses, in order: the individual agent named for it; the operator's
    explicit CLI, provider and model; the first individual agent of the
-   organization; and otherwise the first CLI that is ready, on its own default
-   model. An explicit choice is checked (CLI ready, account signed in, model
+   organization; and otherwise a detected choice. Detection uses the account
+   catalog and selection routine of the team presets: among the models the
+   ready accounts actually offer, it picks one that meets the capability floor
+   of an independent reviewer, free or cheaper first, and checks it like a
+   hand-made choice (`settings_source` is `detected`). When the catalog is
+   unavailable or offers no suitable model, the first ready CLI runs on its
+   own default model (`automatic`). The setup form uses the agent form's model
+   picker, so provider, model and reasoning are chosen from what the account
+   offers, not typed. The Studio tab shows what the agents run on and how it
+   was chosen. An explicit choice is checked (CLI ready, account signed in, model
    offered) before any agent is hired. With no ready CLI the setup stops with
    each CLI's reason and hires nobody; a later attempt continues from the
    notebook it already created. The same order applies to a venture's own
@@ -881,9 +897,9 @@ Remaining limits:
   without one is not implemented.
 - Automatic CLI selection uses the platform's account catalog: Codex and
   Claude must be signed in and OpenCode's configured providers must return a
-  model. The agents still run on the CLI's default model, which is not checked
-  individually; an explicitly chosen model is. Antigravity's sign-in cannot be
-  verified from outside, so it is chosen last.
+  model. A detected model comes from the account's own list, but listing a
+  model does not prove the account may use it: only a real meeting does.
+  Antigravity's sign-in cannot be verified from outside, so it is chosen last.
 - Repair starts the facilitator only. The other agents start when the next
   meeting needs them, so repair does not spend session starts on them.
 - The Flutter page does not create, configure or approve ventures.

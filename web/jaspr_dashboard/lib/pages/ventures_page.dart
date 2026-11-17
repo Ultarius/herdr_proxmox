@@ -1,8 +1,10 @@
 import 'dart:convert';
 
+import 'package:herdr_dashboard_state/organization_tools_bloc.dart';
 import 'package:herdr_dashboard_state/ventures_bloc.dart';
 
 import '../navigation.dart';
+import 'model_catalog.dart';
 import 'operations_support.dart';
 import 'ops_ui.dart';
 import 'ventures_ideas.dart';
@@ -423,12 +425,18 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
               busy ? null : () => _restorePromotion(venture),
               iconName: 'rotate-ccw',
             ),
-          if (attention)
+          if (attention) ...[
             button(
               'Recover artifact',
               busy ? null : () => _recover(venture),
               variant: 'danger',
             ),
+            // Closes the stuck tick so the day can be run again.
+            button(
+              'Dismiss tick',
+              busy ? null : () => _dismissTick(venture),
+            ),
+          ],
           if ((venture['assumptions'] as List? ?? const []).isNotEmpty)
             button(
               'Record assumption outcome',
@@ -937,6 +945,29 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
     );
   }
 
+  /// Closes the tick needing attention so today's review can be run again.
+  Future<void> _dismissTick(Map<String, dynamic> venture) async {
+    final value = await showDialog<Map<String, dynamic>>(
+      'Dismiss tick',
+      (close) => _RejectCandidateForm(
+        title:
+            'Close the tick that needs attention without settling it: no costs and no result are '
+            'applied, and the day can be run again. The group discussion is kept for inspection.',
+        action: 'Dismiss tick',
+        onCancel: () => close(null),
+        onSave: (body) => close(body),
+        allowExclude: false,
+      ),
+    );
+    if (value == null || !mounted) return;
+    await _submit(
+      'dismiss_tick',
+      {'reason': value['reason']},
+      ventureId: '${venture['id']}',
+      organization: '${venture['organization_id']}',
+    );
+  }
+
   Future<void> _archive(Map<String, dynamic> venture) async {
     if (!await confirm(
       'Archive venture?',
@@ -1059,6 +1090,7 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
             .where((agent) => agent['organization_id'] == organization)
             .toList(),
         runtimes: bloc.runtimes,
+        projectsRoot: '${bloc.data['projects_root'] ?? ''}',
         hasOrganization: organization.isNotEmpty,
         onCancel: () => close(null),
         onSave: (body) => close(body),
@@ -1729,9 +1761,13 @@ class _StudioSetupForm extends StatefulComponent {
     required this.hasOrganization,
     required this.onSave,
     required this.onCancel,
+    this.projectsRoot = '',
   });
   final List<Map<String, dynamic>> agents;
   final List<Map<String, dynamic>> runtimes;
+
+  /// Where the gateway looks up the models an account offers.
+  final String projectsRoot;
   final bool hasOrganization;
   final void Function(Map<String, dynamic>) onSave;
   final void Function() onCancel;
@@ -1745,8 +1781,44 @@ class _StudioSetupFormState extends State<_StudioSetupForm> {
   static const roles = ['portfolio', 'scout', 'critic', 'analyst'];
   String _name = 'Venture Studio';
   String _cli = '';
-  String _provider = '';
-  String _model = '';
+  // The same picker and catalog as the agent form: provider, model and
+  // reasoning are chosen from what the account offers, not typed.
+  final Map<String, dynamic> _settings = {
+    'provider': '',
+    'model': '',
+    'reasoning': '',
+  };
+  late final OrganizationToolsBloc _tools;
+  StreamSubscription? _catalogSubscription;
+  ModelCatalog _catalog = const ModelCatalog({});
+
+  @override
+  void initState() {
+    super.initState();
+    _tools = OrganizationToolsBloc(dashboardConnection);
+    _catalogSubscription = _tools.stream.listen((_) {
+      if (mounted) {
+        setState(() => _catalog = ModelCatalog.fromJson(_tools.catalog));
+      }
+    });
+    unawaited(_loadCatalog());
+  }
+
+  Future<void> _loadCatalog() async {
+    try {
+      await _tools.loadCatalog();
+    } catch (_) {
+      // The picker still offers the CLI default and manual entry.
+    }
+  }
+
+  @override
+  void dispose() {
+    _catalogSubscription?.cancel();
+    _tools.dispose();
+    super.dispose();
+  }
+
   String _sources = '';
   String _focus = '';
   String _scout = 'weekly';
@@ -1777,15 +1849,16 @@ class _StudioSetupFormState extends State<_StudioSetupForm> {
       else if (_cli.isNotEmpty)
         'settings': {
           'runtime': _cli,
-          if (_provider.trim().isNotEmpty) 'provider': _provider.trim(),
-          if (_model.trim().isNotEmpty) 'model': _model.trim(),
+          for (final key in const ['provider', 'model', 'reasoning'])
+            if ('${_settings[key] ?? ''}'.trim().isNotEmpty)
+              key: '${_settings[key]}'.trim(),
         },
       'studio_sources': sources,
       'studio_focus': focus,
       'studio_scout_cadence': _scout,
       'studio_portfolio_cadence': _portfolio,
       'studio_mode': _mode,
-      'first_scout': _first && sources.isNotEmpty && focus.isNotEmpty,
+      'first_scout': _first && focus.isNotEmpty,
     });
   }
 
@@ -1831,20 +1904,29 @@ class _StudioSetupFormState extends State<_StudioSetupForm> {
           'agent:${agent['id']}':
               'Copy from ${agent['name']} (${agent['runtime']}'
               '${'${agent['model'] ?? ''}'.isEmpty ? '' : '/${agent['model']}'})',
-      }, (value) => setState(() => _cli = value)),
-      if (_cli.isNotEmpty && !_cli.startsWith('agent:')) ...[
-        field(
-          'Provider (optional)',
-          _provider,
-          (value) => setState(() => _provider = value),
-        ),
-        field(
-          'Model (optional; empty uses the CLI default)',
-          _model,
-          (value) => setState(() => _model = value),
+      }, (value) => setState(() {
+        _cli = value;
+        for (final key in const ['provider', 'model', 'reasoning']) {
+          _settings[key] = '';
+        }
+      })),
+      if (_cli.isEmpty)
+        paragraph(
+          'Automatic picks a ready CLI and detects a suitable model among those its account offers. '
+          'The choice is shown on the Studio tab afterwards.',
+        )
+      else if (!_cli.startsWith('agent:')) ...[
+        ModelFields(
+          key: ValueKey('studio-model-$_cli'),
+          runtime: _cli,
+          project: component.projectsRoot,
+          catalog: _catalog,
+          values: _settings,
+          onChanged: () => setState(() {}),
         ),
         paragraph(
-          'The account and model are checked before any agent is created.',
+          'Leave it on the CLI default or pick a model the account offers. The account and model are '
+          'checked before any agent is created.',
         ),
       ],
       for (final item in blocked)
@@ -1866,8 +1948,8 @@ class _StudioSetupFormState extends State<_StudioSetupForm> {
             'A sector, a buyer and a region, for example: freight forwarding, mid-market finance teams, Benelux',
       ),
       paragraph(
-        'The scout cites these sources. Without a source and a focus it has no market evidence and will not '
-        'run on schedule.',
+        'A focus area is required. Sources are optional: without a readable source the scout researches '
+        'the web itself and suggests feeds you can add.',
       ),
       select('Scout', _scout, const {
         'weekly': 'Weekly',
@@ -1889,10 +1971,10 @@ class _StudioSetupFormState extends State<_StudioSetupForm> {
           'source and reaches the minimum confidence, and never above the active venture limit. It hires that '
           'venture\'s four agents and starts its daily reviews. It never sends mail, spends or publishes.',
         ),
-      if (_sources.trim().isEmpty || _focus.trim().isEmpty)
+      if (_focus.trim().isEmpty)
         paragraph(
-          'Add a scouting source and a focus area to run the first scout right after setup. '
-          'Without them the studio is created and waits for you to add them.',
+          'Add a focus area to run the first scout right after setup. Without one the studio is created '
+          'and waits for you to add it.',
         )
       else
         switchField(

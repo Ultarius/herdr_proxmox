@@ -1888,6 +1888,8 @@ class Ventures(StudioOperations):
                 return self._state(record, 'running')
             if mode == 'recover':
                 return self.recover(record, body)
+            if mode == 'dismiss_tick':
+                return self.dismiss_tick(record, body, actor)
             if mode == 'archive':
                 return self._state(record, 'archived', body.get('reason'))
             if mode == 'outreach':
@@ -2077,11 +2079,20 @@ class Ventures(StudioOperations):
             if latest.get('state') == 'pending':
                 self.save(record)
                 return self._dispatch(record, latest, actor)
-            if latest.get('state') in ('meeting', 'needs_attention'):
-                self._skip_review(record, date, 'news', 'The previous venture tick needs completion or inspection first.',
-                                  actor)
+            if latest.get('state') == 'needs_attention':
+                # One bad day must not stop every later day. The stuck tick is
+                # closed as superseded: its day stays unsettled (no costs, no
+                # result), it can no longer be recovered, and today runs.
+                reason = redact(str(latest.get('error') or 'It needed attention.'))[:300]
+                latest.update(state='superseded', superseded=dict(
+                    at=now().isoformat(), by=actor, reason=reason))
+                self.save_tick(latest)
+                self._touch_review(latest, 'skipped', error='', reason=(
+                    'Not settled: the review needed attention and the next day started. ' + reason)[:500])
+            elif latest.get('state') == 'meeting':
+                self._skip_review(record, date, 'news', 'The previous venture tick is still meeting.', actor)
                 self.save(record)
-                raise ValueError('The previous venture tick needs completion or inspection first.')
+                raise ValueError('The previous venture tick is still meeting; the next one starts after it.')
         previous = json.loads(previous[0]) if previous else None
         since = (previous or {}).get('simulated_at') or (now() - timedelta(days=1)).isoformat()
         configuration, fx = self._live_configuration(record['configuration'], fetch)
@@ -2848,6 +2859,23 @@ class Ventures(StudioOperations):
         record.pop('promoted_at', None)
         record['promotion_restored_at'] = now().isoformat()
         return self.save(record)
+
+    def dismiss_tick(self, record, body, actor):
+        """Close a tick needing attention so the day can be run again.
+
+        The group discussion is kept for inspection. Nothing is settled: the
+        closed tick charges no costs and applies no result."""
+        reason = _value(body.get('reason'), 300, 'dismissal reason', required=True)
+        with closing(self.service.connect()) as db:
+            row = db.execute("SELECT data FROM venture_ticks WHERE venture_id=? AND json_extract(data, '$.state')="
+                             "'needs_attention' ORDER BY rowid DESC LIMIT 1", (record['id'],)).fetchone()
+        if not row:
+            raise ValueError('This venture has no tick needing attention.')
+        tick = json.loads(row[0])
+        tick.update(state='skipped', dismissed=dict(by=actor, at=now().isoformat(), reason=reason))
+        self.save_tick(tick)
+        self._touch_review(tick, 'skipped', error='', reason=('Dismissed: ' + reason)[:500])
+        return tick
 
     def recover(self, record, body):
         if body.get('inspected') is not True:
