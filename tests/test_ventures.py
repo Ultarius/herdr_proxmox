@@ -2082,6 +2082,28 @@ class VentureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'valid venture candidate'):
             self.studio(mode='candidate_brief', candidate_id='../etc')
 
+    def test_a_field_citing_too_many_real_pages_keeps_three_but_an_unknown_page_refuses(self):
+        # A real scout cited five pages for "why now"; that cost the whole idea.
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='scout')
+        self.assertIn('every other field cites 1-3', run['prompt'])
+        research = [dict(id='W' + str(number), url='https://trade.example/page-' + str(number),
+                         title='Page ' + str(number), published='', claim='Claim ' + str(number) + '.')
+                    for number in range(1, 6)]
+        wordy = self.web_candidate('Storage Desk', evidence=('W1', 'W2', 'W3', 'W4', 'W5'))
+        wordy['prior_state']['evidence'] = ['W3', 'W4', 'W5', 'W1', 'W2']
+        invented = self.web_candidate('Dock Ledger', evidence=('W1',))
+        invented['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
+        invented['prior_state']['evidence'] = ['W1', 'W9']
+        done = self.complete_studio(run, {'candidates': [wordy, invented], 'research': research})
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        self.assertEqual([(item['name'], 'W9' in item['error']) for item in done['refused_candidates']],
+                         [('Dock Ledger', True)])
+        stored = self.stored_candidates()[0]
+        self.assertEqual((stored['name'], stored['prior_state']['evidence']), ('Storage Desk', ['W3', 'W4', 'W5']))
+        self.assertEqual(stored['evidence'], ['W1', 'W2', 'W3', 'W4', 'W5'])
+
     def test_approval_without_attaching_leaves_an_idea_s_feeds_alone(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())

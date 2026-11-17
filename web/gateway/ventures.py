@@ -1767,7 +1767,8 @@ class Ventures(StudioOperations):
                     + '; outreach.persona is ' + '|'.join(engine.PERSONA) + '. '
                     'Give 1-' + str(SCOUT_MAX_POINTS) + ' assumptions and 1-' + str(SCOUT_MAX_POINTS)
                     + ' kill_criteria per candidate, each at most ' + str(SCOUT_POINT_LENGTH) + ' characters, and '
-                    'cite 1-' + str(SCOUT_MAX_EVIDENCE) + ' supplied evidence ids. A candidate breaking any of '
+                    'cite 1-' + str(SCOUT_MAX_EVIDENCE) + ' supplied evidence ids; every other field cites 1-3 '
+                    '(the first three are kept). A candidate breaking any of '
                     'these rules is refused whole. '
                     'The bar, thresholds, reference price and schedule are set by the '
                     'gateway, not by the scout. '
@@ -1804,6 +1805,11 @@ class Ventures(StudioOperations):
             if len(value) > limit:
                 raise ValueError('Venture Studio result cites more than ' + str(limit) + ' evidence ids.')
             return value
+        def scout_cited(value, limit=3):
+            # A scout field citing more supplied pages than it may keep loses
+            # the extras, not the idea: only an unknown id is a fabrication.
+            # The candidate's own evidence list is still bounded by its count.
+            return cited(value, max(limit, SCOUT_MAX_EVIDENCE))[:limit]
         if run['kind'] == 'portfolio':
             recommendations = data.get('recommendations')
             active = set(run.get('active_venture_ids') or [])
@@ -1853,7 +1859,8 @@ class Ventures(StudioOperations):
             # One invalid candidate is refused on its own, with its reason on
             # the run; it does not discard the valid ones or stall the studio.
             try:
-                parsed.append(self._scout_candidate(run, item, cited, allowed_sources, known + parsed, exclusions))
+                parsed.append(self._scout_candidate(run, item, scout_cited, allowed_sources, known + parsed,
+                                                    exclusions))
             except ValueError as error:
                 label = item.get('name') if isinstance(item, dict) and isinstance(item.get('name'), str) else ''
                 refused.append(dict(name=label[:120], error=redact(str(error))[:800]))
