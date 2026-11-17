@@ -458,6 +458,19 @@ pages are stored on the run and on the candidate as `evidence_links` and are
 always labelled agent-reported: the gateway does not fetch them. A focus area
 is still required. A scout that does have source items may not cite the web.
 
+A reported page that cannot be used (no `W` id, not https, no title or claim)
+is left out rather than failing the run, so one bad page costs only the ideas
+that cite it, and the refusal names the id. Long titles and claims are
+shortened. Confidence written as a fraction (`0.42`) is read as the same
+opinion on the 0-100 scale.
+
+A settled scout whose ideas were refused can be read again with
+`studio_recover` (**Read the answer again** on the Ideas tab). The saved answer
+is parsed under the current rules, ideas that now pass become candidates,
+ideas already accepted from that run keep their stored state, and no prompt is
+sent. The Ideas tab also says when the latest scout is still meeting, has
+stopped, or proposed nothing, instead of showing an empty queue.
+
 Because those pages are unverified, **autonomous mode never creates a venture
 from web research alone**; such a candidate waits for the operator.
 

@@ -80,7 +80,11 @@ Map<String, dynamic>? latestScoutRun(Map<String, dynamic>? studio) {
 ///
 /// A refused idea never becomes a candidate, so without this the queue
 /// would look as if the scout found nothing.
-List<Component> _refusals(Map<String, dynamic>? scout) {
+List<Component> _refusals(
+  Map<String, dynamic>? scout, {
+  bool busy = false,
+  void Function(Map<String, dynamic> run)? onReread,
+}) {
   final refused = List<Map<String, dynamic>>.from(
     scout?['refused_candidates'] as List? ?? const [],
   );
@@ -90,14 +94,67 @@ List<Component> _refusals(Map<String, dynamic>? scout) {
     notice(
       'The last scout review proposed ${refused.length} ${one ? 'idea' : 'ideas'} '
       'the gateway refused, so ${one ? 'it is' : 'they are'} not in this queue. '
-      'Run the scout again; its prompt states the rules that were broken.',
+      'If the gateway has since been updated, read the saved answer again; otherwise run the scout '
+      'again, as its prompt states the rules that were broken.',
       error: true,
     ),
     for (final item in refused)
       paragraph(
         '${item['name'] ?? 'Unnamed'}: ${item['error'] ?? 'no reason recorded'}',
       ),
+    if (onReread != null && scout != null)
+      actions([
+        button(
+          'Read the answer again',
+          busy ? null : () => onReread(scout),
+          small: true,
+        ),
+      ]),
   ];
+}
+
+/// What the latest scout is doing, when it has not produced reviewable ideas.
+///
+/// Without this the queue looks empty while a scout is still meeting, has
+/// stopped, or found nothing, and the operator cannot tell which.
+List<Component> _scoutStatus(Map<String, dynamic>? scout) {
+  if (scout == null) return const [];
+  final state = '${scout['state'] ?? ''}';
+  final started = displayTime(scout['created_at']);
+  final note = '${scout['research_note'] ?? ''}';
+  if (state == 'meeting' || state == 'pending') {
+    final waiting = scout['waiting'] is Map
+        ? ' ${(scout['waiting'] as Map)['title'] ?? ''}: ${(scout['waiting'] as Map)['message'] ?? ''}'
+        : '';
+    return [
+      notice(
+        'The latest scout (started $started) is still in its meeting. Its ideas appear here once the '
+        'gateway has read the finished answer.$waiting',
+      ),
+    ];
+  }
+  if (state == 'needs_attention') {
+    final failure = scout['failure'] as Map? ?? const {};
+    return [
+      notice(
+        'The latest scout (started $started) stopped before its ideas could be read: '
+        '${failure['title'] ?? 'it needs attention'}. ${scout['error'] ?? ''} '
+        'Recover or dismiss it on the Studio tab.',
+        error: true,
+      ),
+    ];
+  }
+  if (state == 'ready' &&
+      (scout['candidates'] as List? ?? const []).isEmpty &&
+      (scout['refused_candidates'] as List? ?? const []).isEmpty) {
+    return [
+      notice(
+        'The latest scout (started $started) proposed no ideas.'
+        '${note.isEmpty ? '' : ' Its note: $note'}',
+      ),
+    ];
+  }
+  return const [];
 }
 
 /// One page a web-researching scout relied on: a link to open, where it is
@@ -140,13 +197,17 @@ Component venturesIdeas({
   required void Function(Map<String, dynamic>) onApprove,
   required void Function(Map<String, dynamic>) onReject,
   Map<String, dynamic>? latestScout,
+  void Function(Map<String, dynamic> run)? onReread,
 }) {
-  final refusals = _refusals(latestScout);
+  final refusals = [
+    ..._scoutStatus(latestScout),
+    ..._refusals(latestScout, busy: busy, onReread: onReread),
+  ];
   if (candidates.isEmpty) {
     return card('Ideas', [
       ...refusals,
       emptyState(
-        refusals.isEmpty
+        refusals.isEmpty && latestScout == null
             ? 'No venture candidates yet for $organizationName. Set up the Venture Studio and run a scout review.'
             : 'No venture candidates waiting for $organizationName.',
         iconName: 'lightbulb',

@@ -171,6 +171,11 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
             onApprove: _approveCandidate,
             onReject: _rejectCandidate,
             latestScout: latestScoutRun(bloc.studioFor(_studioOrganization)),
+            // Re-reads the saved answer under the current rules; no new meeting.
+            onReread: (run) => _submit('studio_recover', {
+              'inspected': true,
+              'run_id': '${run['id']}',
+            }, organization: _studioOrganization),
           )
         else
           venturesStudio(

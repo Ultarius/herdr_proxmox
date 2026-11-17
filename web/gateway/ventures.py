@@ -285,6 +285,20 @@ def excluded_term(text, exclusions):
     return ''
 
 
+def _confidence(value):
+    """A scout's confidence as a whole number 0-100.
+
+    Agents also write it as a fraction (0.42), which is the same opinion
+    on another scale; anything else is refused."""
+    if type(value) is int and 0 <= value <= 100:
+        return value
+    if type(value) is float and 0 <= value <= 1:
+        return int(round(value * 100))
+    if type(value) is float and 1 < value <= 100:
+        return int(round(value))
+    raise ValueError('confidence: a whole number 0-100 is needed')
+
+
 def scout_configuration(value):
     """A scout's proposed configuration, with the operator-owned parts reset.
 
@@ -837,6 +851,8 @@ class Ventures(StudioOperations):
         if not row:
             raise ValueError('Studio run not found in this organization.')
         run = json.loads(row[0])
+        if run.get('state') == 'ready' and run.get('kind') == 'scout' and run.get('refused_candidates'):
+            return self._studio_reread(run)
         if run.get('state') != 'needs_attention':
             raise ValueError('Only a studio run needing attention can be recovered.')
         # The same step repair would take for this run, so the button always
@@ -867,6 +883,39 @@ class Ventures(StudioOperations):
                 current.update(error=redact(str(error))[:500])
                 self.save_studio_run(current)
             raise
+
+    def _studio_reread(self, run):
+        """Read a settled scout answer again, for the ideas it refused.
+
+        The saved artifact is parsed under the current rules; an idea that
+        now passes becomes a candidate. Ideas already accepted from this run
+        keep their stored state and are never added twice. No prompt is sent."""
+        job = self._job(run.get('job_id'))
+        if not job or job.get('state') != 'artifact_ready':
+            raise ValueError('The saved scout answer is no longer available; run the scout again.')
+        parsed = self._studio_parse(run, job)
+        kept = run.get('candidates') or []
+        names = {str(item.get('name', '')).lower() for item in kept}
+        fresh = [item for item in parsed['candidates'] if item['name'].lower() not in names]
+        refused = [item for item in parsed['refused_candidates'] if str(item.get('name', '')).lower() not in names]
+        run.update(candidates=kept + fresh, refused_candidates=refused, reread=dict(
+            at=now().isoformat(), added=[item['name'] for item in fresh],
+            still_refused=[item.get('name', '') for item in refused]))
+        with closing(self.service.connect()) as db, db:
+            for candidate in fresh:
+                db.execute('INSERT OR REPLACE INTO venture_candidates VALUES (?,?,?)',
+                           (candidate['id'], candidate['organization_id'], json.dumps(candidate)))
+            db.execute('INSERT OR REPLACE INTO venture_studio_runs VALUES (?,?,?,?)',
+                       (run['id'], run['organization_id'], run['kind'], json.dumps(run)))
+            notify(db, 'job', run['id'], run['organization_id'])
+        try:
+            # Autonomous mode sees only the ideas this re-read added.
+            created = self._studio_autocreate(dict(run, candidates=fresh))
+        except Exception as error:
+            created, run['auto_error'] = [], redact(str(error) or error.__class__.__name__)[:300]
+        if created:
+            run['auto'] = (run.get('auto') or []) + created
+        return self.save_studio_run(run)
 
     def _studio_run_record(self, organization, identity):
         with closing(self.service.connect()) as db:
@@ -1179,13 +1228,14 @@ class Ventures(StudioOperations):
                     '"simulation":{"capital":90000,"burn":[{"label":"hosting","amount":2000,"currency":"EUR"}],'
                     '"architecture":"saas","icp_size":"10-200 employees","icp_sector":"..."},'
                     '"outreach":{"stage":"survey","tone":"direct","language":"en","persona":"cfo"}},'
-                    '"assumptions":["..."],"kill_criteria":["..."],"confidence":0,"evidence":["'
+                    '"assumptions":["..."],"kill_criteria":["..."],"confidence":40,"evidence":["'
                     + ('W1' if web else 'L1","N1') + '"]}]'
                     + (',"research":[{"id":"W1","url":"https://...","title":"...","published":"YYYY-MM-DD or empty",'
                        '"claim":"what this page shows"}],"research_note":"..."' if web else '') +
                     ',"suggested_sources":[{"url":"https://...","title":"...","reason":"..."}]}. '
                     + ('List every page you rely on under research (at most 12, one W id each) and cite those '
                        'ids; a claim without a listed page is rejected. ' if web else '') +
+                    'confidence is a whole number 0-100, not a fraction. '
                     'Under suggested_sources name up to 8 RSS or Atom feed URLs (https) that would supply '
                     'dated items for this focus; the operator decides whether to add them. '
                     'Use only allowed studio source URLs in configuration.sources.feeds. '
@@ -1225,9 +1275,15 @@ class Ventures(StudioOperations):
             raise ValueError('Venture Studio result must be a JSON object.')
         delivered = set(run.get('delivered_evidence_ids') or [])
         def cited(value, limit=3):
-            if not isinstance(value, list) or not 1 <= len(value) <= limit or any(
-                    not isinstance(item, str) or item not in delivered for item in value):
-                raise ValueError('Venture Studio result cites evidence that was not supplied.')
+            if not isinstance(value, list) or not value or any(not isinstance(item, str) for item in value):
+                raise ValueError('Venture Studio result must cite at least one evidence id.')
+            value = list(dict.fromkeys(value))
+            unknown = [item for item in value if item not in delivered]
+            if unknown:
+                raise ValueError('Venture Studio result cites evidence that was not supplied: '
+                                 + ', '.join(unknown[:5]) + '.')
+            if len(value) > limit:
+                raise ValueError('Venture Studio result cites more than ' + str(limit) + ' evidence ids.')
             return value
         if run['kind'] == 'portfolio':
             recommendations = data.get('recommendations')
@@ -1299,20 +1355,26 @@ class Ventures(StudioOperations):
         Each needs a ``W`` id and an https URL. They are what the agents
         report; the gateway does not fetch them, so they are stored and
         shown as unverified."""
-        if value in (None, []):
-            return {}
-        if not isinstance(value, list) or len(value) > 12 or any(not isinstance(item, dict) for item in value):
-            raise ValueError('Scout research must list at most twelve pages.')
+        # A page that cannot be used (no W id, not https, no title or claim)
+        # is left out instead of failing the run: an idea citing it is then
+        # refused on its own. Long text is shortened.
         result = {}
-        for item in value:
+        for item in value if isinstance(value, list) else []:
+            if not isinstance(item, dict) or len(result) >= SCOUT_MAX_EVIDENCE:
+                continue
             identity = item.get('id')
             if not isinstance(identity, str) or not re.fullmatch(r'W[1-9][0-9]?', identity) or identity in result:
-                raise ValueError('Scout research ids must be W1, W2 ... and unique.')
-            result[identity] = dict(
-                id=identity, url=venture_feeds.validate_url(item.get('url'), resolve=None),
-                title=redact(_value(item.get('title'), 200, 'research title', required=True)),
-                published=_value(item.get('published'), 40, 'research date'),
-                claim=redact(_value(item.get('claim'), 400, 'research claim', required=True)))
+                continue
+            try:
+                url = venture_feeds.validate_url(item.get('url'), resolve=None)
+            except ValueError:
+                continue
+            title, claim = item.get('title'), item.get('claim')
+            if not isinstance(title, str) or not title.strip() or not isinstance(claim, str) or not claim.strip():
+                continue
+            published = item.get('published') if isinstance(item.get('published'), str) else ''
+            result[identity] = dict(id=identity, url=url, title=redact(title.strip())[:200],
+                                    published=published.strip()[:40], claim=redact(claim.strip())[:600])
         return result
 
     @staticmethod
@@ -1373,7 +1435,7 @@ class Ventures(StudioOperations):
         configured = check('configuration', configuration)
         assumptions = check('assumptions', lambda: points('assumptions', 'assumptions'))
         kill = check('kill criteria', lambda: points('kill_criteria', 'kill criteria'))
-        confidence = check('confidence', lambda: _integer(item.get('confidence'), 0, 100, 'candidate confidence'))
+        confidence = check('confidence', lambda: _confidence(item.get('confidence')))
         evidence = check('evidence', evidence)
         if problems:
             raise ValueError('; '.join(problems))
@@ -1640,7 +1702,7 @@ class Ventures(StudioOperations):
                     ('id', 'kind', 'state', 'summary', 'recommendations', 'error', 'reason',
                      'created_at', 'processed_at', 'job_id', 'dispatch_failed', 'dismissed',
                      'refused_candidates', 'failure', 'waiting', 'auto', 'auto_error', 'manual',
-                     'web_research', 'research', 'research_note', 'suggested_sources')}
+                     'web_research', 'research', 'research_note', 'suggested_sources', 'reread')}
             item['candidates'] = [{key: candidate.get(key) for key in ('id', 'name', 'state', 'confidence')}
                                   for candidate in run.get('candidates') or []]
             if run.get('state') == 'needs_attention':

@@ -1691,6 +1691,60 @@ class VentureTests(unittest.TestCase):
             self.ventures.action(dict(mode='dismiss_tick', organization_id='org', venture_id=record['id'],
                                       reason='Nothing left.'), 'admin', 'admin')
 
+    def test_a_fractional_confidence_and_a_bad_research_page_do_not_lose_the_ideas(self):
+        # The shape a real scout returned: confidence as a fraction, five
+        # citations, and one reported page that is not usable.
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='scout')
+        self.assertIn('not a fraction', run['prompt'])
+        research = [dict(id='W' + str(number), url='https://eur-lex.example/page-' + str(number),
+                         title='Page ' + str(number), published='', claim='Claim ' + str(number) + '. ' + 'x' * 500)
+                    for number in range(1, 6)]
+        research.append(dict(id='W6', url='http://insecure.example/page', title='Dropped', claim='Not https.'))
+        machinery = self.web_candidate('Machinery TechFile', evidence=['W1', 'W2', 'W3', 'W4', 'W5'])
+        machinery['confidence'] = 0.42
+        machinery['thesis'] = 'Machine builders must keep an Annex IV technical file for every model for ten years.'
+        cites_dropped = self.web_candidate('CRA Evidence File', evidence=['W6'])
+        cites_dropped['confidence'] = 0.31
+        cites_dropped['thesis'] = 'Connected-product makers need a maintained Annex VII documentation file.'
+        done = self.complete_studio(run, {'candidates': [machinery, cites_dropped], 'research': research})
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        stored = self.stored_candidates()
+        self.assertEqual([(item['name'], item['confidence']) for item in stored], [('Machinery TechFile', 42)])
+        self.assertEqual(len(done['research']), 5)  # The insecure page was left out, not the run.
+        self.assertLessEqual(len(done['research'][0]['claim']), 600)
+        refused = done['refused_candidates'][0]
+        self.assertEqual(refused['name'], 'CRA Evidence File')
+        self.assertIn('W6', refused['error'])  # Names the id that was not usable.
+
+    def test_a_settled_scout_answer_can_be_read_again_without_a_new_meeting(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='scout')
+        broken = self.web_candidate('Machinery TechFile')
+        broken['confidence'] = 'high'
+        kept = self.web_candidate('Dock Ledger')
+        kept['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
+        done = self.complete_studio(run, {'candidates': [kept, broken], 'research': self.RESEARCH})
+        self.assertEqual([item['name'] for item in done['refused_candidates']], ['Machinery TechFile'])
+        dock = self.stored_candidates()[0]
+        self.studio(mode='candidate_decide', candidate_id=dock['id'], decision='reject', reason='Not now.')
+        # The rules change (simulated here by a readable saved answer); read it again.
+        broken['confidence'] = 42
+        job = next(item for item in self.jobs if item['id'] == run['job_id'])
+        job['result'] = '```json\n' + json.dumps({'candidates': [kept, broken], 'research': self.RESEARCH}) + '\n```'
+        jobs_before = len(self.jobs)
+        again = self.studio(mode='studio_recover', run_id=run['id'], inspected=True)
+        self.assertEqual((again['state'], again['reread']['added'], again['refused_candidates']),
+                         ('ready', ['Machinery TechFile'], []))
+        self.assertEqual(len(self.jobs), jobs_before)  # No new meeting.
+        states = {item['name']: item['state'] for item in self.stored_candidates()}
+        # The rejected one keeps its decision; the re-read one is new.
+        self.assertEqual(states, {'Dock Ledger': 'rejected', 'Machinery TechFile': 'proposed'})
+        with self.assertRaisesRegex(ValueError, 'Only a studio run needing attention'):
+            self.studio(mode='studio_recover', run_id=run['id'], inspected=True)
+
     def test_approval_can_attach_the_studio_sources_to_an_idea_without_feeds(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())
