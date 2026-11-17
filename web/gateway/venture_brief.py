@@ -86,7 +86,10 @@ footer { margin-top: 14px; padding-top: 6px; border-top: 1px solid #d4d7de; font
 
 _MODELS = dict(saas='SaaS subscription', service='Service', productised_service='Productised service',
                hybrid='Hybrid: one-off plus subscription')
-_KINDS = dict(one_off='One-off', recurring='Recurring', credit='Credit')
+_KINDS = dict(one_off='One-off', recurring='Recurring', per_unit='Per unit', take_rate='Share of volume',
+              credit='Credit')
+_DRIVERS = dict(regulation='Regulation', technology='A technology shift', infrastructure='New infrastructure',
+                incumbent='A weakening incumbent', behaviour='Changed behaviour', other='Other')
 _ALTERNATIVES = dict(software='Software', service='Service', in_house='In-house', do_nothing='Do nothing',
                      other='Other')
 
@@ -129,13 +132,21 @@ def _cited(candidate):
             if isinstance(item, str) and item not in seen:
                 seen.append(item)
     add(candidate.get('evidence'))
-    for key in ('prior_state', 'buyer', 'reachable_accounts', 'dissent'):
+    for key in ('prior_state', 'buyer', 'reachable_accounts', 'dissent', 'analogue', 'market_ceiling'):
         if isinstance(candidate.get(key), dict):
             add(candidate[key].get('evidence'))
     for key in ('alternatives', 'evidence_against'):
         for item in candidate.get(key) or []:
             if isinstance(item, dict):
                 add(item.get('evidence'))
+    business = candidate.get('business_model')
+    for line in (business.get('revenue_lines') or []) if isinstance(business, dict) else []:
+        if isinstance(line, dict):
+            add(line.get('evidence'))
+    incumbent = candidate.get('incumbent')
+    for item in (incumbent.get('complaints') or []) if isinstance(incumbent, dict) else []:
+        if isinstance(item, dict):
+            add(item.get('evidence'))
     dimensions = candidate.get('confidence_dimensions')
     if isinstance(dimensions, dict):
         for item in dimensions.values():
@@ -201,11 +212,8 @@ def _economics(candidate):
         for line in business.get('revenue_lines') or []:
             if not isinstance(line, dict):
                 continue
-            period = {'month': ' a month', 'year': ' a year'}.get(line.get('period'), '')
             rows.append('<tr><td>' + _e(_KINDS.get(line.get('kind'), line.get('kind'))) + '</td><td>'
-                        + _e(line.get('label')) + '</td><td class="num">'
-                        + ('&minus; ' if line.get('kind') == 'credit' else '')
-                        + _money(line.get('amount'), line.get('currency')) + _e(period) + '</td></tr>')
+                        + _e(line.get('label')) + '</td><td class="num">' + _line_price(line) + '</td></tr>')
         out.append('<p><b>' + _e(_MODELS.get(business.get('type'), business.get('type'))) + '</b></p>')
         if rows:
             out.append('<table><thead><tr><th>Revenue line</th><th>What</th><th class="num">Price</th></tr>'
@@ -236,6 +244,14 @@ def _economics(candidate):
         days = economics.get('pilot_break_even_days')
         rows.append(('First offer margin', _money(economics.get('project_contribution'), currency) + ' per pilot'
                      + (' · loses money above ' + _e(days) + ' expert days' if days is not None else '')))
+    mix = economics.get('revenue_mix') if isinstance(economics.get('revenue_mix'), dict) else {}
+    if mix.get('per_unit') or mix.get('take_rate'):
+        # Revenue that grows with the customer is what makes the idea scale.
+        parts = [(_money(mix.get(kind), currency) + ' ' + label) for kind, label in
+                 (('recurring', 'subscription'), ('per_unit', 'per unit'), ('take_rate', 'share of volume'))
+                 if mix.get(kind)]
+        rows.append(('Repeating revenue', _money(economics.get('recurring_monthly'), currency)
+                     + ' per customer a month: ' + ', '.join(parts)))
     burn = economics.get('monthly_burn')
     configuration = candidate.get('configuration') if isinstance(candidate.get('configuration'), dict) else {}
     simulation = configuration.get('simulation') if isinstance(configuration.get('simulation'), dict) else {}
@@ -270,6 +286,66 @@ def _economics(candidate):
     out.extend('<div class="warn">' + _e(warning) + '</div>' for warning in economics.get('warnings') or [])
     out.append('<p class="muted">Break-even is a floor: costs beyond the stated delivery effort are not counted.</p>')
     return ''.join(out)
+
+
+def _line_price(line):
+    """One revenue line's price as a person would say it."""
+    kind = line.get('kind')
+    period = {'month': ' a month', 'year': ' a year'}.get(line.get('period'), '')
+    if kind == 'take_rate':
+        percent, cost = line.get('percent'), line.get('cost_percent')
+        text = (_e(format(percent, 'g') if isinstance(percent, (int, float)) else percent) + '% of '
+                + _money(line.get('volume'), line.get('currency')) + ' a month')
+        if isinstance(cost, (int, float)) and cost > 0:
+            text += ' (' + _e(format(cost, 'g')) + '% passed on)'
+        return text + _cite(line.get('evidence'))
+    if kind == 'per_unit':
+        return (_money(line.get('amount'), line.get('currency')) + ' per ' + _e(line.get('unit') or 'unit')
+                + _e(period) + ' &times; ' + _e(line.get('units')))
+    return ('&minus; ' if kind == 'credit' else '') + _money(line.get('amount'), line.get('currency')) + _e(period)
+
+
+def _origin(candidate):
+    """Where the idea comes from: a proven model elsewhere, a weak incumbent."""
+    analogue = candidate.get('analogue') if isinstance(candidate.get('analogue'), dict) else None
+    incumbent = candidate.get('incumbent') if isinstance(candidate.get('incumbent'), dict) else None
+    out = []
+    if analogue:
+        out.append(_rows([('Proven elsewhere', _e(analogue.get('company')) + ' in ' + _e(analogue.get('vertical'))
+                           + _cite(analogue.get('evidence'))),
+                          ('Why it transfers', _e(analogue.get('transfer')))]))
+    if incumbent:
+        complaints = [item for item in incumbent.get('complaints') or [] if isinstance(item, dict)]
+        out.append('<p><b>What customers of ' + _e(incumbent.get('name')) + ' complain about</b></p>'
+                   + ('<ul>' + ''.join('<li>' + _e(item.get('claim')) + _cite(item.get('evidence')) + '</li>'
+                                       for item in complaints) + '</ul>' if complaints else ''))
+    return ''.join(out)
+
+
+def _upside(candidate):
+    """The market ceiling and later modules: reported, never in break-even."""
+    economics = candidate.get('economics') if isinstance(candidate.get('economics'), dict) else {}
+    currency = economics.get('currency')
+    ceiling = candidate.get('market_ceiling') if isinstance(candidate.get('market_ceiling'), dict) else None
+    expansion = [item for item in candidate.get('expansion') or [] if isinstance(item, dict)]
+    rows = []
+    if ceiling:
+        count = ceiling.get('count')
+        rows.append(('Market ceiling', _e(format(count, ',') if isinstance(count, int) else count) + ' accounts · '
+                     + _e(ceiling.get('segment')) + _cite(ceiling.get('evidence'))))
+        if economics.get('ceiling_annual_revenue') is not None:
+            rows.append(('At these prices', _money(economics['ceiling_annual_revenue'], currency)
+                         + ' a year if every one of them bought'
+                         + (' · ' + _money(economics['ceiling_annual_revenue_with_expansion'], currency)
+                            + ' with expansion' if economics.get('ceiling_annual_revenue_with_expansion') else '')))
+    for item in expansion:
+        period = {'month': ' a month', 'year': ' a year'}.get(item.get('period'), '')
+        rows.append(('Later module', _e(item.get('name')) + ' · ' + _money(item.get('amount'), item.get('currency'))
+                     + _e(period) + ' · ' + _e(item.get('attach_percent')) + '% of customers expected'))
+    if economics.get('expansion_monthly'):
+        rows.append(('Expansion per customer', _money(economics['expansion_monthly'], currency)
+                     + ' a month on average'))
+    return _rows(rows)
 
 
 def _stats(candidate):
@@ -338,7 +414,11 @@ def render(candidate, organization_name='', run=None, prepared=None, dimensions=
         body.append('<h2>Why now</h2>' + _rows([
             ('Before', _e(prior.get('previous'))),
             ('What changed', _e(prior.get('change')) + _cite(prior.get('evidence'))),
+            ('Driver', _e(_DRIVERS.get(prior.get('driver'), prior.get('driver')))),
         ]))
+    origin = _origin(candidate)
+    if origin:
+        body.append('<h2>Where the idea comes from</h2>' + origin)
 
     geography = market.get('geography')
     body.append('<h2>Who buys</h2>' + _rows([
@@ -355,6 +435,9 @@ def render(candidate, organization_name='', run=None, prepared=None, dimensions=
     economics = _economics(candidate)
     if economics:
         body.append('<h2>Business model and unit economics</h2>' + economics)
+    upside = _upside(candidate)
+    if upside:
+        body.append('<h2>Upside, not counted in break-even</h2>' + upside)
 
     alternatives = [item for item in candidate.get('alternatives') or [] if isinstance(item, dict)]
     if alternatives:
@@ -380,13 +463,17 @@ def render(candidate, organization_name='', run=None, prepared=None, dimensions=
 
     ratings = candidate.get('confidence_dimensions')
     if isinstance(ratings, dict) and ratings:
-        labels = [(key, label, weight) for key, label, weight in dimensions if key in ratings] or [
-            (key, key.replace('_', ' '), None) for key in ratings]
+        known = {key for key, _, _ in dimensions}
+        # Older records may carry a dimension under a former name; list it too.
+        labels = [(key, label, weight) for key, label, weight in dimensions if key in ratings] + [
+            (key, str(key).replace('_', ' '), None) for key in ratings if key not in known]
         body.append('<h2>Confidence</h2><table><thead><tr><th>Dimension</th><th>Weight</th><th>Rating</th></tr>'
                     '</thead><tbody>'
                     + ''.join('<tr><td>' + _e(label[:1].upper() + label[1:]) + '</td><td>'
                               + (_e(round(weight * 100)) + '%' if weight is not None else '-') + '</td><td>'
                               + _e((ratings[key] or {}).get('rating') if isinstance(ratings[key], dict) else '')
+                              + (' <span class="muted">(not rated)</span>'
+                                 if isinstance(ratings[key], dict) and ratings[key].get('unrated') else '')
                               + _cite((ratings[key] or {}).get('evidence') if isinstance(ratings[key], dict) else [])
                               + '</td></tr>' for key, label, weight in labels)
                     + '</tbody></table>')

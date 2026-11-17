@@ -174,7 +174,28 @@ void main() {
         'prior_state': {
           'previous': 'Manual reconciliation.',
           'change': 'A documented exception trail is now required.',
+          'driver': 'regulation',
         },
+        'analogue': {
+          'company': 'Example Hotel Platform',
+          'vertical': 'hotels',
+          'transfer': 'A system of record with payments built in.',
+        },
+        'business_model': {
+          'type': 'saas',
+          'revenue_lines': [
+            {
+              'kind': 'per_unit',
+              'label': 'sites',
+              'amount': 200,
+              'currency': 'USD',
+              'period': 'month',
+              'unit': 'site',
+              'units': 3,
+            },
+          ],
+        },
+        'market_ceiling': {'count': 4000, 'segment': 'US forwarders'},
         'dissent': {
           'verdict': 'hold',
           'summary': 'The workflow may not be painful enough to pay for.',
@@ -193,6 +214,9 @@ void main() {
           'basis': 'recurring',
           'break_even_share': 1.24,
           'contribution': 600,
+          'recurring_monthly': 600,
+          'revenue_mix': {'recurring': 0, 'per_unit': 600, 'take_rate': 0},
+          'ceiling_annual_revenue': 28800000,
           'warnings': [
             'Break-even needs 31 customers but only 25 are reachable.',
           ],
@@ -494,6 +518,13 @@ void main() {
     expect(page, contains('Skeptic: hold'));
     // Each idea can be exported as a printable brief.
     expect(page, contains('Export brief'));
+    // Where the idea comes from, revenue that grows with the customer, and
+    // the upside kept apart from break-even.
+    expect(page, contains('(driven by regulation)'));
+    expect(page, contains('Example Hotel Platform in hotels'));
+    expect(page, contains('sites: 200 USD per site a month × 3'));
+    expect(page, contains('600 USD per unit'));
+    expect(page, contains('Upside, not counted in break-even'));
     // Another organization's candidate is not listed; a decided one is filed apart.
     expect(page, isNot(contains('Foreign Desk')));
     expect(page, contains('Decided (1)'));

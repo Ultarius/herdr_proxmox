@@ -463,7 +463,7 @@ A reported page that cannot be used (no `W` id, not https, no title or claim)
 is left out rather than failing the run, so one bad page costs only the ideas
 that cite it, and the refusal names the id. Long titles and claims are
 shortened. A legacy numeric confidence is still validated for older clients,
-but it cannot override the summary derived from the five dimensions.
+but it cannot override the summary derived from the dimensions.
 
 A settled scout whose ideas were refused can be read again with
 `studio_recover` (**Read the answer again** on the Ideas tab). The saved answer
@@ -477,7 +477,9 @@ stopped, or proposed nothing, instead of showing an empty queue.
 A scout candidate now carries the case against itself as well as the case for
 it. The gateway refuses a candidate that omits any of these fields:
 
-- `prior_state`: what was required before and what is new, with citations;
+- `prior_state`: what was required before and what is new, with citations,
+  and its `driver`: `regulation`, `technology`, `infrastructure`, `incumbent`
+  (a weakening leader), `behaviour` or `other`;
 - `alternatives`: 3-6 alternatives, including software, a service and either
   doing nothing or in-house work, with a public price where available. A
   software or service alternative needs a cited page; doing nothing or
@@ -485,17 +487,45 @@ it. The gateway refuses a candidate that omits any of these fields:
 - `buyer`: the role that signs and the budget it comes from;
 - `reachable_accounts`: a cited count and the segment it covers;
 - `business_model`: `saas`, `service`, `productised_service` or `hybrid`, with
-  one-off, recurring and credit revenue lines. A recurring line states its
-  `period` (`month` or `year`); a credit reduces the first year of a recurring
-  contract, so it needs a recurring line;
+  one-off, recurring, per-unit, take-rate and credit revenue lines. A
+  recurring line states its `period` (`month` or `year`). A `per_unit` line is
+  a price per `unit` the customer has (room, seat, site) per period, times
+  `units` per customer. A `take_rate` line is `percent` of a cited monthly
+  `volume` per customer (payments, for instance), minus `cost_percent` passed
+  on to banks or networks. Per-unit and take-rate revenue counts as recurring;
+  a credit reduces the first year of that revenue, so it needs one of them;
 - `delivery_effort`: expert days and a day rate;
 - `evidence_against`: at least one cited page or reason that weakens the idea;
 - `dissent`: the Skeptic's structured `advance`, `hold` or `reject` verdict;
-- `confidence_dimensions`: regulatory driver, paid demand, technical
-  feasibility, differentiation and recurring potential, each rated weak,
-  medium or strong and cited;
+- `confidence_dimensions`: timing driver (15%), paid demand (30%), technical
+  feasibility (10%), differentiation (15%), recurring potential (15%) and
+  defensibility (15%), each rated weak, medium or strong and cited. An older
+  answer's `regulatory_driver` is read as the timing driver, and a missing
+  defensibility rating counts as weak (shown as not rated), so leaving it out
+  never raises the summary;
 - `first_offer` and `time_to_first_payment_days`: the smallest sellable first
   offer and how long the first payment takes.
+
+Optional, cited fields describe where the idea comes from and how big it can
+get. They are shown on the card and in the brief as upside, never counted
+toward break-even or the warnings:
+
+- `analogue`: a company that proved the model in another industry, and why it
+  transfers;
+- `incumbent`: the leader buyers use today and 1-5 cited complaints from its
+  own customers (reviews, pricing pages, contract terms);
+- `market_ceiling`: every account the product could serve, at least the
+  reachable count; the gateway reports the yearly revenue if all of them
+  bought at these prices;
+- `expansion`: up to four later modules with a price and the share of
+  customers expected to buy each; the gateway reports the average extra
+  revenue per customer.
+
+The prompt tells the scout how ideas are rated and where promising ones come
+from (an analogue, an incumbent's complaints, or a timing shift beyond
+regulation), asks it to weigh three times as many ideas as it may return and
+keep the strongest, and warns it that ratings are checked against citations.
+The Ideas tab lists open ideas by confidence, highest first.
 
 The gateway, not the agent, derives the summary confidence from the dimensions
 (weak 0, medium 50, strong 100, weighted) and computes the unit economics, per

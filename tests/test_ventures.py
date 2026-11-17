@@ -99,6 +99,7 @@ def candidate(name='Carrier Desk', evidence='V1'):
             'technical_feasibility': {'rating': 'strong', 'evidence': [evidence]},
             'differentiation': {'rating': 'medium', 'evidence': [evidence]},
             'recurring_potential': {'rating': 'strong', 'evidence': [evidence]},
+            'defensibility': {'rating': 'medium', 'evidence': [evidence]},
         },
         'first_offer': 'Fixed-fee invoice reconciliation pilot',
         'time_to_first_payment_days': 30,
@@ -1758,7 +1759,7 @@ class VentureTests(unittest.TestCase):
         done = self.scout_with(proposal)
         self.assertEqual(done['state'], 'ready', done.get('error'))
         stored = self.stored_candidates()[0]
-        self.assertEqual((stored['state'], stored['confidence']), ('proposed', 68))
+        self.assertEqual((stored['state'], stored['confidence']), ('proposed', 62))
         self.assertEqual((stored['prior_state']['change'], stored['buyer']['role']),
                          ('The new filing requires a documented exception trail.', 'CFO'))
         self.assertEqual(stored['confidence_dimensions']['paid_demand']['rating'], 'medium')
@@ -1807,6 +1808,104 @@ class VentureTests(unittest.TestCase):
             ventures.scout_business_model(dict(type='productised_service', revenue_lines=[
                 dict(kind='one_off', label='pilot', amount=1900, currency='USD'),
                 dict(kind='credit', label='credited', amount=1900, currency='USD')]))
+
+    def test_revenue_that_grows_with_the_customer_counts_and_upside_stays_apart(self):
+        # The shape of a hotel platform: onboarding, a price per room and a
+        # share of the card payments that pass through it.
+        configuration = ventures.normalize_config(candidate()['configuration'])
+        business = ventures.scout_business_model(dict(type='hybrid', revenue_lines=[
+            dict(kind='one_off', label='onboarding', amount=1500, currency='USD'),
+            dict(kind='per_unit', label='rooms', amount=12, currency='USD', period='month', unit='room', units=60),
+            dict(kind='take_rate', label='card payments', percent=1.0, cost_percent=0.7, volume=100000,
+                 currency='USD')]))
+        delivery = ventures.scout_delivery_effort(dict(expert_days=2, day_rate=dict(amount=500, currency='USD')))
+        ceiling = dict(count=4000, segment='independent hotels in the US', evidence=['V1'])
+        expansion = ventures.scout_expansion([dict(name='Revenue management', amount=400, currency='USD',
+                                                   period='month', attach_percent=25)])
+        economics = ventures.candidate_economics(configuration, business, delivery, dict(count=300), 30,
+                                                 ceiling, expansion)
+        # 12 x 60 rooms = 720 a month; 0.3% net of 100,000 = 300 a month.
+        self.assertEqual(economics['revenue_mix'], dict(recurring=0, per_unit=720.0, take_rate=300.0))
+        self.assertEqual((economics['recurring_monthly'], economics['break_even_customers'],
+                          economics['break_even_share']), (1020.0, 3, 0.01))
+        # Upside is reported but leaves break-even and warnings alone.
+        self.assertEqual((economics['expansion_monthly'], economics['ceiling_accounts'],
+                          economics['ceiling_annual_revenue'], economics['ceiling_annual_revenue_with_expansion']),
+                         (100.0, 4000, 48960000, 53760000))
+        self.assertEqual(economics['warnings'], [])
+        plain = ventures.candidate_economics(configuration, business, delivery, dict(count=300), 30)
+        self.assertEqual((plain['break_even_customers'], plain['ceiling_annual_revenue']), (3, None))
+        # A share must earn something, a ceiling cannot be below the reachable
+        # accounts, and an expansion needs a share of customers buying it.
+        with self.assertRaisesRegex(ValueError, 'cost_percent must be below percent'):
+            ventures.scout_business_model(dict(type='saas', revenue_lines=[
+                dict(kind='take_rate', label='cards', percent=0.5, cost_percent=0.5, volume=1000, currency='USD')]))
+        with self.assertRaisesRegex(ValueError, 'units per customer'):
+            ventures.scout_business_model(dict(type='saas', revenue_lines=[
+                dict(kind='per_unit', label='seats', amount=10, currency='USD', period='month', unit='seat')]))
+        with self.assertRaisesRegex(ValueError, 'cannot be below'):
+            ventures.scout_market_ceiling(dict(count=10, segment='x', evidence=['V1']), lambda value, limit: value,
+                                          dict(count=300))
+        with self.assertRaisesRegex(ValueError, 'attach_percent'):
+            ventures.scout_expansion([dict(name='POS', amount=50, currency='USD', period='month', attach_percent=0)])
+        # A per-unit or take-rate line is recurring enough for SaaS and a credit.
+        self.assertEqual(ventures.scout_business_model(dict(type='saas', revenue_lines=[
+            dict(kind='per_unit', label='seats', amount=10, currency='USD', period='year', unit='seat', units=5),
+            dict(kind='credit', label='pilot credit', amount=10, currency='USD')]))['type'], 'saas')
+
+    def test_a_scout_idea_carries_its_analogue_incumbent_and_upside(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        proposal = candidate('Marina Desk')
+        proposal['prior_state']['driver'] = 'infrastructure'
+        proposal['business_model'] = dict(type='saas', revenue_lines=[
+            dict(kind='per_unit', label='berths', amount=4, currency='USD', period='month', unit='berth', units=150),
+            dict(kind='take_rate', label='berth payments', percent=1.2, cost_percent=0.8, volume=60000,
+                 currency='USD', evidence=['V1'])])
+        proposal['analogue'] = dict(company='Example Hotel Platform', vertical='hotels', evidence=['V1'],
+                                    transfer='A cloud system of record with payments replaced on-premise software.')
+        proposal['incumbent'] = dict(name='Legacy Harbour', complaints=[
+            dict(claim='Support takes days to answer during the season.', evidence=['V1'])])
+        proposal['market_ceiling'] = dict(count=2500, segment='US marinas', evidence=['V1'])
+        proposal['expansion'] = [dict(name='Fuel dock POS', amount=90, currency='USD', period='month',
+                                      attach_percent=40)]
+        # An older answer's key still reads, and an unrated dimension counts as weak.
+        dimensions = proposal['confidence_dimensions']
+        self.assertIn('regulatory_driver', dimensions)
+        dimensions.pop('defensibility')
+        uncited = candidate('Dock Payments')
+        uncited['thesis'] = 'Boat clubs collect fees by bank transfer and chase late payers by hand.'
+        uncited['business_model'] = dict(type='saas', revenue_lines=[
+            dict(kind='take_rate', label='fees', percent=1.0, cost_percent=0.5, volume=20000, currency='USD')])
+        done = self.scout_with(proposal, uncited)
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        # A share of volume must cite where the volume comes from.
+        self.assertEqual([item['name'] for item in done['refused_candidates']], ['Dock Payments'])
+        self.assertIn('cite', done['refused_candidates'][0]['error'])
+        stored = self.stored_candidates()[0]
+        self.assertEqual((stored['prior_state']['driver'], stored['analogue']['company'],
+                          stored['incumbent']['complaints'][0]['evidence'], stored['market_ceiling']['count']),
+                         ('infrastructure', 'Example Hotel Platform', ['V1'], 2500))
+        self.assertEqual(sorted(stored['confidence_dimensions']), sorted(
+            key for key, _, _ in ventures.SCOUT_CONFIDENCE))
+        self.assertEqual(stored['confidence_dimensions']['defensibility'],
+                         dict(rating='weak', evidence=[], unrated=True))
+        # Without the defensibility rating: 62.5 - 7.5 = 55.
+        self.assertEqual(stored['confidence'], 55)
+        economics = stored['economics']
+        self.assertEqual(economics['revenue_mix'], dict(recurring=0, per_unit=600.0, take_rate=240.0))
+        self.assertEqual((economics['expansion_monthly'], economics['ceiling_annual_revenue']), (36.0, 25200000))
+        # The prompt teaches the three idea sources and how ideas are rated.
+        run = self.studio_runs()[-1]
+        for rule in ('FIND IDEAS THREE WAYS', 'paid demand 30%', 'defensibility 15%', 'take_rate', 'market_ceiling',
+                     'never inflate a rating'):
+            self.assertIn(rule, run['prompt'])
+        self.assertLessEqual(len(run['prompt']), ventures.PROMPT_LIMIT)
+        # The brief shows the upside apart from the economics.
+        page = self.studio(mode='candidate_brief', candidate_id=stored['id'])['html']
+        for shown in ('Example Hotel Platform', 'Legacy Harbour', 'USD 4 per berth a month', '1.2% of USD 60,000 a month',
+                      'Upside, not counted in break-even', 'Fuel dock POS'):
+            self.assertIn(shown, page)
 
     def test_kill_criteria_refuse_only_what_can_be_checked(self):
         economics = dict(runway_months=8.2)
@@ -1888,7 +1987,7 @@ class VentureTests(unittest.TestCase):
         done = self.complete_studio(run, {'candidates': [machinery, cites_dropped], 'research': research})
         self.assertEqual(done['state'], 'ready', done.get('error'))
         stored = self.stored_candidates()
-        self.assertEqual([(item['name'], item['confidence']) for item in stored], [('Machinery TechFile', 68)])
+        self.assertEqual([(item['name'], item['confidence']) for item in stored], [('Machinery TechFile', 62)])
         self.assertEqual(len(done['research']), 5)  # The insecure page was left out, not the run.
         self.assertLessEqual(len(done['research'][0]['claim']), 600)
         refused = done['refused_candidates'][0]

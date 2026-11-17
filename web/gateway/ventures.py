@@ -103,18 +103,35 @@ SCOUT_POINT_LENGTH = 300
 # economics instead of trusting a summary number.
 SCOUT_ALTERNATIVE_KINDS = ('software', 'service', 'in_house', 'do_nothing', 'other')
 SCOUT_BUSINESS_MODELS = ('saas', 'service', 'productised_service', 'hybrid')
-SCOUT_REVENUE_KINDS = ('one_off', 'recurring', 'credit')
-# A recurring line is a price per period; the economics work per month.
+SCOUT_REVENUE_KINDS = ('one_off', 'recurring', 'per_unit', 'take_rate', 'credit')
+# Revenue that comes back every month: a subscription, a price per unit the
+# customer has (rooms, seats, sites), or a share of the money that passes
+# through the product (payments). The last two grow with the customer.
+SCOUT_REPEATING = ('recurring', 'per_unit', 'take_rate')
+# A recurring or per-unit line is a price per period; the economics work per month.
 SCOUT_PERIODS = dict(month=1, year=12)
+# What made the idea possible now. Regulation is one driver among several.
+SCOUT_TIMING = ('regulation', 'technology', 'infrastructure', 'incumbent', 'behaviour', 'other')
+SCOUT_MAX_EXPANSION = 4
+SCOUT_MAX_COMPLAINTS = 5
 # Alternatives that need no page to exist: the buyer's own fallback.
 SCOUT_UNCITED_ALTERNATIVES = ('in_house', 'do_nothing')
+# Weights favour what predicts a business that lasts: buyers who already pay,
+# revenue that repeats and grows, and customers who would find it hard to
+# leave. Feasibility weighs least because most software ideas are buildable.
 SCOUT_CONFIDENCE = (
-    ('regulatory_driver', 'regulatory driver', 0.15),
+    ('timing_driver', 'timing driver', 0.15),
     ('paid_demand', 'paid demand', 0.30),
-    ('technical_feasibility', 'technical feasibility', 0.20),
-    ('differentiation', 'differentiation', 0.20),
+    ('technical_feasibility', 'technical feasibility', 0.10),
+    ('differentiation', 'differentiation', 0.15),
     ('recurring_potential', 'recurring potential', 0.15),
+    ('defensibility', 'defensibility', 0.15),
 )
+# Older answers named the timing driver after regulation only.
+SCOUT_CONFIDENCE_ALIASES = dict(regulatory_driver='timing_driver')
+# Dimensions an older answer may lack. Unrated counts as weak, so leaving one
+# out never raises the summary.
+SCOUT_CONFIDENCE_OPTIONAL = ('defensibility',)
 # Points per rating. Weak counts nothing, so an idea rated weak everywhere
 # summarises to 0, not to a third.
 SCOUT_RATINGS = dict(weak=0, medium=50, strong=100)
@@ -334,8 +351,10 @@ def _scout_money(value, label):
 def scout_prior_state(value, cite):
     if not isinstance(value, dict):
         raise ValueError('prior_state must state what was required before and what is new')
+    driver = value.get('driver')
     return dict(previous=_value(value.get('previous'), 500, 'prior_state previous', required=True),
                 change=_value(value.get('change'), 500, 'prior_state change', required=True),
+                driver=_choice(driver, SCOUT_TIMING, 'prior_state driver') if driver is not None else '',
                 evidence=cite(value.get('evidence'), 3))
 
 
@@ -378,7 +397,20 @@ def scout_reachable_accounts(value, cite):
                 evidence=cite(value.get('evidence'), 3))
 
 
-def scout_business_model(value):
+def _percent(value, low, high, label):
+    if type(value) not in (int, float) or not low <= value <= high:
+        raise ValueError('Invalid venture field: ' + label)
+    return round(float(value), 3)
+
+
+def scout_business_model(value, cite=None):
+    """Revenue lines: one-off, recurring, per unit, a share of volume, or a credit.
+
+    ``per_unit`` is a price per unit the customer has (``unit``, ``units``),
+    per ``period``. ``take_rate`` is ``percent`` of a monthly ``volume`` that
+    passes through the product, minus ``cost_percent`` passed on to banks or
+    networks; the volume is the assumption that matters, so a scout cites it.
+    """
     if not isinstance(value, dict):
         raise ValueError('business_model must name its type and revenue lines')
     model = _choice(value.get('type'), SCOUT_BUSINESS_MODELS, 'business model type')
@@ -389,31 +421,103 @@ def scout_business_model(value):
     for index, line in enumerate(lines, 1):
         if not isinstance(line, dict):
             raise ValueError('business_model.revenue_lines: item ' + str(index) + ' must be an object')
-        kind = _choice(line.get('kind'), SCOUT_REVENUE_KINDS, 'revenue line ' + str(index) + ' kind')
-        parsed.append(dict(kind=kind,
-                           label=_value(line.get('label'), 120, 'revenue line ' + str(index) + ' label',
-                                        required=True),
-                           amount=_integer(line.get('amount'), 0, 1_000_000_000,
-                                           'revenue line ' + str(index) + ' amount'),
-                           currency=_value(line.get('currency'), 3, 'revenue line ' + str(index) + ' currency',
-                                           required=True).upper()))
-        if not CURRENCY.fullmatch(parsed[-1]['currency']):
+        name = 'revenue line ' + str(index)
+        kind = _choice(line.get('kind'), SCOUT_REVENUE_KINDS, name + ' kind')
+        entry = dict(kind=kind, label=_value(line.get('label'), 120, name + ' label', required=True),
+                     currency=_value(line.get('currency'), 3, name + ' currency', required=True).upper())
+        if not CURRENCY.fullmatch(entry['currency']):
             raise ValueError('Invalid venture field: revenue line currency')
-        if kind == 'recurring':
+        if kind == 'take_rate':
+            entry['percent'] = _percent(line.get('percent'), 0.01, 30, name + ' percent')
+            entry['cost_percent'] = _percent(line.get('cost_percent', 0), 0, 30, name + ' cost_percent')
+            if entry['cost_percent'] >= entry['percent']:
+                raise ValueError(name + ': cost_percent must be below percent, or the share earns nothing')
+            entry['volume'] = _integer(line.get('volume'), 1, 1_000_000_000, name + ' monthly volume per customer')
+            entry['evidence'] = cite(line.get('evidence'), 3) if cite else []
+        else:
+            entry['amount'] = _integer(line.get('amount'), 0, 1_000_000_000, name + ' amount')
+        if kind in ('recurring', 'per_unit'):
             # Without a period an annual fee reads as a monthly one, which is
             # twelve times the revenue.
-            parsed[-1]['period'] = _choice(line.get('period'), tuple(SCOUT_PERIODS),
-                                           'revenue line ' + str(index) + ' period (month or year)')
+            entry['period'] = _choice(line.get('period'), tuple(SCOUT_PERIODS), name + ' period (month or year)')
+        if kind == 'per_unit':
+            entry['unit'] = _value(line.get('unit'), 40, name + ' unit (room, seat, site...)', required=True)
+            entry['units'] = _integer(line.get('units'), 1, 1_000_000, name + ' units per customer')
+        parsed.append(entry)
     kinds = {line['kind'] for line in parsed}
-    if 'credit' in kinds and 'recurring' not in kinds:
+    repeating = bool(kinds & set(SCOUT_REPEATING))
+    if 'credit' in kinds and not repeating:
         raise ValueError('A credit reduces a recurring contract, so it needs a recurring revenue line')
-    if model == 'saas' and 'recurring' not in kinds:
+    if model == 'saas' and not repeating:
         raise ValueError('A SaaS business model needs a recurring revenue line')
     if model in ('service', 'productised_service') and 'one_off' not in kinds:
         raise ValueError('A service business model needs a one-off revenue line')
-    if model == 'hybrid' and not {'one_off', 'recurring'} <= kinds:
+    if model == 'hybrid' and not ('one_off' in kinds and repeating):
         raise ValueError('A hybrid business model needs one-off and recurring revenue lines')
     return dict(type=model, revenue_lines=parsed)
+
+
+def scout_analogue(value, cite):
+    """A company that proved this model in another industry, if there is one."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError('analogue must name a company, its industry and why the model transfers')
+    return dict(company=_value(value.get('company'), 120, 'analogue company', required=True),
+                vertical=_value(value.get('vertical'), 120, 'analogue vertical', required=True),
+                transfer=_value(value.get('transfer'), 500, 'analogue transfer', required=True),
+                evidence=cite(value.get('evidence'), 3))
+
+
+def scout_incumbent(value, cite):
+    """The leader buyers use today and what its own customers complain about."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError('incumbent must name the leader and the complaints of its customers')
+    complaints = value.get('complaints')
+    if not isinstance(complaints, list) or not 1 <= len(complaints) <= SCOUT_MAX_COMPLAINTS:
+        raise ValueError('incumbent.complaints must list 1-' + str(SCOUT_MAX_COMPLAINTS) + ' cited complaints')
+    parsed = []
+    for index, item in enumerate(complaints, 1):
+        if not isinstance(item, dict):
+            raise ValueError('incumbent.complaints: item ' + str(index) + ' must be an object')
+        parsed.append(dict(claim=_value(item.get('claim'), 300, 'incumbent complaint', required=True),
+                           evidence=cite(item.get('evidence'), 3)))
+    return dict(name=_value(value.get('name'), 120, 'incumbent name', required=True), complaints=parsed)
+
+
+def scout_market_ceiling(value, cite, reachable=None):
+    """Every account the product could serve, beyond those reachable soon."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError('market_ceiling must give a count, segment and evidence')
+    ceiling = dict(count=_integer(value.get('count'), 1, 100_000_000, 'market ceiling count'),
+                   segment=_value(value.get('segment'), 200, 'market ceiling segment', required=True),
+                   evidence=cite(value.get('evidence'), 3))
+    if reachable and ceiling['count'] < reachable['count']:
+        raise ValueError('market_ceiling.count cannot be below reachable_accounts.count')
+    return ceiling
+
+
+def scout_expansion(value):
+    """Later modules a customer could add, with the share expected to buy them."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > SCOUT_MAX_EXPANSION:
+        raise ValueError('expansion must list at most ' + str(SCOUT_MAX_EXPANSION) + ' later modules')
+    parsed = []
+    for index, item in enumerate(value, 1):
+        if not isinstance(item, dict):
+            raise ValueError('expansion: item ' + str(index) + ' must be an object')
+        name = 'expansion ' + str(index)
+        price = _scout_money(dict(amount=item.get('amount'), currency=item.get('currency')), name + ' price')
+        parsed.append(dict(name=_value(item.get('name'), 120, name + ' name', required=True),
+                           amount=price['amount'], currency=price['currency'],
+                           period=_choice(item.get('period'), tuple(SCOUT_PERIODS), name + ' period'),
+                           attach_percent=_integer(item.get('attach_percent'), 1, 100, name + ' attach_percent')))
+    return parsed
 
 
 def scout_delivery_effort(value):
@@ -452,10 +556,16 @@ def scout_dissent(value, cite):
 
 def scout_confidence(value, cite):
     if not isinstance(value, dict):
-        raise ValueError('confidence must rate each of the five dimensions')
+        raise ValueError('confidence must rate each of the ' + str(len(SCOUT_CONFIDENCE)) + ' dimensions')
+    value = {SCOUT_CONFIDENCE_ALIASES.get(key, key): item for key, item in value.items()}
     result, total, weight_total = {}, 0.0, 0.0
     for key, label, weight in SCOUT_CONFIDENCE:
         item = value.get(key)
+        if item is None and key in SCOUT_CONFIDENCE_OPTIONAL:
+            # Unrated counts as weak: omitting a dimension never helps.
+            result[key] = dict(rating='weak', evidence=[], unrated=True)
+            weight_total += weight
+            continue
         if not isinstance(item, dict):
             raise ValueError('confidence.' + key + ' is required')
         rating = _choice(item.get('rating'), tuple(SCOUT_RATINGS), 'confidence ' + label + ' rating')
@@ -549,7 +659,7 @@ def kill_criteria_notes(value):
 
 
 def candidate_economics(configuration, business_model, delivery_effort, reachable_accounts,
-                        time_to_first_payment_days):
+                        time_to_first_payment_days, market_ceiling=None, expansion=None):
     """Gateway-owned unit economics for one scout proposal.
 
     Agents provide prices, costs and reach, but not the arithmetic. Everything
@@ -563,6 +673,11 @@ def candidate_economics(configuration, business_model, delivery_effort, reachabl
     month) and ``recurring`` otherwise (break-even counts paying customers).
     Variable costs beyond the stated delivery effort are not modelled, so the
     break-even is a floor.
+
+    Per-unit and take-rate lines count as monthly revenue: a price per unit
+    times the units a customer has, and the share of a customer's monthly
+    volume after the costs passed on. The market ceiling and expansion modules
+    are upside: they are reported, never used for break-even or warnings.
     """
     market = configuration['market']
     base = market['currency']
@@ -570,8 +685,18 @@ def candidate_economics(configuration, business_model, delivery_effort, reachabl
         return engine.convert(amount, currency, market)
     lines = business_model['revenue_lines']
     one_off = sum(convert(line['amount'], line['currency']) for line in lines if line['kind'] == 'one_off')
-    recurring_monthly = sum(convert(line['amount'], line['currency']) / SCOUT_PERIODS[line.get('period', 'month')]
-                            for line in lines if line['kind'] == 'recurring')
+    def monthly(line):
+        if line['kind'] == 'recurring':
+            return convert(line['amount'], line['currency']) / SCOUT_PERIODS[line.get('period', 'month')]
+        if line['kind'] == 'per_unit':
+            return (convert(line['amount'], line['currency']) * line['units']
+                    / SCOUT_PERIODS[line.get('period', 'month')])
+        if line['kind'] == 'take_rate':
+            return convert(line['volume'], line['currency']) * (line['percent'] - line['cost_percent']) / 100
+        return 0
+    mix = {kind: round(sum(monthly(line) for line in lines if line['kind'] == kind), 2)
+           for kind in SCOUT_REPEATING}
+    recurring_monthly = sum(monthly(line) for line in lines)
     credits = sum(convert(line['amount'], line['currency']) for line in lines if line['kind'] == 'credit')
     day_rate = convert(delivery_effort['day_rate']['amount'], delivery_effort['day_rate']['currency'])
     delivery_cost = delivery_effort['expert_days'] * day_rate
@@ -615,7 +740,17 @@ def candidate_economics(configuration, business_model, delivery_effort, reachabl
         warnings.append('There is no recurring revenue to cover the monthly costs.')
     if runway_months is not None and time_to_first_payment_days > runway_months * 30:
         warnings.append('The first payment is expected after the money runs out.')
-    return dict(currency=base, monthly_burn=monthly_burn, capital=capital,
+    # Upside: shown to the operator, never counted toward break-even.
+    expansion_monthly = sum(convert(item['amount'], item['currency']) / SCOUT_PERIODS[item['period']]
+                            * item['attach_percent'] / 100 for item in expansion or [])
+    yearly = 12 * recurring_monthly + (one_off if basis == 'project' else 0)
+    ceiling = market_ceiling['count'] if market_ceiling else None
+    return dict(currency=base, revenue_mix=mix,
+                expansion_monthly=round(expansion_monthly, 2),
+                ceiling_accounts=ceiling,
+                ceiling_annual_revenue=round(ceiling * yearly) if ceiling else None,
+                ceiling_annual_revenue_with_expansion=(round(ceiling * (yearly + 12 * expansion_monthly))
+                                                       if ceiling and expansion_monthly else None), monthly_burn=monthly_burn, capital=capital,
                 runway_months=runway_months, delivery_cost=round(delivery_cost, 2),
                 one_off_revenue=round(one_off, 2), credits=round(credits, 2),
                 recurring_monthly=round(recurring_monthly, 2), recurring_revenue=round(recurring_monthly, 2),
@@ -1562,23 +1697,26 @@ class Ventures(StudioOperations):
                     '"simulation":{"capital":90000,"burn":[{"label":"hosting","amount":2000,"currency":"EUR"}],'
                     '"architecture":"saas","icp_size":"10-200 employees","icp_sector":"..."},'
                     '"outreach":{"stage":"survey","tone":"direct","language":"en","persona":"cfo"}},'
-                    '"prior_state":{"previous":"...","change":"...","evidence":["W1"]},'
+                    '"prior_state":{"previous":"...","change":"...","driver":"' + '|'.join(SCOUT_TIMING)
+                    + '","evidence":["W1"]},'
                     '"alternatives":[{"name":"...","kind":"software|service|in_house|do_nothing",'
                     '"price":{"amount":0,"currency":"EUR"},"evidence":["W1"]}],'
                     '"buyer":{"role":"...","budget":"...","evidence":["W1"]},'
                     '"reachable_accounts":{"count":25,"segment":"...","evidence":["W1"]},'
                     '"business_model":{"type":"saas|service|productised_service|hybrid",'
-                    '"revenue_lines":[{"kind":"one_off|recurring|credit","label":"...",'
-                    '"amount":0,"currency":"EUR","period":"month|year (recurring only)"}]},'
+                    '"revenue_lines":[{"kind":"one_off|recurring|per_unit|take_rate|credit","label":"...",'
+                    '"amount":0,"currency":"EUR","period":"month|year"}]},'
                     '"delivery_effort":{"expert_days":2,"day_rate":{"amount":0,"currency":"EUR"}},'
                     '"evidence_against":[{"claim":"...","evidence":["W1"]}],'
                     '"dissent":{"verdict":"advance|hold|reject","summary":"..."},'
                     '"first_offer":"...","time_to_first_payment_days":30,'
-                    '"confidence_dimensions":{"regulatory_driver":{"rating":"medium","evidence":["W1"]},'
-                    '"paid_demand":{"rating":"medium","evidence":["W1"]},'
-                    '"technical_feasibility":{"rating":"strong","evidence":["W1"]},'
-                    '"differentiation":{"rating":"medium","evidence":["W1"]},'
-                    '"recurring_potential":{"rating":"strong","evidence":["W1"]}},'
+                    '"confidence_dimensions":{'
+                    + ','.join('"' + key + '":{"rating":"weak|medium|strong","evidence":["W1"]}'
+                               for key, _, _ in SCOUT_CONFIDENCE) + '},'
+                    '"analogue":{"company":"...","vertical":"...","transfer":"...","evidence":["W1"]},'
+                    '"incumbent":{"name":"...","complaints":[{"claim":"...","evidence":["W1"]}]},'
+                    '"market_ceiling":{"count":4000,"segment":"...","evidence":["W1"]},'
+                    '"expansion":[{"name":"...","amount":0,"currency":"EUR","period":"month","attach_percent":30}],'
                     '"assumptions":["..."],"kill_criteria":["No paid pilot signed within 90 days."],'
                     '"evidence":["' + ('W1' if web else 'L1","N1') + '"]}]'
                     + (',"research":[{"id":"W1","url":"https://...","title":"...","published":"YYYY-MM-DD or empty",'
@@ -1595,6 +1733,22 @@ class Ventures(StudioOperations):
                     'confidence dimensions weak, medium or strong and cite each; do not return one confidence '
                     'number or a fraction. Time to first payment is in days. '
                     'Prefer the smallest sellable fixed-fee first offer over the eventual product. '
+                    'per_unit: amount per unit per period, with "unit" and "units" per customer. take_rate: '
+                    '"percent" of a cited monthly "volume" per customer, minus "cost_percent" passed to banks '
+                    'or networks, with "evidence". '
+                    'FIND IDEAS THREE WAYS: an analogue (a model proven in one industry, missing in another); '
+                    'the incumbent (what its customers complain about in reviews, pricing pages and contract '
+                    'terms); and timing (regulation, a technology or infrastructure shift, a weakening incumbent '
+                    'or changed behaviour: prior_state.driver). Weigh three times the maximum and return only the '
+                    'strongest; never inflate a rating, citations are checked. '
+                    'RATING: ' + ', '.join(label + ' ' + str(round(weight * 100)) + '%'
+                                           for _, label, weight in SCOUT_CONFIDENCE)
+                    + '; weak 0, medium 50, strong 100. Strong paid demand: buyers already pay a cited '
+                    'alternative or a cited paid pilot. Strong recurring potential: revenue grows with the '
+                    'customer (per_unit or take_rate). Strong defensibility: it becomes the customer\'s system of '
+                    'record, holds its data or payments, or integrations make leaving costly. analogue, '
+                    'incumbent, market_ceiling (every account it could serve) and expansion (later modules, share '
+                    'of customers buying) are optional, cited upside, never counted in break-even. '
                     'A recurring line states its period (month or year); a credit reduces the first year of a '
                     'recurring contract. delivery_effort is spent once per project or new customer. '
                     'At least one kill criterion must use a paid project, signed agreement or money; effort is '
@@ -1804,7 +1958,11 @@ class Ventures(StudioOperations):
         buyer = check('buyer', lambda: scout_buyer(item.get('buyer'), cited))
         reachable = check('reachable_accounts',
                           lambda: scout_reachable_accounts(item.get('reachable_accounts'), cited))
-        business = check('business_model', lambda: scout_business_model(item.get('business_model')))
+        business = check('business_model', lambda: scout_business_model(item.get('business_model'), cited))
+        analogue = check('analogue', lambda: scout_analogue(item.get('analogue'), cited))
+        incumbent = check('incumbent', lambda: scout_incumbent(item.get('incumbent'), cited))
+        ceiling = check('market_ceiling', lambda: scout_market_ceiling(item.get('market_ceiling'), cited, reachable))
+        expansion = check('expansion', lambda: scout_expansion(item.get('expansion')))
         delivery = check('delivery_effort', lambda: scout_delivery_effort(item.get('delivery_effort')))
         against = check('evidence_against', lambda: scout_evidence_against(item.get('evidence_against'), cited))
         dissent = check('dissent', lambda: scout_dissent(item.get('dissent'), cited))
@@ -1824,7 +1982,7 @@ class Ventures(StudioOperations):
         economics = None
         if configured and business and delivery and reachable and first_payment is not None:
             economics = check('economics', lambda: candidate_economics(
-                configured[0], business, delivery, reachable, first_payment))
+                configured[0], business, delivery, reachable, first_payment, ceiling, expansion))
         kill = check('kill criteria', lambda: scout_kill_criteria(item.get('kill_criteria'), economics))
         if problems:
             raise ValueError('; '.join(problems))
@@ -1840,6 +1998,7 @@ class Ventures(StudioOperations):
                     reachable_accounts=reachable, business_model=business, delivery_effort=delivery,
                     evidence_against=against, dissent=dissent, first_offer=first_offer,
                     time_to_first_payment_days=first_payment, economics=economics,
+                    analogue=analogue, incumbent=incumbent, market_ceiling=ceiling, expansion=expansion or [],
                     kill_criteria_notes=kill_criteria_notes(kill),
                     duplicate_of=duplicate or '', excluded_by=excluded_by, decision=None,
                     created_at=now().isoformat(), actor=run.get('actor', 'venture_studio'))
@@ -2167,7 +2326,8 @@ class Ventures(StudioOperations):
                 and candidate.get('time_to_first_payment_days') is not None):
             candidate['economics'] = candidate_economics(
                 candidate['configuration'], candidate['business_model'], candidate['delivery_effort'],
-                candidate['reachable_accounts'], candidate['time_to_first_payment_days'])
+                candidate['reachable_accounts'], candidate['time_to_first_payment_days'],
+                candidate.get('market_ceiling'), candidate.get('expansion'))
         if 'kill_criteria' in body:
             candidate['kill_criteria'] = scout_kill_criteria(candidate['kill_criteria'],
                                                              candidate.get('economics'))

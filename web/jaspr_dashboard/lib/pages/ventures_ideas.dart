@@ -205,19 +205,30 @@ Component venturesIdeas({
     ..._refusals(latestScout, busy: busy, onReread: onReread),
   ];
   if (candidates.isEmpty) {
-    return card('Ideas', [
-      ...refusals,
-      emptyState(
-        refusals.isEmpty && latestScout == null
-            ? 'No venture candidates yet for $organizationName. Set up the Venture Studio and run a scout review.'
-            : 'No venture candidates waiting for $organizationName.',
-        iconName: 'lightbulb',
-      ),
-    ], subtitle: 'Candidates stay proposals until an administrator creates one.');
+    return card(
+      'Ideas',
+      [
+        ...refusals,
+        emptyState(
+          refusals.isEmpty && latestScout == null
+              ? 'No venture candidates yet for $organizationName. Set up the Venture Studio and run a scout review.'
+              : 'No venture candidates waiting for $organizationName.',
+          iconName: 'lightbulb',
+        ),
+      ],
+      subtitle: 'Candidates stay proposals until an administrator creates one.',
+    );
   }
-  final open = candidates
-      .where((item) => openCandidateStates.contains('${item['state']}'))
-      .toList();
+  // Strongest first, so the most promising idea is the one read first.
+  final open =
+      candidates
+          .where((item) => openCandidateStates.contains('${item['state']}'))
+          .toList()
+        ..sort(
+          (a, b) => ((b['confidence'] as num?) ?? -1).compareTo(
+            (a['confidence'] as num?) ?? -1,
+          ),
+        );
   final closed = candidates
       .where((item) => !openCandidateStates.contains('${item['state']}'))
       .toList();
@@ -270,6 +281,57 @@ String _priceText(Map? price) {
   return _moneyText(price['amount'], price['currency']);
 }
 
+String _numberText(Object? value) =>
+    value is num && value == value.roundToDouble()
+    ? '${value.round()}'
+    : '$value';
+
+const _periodText = {'month': ' a month', 'year': ' a year'};
+
+const _driverText = {
+  'regulation': 'regulation',
+  'technology': 'a technology shift',
+  'infrastructure': 'new infrastructure',
+  'incumbent': 'a weakening incumbent',
+  'behaviour': 'changed behaviour',
+  'other': 'other timing',
+};
+
+/// One revenue line as a person would say it.
+String revenueLineText(Map line) {
+  final kind = '${line['kind'] ?? ''}';
+  final period = _periodText['${line['period'] ?? ''}'] ?? '';
+  final currency = line['currency'];
+  switch (kind) {
+    case 'take_rate':
+      final cost = line['cost_percent'];
+      return '${line['label'] ?? 'share'}: ${_numberText(line['percent'])}% of '
+          '${_moneyText(line['volume'], currency)} a month'
+          '${cost is num && cost > 0 ? ' (${_numberText(cost)}% passed on)' : ''}';
+    case 'per_unit':
+      return '${line['label'] ?? 'per unit'}: ${_moneyText(line['amount'], currency)} '
+          'per ${line['unit'] ?? 'unit'}$period × ${line['units'] ?? 0}';
+    case 'credit':
+      return '${line['label'] ?? 'credit'}: − ${_moneyText(line['amount'], currency)}';
+    default:
+      return '${line['label'] ?? kind}: ${_moneyText(line['amount'], currency)}$period';
+  }
+}
+
+/// Monthly repeating revenue per customer by kind, e.g. "720 USD per unit".
+String _mixText(Map mix, Object? currency) {
+  const labels = {
+    'recurring': 'subscription',
+    'per_unit': 'per unit',
+    'take_rate': 'share of volume',
+  };
+  return [
+    for (final entry in labels.entries)
+      if (((mix[entry.key] as num?) ?? 0) > 0)
+        '${_moneyText(mix[entry.key], currency)} ${entry.value}',
+  ].join(', ');
+}
+
 String _breakEvenText(Map economics) {
   final count = economics['break_even_customers'];
   if ('${economics['basis'] ?? ''}' == 'project') {
@@ -305,6 +367,18 @@ Component candidateDiligence(Map<String, dynamic> item) {
   final economics = item['economics'] as Map?;
   final firstOffer = '${item['first_offer'] ?? ''}';
   final firstPayment = item['time_to_first_payment_days'];
+  final analogue = item['analogue'] as Map?;
+  final incumbent = item['incumbent'] as Map?;
+  final complaints = List<Map<String, dynamic>>.from(
+    (incumbent?['complaints'] as List? ?? const []).whereType<Map>(),
+  );
+  final ceiling = item['market_ceiling'] as Map?;
+  final expansion = List<Map<String, dynamic>>.from(
+    (item['expansion'] as List? ?? const []).whereType<Map>(),
+  );
+  final mix = economics?['revenue_mix'] as Map?;
+  final currency = economics?['currency'];
+  final driver = _driverText['${prior?['driver'] ?? ''}'];
   final warnings = (economics?['warnings'] as List? ?? const [])
       .map((value) => '$value')
       .where((value) => value.isNotEmpty)
@@ -320,7 +394,16 @@ Component candidateDiligence(Map<String, dynamic> item) {
       (
         'Prior state',
         text(
-          '${prior['previous'] ?? ''} → ${prior['change'] ?? ''}',
+          '${prior['previous'] ?? ''} → ${prior['change'] ?? ''}'
+          '${driver == null ? '' : ' (driven by $driver)'}',
+        ),
+      ),
+    if (analogue != null)
+      (
+        'Proven elsewhere',
+        text(
+          '${analogue['company'] ?? ''} in ${analogue['vertical'] ?? ''}: '
+          '${analogue['transfer'] ?? ''}',
         ),
       ),
     if (buyer != null)
@@ -335,7 +418,18 @@ Component candidateDiligence(Map<String, dynamic> item) {
         'Business model',
         text(
           '${business['type'] ?? ''}: '
-          '${(business['revenue_lines'] as List? ?? const []).map((line) => line is Map ? '${line['kind']} ${_moneyText(line['amount'], line['currency'])}' : '$line').join(', ')}',
+          '${(business['revenue_lines'] as List? ?? const []).map((line) => line is Map ? revenueLineText(line) : '$line').join('; ')}',
+        ),
+      ),
+    // Revenue that grows with the customer is what lets an idea scale.
+    if (mix != null &&
+        ((mix['per_unit'] as num? ?? 0) > 0 ||
+            (mix['take_rate'] as num? ?? 0) > 0))
+      (
+        'Repeating revenue',
+        text(
+          '${_moneyText(economics?['recurring_monthly'], currency)} per customer a month: '
+          '${_mixText(mix, currency)}',
         ),
       ),
     if (delivery != null)
@@ -365,7 +459,9 @@ Component candidateDiligence(Map<String, dynamic> item) {
               : '${_moneyText(economics['contribution'], economics['currency'])} per customer a month',
         ),
       ),
-    if (economics != null && economics['first_year_revenue'] != null && economics['basis'] != 'project')
+    if (economics != null &&
+        economics['first_year_revenue'] != null &&
+        economics['basis'] != 'project')
       (
         'First year per customer',
         text(
@@ -381,10 +477,38 @@ Component candidateDiligence(Map<String, dynamic> item) {
           '${economics['pilot_break_even_days'] == null ? '' : ' · loses money above ${economics['pilot_break_even_days']} expert days'}',
         ),
       ),
-    if (firstPayment != null)
-      ('First payment', text('$firstPayment days')),
+    if (firstPayment != null) ('First payment', text('$firstPayment days')),
+  ];
+  // Upside: shown, never counted toward break-even or the warnings.
+  final upside = <(String, Component)>[
+    if (ceiling != null)
+      (
+        'Market ceiling',
+        text(
+          '${ceiling['count'] ?? 0} accounts · ${ceiling['segment'] ?? ''}'
+          '${economics?['ceiling_annual_revenue'] == null ? '' : ' · ${_moneyText(economics?['ceiling_annual_revenue'], currency)} a year if all bought'}',
+        ),
+      ),
+    for (final module in expansion)
+      (
+        'Later module',
+        text(
+          '${module['name'] ?? ''} · ${_moneyText(module['amount'], module['currency'])}'
+          '${_periodText['${module['period'] ?? ''}'] ?? ''} · '
+          '${module['attach_percent'] ?? 0}% of customers expected',
+        ),
+      ),
+    if (((economics?['expansion_monthly'] as num?) ?? 0) > 0)
+      (
+        'Expansion per customer',
+        text(
+          '${_moneyText(economics?['expansion_monthly'], currency)} a month on average',
+        ),
+      ),
   ];
   if (rows.isEmpty &&
+      upside.isEmpty &&
+      complaints.isEmpty &&
       alternatives.isEmpty &&
       against.isEmpty &&
       dissent == null &&
@@ -395,50 +519,48 @@ Component candidateDiligence(Map<String, dynamic> item) {
   }
   return el('section', [
     if (rows.isNotEmpty) facts(rows),
-    for (final warning in warnings)
-      notice(warning, error: true),
+    for (final warning in warnings) notice(warning, error: true),
     if (notes.isNotEmpty)
       disclosure('Kill criteria to tighten (${notes.length})', [
         for (final note in notes) paragraph(note),
       ]),
+    if (upside.isNotEmpty)
+      disclosure('Upside, not counted in break-even', [facts(upside)]),
+    if (complaints.isNotEmpty)
+      disclosure(
+        'What customers of ${incumbent?['name'] ?? 'the incumbent'} complain about (${complaints.length})',
+        [for (final entry in complaints) paragraph('${entry['claim'] ?? ''}')],
+      ),
     if (alternatives.isNotEmpty)
-      disclosure(
-        'Alternatives (${alternatives.length})',
-        [
-          for (final alternative in alternatives)
-            paragraph(
-              '${alternative['name'] ?? 'Unnamed'} · '
-              '${alternative['kind'] ?? ''} · '
-              '${_priceText(alternative['price'] as Map?)}',
-            ),
-        ],
-      ),
+      disclosure('Alternatives (${alternatives.length})', [
+        for (final alternative in alternatives)
+          paragraph(
+            '${alternative['name'] ?? 'Unnamed'} · '
+            '${alternative['kind'] ?? ''} · '
+            '${_priceText(alternative['price'] as Map?)}',
+          ),
+      ]),
     if (against.isNotEmpty)
-      disclosure(
-        'Case against (${against.length})',
-        [
-          for (final entry in against)
-            paragraph(
-              '${entry['claim'] ?? ''}'
-              '${'${entry['reason'] ?? ''}'.isEmpty ? '' : ' — ${entry['reason']}'}',
-            ),
-        ],
-      ),
+      disclosure('Case against (${against.length})', [
+        for (final entry in against)
+          paragraph(
+            '${entry['claim'] ?? ''}'
+            '${'${entry['reason'] ?? ''}'.isEmpty ? '' : ' — ${entry['reason']}'}',
+          ),
+      ]),
     if (dissent != null)
       paragraph(
         'Skeptic: ${dissent['verdict'] ?? ''} — ${dissent['summary'] ?? ''}',
       ),
     if (dimensions != null)
-      disclosure(
-        'Confidence dimensions',
-        [
-          for (final entry in dimensions.entries)
-            paragraph(
-              '${entry.key.toString().replaceAll('_', ' ')}: '
-              '${entry.value is Map ? (entry.value as Map)['rating'] ?? '' : ''}',
-            ),
-        ],
-      ),
+      disclosure('Confidence dimensions', [
+        for (final entry in dimensions.entries)
+          paragraph(
+            '${entry.key.toString().replaceAll('_', ' ')}: '
+            '${entry.value is Map ? (entry.value as Map)['rating'] ?? '' : ''}'
+            '${entry.value is Map && (entry.value as Map)['unrated'] == true ? ' (not rated)' : ''}',
+          ),
+      ]),
   ], classes: 'stack');
 }
 
