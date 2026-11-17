@@ -60,6 +60,9 @@ OUTCOMES = ('sent', 'replied', 'meeting', 'declined')
 CADENCES = ('news_only', 'every_day')
 STUDIO_CADENCES = ('off', 'daily', 'weekly')
 STUDIO_ROLES = ('portfolio', 'scout', 'critic', 'analyst')
+# Groups belong to one organization, so the name needs no identifier. Studios
+# set up before this carried the organization id; they are renamed once.
+STUDIO_GROUP_NAME = 'Venture Studio'
 STUDIO_ROLE_LABELS = dict(portfolio='Portfolio Manager', scout='Venture Scout',
                           critic='Skeptic', analyst='Research Analyst')
 STUDIO_DEFAULTS = dict(studio_portfolio_cadence='off', studio_scout_cadence='off',
@@ -603,15 +606,50 @@ class Ventures(StudioOperations):
             raise ValueError('Every Venture Studio member must be assigned to the studio notebook.')
         return group
 
+    def _studio_notebook_path(self, organization):
+        """``ventures/studio-<organization name>-<short id>``: readable in
+        Herdr's workspace list, and still unique per organization."""
+        name = next((item.get('name') for item in self._organizations() if item.get('id') == organization), '')
+        readable = venture_notebook.slug(name) if name else ''
+        short = venture_notebook.slug(organization)[:8]
+        return 'ventures/studio-' + (readable[:31] + '-' + short if readable and readable != 'venture' else short)
+
+    def _studio_rename_group(self, organization, studio):
+        """Rename a studio group still called "Venture Studio <organization id>".
+
+        Cosmetic and idempotent: a refusal (a limit, Herdr stopped) leaves the
+        old name and is retried by the next studio action."""
+        group_id = studio.get('group_id')
+        group = next((item for item in self.service.store.snapshot(live_status=False).get('groups', [])
+                      if item.get('id') == group_id and item.get('organization_id') == organization), None)
+        if not group or group.get('name') != ('Venture Studio ' + organization)[:120]:
+            return
+        try:
+            self.service.store.action('group', dict(
+                request_id='studio-rename-' + group_id, organization_id=organization, id=group_id,
+                name=STUDIO_GROUP_NAME, description=group.get('description', ''), members=group['members'],
+                read_only=group.get('read_only', True), use_worktree=group.get('use_worktree', True),
+                permission_mode=group.get('permission_mode', 'default'),
+                accessible_paths=group.get('accessible_paths', []),
+                notify_outcomes=group.get('notify_outcomes', False), create_tasks=group.get('create_tasks', False),
+                review_scope=group.get('review_scope', 'topic')))
+        except (ValueError, OSError):
+            return
+        team = dict(studio.get('team') or {})
+        team['group_name'] = STUDIO_GROUP_NAME
+        studio['team'] = team
+        self.save_studio(organization, studio)
+
     def setup_studio(self, organization, body, actor):
         if body.get('confirmed') is not True:
             raise ValueError('Confirm creating the Venture Studio notebook, agents and read-only group.')
         studio = self._studio(organization)
         if studio.get('group_id'):
             self._studio_group(organization, studio)
+            self._studio_rename_group(organization, studio)
             return studio
         self._require_herdr('set up the Venture Studio')
-        relative = studio.get('notebook') or ('ventures/studio-' + venture_notebook.slug(organization))
+        relative = studio.get('notebook') or self._studio_notebook_path(organization)
         if not studio.get('notebook'):
             venture_notebook.provision_studio(self.service.projects, relative, organization)
             studio['notebook'] = relative
@@ -625,7 +663,7 @@ class Ventures(StudioOperations):
                 organization, STUDIO_ROLES, body, hired=(team.get('members') or {}).values(),
                 project=str(self._studio_notebook(studio)))
             team.update(settings_by_role=chosen, template_ids=templates, settings_source=source, members={},
-                        group_name=('Venture Studio ' + organization)[:120])
+                        group_name=STUDIO_GROUP_NAME)
             studio['team'] = team
             self.save_studio(organization, studio)
         notebook = str(self._studio_notebook(studio))
@@ -700,6 +738,8 @@ class Ventures(StudioOperations):
             raise ValueError('The Venture Studio is paused.')
         studio = self._studio(organization)
         self._studio_group(organization, studio)
+        if manual:
+            self._studio_rename_group(organization, studio)
         # Only a run that is still meeting blocks a new one (both kinds share
         # one group). A run needing attention stays visible with recover and
         # dismiss, but never stops the studio from working.
@@ -726,6 +766,12 @@ class Ventures(StudioOperations):
             self._fetch_urls(organization, policy['studio_sources'])
         evidence, active_ids, evidence_index = self._studio_evidence(organization, kind, policy)
         web = kind == 'scout' and policy['studio_web_research'] and not evidence['items']
+        if web and not policy['studio_focus']:
+            # Without sources the scout searches the web; without a focus it
+            # would search for anything. "Run without sources" skips sources,
+            # never this.
+            raise StudioWaiting('Add a focus area in the studio settings: with no readable sources the scout '
+                                'researches the web and needs to know where to look.', 'inputs')
         if web:
             evidence.update(web_research=True, coverage=(
                 'No readable source items were supplied, so this scout researches the web itself. Only pages '
@@ -793,31 +839,42 @@ class Ventures(StudioOperations):
         run = json.loads(row[0])
         if run.get('state') != 'needs_attention':
             raise ValueError('Only a studio run needing attention can be recovered.')
-        job = next((item for item in self.service.store.snapshot(live_status=False).get('jobs', [])
-                    if item.get('id') == run.get('job_id')), None) if run.get('job_id') else None
-        if not job:
-            if run.get('job_id'):
-                raise ValueError('The studio discussion record is gone; dismiss this run.')
-            # The prompt never reached the group (or its answer was lost).
-            # Re-send the frozen prompt under the same request id.
+        # The same step repair would take for this run, so the button always
+        # does what fits: re-send a prompt that never left, retry a meeting
+        # whose preparation stopped before anything was sent, recover a
+        # submitted meeting's output, or read a saved result again.
+        action, _ = self._repair_step(run, True)
+        if action == 'dismiss':
+            raise ValueError('The studio discussion record is gone; dismiss this run.')
+        if action in ('redispatch', 'retry'):
             busy = self._studio_in_flight(organization)
             if busy and busy['id'] != run['id']:
                 raise StudioBusy('A ' + busy['kind'] + ' studio run is still in its meeting; recover this one after it.')
-            try:
-                return self._studio_dispatch(organization, run)
-            except (ValueError, OSError) as error:
-                run.update(error=redact(str(error))[:500])
-                self.save_studio_run(run)
-                raise
-        if job.get('state') != 'artifact_ready':
-            raise ValueError('Recover the existing group artifact before reprocessing, or dismiss this run; '
-                             'no prompt will be resent.')
         try:
-            return self._studio_settle(run, self._studio_parse(run, job))
-        except ValueError as error:
-            run.update(error=redact(str(error))[:500])
-            self.save_studio_run(run)
-            raise ValueError(str(error) + ' The result still does not validate; dismiss this run.') from error
+            if action == 'redispatch':
+                return self._studio_dispatch(organization, run)
+            if action == 'settle':
+                job = self._job(run.get('job_id'))
+                try:
+                    return self._studio_settle(run, self._studio_parse(run, job))
+                except ValueError as error:
+                    raise ValueError(str(error) + ' The result still does not validate; dismiss this run.') from error
+            self._repair_run(organization, run, action, actor)
+            return self._studio_run_record(organization, run['id'])
+        except (ValueError, OSError) as error:
+            current = self._studio_run_record(organization, run['id'])
+            if current.get('state') == 'needs_attention':
+                current.update(error=redact(str(error))[:500])
+                self.save_studio_run(current)
+            raise
+
+    def _studio_run_record(self, organization, identity):
+        with closing(self.service.connect()) as db:
+            row = db.execute('SELECT data FROM venture_studio_runs WHERE id=? AND organization_id=?',
+                             (identity, organization)).fetchone()
+        if not row:
+            raise ValueError('Studio run not found in this organization.')
+        return json.loads(row[0])
 
     def studio_dismiss(self, organization, body, actor):
         """Close a run needing attention without reprocessing it. The group's
@@ -1586,6 +1643,11 @@ class Ventures(StudioOperations):
                      'web_research', 'research', 'research_note', 'suggested_sources')}
             item['candidates'] = [{key: candidate.get(key) for key in ('id', 'name', 'state', 'confidence')}
                                   for candidate in run.get('candidates') or []]
+            if run.get('state') == 'needs_attention':
+                try:
+                    item['recover'] = self._recover_hint(run)
+                except (ValueError, OSError):
+                    item['recover'] = None
             run_summaries.append(item)
         schedule = {kind: dict(cadence=policy['studio_' + kind + '_cadence'],
                                next_at=policy.get('studio_next_' + kind + '_at'),

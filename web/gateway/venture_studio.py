@@ -46,6 +46,8 @@ FAILURES = dict(
                   help='Connect or repair the CLI account on the CLI accounts page, then repair the studio.'),
     model=dict(title='The model is not available', action='cli_accounts',
                help='Choose a model the connected account offers, then repair the studio.'),
+    busy=dict(title='A studio agent was still busy', action='repair',
+              help='Nothing was sent to the group yet. Repair prepares the meeting again once the agent is idle.'),
     team=dict(title='A studio agent did not start', action='repair',
               help='Repair releases the failed session and starts the team again.'),
     limits=dict(title='An organization limit blocks the meeting', action='limits',
@@ -62,6 +64,9 @@ FAILURES = dict(
 # First match wins, so the specific causes come before the general ones.
 _RULES = (
     ('herdr', ('server_not_running', 'herdr is stopped', 'start herdr', 'herdr.sock', 'no herdr server')),
+    # Busy is not "did not start": the agent runs, it was answering something.
+    ('busy', ('agent is still working', 'agent_working', 'not ready for input', 'agent_not_ready',
+              'finish its current reply')),
     ('permission', ('permission', 'waiting for a decision', 'waiting_for_input', 'approval', 'agent_blocked')),
     ('model', ('provider/model', 'model is unavailable', 'unsupported model', 'model not found', 'unknown model',
                'reasoning variant')),
@@ -350,8 +355,11 @@ class StudioOperations:
         studio = studio if studio is not None else self._studio(organization)
         checks = []
 
-        def add(identity, label, ok, detail, action):
-            checks.append(dict(id=identity, label=label, ok=bool(ok), detail=detail, action='' if ok else action))
+        def add(identity, label, ok, detail, action, optional=False):
+            # Optional: not met, but the studio works without it (shown as a
+            # suggestion, not as something that needs the operator).
+            checks.append(dict(id=identity, label=label, ok=bool(ok), detail=detail, action='' if ok else action,
+                               optional=bool(optional and not ok)))
 
         herdr = self._herdr_state()
         add('herdr', 'Herdr is running', herdr != 'stopped',
@@ -408,13 +416,15 @@ class StudioOperations:
         if not usable:
             detail += (' The scout researches the web instead and suggests feeds you can add.' if web else
                        ' The scout would have no market evidence to cite.')
-        add('sources', 'Scouting sources', usable, detail, 'configure')
+        add('sources', 'Scouting sources', usable, detail, 'configure', optional=web)
         add('focus', 'Focus areas', bool(focus),
             ', '.join(focus) if focus else 'None: the scout would not know where to look.', 'configure')
         failing = {check['id'] for check in checks if not check['ok']}
         blocking = [identity for identity in ('herdr', 'provider', 'team', 'sessions', 'limits') if identity in failing]
         return dict(herdr=herdr, checks=checks, blocking=blocking, can_run=not blocking,
                     can_scout=not blocking and 'focus' not in failing and (usable or web),
+                    # "Run scout without sources" skips sources, never the focus.
+                    can_scout_override=not blocking and bool(focus),
                     coverage=dict(sources=len(sources), focus=len(focus), readable=len(sources) - len(broken),
                                   web_research=web and not usable),
                     sources=health,
@@ -560,6 +570,14 @@ class StudioOperations:
         return next((item for item in self.service.store.snapshot(live_status=False).get('jobs', [])
                      if item.get('id') == identity), None)
 
+    RECOVER_LABELS = dict(settle='Read result again', redispatch='Re-send prompt', retry='Retry preparation',
+                          finalize='Recover result', dismiss='')
+
+    def _recover_hint(self, run):
+        """The one step "recover" takes for this run, for the dashboard button."""
+        action, label = self._repair_step(run, True)
+        return dict(action=action, label=self.RECOVER_LABELS.get(action, ''), detail=label)
+
     def _repair_step(self, run, newest):
         """What repair does with one run needing attention: ``(action, label)``."""
         job = self._job(run.get('job_id'))
@@ -652,6 +670,7 @@ class StudioOperations:
                 ensure_facilitator(store, studio['group_id'], organization)
                 record('facilitator', True, 'The facilitator session is live; the other agents start '
                                             'when the next meeting needs them.')
+                self._studio_rename_group(organization, studio)
             except (ValueError, OSError) as error:
                 failure = self._failure(str(error), 'preparation', organization=organization)
                 record('facilitator', False, error, failure=failure)
@@ -710,6 +729,7 @@ class StudioOperations:
         self._studio_group(organization, studio)
         if self._herdr_state(fresh=True) == 'stopped':
             raise StudioWaiting('Herdr is stopped. Start Herdr to start the studio team.', 'herdr')
+        self._studio_rename_group(organization, studio)
         store = self.service.store
         if getattr(store, 'supports_discussion_preparation', False) is True:
             from discussion_scheduler import ensure_facilitator

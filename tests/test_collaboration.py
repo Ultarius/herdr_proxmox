@@ -358,6 +358,37 @@ class CollaborationTests(unittest.TestCase):
         prompts = [a for a, _ in self.calls if a[:2] == ('agent', 'prompt') and 'Discussion directory:' in a[3]]
         self.assertEqual(len(prompts), 3)
 
+    def test_a_member_still_answering_its_startup_prompt_waits_instead_of_failing(self):
+        # Members get their startup prompt without waiting for the reply, so
+        # one can turn busy between preparation and discussion assembly. That
+        # is a wait, not a fault: nothing was sent and the poll loop retries.
+        from herdr_errors import HerdrError
+        import collaboration
+        group = self.group()
+        with patch.object(self.store, 'execute'):
+            meeting = self.action('discuss', organization_id=self.org, group_id=group)
+            self.drain()
+        original = collaboration.current_run
+        raised = []
+        def busy_once(store, run, ready=True):
+            if ready and not raised:
+                raised.append(run['id'])
+                raise HerdrError('Portfolio Manager: Agent is still working; no new prompt was sent.',
+                                 code='agent_working', delivery='none')
+            return original(store, run, ready=ready)
+        with patch.object(collaboration, 'current_run', side_effect=busy_once):
+            self.store.execute(meeting)
+        job = self.job(meeting)
+        self.assertEqual(job['state'], 'waiting_for_members', job.get('error'))
+        self.assertIn('still working', job['progress'])
+        self.assertEqual(job.get('error'), '')
+        self.assertFalse(job.get('discussion_submitted_at'))
+        self.store.advance_discussions()
+        self.drain()
+        self.assertEqual(self.job(meeting)['state'], 'artifact_ready', self.job(meeting).get('error'))
+        prompts = [a for a, _ in self.calls if a[:2] == ('agent', 'prompt') and 'Discussion directory:' in a[3]]
+        self.assertEqual(len(prompts), 1)
+
     def test_blocked_member_waits_then_resumes_without_manual_retry(self):
         group = self.group()
         run = next(j for j in self.store.job_records() if j.get('profile_id') == self.max and j['kind'] == 'launch')

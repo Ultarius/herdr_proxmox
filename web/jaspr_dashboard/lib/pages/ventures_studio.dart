@@ -153,6 +153,8 @@ Component venturesStudio({
   // A snapshot from an older gateway has no readiness: nothing is blocked.
   final canRun = readiness['can_run'] != false;
   final canScout = readiness['can_scout'] != false;
+  // Running without sources skips sources, never the focus area.
+  final canScoutOverride = readiness['can_scout_override'] == true;
   final coverage = Map<String, dynamic>.from(
     readiness['coverage'] as Map? ?? const {},
   );
@@ -160,25 +162,43 @@ Component venturesStudio({
     readiness['checks'] as List? ?? const [],
   );
   final mode = '${studio?['mode'] ?? policy['studio_mode'] ?? 'proposal'}';
-  Component recoverActions(Map<String, dynamic> run) => actions([
-    button(
-      run['dispatch_failed'] == true ? 'Re-send prompt' : 'Recover result',
-      busy ? null : () => onRecover(run),
-      small: true,
-    ),
-    button(
-      'Dismiss run',
-      busy ? null : () => onDismiss(run),
-      small: true,
-      variant: 'danger',
-    ),
-  ]);
+  Component recoverActions(Map<String, dynamic> run) {
+    // The gateway names the one step recovery takes for this run.
+    final recover = run['recover'] is Map
+        ? Map<String, dynamic>.from(run['recover'] as Map)
+        : const <String, dynamic>{};
+    final label = '${recover['label'] ?? ''}'.isNotEmpty
+        ? '${recover['label']}'
+        : run['dispatch_failed'] == true
+        ? 'Re-send prompt'
+        : 'Recover result';
+    return actions([
+      if (recover['action'] != 'dismiss')
+        button(label, busy ? null : () => onRecover(run), small: true),
+      button(
+        'Dismiss run',
+        busy ? null : () => onDismiss(run),
+        small: true,
+        variant: 'danger',
+      ),
+      if ('${recover['detail'] ?? ''}'.isNotEmpty)
+        text(' ${recover['detail']}'),
+    ]);
+  }
+
   return card(
     'Venture Studio',
     [
       facts([
         ('Mode', text(_modeLabels[mode] ?? mode)),
-        ('Group', text(groupId)),
+        (
+          'Group',
+          text(
+            '${(record['team'] as Map? ?? const {})['group_name'] ?? ''}'.isEmpty
+                ? groupId
+                : '${(record['team'] as Map)['group_name']}',
+          ),
+        ),
         if (_agentSettings(record).isNotEmpty)
           ('Agents run on', text(_agentSettings(record))),
         ('Notebook', mono('${record['notebook'] ?? ''}')),
@@ -215,7 +235,7 @@ Component venturesStudio({
           busy || !canScout ? null : onRunScout,
           small: true,
         ),
-        if (canRun && !canScout && onRunScoutAnyway != null)
+        if (canRun && !canScout && canScoutOverride && onRunScoutAnyway != null)
           button(
             'Run scout without sources',
             busy ? null : onRunScoutAnyway,
@@ -277,8 +297,8 @@ Component venturesStudio({
         '${budget['max_daily_meetings'] ?? budget['daily_meetings'] ?? 0} with news-only ventures; '
         '${budget['projected_agent_sessions'] ?? 0} to ${budget['max_agent_sessions'] ?? 0} agent sessions. '
         'Studio runs per week: ${budget['studio_runs_per_week'] ?? 0}. '
-        'Limits: ${budget['max_active_meetings'] ?? 0} active meetings, '
-        '${budget['daily_session_cap'] ?? 0} sessions per day (0 = off).',
+        'Limits: ${_limit(budget['max_active_meetings'], 'active meetings')}, '
+        '${_limit(budget['daily_session_cap'], 'sessions per day')}.',
         error: budget['over_cap'] == true,
       ),
       if (budget['over_cap'] == true)
@@ -446,6 +466,12 @@ String _agentSettings(Map<String, dynamic> record) {
   return '${shown.join('; ')}${source == null ? '' : ' ($source)'}';
 }
 
+/// A session limit for people: 0 means the organization sets none.
+String _limit(Object? value, String label) {
+  final number = value is num ? value.toInt() : int.tryParse('$value') ?? 0;
+  return number <= 0 ? 'no limit on $label' : '$number $label';
+}
+
 /// The setup checklist: one line per requirement, with the action that fixes it.
 Component _checklist(
   List<Map<String, dynamic>> checks,
@@ -455,9 +481,23 @@ Component _checklist(
   for (final check in checks)
     el('div', [
       pill(
-        check['ok'] == true ? 'Ready' : 'Needs you',
-        tone: check['ok'] == true ? 'success' : 'danger',
-        shape: shapeFor(check['ok'] == true ? 'success' : 'danger'),
+        check['ok'] == true
+            ? 'Ready'
+            : check['optional'] == true
+            ? 'Optional'
+            : 'Needs you',
+        tone: check['ok'] == true
+            ? 'success'
+            : check['optional'] == true
+            ? 'neutral'
+            : 'danger',
+        shape: shapeFor(
+          check['ok'] == true
+              ? 'success'
+              : check['optional'] == true
+              ? 'neutral'
+              : 'danger',
+        ),
       ),
       text(' ${check['label'] ?? ''}: ${check['detail'] ?? ''} '),
       if ('${check['action'] ?? ''}'.isNotEmpty)

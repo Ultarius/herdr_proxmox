@@ -215,6 +215,22 @@ void main() {
         'studio': {
           'group_id': 'studio-group',
           'notebook': 'ventures/studio-org',
+          'team': {'group_name': 'Venture Studio'},
+        },
+        'readiness': {
+          'can_run': true,
+          'can_scout': true,
+          'can_scout_override': true,
+          'checks': [
+            {
+              'id': 'sources',
+              'label': 'Scouting sources',
+              'ok': false,
+              'optional': true,
+              'detail': 'None. The scout researches the web instead.',
+              'action': 'configure',
+            },
+          ],
         },
         'schedule': {
           'portfolio': {
@@ -269,6 +285,11 @@ void main() {
             'state': 'needs_attention',
             'error': 'Meeting limit reached.',
             'dispatch_failed': true,
+            'recover': {
+              'action': 'retry',
+              'label': 'Retry preparation',
+              'detail': 'Retry preparing the scout meeting; no prompt was sent yet',
+            },
           },
         ],
         'budget': {
@@ -464,9 +485,16 @@ void main() {
       expect(page, contains('(2 times)'));
       expect(page, contains('#1 Settlement Desk · continue'));
       expect(page, contains('Needs attention (1)'));
-      expect(page, contains('Re-send prompt'));
+      // The gateway names the step recovery takes, not a generic "recover".
+      expect(page, contains('Retry preparation'));
+      expect(page, contains('no prompt was sent yet'));
       expect(page, contains('Dismiss run'));
       expect(page, contains('Lessons the studio sees (1)'));
+      // The group reads as its name; web research makes sources a suggestion.
+      expect(page, contains('Venture Studio'));
+      expect(page, isNot(contains('studio-group')));
+      expect(page, contains('Optional'));
+      expect(page, isNot(contains('Needs you')));
     },
   );
 

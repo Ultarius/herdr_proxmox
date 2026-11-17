@@ -1922,6 +1922,20 @@ class OrganizationStore:
                     with self.lock, closing(self.connect()) as db:
                         current = self.get(db, 'jobs', job_id)
                     discussion_not_submitted = not current.get('discussion_submitted_at')
+                    if discussion_not_submitted and code in TRANSIENT_AGENT_CODES:
+                        # A member still answering its startup prompt (or
+                        # otherwise busy) when the discussion is assembled is a
+                        # reason to wait, as it is during preparation. Nothing
+                        # was sent, so the poll loop retries by itself instead
+                        # of parking the meeting for an operator.
+                        from discussion_scheduler import mark_waiting
+                        with self.lock, closing(self.connect()) as db, db:
+                            current = self.get(db, 'jobs', job_id)
+                            if current['state'] == 'running' and not current.get('discussion_submitted_at'):
+                                current.update(state='queued', updated_at=now())
+                                self.put(db, 'jobs', current)
+                        mark_waiting(self, job_id, 'Waiting for a member to finish its current reply. ' + detail)
+                        return
                 except Exception:
                     pass  # Unavailable evidence must not claim delivery certainty.
             if job['kind'] in ('launch', 'chat', 'delegate') and delivery in ('blocked', 'unknown') and code:

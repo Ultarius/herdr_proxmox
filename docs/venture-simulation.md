@@ -399,6 +399,13 @@ session. The same check guards a venture's own team.
    raised and reported as `limits_raised`. Calling it again on an existing
    studio changes only what the call names: it never re-enables a cadence the
    operator turned off and never raises a limit again.
+   The group is named **Venture Studio** (a group belongs to one
+   organization, so it needs no identifier) and the notebook folder is
+   `ventures/studio-<organization name>-<short id>`. A studio set up earlier,
+   whose group is still called `Venture Studio <organization id>`, is renamed
+   once by the next setup, team start, repair or manual run; a name the
+   operator chose is left alone. The notebook folder of an existing studio is
+   not moved.
 4. **First scout**, when asked. If it cannot start (Herdr stopped, no sources)
    the studio still exists and the answer says why.
 
@@ -414,7 +421,7 @@ with one action per failing item.
 | The studio team exists | every run | Set up, or Repair |
 | No agent session is stuck | every run | Repair studio |
 | The organization limits allow a studio meeting (five sessions) | every run | Raise limits for the studio |
-| Scouting sources | the scout | Configure studio |
+| Scouting sources | the scout, unless web research is on (then shown as **Optional**) | Configure studio |
 | Focus areas | the scout | Configure studio |
 
 The same checks run as a **preflight** before a run is recorded, so the studio
@@ -425,8 +432,12 @@ never starts a meeting that cannot work:
   line, it is not an error, it adds no failure and no backoff, and the same
   due window runs on the first pass after the cause clears.
 - A scout needs at least one source and one focus area. A manual scout may
-  run without them only with an explicit override (**Run scout without
-  sources**); a scheduled one never does.
+  run without sources only with an explicit override (**Run scout without
+  sources**); a scheduled one never does. The override never skips the focus
+  area: a scout without readable sources researches the web, and without a
+  focus it would not know where to look, so that run is refused and the
+  button is only offered when a focus is set (`can_scout_override`).
+- Session limits of 0 mean no limit and are shown that way.
 - A venture's own meeting tick has the Herdr check too: it is skipped with a
   review record, and the news items it was offered are offered again.
 
@@ -553,15 +564,34 @@ A success resets the kind's failure count and records `last_at`. A `pending`
 run left for more than ten minutes (an interrupted dispatch) is moved to
 needs-attention, so it cannot block the studio.
 
-A run needing attention is listed on the page but never blocks the studio:
+A member that is still busy when the meeting is assembled, typically still
+answering its startup prompt, makes the meeting **wait**, not fail. Members
+receive that prompt without the gateway waiting for the reply, so one can turn
+busy between preparation and assembly. Nothing has been sent at that point,
+so Herdr puts the meeting back to `waiting_for_members` and the poll loop
+retries it; the studio shows it as "Waiting to start". It turns into a
+failure only after 24 hours, like any other wait.
+
+A run needing attention is listed on the page but never blocks the studio. Its
+recover button takes the same step repair would take for that run, and its
+label says which (`recover` in the studio summary carries the action, the
+label and a sentence):
 
 - **The prompt never reached the group** (a meeting limit, a restart):
   **Re-send prompt** sends the frozen prompt again under the same request id
   `studio-<run id>`. A first attempt that did reach the group therefore
   returns the same discussion instead of a second meeting.
-- **The agents' result does not validate**: **Recover result** re-parses the
+- **The meeting stopped before its prompt was sent** (an agent that was busy
+  or not ready): **Retry preparation** prepares the same meeting again. It
+  never finalizes a discussion that has no output.
+- **The meeting stopped after its prompt was sent**: **Recover result**
+  recovers the group's saved output, then reads it.
+- **The agents' result does not validate**: **Read result again** re-parses the
   saved artifact; if it still fails, **Dismiss run** closes it with a required
   reason. The discussion and its artifact are left for inspection.
+
+A busy agent is named as such ("A studio agent was still busy"), not as an
+agent that did not start.
 
 Scheduler errors, failure counts and the last and next run for each kind are
 shown on both dashboards.

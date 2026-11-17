@@ -167,7 +167,8 @@ void main() {
         readiness: const {
           'can_run': true,
           'can_scout': false,
-          'coverage': {'sources': 0, 'focus': 0},
+          'can_scout_override': true,
+          'coverage': {'sources': 0, 'focus': 1},
           'checks': [
             {
               'id': 'sources',
@@ -180,13 +181,55 @@ void main() {
         },
       ),
     );
-    expect(page(), contains('Evidence coverage: 0 source(s), no focus'));
+    expect(page(), contains('Evidence coverage: 0 source(s), 1 focus area(s)'));
     expect(button('Run scout now').disabled, isTrue);
     expect(button('Run portfolio now').disabled, isFalse);
     button('Run scout without sources').click();
     button('Configure studio').click();
     await settle();
     expect(calls, ['scout-anyway', 'configure']);
+  });
+
+  test('without a focus area the override is not offered', () async {
+    // A scout without sources researches the web; without a focus it would
+    // not know where to look, so the gateway refuses that run.
+    await mount(
+      configured(
+        readiness: const {
+          'can_run': true,
+          'can_scout': false,
+          'can_scout_override': false,
+          'coverage': {'sources': 0, 'focus': 0},
+          'checks': [
+            {
+              'id': 'sources',
+              'label': 'Scouting sources',
+              'ok': false,
+              'optional': true,
+              'detail': 'None. The scout researches the web instead.',
+              'action': 'configure',
+            },
+            {
+              'id': 'focus',
+              'label': 'Focus areas',
+              'ok': false,
+              'detail': 'None: the scout would not know where to look.',
+              'action': 'configure',
+            },
+          ],
+        },
+      ),
+    );
+    expect(button('Run scout now').disabled, isTrue);
+    expect(
+      nodes('button').where(
+        (item) => item.textContent!.trim() == 'Run scout without sources',
+      ),
+      isEmpty,
+    );
+    // Missing sources are a suggestion here; the missing focus needs the operator.
+    expect(page(), contains('Optional'));
+    expect(page(), contains('Needs you'));
   });
 
   test('a failed run names its cause, its phase, its agent and one action', () async {

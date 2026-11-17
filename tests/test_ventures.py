@@ -125,7 +125,8 @@ class VentureTests(unittest.TestCase):
             if replay[0] != json.dumps(body, sort_keys=True):
                 raise ValueError('Request ID already used for different content.')
             return replay[1]
-        if body.get('id'):
+        if body.get('id') and not (action == 'group' and any(
+                group['id'] == body['id'] for group in self.groups)):
             raise ValueError('Record not found.')
         if self.fail_next == action:
             self.fail_next = None
@@ -146,6 +147,10 @@ class VentureTests(unittest.TestCase):
                            accessible_paths=body.get('accessible_paths', []))
             self.profiles.append(profile)
             return profile
+        if action == 'group' and body.get('id'):
+            group = next(group for group in self.groups if group['id'] == body['id'])
+            group.update(name=body['name'], members=body['members'])
+            return group
         if action == 'group':
             member = next(profile for profile in self.profiles if profile['id'] == body['members'][0])
             facilitator = dict(id=uuid.uuid4().hex, organization_id=body['organization_id'],
@@ -1527,6 +1532,56 @@ class VentureTests(unittest.TestCase):
         for problem in ('configuration: A candidate needs at least one monthly cost',
                         'kill criteria: 1 to 8 items needed, got 9', 'evidence:'):
             self.assertIn(problem, refused['error'])
+
+    def test_the_studio_group_name_carries_no_identifier_and_an_old_one_is_renamed_once(self):
+        self.setup_studio_manual()
+        self.assertEqual(self.ventures._studio_notebook_path('org'), 'ventures/studio-product-organization-org')
+        self.groups[0]['name'] = 'Venture Studio org'  # How studios were named before.
+        self.ventures._studio_rename_group('org', self.ventures._studio('org'))
+        self.assertEqual(self.groups[0]['name'], 'Venture Studio')
+        self.assertEqual(self.ventures._studio('org')['team']['group_name'], 'Venture Studio')
+        calls = self.store.action.call_count
+        self.ventures._studio_rename_group('org', self.ventures._studio('org'))
+        self.assertEqual(self.store.action.call_count, calls)  # Nothing left to rename.
+        self.groups[0]['name'] = 'Pricing desk'  # An operator's own name is left alone.
+        self.ventures._studio_rename_group('org', self.ventures._studio('org'))
+        self.assertEqual(self.groups[0]['name'], 'Pricing desk')
+
+    def test_a_scout_without_sources_still_needs_a_focus_to_research_the_web(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.service.patch_policy('org', dict(studio_focus=[]), 'test')
+        readiness = self.readiness()
+        self.assertEqual((readiness['can_scout'], readiness['can_scout_override']), (False, False))
+        # With web research on, missing sources are a suggestion, not a blocker.
+        self.assertTrue(self.check('sources')['optional'])
+        self.assertFalse(self.check('focus').get('optional'))
+        with self.assertRaisesRegex(ValueError, 'Add a focus area'):
+            self.studio(mode='studio_run', kind='scout', override=True)
+        self.assertEqual(self.studio_runs(), [])
+        self.service.patch_policy('org', dict(studio_focus=['freight forwarding']), 'test')
+        self.assertEqual(self.studio(mode='studio_run', kind='scout', override=True)['state'], 'meeting')
+
+    def test_a_meeting_stopped_by_a_busy_agent_is_named_and_recover_retries_its_preparation(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='scout')
+        job = next(job for job in self.jobs if job['id'] == run['job_id'])
+        job.update(state='needs_attention', error=(
+            'Portfolio Manager: Agent is still working; no new prompt was sent. Discussion preparation failed '
+            'before submission; no discussion prompt was sent. Retry inspected preparation after resolving the cause.'))
+        self.ventures.advance()
+        stored = self.studio_runs()[-1]
+        self.assertEqual(stored['state'], 'needs_attention')
+        self.assertEqual((stored['failure']['category'], stored['failure']['title'], stored['failure']['agent']),
+                         ('busy', 'A studio agent was still busy', 'Portfolio Manager'))
+        shown = self.ventures._studio_summary('org')['runs'][0]
+        self.assertEqual((shown['recover']['action'], shown['recover']['label']), ('retry', 'Retry preparation'))
+        # Recover takes that step: the meeting is prepared again, nothing is finalized or resent.
+        recovered = self.studio(mode='studio_recover', run_id=run['id'], inspected=True)
+        self.assertEqual(recovered['state'], 'meeting')
+        self.assertEqual(job['state'], 'queued')
+        self.assertEqual(len([item for item in self.jobs if item.get('kind') == 'discussion']), 1)
 
     def test_an_unreadable_source_falls_back_to_web_research_and_is_named(self):
         self.setup_studio_manual()
