@@ -517,9 +517,9 @@ month in the market currency:
 Variable costs beyond the stated delivery effort are not modelled, so the
 break-even is a floor. These figures are stored on the candidate, shown on the
 Ideas card and in the approval dialog, and recomputed if the operator edits the
-configuration. Warnings (a losing first offer, a break-even above the reachable
-accounts, a first payment after the money runs out) cannot be overridden by the
-scout. Autonomous mode creates only an idea the Skeptic would `advance` and
+configuration. Warnings (a losing first offer, a service with no one-off
+revenue to fund delivery, a break-even above the reachable accounts, a first
+payment after the money runs out) cannot be overridden by the scout. Autonomous mode creates only an idea the Skeptic would `advance` and
 whose economics carry no warning; the operator can still approve the others.
 
 Kill criteria are refused only on what the gateway can check: 1-8 items, at
@@ -528,7 +528,9 @@ and every date (ISO, `31 Mar 2027`, `31 March 2027` or `March 2027`) in the
 future, within the first 120-day gate and inside the computed runway. Wording
 problems that are a matter of judgement (effort without the customer's current
 baseline, a proxy such as stated interest, guidance or a template without
-saying why it would kill the business) are stored as `kill_criteria_notes` and
+saying why it would kill the business, unless a payment such as a signed or paid
+pilot decides the item; a bare amount, such as a competitor's price, does not)
+are stored as `kill_criteria_notes` and
 shown on the card as criteria to tighten, so they do not cost an otherwise
 sound idea. Operator edits are checked the same way.
 
@@ -555,6 +557,25 @@ settings and feeds, the research pages as links, and the scout's own note.
 Whether the agents can search depends on the agent CLI and its permissions;
 a CLI without a web tool is told to return no candidates and say so in
 `research_note`.
+
+### Printable brief
+
+**Export brief** on an idea card opens a printable brief of that candidate in
+a new tab and starts the print dialog, so the idea can be presented on paper
+or saved as a PDF. With pop-ups blocked the dashboard downloads the brief as an
+HTML file instead. The gateway renders it (`candidate_brief`,
+`venture_brief.py`) on A4: the key figures, the idea, why now, who buys, the
+business model and gateway economics with their warnings, the alternatives,
+the case against and the Skeptic, the confidence dimensions, assumptions, kill
+criteria with the notes to tighten them, and every cited id with its page or
+news item from the scout run. Every page says that the narrative is agent
+opinion and that the numbers come from the gateway.
+
+Agent text is escaped, and the brief carries its own Content-Security-Policy:
+no network requests and only the hashed print script. The brief is shown from
+a blob of the dashboard's origin, so this policy, not the escaping alone, is
+what keeps a hostile scout answer from running in it. Exporting changes
+nothing and takes no lock; it is available for decided candidates too.
 
 ### Where the evidence file goes
 
@@ -819,6 +840,9 @@ formula.
   Studio modes run under the organization's `studio:` lock: `studio_setup`,
   `studio_run` (`kind`, optional `override`), `studio_recover`,
   `studio_dismiss`, `studio_repair` (optional `confirmed`) and `studio_team`.
+  `candidate_update` and `candidate_decide` run under the candidate's lock;
+  `candidate_brief` (`candidate_id`) is read-only and returns the printable
+  brief as `html` with a `filename`.
   `studio_policy`, `studio_limits` and `studio_source_add` (`url`) run under
   the `policy:` lock.
   `studio_start` (the one-call setup) and `herdr_start` need no organization.

@@ -492,6 +492,8 @@ void main() {
     expect(page, contains('Break-even needs 31 customers'));
     expect(page, contains('Case against (1)'));
     expect(page, contains('Skeptic: hold'));
+    // Each idea can be exported as a printable brief.
+    expect(page, contains('Export brief'));
     // Another organization's candidate is not listed; a decided one is filed apart.
     expect(page, isNot(contains('Foreign Desk')));
     expect(page, contains('Decided (1)'));

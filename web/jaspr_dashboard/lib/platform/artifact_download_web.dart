@@ -48,6 +48,22 @@ Future<void> downloadTaskBackupLink(Uri uri) async {
   link.remove();
 }
 
+/// Shows an HTML document in a tab reserved with `window.open('about:blank')`.
+///
+/// The document comes from a blob of this origin, so it must carry its own
+/// Content-Security-Policy; the venture brief allows only its print script.
+void showHtmlDocument(web.Window tab, String content) {
+  final url = web.URL.createObjectURL(
+    web.Blob(
+      [content.toJS].toJS,
+      web.BlobPropertyBag(type: 'text/html;charset=utf-8'),
+    ),
+  );
+  tab.location.replace(url);
+  // The tab keeps the loaded document; the URL is only needed to load it.
+  Timer(const Duration(seconds: 60), () => web.URL.revokeObjectURL(url));
+}
+
 Future<void> downloadArtifact(String content, String filename) async {
   _save(
     web.Blob(
@@ -55,6 +71,8 @@ Future<void> downloadArtifact(String content, String filename) async {
       web.BlobPropertyBag(
         type: filename.endsWith('.json')
             ? 'application/json;charset=utf-8'
+            : filename.endsWith('.html')
+            ? 'text/html;charset=utf-8'
             : 'text/markdown;charset=utf-8',
       ),
     ),

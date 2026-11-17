@@ -1,5 +1,7 @@
+import base64
 from datetime import timedelta
 import hashlib
+import html
 import json
 from pathlib import Path
 import re
@@ -1791,6 +1793,12 @@ class VentureTests(unittest.TestCase):
         self.assertEqual((outgrown['break_even_customers'], outgrown['break_even_unit'], outgrown['accounts_needed']),
                          (6, 'projects a month', 72))
         self.assertIn('only 30 accounts are cited as reachable', outgrown['warnings'][0])
+        # A service priced at nothing has no project to fund delivery.
+        free = ventures.scout_business_model(dict(type='service', revenue_lines=[
+            dict(kind='one_off', label='free audit', amount=0, currency='USD')]))
+        unfunded = ventures.candidate_economics(configuration, free, fast, dict(count=30), 30)
+        self.assertEqual((unfunded['break_even_customers'], unfunded['project_contribution']), (None, None))
+        self.assertEqual(unfunded['warnings'], ['The service model has no one-off revenue to fund delivery.'])
         # A recurring line without a period, or a credit with nothing to credit, is refused.
         with self.assertRaisesRegex(ValueError, 'period'):
             ventures.scout_business_model(dict(type='saas', revenue_lines=[
@@ -1814,6 +1822,13 @@ class VentureTests(unittest.TestCase):
         self.assertTrue(notes[0].startswith('Item 1 rests on a proxy'))
         with self.assertRaisesRegex(ValueError, 'at least one must use a paid'):
             ventures.scout_kill_criteria([real[0], real[2]], economics)
+        # A payment decides an item even when it mentions a survey or a ranking;
+        # a bare amount, such as a competitor's price, does not.
+        self.assertEqual(ventures.kill_criteria_notes([
+            'Fewer than 3 signed pilots among the survey respondents within 90 days.',
+            'Fewer than 2 buyers pay EUR 3,000 after 15 interviews that rank the problem top 3.']), [])
+        self.assertEqual(len(ventures.kill_criteria_notes([
+            'An incumbent at EUR 99/month or free templates cover 80% of the requested scope.'])), 1)
         # Dates in words count as dates, and a date past the runway is refused.
         late = ventures.now().date() + timedelta(days=200)
         with self.assertRaisesRegex(ValueError, 'beyond the first gate'):
@@ -1922,6 +1937,51 @@ class VentureTests(unittest.TestCase):
         venture = self.ventures.get(approved['venture_id'], 'org')
         self.assertEqual(venture['configuration']['sources']['feeds'], ['https://trade.example/feed.xml'])
         self.assertEqual(approved['feeds_attached']['feeds'], ['https://trade.example/feed.xml'])
+
+    def test_an_idea_exports_as_a_printable_brief_that_runs_no_agent_text(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='scout')
+        proposal = self.web_candidate('Carrier <Desk>')
+        proposal['thesis'] = 'Forwarders overpay carriers.<script>alert(1)</script>'
+        proposal['alternatives'][0]['name'] = '<img src=x onerror=alert(2)>'
+        done = self.complete_studio(run, {'candidates': [proposal], 'research': self.RESEARCH})
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        stored = self.stored_candidates()[0]
+        brief = self.studio(mode='candidate_brief', candidate_id=stored['id'])
+        page = brief['html']
+        self.assertEqual((brief['filename'], brief['content_type']), ('carrier-desk-brief.html', 'text/html'))
+        # Agent text is escaped; the only script is the print helper the policy allows by hash.
+        self.assertIn('Carrier &lt;Desk&gt;', page)
+        self.assertIn('&lt;script&gt;alert(1)&lt;/script&gt;', page)
+        self.assertIn('&lt;img src=x onerror=alert(2)&gt;', page)
+        self.assertEqual(page.count('<script>'), 1)
+        script = re.search(r'<script>(.*?)</script>', page, re.S).group(1)
+        policy = html.unescape(re.search(r'Content-Security-Policy" content="([^"]*)"', page).group(1))
+        digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+        self.assertIn("script-src 'sha256-" + digest + "'", policy)
+        self.assertTrue(policy.startswith("default-src 'none';"))
+        # The figures and the cited page travel with the idea onto paper.
+        self.assertIn('Business model and unit economics', page)
+        self.assertIn('Break-even', page)
+        self.assertIn('Kill criteria', page)
+        self.assertIn('Forwarders dispute one invoice in nine', page)
+        self.assertIn('href="https://trade.example/report"', page)
+        self.assertIn('not been verified', page)
+        # Malformed saved data still renders: a broken URL, odd shapes, a pruned run.
+        odd = dict(stored, confidence_dimensions=['bad'], configuration='bad', economics=None, evidence_links=[])
+        page = ventures.venture_brief.render(odd, 'Org', dict(research=[dict(id='W1', url='https://[bad', title='T')]))
+        self.assertIn('<b>W1</b> T', page)
+        self.assertIn('Business model and unit economics', page)
+        # Without the run, the pages saved on the candidate itself still list.
+        self.assertIn('trade.example', ventures.venture_brief.render(stored, 'Org', None))
+        # Exporting changes nothing, and it stays inside the organization.
+        self.assertEqual(self.stored_candidates()[0], stored)
+        with self.assertRaisesRegex(ValueError, 'administrator'):
+            self.ventures.action(dict(mode='candidate_brief', organization_id='org', candidate_id=stored['id']),
+                                 'member', 'member')
+        with self.assertRaisesRegex(ValueError, 'valid venture candidate'):
+            self.studio(mode='candidate_brief', candidate_id='../etc')
 
     def test_approval_without_attaching_leaves_an_idea_s_feeds_alone(self):
         self.setup_studio_manual()

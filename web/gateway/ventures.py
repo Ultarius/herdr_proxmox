@@ -36,6 +36,7 @@ from notifications import record as notify
 from project_files import project_directory
 import project_git
 from repository_lock import repository_lock
+import venture_brief
 import venture_engine as engine
 import venture_feeds
 import venture_fx
@@ -467,6 +468,10 @@ def scout_confidence(value, cite):
 _MONTHS = dict(jan=1, feb=2, mar=3, apr=4, may=5, jun=6, jul=7, aug=8, sep=9, oct=10, nov=11, dec=12)
 _PAID = re.compile(r'\b(paid|pay|pays|signed|sign|signs|contract|contracts|purchase|purchases|order|orders|'
                    r'revenue|deposit|invoiced|eur|usd|gbp|chf|euros?|dollars?)\b|[€$£]')
+# A payment event, not merely an amount: "a competitor at EUR 99" is a price,
+# "fewer than 3 signed pilots" is evidence that someone paid.
+_PAYMENT = re.compile(r'\b(paid|pay|pays|signed|sign|signs|contract|contracts|purchase|purchases|order|orders|'
+                      r'deposit|deposits|invoiced)\b')
 _EFFORT = re.compile(r'\b(hours?|effort|workload|takes?|spend|spent|saves?|reduction)\b')
 _BASELINE = re.compile(r'\b(current|currently|today|baseline|existing|compared|versus|vs|than)\b')
 _PROXY = re.compile(r'\b(guidance|template|templates|rank|ranks|ranking|survey|interest|say|says)\b')
@@ -535,7 +540,9 @@ def kill_criteria_notes(value):
         lower = str(criterion).lower()
         if _EFFORT.search(lower) and not _BASELINE.search(lower):
             notes.append('Item ' + str(index) + ' measures effort without the customer\'s current baseline.')
-        if _PROXY.search(lower) and not _PAID.search(lower) and not _EXPLANATION.search(lower):
+        # A proxy is fine when the item is decided by a payment; a bare amount
+        # (a competitor's price) does not make it one.
+        if _PROXY.search(lower) and not _PAYMENT.search(lower) and not _EXPLANATION.search(lower):
             notes.append('Item ' + str(index) + ' rests on a proxy (stated interest, guidance or a template) '
                          'without saying why it would kill the business.')
     return notes
@@ -589,6 +596,8 @@ def candidate_economics(configuration, business_model, delivery_effort, reachabl
                  and selling_months and selling_months > 0 else None)
     pilot_days = round(one_off / day_rate, 2) if day_rate > 0 and one_off > 0 else None
     warnings = []
+    if basis == 'project' and one_off <= 0:
+        warnings.append('The service model has no one-off revenue to fund delivery.')
     if project_contribution is not None and project_contribution <= 0:
         warnings.append('The first offer loses money: ' + str(delivery_effort['expert_days']) + ' expert days cost '
                         + str(round(delivery_cost)) + ' ' + base + ' against ' + str(round(one_off)) + ' ' + base
@@ -2167,6 +2176,20 @@ class Ventures(StudioOperations):
         candidate['revisions'] = candidate['revisions'][-20:]
         return self.save_candidate(candidate)
 
+    def candidate_brief(self, organization, identity):
+        """A printable brief of one candidate, to present the idea on paper."""
+        candidate = self.get_candidate(organization, identity)
+        run = None
+        if isinstance(candidate.get('run_id'), str) and ID.fullmatch(candidate['run_id']):
+            try:
+                # The run holds the pages and news items behind each cited id.
+                run = self._studio_run_record(organization, candidate['run_id'])
+            except ValueError:
+                pass  # Pruned: the brief lists the ids without their pages.
+        name = next((item.get('name') for item in self._organizations() if item.get('id') == organization), '')
+        return dict(candidate_id=identity, filename=venture_brief.filename(candidate), content_type='text/html',
+                    html=venture_brief.render(candidate, name or '', run, now(), SCOUT_CONFIDENCE))
+
     def candidate_decide(self, organization, identity, body, actor):
         candidate = self.get_candidate(organization, identity)
         decision = body.get('decision')
@@ -2385,6 +2408,12 @@ class Ventures(StudioOperations):
         if mode == 'studio_dismiss':
             with self.service.operation('studio:' + organization):
                 return self.studio_dismiss(organization, body, actor)
+        if mode == 'candidate_brief':
+            # Read-only: a printable brief changes nothing, so it takes no lock.
+            identity = body.get('candidate_id')
+            if not isinstance(identity, str) or not ID.fullmatch(identity):
+                raise ValueError('Select a valid venture candidate.')
+            return self.candidate_brief(organization, identity)
         if mode in ('candidate_update', 'candidate_decide'):
             identity = body.get('candidate_id')
             if not isinstance(identity, str) or not ID.fullmatch(identity):

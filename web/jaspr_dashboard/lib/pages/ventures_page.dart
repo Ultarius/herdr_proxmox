@@ -170,6 +170,7 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
             onEdit: _editCandidate,
             onApprove: _approveCandidate,
             onReject: _rejectCandidate,
+            onExport: _exportCandidate,
             latestScout: latestScoutRun(bloc.studioFor(_studioOrganization)),
             // Re-reads the saved answer under the current rules; no new meeting.
             onReread: (run) => _submit('studio_recover', {
@@ -1320,6 +1321,44 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
       'confirmed': true,
       ...value,
     }, organization: '${candidate['organization_id']}');
+  }
+
+  /// Opens a printable brief of [candidate] in a new tab with the print
+  /// dialog, to present the idea on paper or save it as a PDF. With pop-ups
+  /// blocked the brief is downloaded instead.
+  Future<void> _exportCandidate(Map<String, dynamic> candidate) async {
+    // Reserve the tab now: after the await the click no longer counts.
+    final tab = reserveTab('Preparing the brief…');
+    final epoch = connection.generation;
+    try {
+      final result = await bloc.ask('candidate_brief', {
+        'organization_id': '${candidate['organization_id']}',
+        'candidate_id': '${candidate['id']}',
+      });
+      final page = '${result['html'] ?? ''}';
+      if (page.isEmpty) throw Exception('The gateway returned no brief.');
+      if (!valid(epoch)) {
+        tab?.close();
+        return;
+      }
+      if (tab != null) {
+        showHtml(tab, page);
+        return;
+      }
+      await downloadText(page, '${result['filename'] ?? 'idea-brief.html'}');
+      if (mounted) {
+        setState(
+          () => message =
+              'Pop-ups are blocked, so the brief was downloaded. Open it and print it, '
+              'or save it as a PDF.',
+        );
+      }
+    } catch (e) {
+      tab?.close();
+      if (mounted && valid(epoch)) {
+        setState(() => error = e.toString().replaceFirst('Exception: ', ''));
+      }
+    }
   }
 
   Future<void> _rejectCandidate(Map<String, dynamic> candidate) async {

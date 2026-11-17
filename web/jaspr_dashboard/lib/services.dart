@@ -58,6 +58,21 @@ Future<String> copyText(
   }
 }
 
+/// Opens an empty tab while a click still counts as user activation, so a
+/// document fetched afterwards can be shown without the pop-up blocker.
+/// Null when pop-ups are blocked.
+web.Window? reserveTab(String placeholder) {
+  final tab = web.window.open('about:blank', '_blank');
+  if (tab == null) return null;
+  tab.opener = null;
+  tab.document.body?.textContent = placeholder;
+  return tab;
+}
+
+/// Shows [content] (a complete HTML document) in a tab from [reserveTab].
+void showHtml(web.Window tab, String content) =>
+    artifacts.showHtmlDocument(tab, content);
+
 void openExternal(String url) {
   final uri = Uri.tryParse(url);
   if (uri == null || !['http', 'https'].contains(uri.scheme)) return;

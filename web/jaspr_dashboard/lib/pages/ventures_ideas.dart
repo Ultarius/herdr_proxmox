@@ -198,6 +198,7 @@ Component venturesIdeas({
   required void Function(Map<String, dynamic>) onReject,
   Map<String, dynamic>? latestScout,
   void Function(Map<String, dynamic> run)? onReread,
+  void Function(Map<String, dynamic>)? onExport,
 }) {
   final refusals = [
     ..._scoutStatus(latestScout),
@@ -234,6 +235,7 @@ Component venturesIdeas({
           onApprove,
           onReject,
           scout: latestScout,
+          onExport: onExport,
         ),
       if (closed.isNotEmpty)
         disclosure(
@@ -247,6 +249,7 @@ Component venturesIdeas({
                 onEdit,
                 onApprove,
                 onReject,
+                onExport: onExport,
               ),
           ],
         ),
@@ -265,6 +268,19 @@ String _moneyText(Object? value, Object? currency) {
 String _priceText(Map? price) {
   if (price == null) return 'price not public';
   return _moneyText(price['amount'], price['currency']);
+}
+
+String _breakEvenText(Map economics) {
+  final count = economics['break_even_customers'];
+  if ('${economics['basis'] ?? ''}' == 'project') {
+    final accounts = economics['accounts_needed'];
+    return '$count projects a month'
+        '${accounts == null ? '' : ' · $accounts accounts a year'}';
+  }
+  final share = economics['break_even_share'];
+  // Without a share (older or partial economics) say nothing rather than "null".
+  return '$count paying customers'
+      '${share is num ? ' · ${(share * 100).round()}% of cited reach' : ''}';
 }
 
 /// The scout's diligence case and the gateway's unit economics.
@@ -339,16 +355,7 @@ Component candidateDiligence(Map<String, dynamic> item) {
         ),
       ),
     if (economics != null && economics['break_even_customers'] != null)
-      (
-        'Break-even',
-        text(
-          '${economics['break_even_customers']} '
-          '${economics['break_even_unit'] ?? '${economics['basis']} customers'}'
-          '${economics['break_even_share'] == null ? '' : ' · ${((economics['break_even_share'] as num) * 100).round()}% of the cited reachable accounts'}'
-          '${economics['customers_per_month'] == null ? '' : ' · about ${economics['customers_per_month']} new a month to get there before the money runs out'}'
-          ' (a floor: variable costs beyond delivery are not counted)',
-        ),
-      ),
+      ('Break-even', text(_breakEvenText(economics))),
     if (economics != null)
       (
         'Contribution',
@@ -443,6 +450,7 @@ Component _candidate(
   void Function(Map<String, dynamic>) onApprove,
   void Function(Map<String, dynamic>) onReject, {
   Map<String, dynamic>? scout,
+  void Function(Map<String, dynamic>)? onExport,
 }) {
   final state = '${item['state'] ?? 'proposed'}';
   final configuration = item['configuration'] as Map? ?? const {};
@@ -571,6 +579,15 @@ Component _candidate(
           busy ? null : () => onReject(item),
           small: true,
           variant: 'danger',
+        ),
+      // Read-only, so it stays available while another action runs and
+      // for decided ideas too.
+      if (onExport != null)
+        button(
+          'Export brief',
+          () => onExport(item),
+          small: true,
+          iconName: 'file-text',
         ),
     ]),
   ]);
