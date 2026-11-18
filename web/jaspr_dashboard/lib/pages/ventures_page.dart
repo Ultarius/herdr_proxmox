@@ -7,6 +7,7 @@ import '../navigation.dart';
 import 'model_catalog.dart';
 import 'operations_support.dart';
 import 'ops_ui.dart';
+import 'org_form_values.dart' show codexPermissionChoices;
 import 'ventures_ideas.dart';
 import 'ventures_studio.dart';
 
@@ -1894,6 +1895,7 @@ class _PanelFormState extends State<_PanelForm> {
           key: current != null && current['source'] == 'chosen'
               ? '${current[key] ?? ''}'
               : '',
+        'permission_mode': current?['permission_mode'] ?? 'default',
       };
     }
     _tools = OrganizationToolsBloc(dashboardConnection);
@@ -1937,6 +1939,8 @@ class _PanelFormState extends State<_PanelForm> {
             if (_cli[role] != 'auto')
               'settings': {
                 'runtime': _cli[role],
+                if (_cli[role] == 'codex')
+                  'permission_mode': _settings[role]!['permission_mode'],
                 for (final key in const ['provider', 'model', 'reasoning'])
                   if ('${_settings[role]![key] ?? ''}'.trim().isNotEmpty)
                     key: '${_settings[role]![key]}'.trim(),
@@ -1976,6 +1980,7 @@ class _PanelFormState extends State<_PanelForm> {
             for (final key in const ['provider', 'model', 'reasoning']) {
               _settings[entry.key]![key] = '';
             }
+            _settings[entry.key]!['permission_mode'] = 'default';
           }),
         ),
         if (_cli[entry.key] != 'off' && _cli[entry.key] != 'auto')
@@ -1986,6 +1991,15 @@ class _PanelFormState extends State<_PanelForm> {
             catalog: _catalog,
             values: _settings[entry.key]!,
             onChanged: () => setState(() {}),
+          ),
+        if (_cli[entry.key] == 'codex')
+          select(
+            '${entry.value} Codex command approvals',
+            '${_settings[entry.key]!['permission_mode']}',
+            codexPermissionChoices,
+            (value) => setState(
+              () => _settings[entry.key]!['permission_mode'] = value,
+            ),
           ),
       ],
       paragraph(
@@ -2033,6 +2047,7 @@ class _StudioSetupFormState extends State<_StudioSetupForm> {
     'provider': '',
     'model': '',
     'reasoning': '',
+    'permission_mode': 'default',
   };
   late final OrganizationToolsBloc _tools;
   StreamSubscription? _catalogSubscription;
@@ -2095,6 +2110,7 @@ class _StudioSetupFormState extends State<_StudioSetupForm> {
       else if (_cli.isNotEmpty)
         'settings': {
           'runtime': _cli,
+          if (_cli == 'codex') 'permission_mode': _settings['permission_mode'],
           for (final key in const ['provider', 'model', 'reasoning'])
             if ('${_settings[key] ?? ''}'.trim().isNotEmpty)
               key: '${_settings[key]}'.trim(),
@@ -2158,6 +2174,7 @@ class _StudioSetupFormState extends State<_StudioSetupForm> {
           for (final key in const ['provider', 'model', 'reasoning']) {
             _settings[key] = '';
           }
+          _settings['permission_mode'] = 'default';
         }),
       ),
       if (_cli.isEmpty)
@@ -2174,6 +2191,13 @@ class _StudioSetupFormState extends State<_StudioSetupForm> {
           values: _settings,
           onChanged: () => setState(() {}),
         ),
+        if (_cli == 'codex')
+          select(
+            'Codex command approvals',
+            '${_settings['permission_mode']}',
+            codexPermissionChoices,
+            (value) => setState(() => _settings['permission_mode'] = value),
+          ),
         paragraph(
           'Leave it on the CLI default or pick a model the account offers. The account and model are '
           'checked before any agent is created.',

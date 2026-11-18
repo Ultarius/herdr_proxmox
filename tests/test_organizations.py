@@ -1194,6 +1194,7 @@ class OrganizationTests(unittest.TestCase):
             ('opencode', dict(provider='opencode', model='deepseek-v4.1-flash'), ['--model', 'opencode/deepseek-v4.1-flash']),
             ('opencode', dict(provider='openai', model='test-model', reasoning='high'), ['--model', 'openai/test-model']),
             ('codex', dict(provider='openai', model='test-model', reasoning='high'), ['--model', 'test-model', '--config', 'model_provider="openai"', '--config', 'model_reasoning_effort="high"']),
+            ('codex', dict(permission_mode='codex_no_approval'), ['--sandbox', 'workspace-write', '--ask-for-approval', 'never']),
             ('claude', dict(provider='anthropic', model='sonnet', reasoning='high'), ['--model', 'sonnet', '--effort', 'high']),
         ]
         for runtime, config, expected in settings:
@@ -1208,10 +1209,12 @@ class OrganizationTests(unittest.TestCase):
             call = next(args for args, _ in self.calls if args[:3] == ('agent', 'start', run['alias']))
             # Every OpenCode launch selects a dashboard agent file: the
             # chat-reply grant is part of the protocol, and a permission policy
-            # can only be attached through an agent. Other runtimes take their
-            # model arguments directly.
+            # can only be attached through an agent. Codex gets the reply folder
+            # as a writable root instead. Claude takes its model arguments only.
             if runtime == 'opencode':
                 expected = expected + ['--agent', 'herdr-dashboard-' + profile_id]
+            if runtime == 'codex':
+                expected = expected + ['--add-dir', str(self.store.path.parent / 'chat-replies')]
             self.assertEqual(list(call[call.index('--') + 1:]), expected)
             self.assertEqual(run['launch_arguments'], expected)
         for config in [dict(provider='openai'), dict(model='test-model'), dict(provider='-bad', model='model')]:

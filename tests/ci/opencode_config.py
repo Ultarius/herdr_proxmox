@@ -106,9 +106,10 @@ def check(binary, gateway):
                 assert not resolved.get('variant'), case + ': invented reasoning variant'
                 assert not resolved.get('model'), case + ': agent file overrides CLI/default model'
             print(f'OpenCode {version}: {case} configuration verified', flush=True)
-        for runtime in ('codex', 'claude'):
-            assert prepare_permissions(dict(id=runtime, runtime=runtime), output, home=home,
-                                       output_directories=('chat-replies',)) == []
+        assert prepare_permissions(dict(id='claude', runtime='claude'), output, home=home,
+                                   output_directories=('chat-replies',)) == []
+        assert prepare_permissions(dict(id='codex', runtime='codex'), output, home=home,
+                                   output_directories=('chat-replies',)) == ['--add-dir', str(Path(output) / 'chat-replies')]
         assert not (home / '.local/share/opencode/auth.json').exists(), 'Probe created credentials'
         return version
 

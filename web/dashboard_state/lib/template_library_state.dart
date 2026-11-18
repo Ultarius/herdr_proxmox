@@ -64,6 +64,7 @@ String memberExecutionSummary(Map<String, dynamic> member) {
   final permission = switch (member['permission_mode']) {
     'full_autonomy' => 'Full autonomy',
     'dashboard_outputs' => 'Allow dashboard outputs',
+    'codex_no_approval' => 'Workspace sandbox, no command prompts',
     _ => 'CLI default permissions',
   };
   final paths = (member['accessible_paths'] as List? ?? []).cast<String>();

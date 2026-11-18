@@ -215,6 +215,9 @@ class StudioOperations:
         if runtime not in RUNTIME_ORDER:
             raise ValueError('Choose a supported agent CLI.')
         from organizations import model_settings
+        from permissions import permission_mode
+        # An empty or null mode is the CLI default, as it was before modes were validated.
+        mode = permission_mode(dict(permission_mode=value.get('permission_mode') or 'default'), runtime)
         settings = model_settings({key: value.get(key) or '' for key in ('provider', 'model', 'reasoning')}, runtime)
         entry = next(item for item in self._runtimes(deep=True, project=project) if item['runtime'] == runtime)
         if not entry['ready']:
@@ -222,9 +225,6 @@ class StudioOperations:
         validator = getattr(self.service.store, 'model_validator', None)
         if callable(validator):
             validator(dict(settings, runtime=runtime, project=project))
-        mode = value.get('permission_mode') or 'default'
-        if not isinstance(mode, str) or len(mode) > 40:
-            raise ValueError('Invalid permission mode.')
         return dict(runtime=runtime, **settings, permission_mode=mode, accessible_paths=[])
 
     def _automatic_settings(self, project=''):

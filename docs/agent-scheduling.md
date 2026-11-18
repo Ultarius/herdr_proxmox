@@ -389,6 +389,21 @@ Entries are exact roots under `HERDR_PROJECTS` and may be relative to that
 directory or absolute. The gateway uses the service's `CODEX_HOME` if set.
 Existing trust entries and explicit refusals take precedence.
 
+Choose **Workspace sandbox, no command prompts** in a Codex agent's
+permissions, a Codex-led group's facilitator permissions, or explicitly
+configured Codex Venture Studio settings. Herdr launches Codex with
+`--sandbox workspace-write --ask-for-approval never`. Commands outside its
+sandbox rules fail without asking for escalation. Folder trust and CLI
+sign-in follow their own startup flow. Existing sessions use their original
+launch arguments until relaunched.
+
+Codex receives exact dashboard output directories through `--add-dir`.
+Ordinary launches get `chat-replies`, group chairs and discussion member
+launches also get `discussion-artifacts`, and an environment helper gets its
+own `environment-assistance/<id>` directory. Managed storage grants cover the
+execution's registered data directories. OpenCode receives its output grants
+through the per-agent configuration.
+
 The gateway poll loop rechecks `waiting_for_members` meetings in rotating batches
 of twenty every ten seconds, so busy early meetings do not hide later ones.
 After 24 hours waiting becomes `needs_attention`. Group history shows preparation

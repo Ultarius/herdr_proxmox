@@ -33,6 +33,7 @@ Future<Json?> editRecord(
   Set<String> required = const {},
   Set<String> long = const {},
   Map<String, Map<String, String>> choices = const {},
+  Map<String, String>? Function(String key, Json values)? choicesFor,
   Map<String, int> limits = const {},
   List<Component> Function(Json)? extra,
   String? Function(Json)? validate,
@@ -45,6 +46,8 @@ Future<Json?> editRecord(
   Set<String> wide = const {},
 }) {
   final values = Json.from(initial);
+  Map<String, String>? options(String key) =>
+      choicesFor?.call(key, values) ?? choices[key];
   String? error;
   var fieldErrors = <String, String>{};
   var saving = false;
@@ -71,7 +74,7 @@ Future<Json?> editRecord(
     if (fieldErrors.remove(key) != null ||
         key == 'project' ||
         flags.contains(key) ||
-        choices.containsKey(key))
+        options(key) != null)
       refreshDialogs();
   }
 
@@ -183,14 +186,14 @@ Future<Json?> editRecord(
                 el('span', [text(entry.value)], classes: 'switch__label'),
               ], classes: 'switch'),
             )
-          else if (choices.containsKey(entry.key))
+          else if (options(entry.key) case final available?)
             item(
               half,
               entry.key,
               select(
                 entry.value,
                 '${values[entry.key] ?? ''}',
-                choices[entry.key]!,
+                available,
                 (v) {
                   update(entry.key, v);
                 },
@@ -899,19 +902,18 @@ Future<Json?> hireForm(
         for (final p in profiles.where((p) => p['id'] != profile?['id']))
           '${p['id']}': '${p['name']}',
       },
-      'permission_mode': {
-        'default': 'CLI defaults',
-        'dashboard_outputs': 'Allow dashboard outputs',
-        'full_autonomy': 'Full autonomy',
-      },
     },
+    choicesFor: (key, v) =>
+        key == 'permission_mode' ? permissionChoices('${v['runtime']}') : null,
     changed: (key, value, v) {
       if (key == 'runtime')
         updateHireRuntime(v, '$value', creating: profile == null);
     },
-    visible: (key, v) =>
-        !['permission_mode', 'accessible_paths'].contains(key) ||
-        v['runtime'] == 'opencode',
+    visible: (key, v) => switch (key) {
+      'permission_mode' => permissionChoices('${v['runtime']}').length > 1,
+      'accessible_paths' => v['runtime'] == 'opencode',
+      _ => true,
+    },
     extra: (v) => [
       if (v['runtime'] != 'agy' && '${v['runtime'] ?? ''}'.isNotEmpty)
         ModelFields(
@@ -921,9 +923,15 @@ Future<Json?> hireForm(
           values: v,
           onChanged: refreshDialogs,
         ),
-      note(
-        'Saved settings apply on next launch. Connect the same CLI account before launching. Permission changes require relaunch. Full autonomy allows all tools; dashboard outputs grants reply/artifact folder access. Additional path globs allow external-directory access; this is not a sandbox.',
-      ),
+      note('Saved settings apply on the next launch.'),
+      if (v['runtime'] == 'codex')
+        note(
+          'Codex can run commands within its workspace sandbox without waiting for approval. Folder trust and sign-in are handled separately.',
+        ),
+      if (v['runtime'] == 'opencode')
+        note(
+          'Full autonomy allows all OpenCode tools. Dashboard outputs grants reply and artifact access. Additional path globs allow external-directory access.',
+        ),
     ],
     validate: (v) {
       if (v['runtime'] == 'opencode' &&
@@ -959,6 +967,14 @@ Future<Json?> hireForm(
 
 Future<Json?> groupForm(List<Json> profiles, [Json? group]) async {
   final members = List<String>.from(group?['members'] ?? []);
+  final runtimes = {for (final p in profiles) p['id']: p['runtime']};
+  Map<String, String> facilitatorChoices() {
+    if (members.isNotEmpty && runtimes[members.first] == 'codex')
+      return codexPermissionChoices;
+    if (members.isNotEmpty && members.every((id) => runtimes[id] == 'opencode'))
+      return openCodePermissionChoices;
+    return permissionChoices('');
+  }
   final result = await editRecord(
     group == null ? 'Create discussion group' : 'Edit discussion group',
     {
@@ -993,12 +1009,11 @@ Future<Json?> groupForm(List<Json> profiles, [Json? group]) async {
         'topic': 'Group topic',
         'repository': 'Whole repository at configured HEAD',
       },
-      'permission_mode': {
-        'default': 'CLI defaults',
-        'dashboard_outputs': 'Allow dashboard outputs',
-        'full_autonomy': 'Full autonomy',
-      },
     },
+    choicesFor: (key, _) =>
+        key == 'permission_mode' ? facilitatorChoices() : null,
+    visible: (key, _) =>
+        key != 'accessible_paths' || facilitatorChoices() == openCodePermissionChoices,
     extra: (v) => [
       el('fieldset', [
         el('legend', [
@@ -1008,7 +1023,7 @@ Future<Json?> groupForm(List<Json> profiles, [Json? group]) async {
           ], classes: 'org-form__legend-meta'),
         ], classes: 'org-form__legend'),
         note(
-          'Choose 2–6 agents. Repository scope requires the same configured project. Facilitator permissions and worktree settings apply on next launch; members retain their own settings. Read-only is a discussion rule, not a sandbox. Automatic tasks remain subject to organization limits.',
+          'Choose 2–6 agents. The first selected member sets the facilitator’s CLI. Repository scope requires the same project. Facilitator settings apply on the next launch. Members keep their own permissions. Read-only guides the discussion. CLI permissions govern filesystem access.',
         ),
         el('div', [
           for (final p in profiles.where((p) => p['group_id'] == null))
@@ -1027,6 +1042,10 @@ Future<Json?> groupForm(List<Json> profiles, [Json? group]) async {
                     } else {
                       members.remove(p['id']);
                     }
+                    if (!facilitatorChoices().containsKey(v['permission_mode']))
+                      v['permission_mode'] = 'default';
+                    if (facilitatorChoices() != openCodePermissionChoices)
+                      v['accessible_paths'] = '';
                     refreshDialogs();
                   },
                 },

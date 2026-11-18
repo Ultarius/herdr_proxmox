@@ -182,7 +182,8 @@ class VentureTests(unittest.TestCase):
             return profile
         if action == 'group' and body.get('id'):
             group = next(group for group in self.groups if group['id'] == body['id'])
-            group.update(name=body['name'], members=body['members'])
+            group.update(name=body['name'], members=body['members'],
+                         permission_mode=body.get('permission_mode', 'default'))
             return group
         if action == 'group':
             member = next(profile for profile in self.profiles if profile['id'] == body['members'][0])
@@ -191,7 +192,8 @@ class VentureTests(unittest.TestCase):
                                use_worktree=True, runtime='codex', group_id='g' * 32)
             self.profiles.append(facilitator)
             group = dict(id='g' * 32, organization_id=body['organization_id'], name=body['name'],
-                         members=body['members'], read_only=True, facilitator_id=facilitator['id'])
+                         members=body['members'], read_only=True, facilitator_id=facilitator['id'],
+                         permission_mode=body.get('permission_mode', 'default'))
             self.groups.append(group)
             return group
         # The session and organization actions the studio's setup and repair use.
@@ -2525,6 +2527,26 @@ class VentureTests(unittest.TestCase):
         on = self.studio(mode='studio_panel')
         self.assertEqual((on['enabled'], on['members'], len(self.profiles)), (True, off['members'], hired))
 
+    def test_panel_changes_codex_approval_mode_without_changing_the_models(self):
+        self.setup_studio_manual()
+        customer = dict(role='customer', settings=dict(runtime='opencode'))
+
+        def configure(mode):
+            return self.setup_panel(stakeholders=[dict(role='investor', settings=dict(
+                runtime='codex', permission_mode=mode)), customer])
+
+        first = configure('default')
+        updated = configure('codex_no_approval')
+        self.assertNotEqual(first['members']['investor'], updated['members']['investor'])
+        self.assertEqual(first['members']['customer'], updated['members']['customer'])
+        self.assertEqual(updated['settings']['investor']['permission_mode'], 'codex_no_approval')
+        group = next(item for item in self.groups if item['id'] == updated['group_id'])
+        self.assertEqual(group['permission_mode'], 'codex_no_approval')
+        self.assertEqual(configure('codex_no_approval')['members'], updated['members'])
+        self.assertEqual(configure('default')['members'], first['members'])
+        self.assertEqual(group['members'], list(first['members'].values()))
+        self.assertEqual(group['permission_mode'], 'default')
+
     def test_autonomous_mode_waits_for_the_panel_and_needs_most_stakeholders_to_back(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())
@@ -2727,6 +2749,36 @@ class VentureTests(unittest.TestCase):
         self.assertEqual(chair_run['state'], 'released')
         self.assertTrue(any('panel chair, which ran on opencode/deepseek-v4.1-flash' in item['detail']
                             for item in result['steps']), result['steps'])
+
+    def test_a_chair_with_outdated_command_approvals_or_folder_access_is_released(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        panel = self.setup_panel(stakeholders=[dict(role='investor', settings=dict(
+            runtime='codex', permission_mode='codex_no_approval')), dict(role='customer')])
+        group = next(item for item in self.groups if item['id'] == panel['group_id'])
+        chair = next(item for item in self.profiles if item['id'] == group['facilitator_id'])
+        first = next(item for item in self.profiles if item['id'] == group['members'][0])
+        chair.update({key: first.get(key, '') for key in ('runtime', 'provider', 'model', 'reasoning')})
+        outputs = '/home/herdr/.config/herdr-web/discussion-artifacts'
+        cases = [
+            ('a' * 32, dict(permission_mode='default'), ['--add-dir', outputs], 'other command approvals'),
+            ('b' * 32, dict(permission_mode='codex_no_approval'), ['--add-dir', '/x/chat-replies'],
+             'could not save meeting files'),
+            ('c' * 32, dict(permission_mode='codex_no_approval'), ['--add-dir', outputs], ''),
+            ('d' * 32, dict(permission_mode='codex_no_approval'), None, ''),  # Unknown launch: kept.
+        ]
+        for job_id, started, arguments, expected in cases:
+            with self.subTest(expected=expected):
+                run = dict(id=job_id, kind='launch', state='persona_sent', organization_id='org',
+                           profile_id=chair['id'], profile=dict(chair, **started))
+                if arguments is not None:
+                    run['launch_arguments'] = arguments
+                self.jobs.append(run)
+                message = self.ventures._refresh_panel_chair('org')
+                self.assertIn(expected, message)
+                self.assertEqual(run['state'], 'released' if expected else 'persona_sent')
+                if run['state'] == 'persona_sent':
+                    run['state'] = 'released'
 
     def test_a_pitch_out_of_preparation_retries_is_pitched_again_with_its_open_ideas(self):
         self.setup_studio_manual()

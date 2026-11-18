@@ -1,5 +1,22 @@
 /// Framework-independent form rules copied from the existing dashboard UI.
 /// They prepare form values; gateway repositories and blocs still own actions.
+const codexNoApprovalMode = 'codex_no_approval';
+const codexPermissionChoices = {
+  'default': 'CLI defaults',
+  codexNoApprovalMode: 'Workspace sandbox, no command prompts',
+};
+const openCodePermissionChoices = {
+  'default': 'CLI defaults',
+  'dashboard_outputs': 'Allow dashboard outputs',
+  'full_autonomy': 'Full autonomy',
+};
+
+Map<String, String> permissionChoices(String runtime) => switch (runtime) {
+  'codex' => codexPermissionChoices,
+  'opencode' => openCodePermissionChoices,
+  _ => const {'default': 'CLI defaults'},
+};
+
 void updateHireRuntime(
   Map<String, dynamic> values,
   String runtime, {
@@ -8,8 +25,9 @@ void updateHireRuntime(
   for (final key in ['provider', 'model', 'reasoning']) values[key] = '';
   if (creating && runtime == 'opencode')
     values['permission_mode'] = 'dashboard_outputs';
-  if (runtime != 'opencode') {
+  if (!permissionChoices(runtime).containsKey(values['permission_mode']))
     values['permission_mode'] = 'default';
+  if (runtime != 'opencode') {
     values['accessible_paths'] = '';
   }
 }

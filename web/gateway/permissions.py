@@ -1,9 +1,13 @@
-"""Per-profile OpenCode permission policies; no global configuration mutation."""
+"""Per-profile OpenCode permissions and Codex launch policy."""
 import json
 import re
 from pathlib import Path
 
-MODES = ('default', 'dashboard_outputs', 'full_autonomy')
+CODEX_NO_APPROVAL = 'codex_no_approval'
+MODES = {
+    'codex': ('default', CODEX_NO_APPROVAL),
+    'opencode': ('default', 'dashboard_outputs', 'full_autonomy'),
+}
 # The id becomes part of a file name, so it must not carry separators or
 # traversal segments. Generated ids are 32-character hex and always match.
 IDENTITY = re.compile(r'[A-Za-z0-9_-]{1,64}')
@@ -23,34 +27,17 @@ def accessible_paths(body, runtime):
 
 def permission_mode(body, runtime):
     mode = body.get('permission_mode', 'default')
-    if mode not in MODES:
-        raise ValueError('Choose a supported permission mode.')
-    if runtime != 'opencode' and mode != 'default':
-        raise ValueError('Dashboard permission policies currently support OpenCode only.')
+    if mode not in MODES.get(runtime, ('default',)):
+        raise ValueError('Choose a supported permission mode for this runtime.')
     return mode
 
 
-def prepare_permissions(profile, output_root, home=None, output_directories=(), managed_directories=(), managed_root=None):
-    # The profile id is interpolated into a file name, so a crafted id with a
-    # separator or '..' would write outside the agent directory.
-    if not isinstance(profile.get('id'), str) or not IDENTITY.fullmatch(profile['id']):
-        raise ValueError('Profile identity is not usable for a permission file name.')
-    mode = permission_mode(profile, profile['runtime'])
-    paths = accessible_paths(profile, profile['runtime'])
-    variant = bool(profile.get('provider') and profile.get('model') and profile.get('reasoning'))
-    if profile['runtime'] != 'opencode':
-        return []
-    root = Path(output_root)
-    if mode == 'dashboard_outputs':
-        granted = ('chat-replies', 'discussion-artifacts')
-    else:
-        # A run the gateway tells to save a reply or artifact must be able to
-        # write there whatever mode was chosen. The output path is part of the
-        # protocol, not an optional grant: without it a read-only discussion
-        # stalls on an interactive permission prompt the gateway can never
-        # answer, and the meeting never finalizes.
-        granted = tuple(output_directories)
-    paths = [str(root / folder / '**') for folder in granted] + paths
+OUTPUT_FOLDERS = ('chat-replies', 'discussion-artifacts')
+ASSISTANCE_OUTPUT = re.compile(r'environment-assistance/[a-f0-9]{32}')
+
+
+def _managed_paths(managed_directories, managed_root):
+    paths = []
     for directory in managed_directories:
         path = Path(directory)
         if not path.is_absolute() or '..' in path.parts or any(c in str(path) for c in ('\0', '\n', '\r', '*', '?')):
@@ -66,7 +53,49 @@ def prepare_permissions(profile, output_root, home=None, output_directories=(), 
             raise ValueError('Managed grants cover only registered data children, never control directories.')
         from workspace_storage import _safe_chain
         _safe_chain(path)
-        paths.append(str(path / '**'))
+        paths.append(path)
+    return list(dict.fromkeys(paths))
+
+
+def _output_paths(root, output_directories):
+    paths = []
+    for folder in output_directories:
+        if not isinstance(folder, str) or (folder not in OUTPUT_FOLDERS and not ASSISTANCE_OUTPUT.fullmatch(folder)):
+            raise ValueError('Unknown dashboard output folder.')
+        paths.append(root / folder)
+    return list(dict.fromkeys(paths))
+
+
+def _codex_writable_roots(outputs, managed):
+    """Provision the exact output directories before handing them to Codex."""
+    from workspace_storage import _safe_chain
+    for directory in outputs:
+        _safe_chain(directory)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _safe_chain(directory)
+    return [argument for path in dict.fromkeys([*outputs, *managed]) for argument in ('--add-dir', str(path))]
+
+
+def prepare_permissions(profile, output_root, home=None, output_directories=(), managed_directories=(), managed_root=None):
+    # The profile id is interpolated into a file name, so a crafted id with a
+    # separator or '..' would write outside the agent directory.
+    if not isinstance(profile.get('id'), str) or not IDENTITY.fullmatch(profile['id']):
+        raise ValueError('Profile identity is not usable for a permission file name.')
+    mode = permission_mode(profile, profile['runtime'])
+    paths = accessible_paths(profile, profile['runtime'])
+    variant = bool(profile.get('provider') and profile.get('model') and profile.get('reasoning'))
+    if profile['runtime'] not in ('codex', 'opencode'):
+        return []
+    managed = _managed_paths(managed_directories, managed_root)
+    root = Path(output_root).absolute()
+    outputs = _output_paths(root, output_directories)
+    if profile['runtime'] == 'codex':
+        sandbox = ['--sandbox', 'workspace-write', '--ask-for-approval', 'never'] if mode == CODEX_NO_APPROVAL else []
+        return sandbox + _codex_writable_roots(outputs, managed)
+    if mode == 'dashboard_outputs':
+        outputs = [*(root / folder for folder in OUTPUT_FOLDERS), *outputs]
+    paths = [str(path / '**') for path in outputs] + paths
+    paths += [str(path / '**') for path in managed]
     paths = list(dict.fromkeys(paths))
     if mode == 'default' and not paths and not variant:
         return []

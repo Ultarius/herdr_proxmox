@@ -44,6 +44,9 @@ class PermissionTests(unittest.TestCase):
     def test_unsupported_runtime_or_mode_is_rejected(self):
         with self.assertRaises(ValueError): permission_mode({'permission_mode': 'invalid'}, 'opencode')
         with self.assertRaises(ValueError): permission_mode({'permission_mode': 'full_autonomy'}, 'codex')
+        for runtime in ('opencode', 'claude', 'agy'):
+            with self.assertRaises(ValueError):
+                permission_mode({'permission_mode': 'codex_no_approval'}, runtime)
 
     def test_custom_globs_combine_with_outputs_and_work_with_cli_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -100,6 +103,65 @@ class PermissionTests(unittest.TestCase):
                              {str(home / 'outputs' / 'chat-replies' / '**')})
             # Without an output contract a default profile still writes nothing.
             self.assertEqual(prepare_permissions(profile, home / 'outputs', home), [])
+
+    def test_codex_may_write_its_dashboard_outputs_without_asking(self):
+        # Codex sandboxes writes to its workspace. A meeting artifact or chat
+        # reply lives under the dashboard's output folder, so without an added
+        # root every write there stops on an approval prompt nobody answers.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            outputs = home / 'outputs'
+            owned = home / 'storage' / 'objects' / ('a' * 64) / 'data'
+            owned.mkdir(parents=True)
+            profile = dict(id='investor', runtime='codex', model='gpt-5.5')
+            args = prepare_permissions(profile, outputs, home,
+                                       output_directories=('chat-replies', 'discussion-artifacts', 'chat-replies'),
+                                       managed_directories=(str(owned),), managed_root=home / 'storage')
+            self.assertEqual(args, ['--add-dir', str(outputs / 'chat-replies'),
+                                    '--add-dir', str(outputs / 'discussion-artifacts'),
+                                    '--add-dir', str(owned)])
+            self.assertTrue((outputs / 'discussion-artifacts').is_dir())
+            # Only the output folders, never the gateway's own state beside them.
+            self.assertNotIn(str(outputs), args)
+            # Codex never gets an OpenCode agent file.
+            self.assertFalse((home / '.config/opencode').exists())
+            # Nothing to save means nothing is added.
+            self.assertEqual(prepare_permissions(profile, outputs, home), [])
+            with self.assertRaisesRegex(ValueError, 'Unknown dashboard output'):
+                prepare_permissions(profile, outputs, home, output_directories=('../state',))
+            with self.assertRaisesRegex(ValueError, 'outside the verified'):
+                prepare_permissions(profile, outputs, home, managed_directories=(str(home / 'other'),),
+                                    managed_root=home / 'storage')
+
+    def test_unattended_codex_keeps_its_sandbox_and_assisted_setup_gets_the_exact_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            outputs = home / 'outputs'
+            folder = 'environment-assistance/' + 'a' * 32
+            profile = dict(id='helper', runtime='codex', permission_mode='codex_no_approval')
+            args = prepare_permissions(profile, outputs, home, output_directories=(folder,))
+            self.assertEqual(args, ['--sandbox', 'workspace-write', '--ask-for-approval', 'never',
+                                    '--add-dir', str(outputs / folder)])
+            self.assertTrue((outputs / folder).is_dir())
+            self.assertFalse((home / '.codex').exists())
+            with self.assertRaisesRegex(ValueError, 'Unknown dashboard output'):
+                prepare_permissions(profile, outputs, home, output_directories=('environment-assistance',))
+
+    def test_codex_rejects_linked_assistance_output_ancestors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            outputs = home / 'outputs'
+            outputs.mkdir()
+            unrelated = home / 'unrelated'
+            unrelated.mkdir()
+            try:
+                (outputs / 'environment-assistance').symlink_to(unrelated, target_is_directory=True)
+            except OSError:
+                self.skipTest('Creating a directory symlink is unavailable.')
+            profile = dict(id='helper', runtime='codex')
+            with self.assertRaisesRegex(ValueError, 'symlinks'):
+                prepare_permissions(profile, outputs, home, output_directories=('environment-assistance/' + 'b' * 32,))
+            self.assertEqual(list(unrelated.iterdir()), [])
 
     def test_a_crafted_profile_identity_cannot_escape_the_agent_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

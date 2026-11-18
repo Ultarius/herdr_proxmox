@@ -190,9 +190,20 @@ class CollaborationTests(unittest.TestCase):
         for members in ([self.max, self.iris], [self.iris, self.max]):
             for policy in (dict(permission_mode='dashboard_outputs'), dict(accessible_paths=['/project/**'])):
                 with self.subTest(members=members, policy=policy):
-                    with self.assertRaisesRegex(ValueError, 'OpenCode only'):
+                    with self.assertRaisesRegex(ValueError, 'for this runtime|OpenCode only'):
                         self.action('group', organization_id=self.org, name='Mixed',
                                     description='Mixed-runtime team', members=members, **policy)
+        with self.assertRaisesRegex(ValueError, 'for this runtime'):
+            self.action('group', organization_id=self.org, name='Mixed', description='OpenCode facilitator',
+                        members=[self.iris, self.max], permission_mode='codex_no_approval')
+        group = self.action('group', organization_id=self.org, name='Mixed', description='Codex facilitator',
+                            members=[self.max, self.iris], permission_mode='codex_no_approval')
+        self.drain()
+        facilitator, = [run for run in self.store.job_records(launches_only=True)
+                        if run.get('profile', {}).get('group_id') == group]
+        self.assertEqual(facilitator['state'], 'persona_sent', facilitator.get('error'))
+        self.assertEqual(facilitator['launch_arguments'][:4],
+                         ['--sandbox', 'workspace-write', '--ask-for-approval', 'never'])
 
     def test_recovery_paginates_past_unresolved_rows_while_successes_shrink_the_set(self):
         ids = [uuid.uuid4().hex for _ in range(7)]

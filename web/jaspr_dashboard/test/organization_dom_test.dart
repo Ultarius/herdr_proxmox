@@ -1309,6 +1309,22 @@ void main() {
     },
   );
 
+  test('hiring a Codex agent can opt out of command prompts', () async {
+    await mount(const OrganizationPage(initialView: 'team'));
+    await click('Hire an agent');
+    await input('Name', 'Codex reviewer');
+    await input('Role', 'Reviewer');
+    await input('Persona instructions', 'Review exact changes');
+    await choose('Runtime', 'codex');
+    expect((control('Permissions') as web.HTMLSelectElement).value, 'default');
+    await choose('Permissions', 'codex_no_approval');
+    await click('Save');
+    final request = actions('hire').single;
+    expect(request['runtime'], 'codex');
+    expect(request['permission_mode'], 'codex_no_approval');
+    expect(request['accessible_paths'], isEmpty);
+  });
+
   test('a parked startup shows the deadline and opens its console', () async {
     final oldHash = web.window.location.hash;
     addTearDown(

@@ -123,7 +123,9 @@ class StakeholderPanel:
         The chair runs on the first stakeholder's CLI and model, but a session
         keeps the model it started with: after the panel is set up again, the
         old chair would go on chairing (and writing the transcript) on the old
-        model. Returns what was done, or '' when nothing was needed."""
+        model. The same holds for its command approvals, and for a Codex chair
+        started before it could write the meeting folder. Returns what was
+        done, or '' when nothing was needed."""
         studio = studio if studio is not None else self._studio(organization)
         group_id = (studio.get('panel') or {}).get('group_id')
         if not group_id:
@@ -142,12 +144,30 @@ class StakeholderPanel:
             return ''
         started = run.get('profile') if isinstance(run.get('profile'), dict) else {}
         keys = ('runtime', 'provider', 'model', 'reasoning')
-        if all((started.get(key) or '') == (first.get(key) or '') for key in keys):
+        if not all((started.get(key) or '') == (first.get(key) or '') for key in keys):
+            reason = ('Released the stakeholder panel chair, which ran on ' + model_key(started) + '; the next pitch '
+                      'starts it on ' + model_key(first) + '.')
+        elif (started.get('permission_mode') or 'default') != (group.get('permission_mode') or 'default'):
+            reason = ('Released the stakeholder panel chair, which started with other command approvals; the next '
+                      'pitch starts it with the panel\'s current ones.')
+        elif started.get('runtime') == 'codex' and self._codex_without_outputs(run):
+            # Started before Codex got the meeting folder as a writable root:
+            # it would stop on an approval prompt for every file it saves.
+            reason = ('Released the stakeholder panel chair, which could not save meeting files without asking; '
+                      'the next pitch starts it with access to them.')
+        else:
             return ''
         store.action('release', dict(request_id='panel-chair-release-' + run['id'], organization_id=organization,
                                      job_id=run['id']))
-        return ('Released the stakeholder panel chair, which ran on ' + model_key(started) + '; the next pitch '
-                'starts it on ' + model_key(first) + '.')
+        return reason
+
+    @staticmethod
+    def _codex_without_outputs(run):
+        arguments = run.get('launch_arguments')
+        if not isinstance(arguments, list):
+            return False  # Unknown launch: never release on a guess.
+        return not any(isinstance(item, str) and item.replace('\\', '/').endswith('/discussion-artifacts')
+                       for item in arguments)
 
     def _panel_enabled(self, organization):
         panel = self._panel(organization)
@@ -223,22 +243,28 @@ class StakeholderPanel:
         hired = dict(panel.get('settings') or {})
         for role in roles:
             wanted = {key: chosen[role].get(key, '') for key in ('runtime', 'provider', 'model', 'reasoning')}
-            if role in members and {key: (hired.get(role) or {}).get(key, '') for key in wanted} == wanted:
+            mode = chosen[role].get('permission_mode') or 'default'
+            previous = hired.get(role) or {}
+            if (role in members and {key: previous.get(key, '') for key in wanted} == wanted
+                    and previous.get('permission_mode', 'default') == mode):
                 continue
-            # A changed model is a new agent: the request id follows the settings.
-            digest = hashlib.sha256(json.dumps([organization, role, wanted], sort_keys=True).encode()).hexdigest()
+            # Keep the original request identity for default permissions.
+            identity = wanted if mode == 'default' else dict(wanted, permission_mode=mode)
+            digest = hashlib.sha256(json.dumps([organization, role, identity], sort_keys=True).encode()).hexdigest()
             name, persona = PANEL_ROLES[role]
             profile = self.service.store.action('hire', dict(
                 request_id='panel-hire-' + digest[:32], organization_id=organization,
                 name=name + ' (stakeholder)', role='stakeholder', persona=persona + PANEL_RULES,
                 project=notebook, use_worktree=True, **wanted,
-                permission_mode=chosen[role].get('permission_mode') or 'default', accessible_paths=[]))
+                permission_mode=mode, accessible_paths=[]))
             members[role] = profile['id']
-            hired[role] = dict(wanted, source=chosen[role].get('source', 'chosen'))
+            hired[role] = dict(wanted, permission_mode=mode, source=chosen[role].get('source', 'chosen'))
         identities = [members[role] for role in roles]
+        group_request = organization + ':' + ','.join(identities)
+        if panel.get('group_id'):
+            group_request += ':' + str(panel.get('updated_at') or panel['group_id'])
         group_body = dict(
-            request_id='panel-group-' + hashlib.sha256(
-                (organization + ':' + ','.join(identities)).encode()).hexdigest()[:32],
+            request_id='panel-group-' + hashlib.sha256(group_request.encode()).hexdigest()[:32],
             organization_id=organization, name=PANEL_GROUP_NAME,
             description='Read-only stakeholder panel: reviews the Venture Studio\'s ideas independently and '
                         'gives critical feedback for the next round.',

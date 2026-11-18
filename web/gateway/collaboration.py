@@ -9,7 +9,7 @@ from pathlib import Path
 import uuid
 from organizations import now, text
 from session_ownership import active as session_active, reserves as session_reserves
-from permissions import accessible_paths, permission_mode, prepare_permissions
+from permissions import CODEX_NO_APPROVAL, accessible_paths, permission_mode
 from herdr_errors import HerdrError, parse_completion
 from folder_access import folder_access_request
 
@@ -188,13 +188,11 @@ def action(store, db, name, body, org):
             if member.get('group_id'):
                 raise ValueError('Select member agents, not other group conversations.')
             members.append(member)
-        # Validate against every member's runtime. Reading the loop variable
-        # after the loop would check only the last member, so a mixed-runtime
-        # group could accept a mode that another member cannot use. Both
-        # helpers return the same value for every runtime and only differ in
-        # what they reject, so the first result is the group's policy.
+        # The Codex option controls the facilitator's launch. Members keep
+        # their own permissions, including when the group mixes runtimes.
+        policy_members = members[:1] if body.get('permission_mode') == CODEX_NO_APPROVAL else members
         policies = [(permission_mode(body, member['runtime']),
-                     accessible_paths(body, member['runtime'])) for member in members]
+                     accessible_paths(body, member['runtime'])) for member in policy_members]
         item_id = text(body, 'id', 40, optional=True) or uuid.uuid4().hex
         if body.get('id'):
             store.get(db, 'groups', item_id, org_id)
