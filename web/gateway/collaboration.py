@@ -34,13 +34,15 @@ def console_token(run, output):
                                      sort_keys=True).encode()).hexdigest()
 
 
-def active_run(store, db, organization_id, profile_id):
+def active_run(store, db, organization_id, profile_id, *, inspect=False):
     store.get(db, 'profiles', profile_id, organization_id)
     row = db.execute("SELECT data FROM jobs WHERE organization_id=? "
                      "AND json_extract(data,'$.kind')='launch' "
                      "AND json_extract(data,'$.profile_id')=? "
-                     "AND json_extract(data,'$.state')='persona_sent' ORDER BY rowid DESC LIMIT 1",
-                     (organization_id, profile_id)).fetchone()
+                     "AND (json_extract(data,'$.state')='persona_sent' OR (? AND "
+                     "json_extract(data,'$.state')='waiting_for_input' AND "
+                     "json_extract(data,'$.startup_prompt.state')='parked')) ORDER BY rowid DESC LIMIT 1",
+                     (organization_id, profile_id, inspect)).fetchone()
     if row is None:
         raise ValueError('Launch this agent and deliver its persona first.')
     return json.loads(row['data'])
@@ -74,11 +76,13 @@ def inspect_output(store, run, current=None):
         path = store.path.parent / 'chat-replies' / current['id'] / 'reply.md'
         if path.is_file() and not path.is_symlink() and path.stat().st_size <= 40000:
             draft = path.read_text(encoding='utf-8', errors='replace')[:40000]
-    return dict(output=output, status=status, reply_draft=draft,
+    startup_wait = run.get('state') == 'waiting_for_input' and (run.get('startup_prompt') or {}).get('state') == 'parked'
+    return dict(output=output, status=status, reply_draft=draft, startup_wait=startup_wait,
                 launch_directory=run.get('worktree_path') or run.get('source_project'),
                 scratch_directory=run.get('scratch_directory'),
                 access_request=folder_access_request(output, status) if source == 'visible' else None,
-                console_token=console_token(run, output) if status == 'blocked' and source == 'visible' else None,
+                console_token=(console_token(run, output)
+                               if not startup_wait and status == 'blocked' and source == 'visible' else None),
                 reply_job_id=current['id'] if current else None)
 
 
@@ -86,7 +90,7 @@ def inspect_profile(store, body):
     org_id, profile_id = text(body, 'organization_id', 40), text(body, 'profile_id', 40)
     with store.lock, closing(store.connect()) as db:
         store.get(db, 'organizations', org_id)
-        run = active_run(store, db, org_id, profile_id)
+        run = active_run(store, db, org_id, profile_id, inspect=True)
         row = db.execute("SELECT data FROM jobs WHERE organization_id=? "
                          "AND json_extract(data,'$.profile_id')=? "
                          "AND json_extract(data,'$.kind')='chat' "
@@ -236,7 +240,7 @@ def action(store, db, name, body, org):
             item['launch_job_id'] = run['id']
         return item
     if name in ('chat', 'inspect', 'input'):
-        runs = [active_run(store, db, org_id, text(body, 'profile_id', 40))]
+        runs = [active_run(store, db, org_id, text(body, 'profile_id', 40), inspect=name == 'inspect')]
         if name == 'chat' and body.get('expected_run_id') and body['expected_run_id'] != runs[0]['id']:
             raise ValueError('Original task conversation changed; no inspection prompt was sent.')
     else:

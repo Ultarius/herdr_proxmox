@@ -660,6 +660,12 @@ class _OrganizationPageState extends State<OrganizationPage> {
     final admin = connection.operator.value['role'] == 'admin';
     final launch = job['kind'] == 'launch';
     final preparation = job['kind'] == 'environment_preparation';
+    final startup = job['startup_prompt'];
+    final startupWaiting =
+        launch &&
+        job['state'] == 'waiting_for_input' &&
+        startup is Map &&
+        startup['state'] == 'parked';
     final profile = bloc.state.profiles
         .where((p) => p['id'] == job['profile_id'])
         .firstOrNull;
@@ -668,6 +674,13 @@ class _OrganizationPageState extends State<OrganizationPage> {
         ? Map<String, dynamic>.from(job['profile'])
         : null;
     final actions = <Component>[
+      if (startupWaiting && job['profile_id'] is String)
+        button(
+          'Inspect startup console',
+          () => navigate('/agents/${job['profile_id']}'),
+          small: true,
+          iconName: 'terminal',
+        ),
       if (job['kind'] == 'delegate' &&
           admin &&
           [
@@ -779,6 +792,8 @@ class _OrganizationPageState extends State<OrganizationPage> {
           if (job['alias'] != null)
             ('Pane', mono(job['pane_id'] ?? 'not allocated')),
           if (job['progress'] != null) ('Progress', textBlock(job['progress'])),
+          if (startupWaiting && startup['expires_at'] is String)
+            ('Startup wait ends', timeStamp(startup['expires_at'])),
           if (job['preparation_execution_id'] != null)
             ('Preparation execution', mono(job['preparation_execution_id'])),
           if (job['parent_execution_id'] != null)

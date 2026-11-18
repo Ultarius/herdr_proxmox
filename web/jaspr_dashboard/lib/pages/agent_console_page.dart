@@ -179,6 +179,7 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
     final status = inspection?['status'] as String?;
 
     final blocked = status == 'blocked';
+    final startupWait = inspection?['startup_wait'] == true;
 
     final delivery = jobs.where((j) => j['id'] == inputJob).firstOrNull;
 
@@ -301,7 +302,17 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
 
           if (error == null) folderAccessPanel(inspection),
 
-          if (blocked)
+          if (startupWait)
+            callout(
+              [
+                calloutText(
+                  'If the terminal shows a startup question, answer it over SSH. The gateway sends the saved prompt after the session is ready.',
+                ),
+              ],
+              tone: 'warning',
+              title: 'Startup prompt waiting',
+            )
+          else if (blocked)
             callout(
               [
                 calloutText(

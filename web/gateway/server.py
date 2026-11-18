@@ -22,6 +22,7 @@ from integration_coordinator import IntegrationCoordinator
 from project_files import ProjectJobs, clone_repository, project_directory
 from repository_connections import RepositoryConnections
 from cli_setup import CliSetup
+import codex_trust
 import model_catalog
 import team_templates
 import project_explorer
@@ -1065,9 +1066,15 @@ def main():
     sdk_install = SdkInstall()
     build_service_install = BuildServiceInstall()
     cli_setup = CliSetup()
+    approved_codex_projects = codex_trust.approved_roots(os.environ.get('HERDR_CODEX_TRUST_PROJECTS'), PROJECTS)
+    codex_home = os.environ.get('CODEX_HOME')
+    def record_codex_trust(project):
+        return codex_trust.ensure_trusted(project, PROJECTS, cli_setup.home,
+                                          approved=approved_codex_projects, codex_home=codex_home)
     organizations = OrganizationStore(DATABASE, PROJECTS, command, runtime_status=cli_setup.status, runtime_ready=cli_setup.ready,
                                       model_validator=lambda profile: model_catalog.validate_selection(cli_setup, PROJECTS, profile),
-                                      template_catalog=lambda project: team_templates.catalog(cli_setup, PROJECTS, project))
+                                      template_catalog=lambda project: team_templates.catalog(cli_setup, PROJECTS, project),
+                                      codex_trust=record_codex_trust if approved_codex_projects else None)
     github = GitHub(DATABASE.parent / 'github.json', require_root_policy=True)
     # Missing policy means no protected projects; a present invalid file is a
     # deployment error and must never silently remove protection at startup.

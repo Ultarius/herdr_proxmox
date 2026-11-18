@@ -11,6 +11,12 @@ from unittest.mock import patch, Mock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'web/gateway'))
 from integration_coordinator import IntegrationCoordinator, report_digest, prompt_payload
+from project_access import ANCHORED_ACCESS
+
+# Toolchain detection reads project manifests through descriptor-anchored
+# access, which fails closed outside Linux, as the gateway does in production.
+needs_project_access = unittest.skipUnless(ANCHORED_ACCESS and sys.platform == 'linux',
+                                           'Requires native anchored Linux project access.')
 
 
 class Store:
@@ -763,6 +769,7 @@ class CoordinatorTests(unittest.TestCase):
         reviews = [entry for entry in self.service.snapshot()['audit'] if entry.get('action') == 'blocker_review']
         self.assertEqual(reviews[0]['actor'], 'damien')
 
+    @needs_project_access
     def test_missing_toolchain_queues_one_opt_in_sdk_request(self):
         queued = []
         self.store.toolchains['repo'] = {'toolchain': 'flutter', 'version': ''}
@@ -782,6 +789,7 @@ class CoordinatorTests(unittest.TestCase):
         service.tick()
         self.assertEqual(queued, ['flutter'])
 
+    @needs_project_access
     def test_an_undeclared_project_never_queues_an_installation(self):
         # A worker reports a category, not a tool. Without a declared identity
         # there is nothing to install, so the blocked build is told why rather
@@ -802,6 +810,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertFalse(event.get('sdk_requested'))
         self.assertIn('No requirement of this project can be satisfied', event['reason'])
 
+    @needs_project_access
     def test_a_tool_the_release_cannot_install_is_reported_not_queued(self):
         queued = []
         self.store.toolchains['repo'] = {'toolchain': 'php', 'version': '8.2'}
@@ -859,6 +868,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(queued, [])
         self.assertFalse(service.snapshot()['events'][0].get('sdk_requested'))
 
+    @needs_project_access
     def test_a_refused_automatic_sdk_request_is_explained_once(self):
         # The gateway can still refuse a named request; the blocked build must
         # say so rather than stall silently.
@@ -882,6 +892,7 @@ class CoordinatorTests(unittest.TestCase):
         service.tick()
         self.assertEqual(service.snapshot()['events'][0]['reason'], event['reason'])
 
+    @needs_project_access
     def test_sdk_refusal_stays_visible_after_a_long_build_reason(self):
         self.store.toolchains['repo'] = {'toolchain': 'flutter', 'version': ''}
         service = self.coordinator(sdk_request=Mock(side_effect=ValueError('Choose a toolchain')))
@@ -952,6 +963,7 @@ class CoordinatorTests(unittest.TestCase):
                 self.service.review_blockers(body)
         self.assertEqual(self.event()['state'], 'validation_pending')
 
+    @needs_project_access
     def test_merged_work_with_missing_toolchain_queues_authorized_sdk_install(self):
         from unittest.mock import Mock
         self.store.toolchains['repo'] = {'toolchain': 'flutter', 'version': ''}

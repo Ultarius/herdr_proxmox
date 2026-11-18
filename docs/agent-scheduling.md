@@ -375,6 +375,20 @@ a durable deterministic identity, retains the selected runtime/model/persona,
 and uses the normal managed checkout setup. Task sessions can participate only
 after their completion evidence, checkout and live readiness have been verified.
 
+A new launch can wait for its startup prompt while the terminal is busy or
+shows a question. The Runs view shows the wait deadline and opens a read-only
+console for inspection. Answer startup questions over SSH. The gateway delivers
+the prompt after a readiness check, provided the wait is still within 24 hours.
+Releasing a waiting launch cancels its saved prompt. If delivery is uncertain,
+inspect the terminal before restarting.
+
+Codex folder trust is recorded only for project roots that the deployment
+operator has approved in `HERDR_CODEX_TRUST_PROJECTS`. Set it in the gateway
+service environment as a JSON array, for example `["ventures/studio"]`.
+Entries are exact roots under `HERDR_PROJECTS` and may be relative to that
+directory or absolute. The gateway uses the service's `CODEX_HOME` if set.
+Existing trust entries and explicit refusals take precedence.
+
 The gateway poll loop rechecks `waiting_for_members` meetings in rotating batches
 of twenty every ten seconds, so busy early meetings do not hide later ones.
 After 24 hours waiting becomes `needs_attention`. Group history shows preparation

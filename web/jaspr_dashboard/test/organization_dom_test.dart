@@ -1309,6 +1309,40 @@ void main() {
     },
   );
 
+  test('a parked startup shows the deadline and opens its console', () async {
+    final oldHash = web.window.location.hash;
+    addTearDown(
+      () => web.window.history.replaceState(
+        null,
+        '',
+        oldHash.isEmpty ? '#' : oldHash,
+      ),
+    );
+    await mount(
+      const OrganizationPage(initialView: 'runs'),
+      jobs: [
+        {
+          'id': 'starting',
+          'organization_id': 'org',
+          'kind': 'launch',
+          'profile_id': 'alice',
+          'state': 'waiting_for_input',
+          'startup_prompt': {
+            'state': 'parked',
+            'expires_at': '2026-11-19T08:30:00Z',
+          },
+        },
+      ],
+    );
+    expect(
+      nodes('dt').map((node) => node.textContent),
+      contains('Startup wait ends'),
+    );
+    await click('Inspect startup console');
+    expect(web.window.location.hash, '#/agents/alice');
+    expect(posts, isEmpty);
+  });
+
   test(
     'session restart is inspection-gated and a lost response retries the same identity',
     () async {

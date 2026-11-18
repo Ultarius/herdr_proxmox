@@ -333,6 +333,37 @@ class CollaborationTests(unittest.TestCase):
         prompts = [a for a, _ in self.calls if a[:2] == ('agent', 'prompt') and 'Discussion directory:' in a[3]]
         self.assertEqual(len(prompts), 1)
 
+    def test_a_meeting_waits_for_a_member_blocked_at_startup_and_runs_once_it_is_answered(self):
+        # A new Codex session stops on its folder-trust question before its startup prompt.
+        group = self.group()
+        other = next(j for j in self.store.job_records() if j.get('profile_id') == self.iris and j['kind'] == 'launch')
+        self.action('release', organization_id=self.org, job_id=other['id'])
+        simulate = self.store.command
+        def blocked_start(*args, **kwargs):
+            response = simulate(*args, **kwargs)
+            if args[:2] == ('agent', 'start') and args[2].startswith('meeting_'):
+                self.agents[args[2]]['agent_status'] = 'blocked'
+            return response
+        self.store.command = blocked_start
+        meeting = self.action('discuss', organization_id=self.org, group_id=group, prompt='Review the product')
+        self.drain()
+        job = self.job(meeting)
+        self.assertEqual(job['state'], 'waiting_for_members', job.get('error'))
+        self.assertIn('Iris is waiting for an answer in its terminal', job['progress'])
+        member = next(j for j in self.store.job_records()
+                      if j['kind'] == 'launch' and j.get('preparation_meeting_id') == meeting)
+        self.assertEqual(member['state'], 'waiting_for_input')
+        self.agents[member['alias']]['agent_status'] = 'idle'  # The operator answered it.
+        for unused in range(3):
+            self.store.advance_discussions()
+            self.drain()
+        job = self.job(meeting)
+        self.assertEqual(job['state'], 'artifact_ready', job.get('error'))
+        prompts = [a for a, _ in self.calls if a[:2] == ('agent', 'prompt') and 'Discussion directory:' in a[3]]
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(len([a for a, _ in self.calls if a[:2] == ('agent', 'prompt') and a[2] == member['alias']
+                              and 'Acknowledge readiness' in a[3]]), 1)
+
     def test_transient_readiness_errors_wait_then_submit_only_once(self):
         from herdr_errors import HerdrError
         group = self.group()

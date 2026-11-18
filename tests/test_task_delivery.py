@@ -2,10 +2,12 @@
 import copy
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'web/gateway'))
 from contributions import Contributions
 import task_delivery
 

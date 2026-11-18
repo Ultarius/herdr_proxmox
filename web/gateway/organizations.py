@@ -4,6 +4,7 @@ from contextlib import closing, nullcontext
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -25,12 +26,36 @@ from request_identity import ORGANIZATION_REQUEST
 TRANSIENT_AGENT_CODES = ('agent_blocked', 'agent_working', 'agent_not_ready')
 SAVED_REPLY_NAME = re.compile(r'reply-[a-f0-9]{12}\.md|reply\.md')
 MAX_DELIVERY_TRANSITIONS = 20
+# A launch whose agent never accepts its startup prompt stops waiting after this.
+STARTUP_WAIT = timedelta(hours=24)
+STARTUP_WORKERS = 2
 import toolchain_policy
 from herdr_errors import HerdrError, delivery_for, parse_completion, parse_resume, preview as preview_text
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def startup_deadline(startup):
+    since = datetime.fromisoformat(startup.get('parked_since') or startup['at'])
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    return since + STARTUP_WAIT
+
+
+def without_startup_text(job):
+    """Keep launch delivery metadata on dashboard records without the saved prompt."""
+    startup = job.get('startup_prompt')
+    if not isinstance(startup, dict):
+        return job
+    visible = {key: value for key, value in startup.items() if key != 'text'}
+    if visible.get('state') == 'parked' and not visible.get('expires_at'):
+        try:
+            visible['expires_at'] = startup_deadline(visible).isoformat()
+        except (KeyError, TypeError, ValueError):
+            pass
+    return dict(job, startup_prompt=visible)
 
 
 def delivery_transition(previous, current, at):
@@ -135,7 +160,8 @@ def policy_guidance(frozen):
 
 class OrganizationStore:
     supports_discussion_preparation = True
-    def __init__(self, path, projects, command, runtime_status=None, model_validator=None, runtime_ready=None, template_catalog=None):
+    def __init__(self, path, projects, command, runtime_status=None, model_validator=None, runtime_ready=None, template_catalog=None,
+                 codex_trust=None):
         self.path = Path(path)
         self.projects = Path(projects).resolve()
         self.command = command
@@ -143,6 +169,8 @@ class OrganizationStore:
         self.runtime_ready = runtime_ready
         self.model_validator = model_validator
         self.template_catalog = template_catalog
+        # Records Codex folder trust for a project before a Codex agent starts.
+        self.codex_trust = codex_trust
         self.lock = threading.RLock()
         # One-way notification only: never call the watcher while holding a
         # store/profile lock or SQLite transaction.
@@ -159,6 +187,8 @@ class OrganizationStore:
         self.environment_admission = None
         self.capacity_guard = None
         self.discussion_cursor = 0
+        self.startup_cursor = 0
+        self.startup_checks = set()
         self.futures = set()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with closing(self.connect()) as db, db:
@@ -193,6 +223,9 @@ class OrganizationStore:
                         # This continuation was explicitly authorized by realignment,
                         # and no prompt was sent. Recover only its interrupted admission.
                         job['realignment_resume_interrupted'] = True
+                    startup = job.get('startup_prompt') or {}
+                    if job['kind'] == 'launch' and startup.get('state') in ('pending', 'sending'):
+                        job['startup_prompt'] = dict(startup, state='unknown', text='')
                     job.update(state='uncertain', error='Gateway restarted. Inspect the SSH terminal before creating another run or task.', updated_at=now())
                     self.put(db, 'jobs', job)
             # Refine restart recovery: annotate liveness of bound sessions without
@@ -302,6 +335,7 @@ class OrganizationStore:
                 data['archived_groups'] = [g for g in data['archived_groups'] if g['organization_id'] == org_id]
             else:
                 data['jobs'] = [json.loads(r['data']) for r in db.execute('SELECT data FROM jobs ORDER BY rowid')]
+        data['jobs'] = [without_startup_text(job) for job in data['jobs']]
         for table in ('profiles', 'groups'):
             data[table] = [item for item in data[table] if not item.get('removed_at') and not item.get('ephemeral')]
         if directory:
@@ -579,7 +613,7 @@ class OrganizationStore:
         omitted = {'runs', 'group_run', 'organization', 'profile'}
         if not document and job['kind'] not in ('launch', 'delegate'):
             omitted.update(('result', 'contributions', 'group', 'prompt', 'knowledge_pack'))
-        return {k: v for k, v in job.items() if k not in omitted}
+        return without_startup_text({k: v for k, v in job.items() if k not in omitted})
 
     def activity(self, body):
         if not isinstance(body, dict):
@@ -663,7 +697,8 @@ class OrganizationStore:
             for key in ('run_id', 'task_id', 'profile_id', 'group_id', 'display_name', 'entity_type'):
                 item.pop(key, None)
             for run in by_alias.get(agent.get('name'), []):
-                if run['kind'] != 'launch' or run['state'] not in ('running', 'persona_sent', 'needs_attention') or run.get('alias') != agent.get('name'):
+                if (run['kind'] != 'launch' or run.get('alias') != agent.get('name')
+                        or run['state'] not in ('running', 'persona_sent', 'needs_attention', 'waiting_for_input')):
                     continue
                 # Label initialization/error states only after the launched conversation
                 # has been captured; an alias alone does not prove ownership.
@@ -941,7 +976,9 @@ class OrganizationStore:
                     submitted = item['id']
                 elif action in ('release', 'report', 'resolve_delegation'):
                     item = self.get(db, 'jobs', text(body, 'job_id', 40), org_id)
-                    if active(item) and not (action == 'release' and item['state'] == 'waiting_environment'):
+                    # A launch still waiting to deliver its startup prompt can be given up.
+                    if active(item) and not (action == 'release' and item['state'] in ('waiting_environment', 'waiting_for_input')
+                                             and item['kind'] in ('launch', 'environment_preparation')):
                         raise ValueError('Wait for the running job to finish.')
                     if action == 'resolve_delegation':
                         if item['kind'] != 'delegate' or item['state'] not in ('delivered', 'reported_complete', 'needs_attention', 'uncertain', 'completed', 'cancelled'):
@@ -971,6 +1008,9 @@ class OrganizationStore:
                                for j in others):
                             raise ValueError('A discussion or meeting still owns this session; resolve it before releasing.')
                         item['state'] = 'released'
+                        startup = item.get('startup_prompt') or {}
+                        if startup.get('state') in ('pending', 'parked'):
+                            item['startup_prompt'] = dict(startup, state='cancelled', text='')
                     else:
                         if item['kind'] != 'delegate' or item['state'] not in ('delivered', 'reported_complete'):
                             raise ValueError('Only delivered tasks can have completion reports.')
@@ -1578,7 +1618,124 @@ class OrganizationStore:
             time.sleep(0.25)
         raise ValueError('New pane shell did not become available. Inspect its terminal over SSH.')
 
+    def deliver_startup(self, job_id):
+        """Deliver once, claiming the saved prompt before calling the terminal."""
+        job = self.startup_candidate(job_id)
+        if job is None:
+            return False
+        try:
+            self.identity(job)
+        except Exception as error:
+            self.startup_failure(job, error, attempted=False)
+            return False
+        with self.lock:
+            # Release can win while the read-only readiness check is running.
+            job = self.startup_candidate(job_id)
+            if job is None:
+                return False
+            startup = job['startup_prompt']
+            self.update_job(job_id, state='running', startup_prompt=dict(startup, state='sending', text=''))
+        try:
+            if startup['group']:
+                response = self.command('agent', 'prompt', job['alias'], startup['text'],
+                                        '--wait', '--timeout', '180000', timeout=190)
+            else:
+                response = self.command('agent', 'prompt', job['alias'], startup['text'])
+        except Exception as error:
+            self.startup_failure(job, error, attempted=True)
+            return False
+        sent = dict(startup, text='', state='sent', sent_at=now())
+        try:
+            if startup['group']:
+                self.identity(job)
+        except Exception as error:
+            self.update_job(job_id, state='needs_attention', progress='', startup_prompt=sent,
+                            error=str(error)[:380] + ' The startup prompt was sent. Inspect the terminal.')
+            return False
+        delivery = {} if startup['group'] else dict(delivery=dict(
+            stage='sent', at=now(), completion=self.completion_baseline(response)))
+        self.update_job(job_id, state='persona_sent', progress='', startup_prompt=sent, **delivery)
+        return True
+
+    def startup_candidate(self, job_id):
+        with self.lock:
+            job = self.job_record(job_id)
+            startup = job.get('startup_prompt') or {}
+            if (job['kind'] != 'launch' or job['state'] not in ('running', 'waiting_for_input')
+                    or startup.get('state') not in ('pending', 'parked')):
+                return None
+            if startup['state'] == 'parked' and datetime.now(timezone.utc) >= startup_deadline(startup):
+                self.update_job(job_id, state='needs_attention', progress='',
+                                startup_prompt=dict(startup, text='', state='expired'),
+                                error='The agent did not accept its startup prompt within 24 hours. '
+                                      'No startup prompt was sent. Inspect the terminal before restarting.')
+                return None
+            return job
+
+    def startup_failure(self, job, error, *, attempted):
+        code = getattr(error, 'code', '')
+        refused = isinstance(error, HerdrError) and error.delivery == 'none'
+        startup = job['startup_prompt']
+        with self.lock:
+            current = self.job_record(job['id'])
+            expected = ('sending',) if attempted else ('pending', 'parked')
+            if (current['state'] not in ('running', 'waiting_for_input')
+                    or (current.get('startup_prompt') or {}).get('state') not in expected):
+                return  # A release during the readiness check already cancelled the prompt.
+            if refused and code in TRANSIENT_AGENT_CODES:
+                if current['state'] == 'waiting_for_input' and startup.get('code') == code:
+                    return
+                parked = dict(startup, state='parked', parked_since=startup.get('parked_since') or now(), code=code)
+                parked['expires_at'] = startup_deadline(parked).isoformat()
+                waiting = 'answer the question in its terminal' if code == 'agent_blocked' else 'become ready'
+                self.update_job(job['id'], state='waiting_for_input', error='', startup_prompt=parked,
+                                progress='Waiting for the agent to ' + waiting + '; the startup prompt is sent '
+                                         'automatically after that.')
+                return
+            uncertain = attempted and not refused
+            guidance = (' The startup prompt may have been sent; inspect the terminal before restarting.'
+                        if uncertain else ' No startup prompt was sent; inspect the terminal before restarting.')
+            self.update_job(job['id'], state='needs_attention', progress='', error=str(error)[:380] + guidance,
+                            startup_prompt=dict(startup, text='', state='unknown' if uncertain else 'failed', code=code))
+
+    def resume_startups(self):
+        """Deliver parked startup prompts whose agents may accept input now."""
+        with self.lock, closing(self.connect()) as db:
+            slots = STARTUP_WORKERS - len(self.startup_checks)
+            if slots <= 0:
+                return
+            query = ("SELECT rowid, id, json_extract(data, '$.profile_id') AS profile_id "
+                "FROM jobs WHERE json_extract(data, '$.kind')='launch' "
+                "AND json_extract(data, '$.state')='waiting_for_input' "
+                "AND json_extract(data, '$.startup_prompt.state')='parked' AND rowid>? ORDER BY rowid LIMIT ?")
+            rows = db.execute(query, (self.startup_cursor, slots)).fetchall()
+            if not rows and self.startup_cursor:
+                self.startup_cursor = 0
+                rows = db.execute(query, (0, slots)).fetchall()
+            for row in rows:
+                self.startup_cursor = row['rowid']
+                job_id = row['id']
+                if job_id in self.startup_checks:
+                    continue
+                self.startup_checks.add(job_id)
+                future = self.worker.submit(self._resume_startup, job_id, row['profile_id'])
+                self.futures.add(future)
+                future.add_done_callback(self._finished)
+
+    def _resume_startup(self, job_id, profile_id):
+        try:
+            lock = self.agent_locks.setdefault(profile_id, threading.RLock())
+            if lock.acquire(blocking=False):
+                try:
+                    self.deliver_startup(job_id)
+                finally:
+                    lock.release()
+        finally:
+            with self.lock:
+                self.startup_checks.discard(job_id)
+
     def advance_discussions(self):
+        self.resume_startups()
         from discussion_recovery import advance
         advance(self)
         # Waiting meetings reserve no busy workers. Recheck on the normal poll loop.
@@ -1827,8 +1984,17 @@ class OrganizationStore:
                         expected['PATH'] = str(commands) + os.pathsep + expected['PATH']
                     job = self.update_job(job_id, environment_binding=dict(binding_record, environment=expected))
                 job = self.update_job(job_id, launch_stage='agent_starting')
+                if profile['runtime'] == 'codex' and self.codex_trust is not None:
+                    # Codex would otherwise stop on its "Trust this folder?"
+                    # screen, with nobody there to answer it.
+                    try:
+                        self.codex_trust(project)
+                    except (OSError, ValueError, RuntimeError) as error:
+                        logging.warning('Codex trust not recorded for %s: %s', project, error)
                 self.command('agent', 'start', job['alias'], '--kind', profile['runtime'], '--pane', pane, '--timeout', '60000', *(['--', *arguments] if arguments else []), timeout=70)
-                agent = self.identity(job)
+                # Readiness is checked when the startup prompt is delivered: an
+                # agent that stopped on a startup question is parked, not failed.
+                agent = self.identity(job, ready=False)
                 job = self.update_job(job_id, agent_session=agent.get('agent_session'))
                 if (job.get('environment_binding') or {}).get('state') == 'requested':
                     from environment_launch import verify_process
@@ -1888,15 +2054,14 @@ class OrganizationStore:
                                'publication authorization. Dashboard task publishing is administrator-controlled.')
                     if job.get('continuation_context'):
                         prompt += '\n\n' + job['continuation_context']
-                    self.command('agent', 'prompt', job['alias'], prompt + policy_guidance(job.get('execution_toolchain_policy') or frozen) + environment_notice, '--wait', '--timeout', '180000', timeout=190)
-                    self.identity(job)
                 else:
                     if job.get('continuation_context'):
                         prompt += '\n\n' + job['continuation_context']
-                    response = self.command('agent', 'prompt', job['alias'], prompt + policy_guidance(job.get('execution_toolchain_policy') or frozen) + environment_notice)
-                    self.update_job(job_id, delivery=dict(stage='sent', at=now(),
-                                                          completion=self.completion_baseline(response)))
-                self.update_job(job_id, state='persona_sent')
+                # Saved before the first attempt, so it can be delivered later.
+                self.update_job(job_id, startup_prompt=dict(
+                    text=prompt + policy_guidance(job.get('execution_toolchain_policy') or frozen) + environment_notice,
+                    group=bool(profile.get('group_id')), state='pending', at=now()))
+                self.deliver_startup(job_id)
             else:
                 # Resolve persisted runs again: the operator may have released one while this was queued.
                 with self.lock, closing(self.connect()) as db:

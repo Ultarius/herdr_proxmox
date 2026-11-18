@@ -33,6 +33,14 @@ def mark_waiting(store, job_id, reason):
             store.update_job(job_id, state='waiting_for_members', waiting_since=since.isoformat(), progress=reason, error='')
 
 
+def startup_waiting(profile, run):
+    """Why a meeting waits for a member whose startup prompt is parked."""
+    if (run.get('startup_prompt') or {}).get('code') == 'agent_blocked':
+        return (profile['name'] + ' is waiting for an answer in its terminal (for example a folder-trust '
+                'question); the meeting continues once it is answered')
+    return profile['name'] + ' is still starting; the meeting continues once it is ready'
+
+
 def prepare(store, job_id):
     with store.lock, closing(store.connect()) as db:
         job = store.get(db, 'jobs', job_id)
@@ -100,6 +108,8 @@ def prepare_locked(store, job_id):
             if run['state'] == 'queued':
                 selected[profile['id']] = run
                 continue
+            if run['state'] == 'waiting_for_input':
+                raise Waiting(startup_waiting(profile, run))
             if run['state'] != 'persona_sent':
                 raise ValueError(profile['name'] + ': inspect the existing session before meeting preparation')
             # Pending meetings are ordered above, rather than owning one
@@ -190,6 +200,8 @@ def prepare_locked(store, job_id):
                                error='', result='', created_at=now(), updated_at=now(), session_purpose='discussion',
                                preparation_meeting_id=job_id)
                     store.put(db, 'jobs', run)
+                if run['state'] == 'waiting_for_input':
+                    raise Waiting(startup_waiting(profile, run))
                 if run['state'] not in ('queued', 'persona_sent'):
                     raise ValueError(profile['name'] + ': prepared session needs inspection; it will not be relaunched')
                 preparation[profile['id']] = identity
@@ -202,6 +214,8 @@ def prepare_locked(store, job_id):
                 store.execute(run['id'])  # Reentrant participant lock; no worker waits for another worker.
             with store.lock, closing(store.connect()) as db:
                 run = store.get(db, 'jobs', run['id'], job['organization_id'])
+            if run['state'] == 'waiting_for_input':
+                raise Waiting(startup_waiting(profile, run))
             if run['state'] != 'persona_sent':
                 raise ValueError(profile['name'] + ': session preparation failed; inspect its run')
             store.identity(run)
@@ -236,6 +250,8 @@ def ensure_facilitator(store, group_id, organization_id):
             store.execute(run['id'])
         with store.lock, closing(store.connect()) as db:
             run = store.get(db, 'jobs', run['id'], organization_id)
+        if run['state'] == 'waiting_for_input':
+            raise Waiting(startup_waiting(run['profile'], run))
         if run['state'] != 'persona_sent':
             raise ValueError('Inspect the product facilitator session before discovery preparation.')
         store.identity(run)

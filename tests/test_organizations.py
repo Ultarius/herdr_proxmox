@@ -625,6 +625,158 @@ class OrganizationTests(unittest.TestCase):
         self.assertIn('Prepare SDKs', prompt)
         self.assertIn('not dashboard administrator authorization', prompt)
 
+    def test_a_codex_launch_records_folder_trust_before_the_agent_starts(self):
+        # Otherwise Codex waits on its "Trust this folder?" screen and the prompt is lost.
+        trusted = []
+        self.store.codex_trust = lambda project: trusted.append((Path(project), len(self.calls)))
+        org = self.organization()
+        self.action('launch', organization_id=org, profile_id=self.hire(org, runtime='opencode'))
+        self.drain()
+        self.assertEqual(trusted, [])
+        self.action('launch', organization_id=org, profile_id=self.hire(org, name='Noor'))
+        self.drain()
+        starts = [index for index, (args, _) in enumerate(self.calls) if args[:2] == ('agent', 'start')]
+        self.assertEqual(len(trusted), 1)
+        self.assertEqual(trusted[0][0].resolve(), self.projects.resolve())
+        self.assertGreater(trusted[0][1], starts[0])
+        self.assertLessEqual(trusted[0][1], starts[1])
+
+    def block_new_agents(self):
+        # Codex's folder-trust question blocks a new agent before its startup prompt.
+        command = self.store.command
+        def blocked_start(*args, **kwargs):
+            response = command(*args, **kwargs)
+            if args[:2] == ('agent', 'start'):
+                self.agents[args[2]]['agent_status'] = 'blocked'
+            return response
+        self.store.command = blocked_start
+
+    def startup_prompts(self, alias):
+        return [args for args, _ in self.calls if args[:2] == ('agent', 'prompt') and args[2] == alias]
+
+    def test_a_startup_prompt_waits_for_a_blocked_agent_and_is_sent_once_it_is_answered(self):
+        self.block_new_agents()
+        org = self.organization()
+        run_id = self.action('launch', organization_id=org, profile_id=self.hire(org))
+        self.drain()
+        run = self.store.job_record(run_id)
+        self.assertEqual((run['state'], run['startup_prompt']['state']), ('waiting_for_input', 'parked'), run.get('error'))
+        self.assertIn('answer the question in its terminal', run['progress'])
+        self.assertEqual(self.startup_prompts(run['alias']), [])
+        visible = next(item for item in self.store.state_snapshot()['jobs'] if item['id'] == run_id)
+        self.assertNotIn('text', visible['startup_prompt'])
+        self.assertTrue(visible['startup_prompt']['expires_at'])
+        inspected = self.store.action('inspect', dict(request_id=uuid.uuid4().hex, organization_id=org,
+                                                       profile_id=run['profile_id']))
+        self.assertTrue(inspected['startup_wait'])
+        self.assertEqual(inspected['status'], 'blocked')
+        self.assertIsNone(inspected['console_token'])
+        self.store.advance_discussions()  # Still blocked: nothing is typed into the question.
+        self.drain()
+        self.assertEqual(self.startup_prompts(run['alias']), [])
+        self.agents[run['alias']]['agent_status'] = 'idle'  # The operator answered it.
+        for unused in range(2):
+            self.store.advance_discussions()
+            self.drain()
+        run = self.store.job_record(run_id)
+        self.assertEqual((run['state'], run['startup_prompt']['state'], run['startup_prompt']['text']),
+                         ('persona_sent', 'sent', ''))
+        self.assertEqual(len(self.startup_prompts(run['alias'])), 1)
+        self.assertIn('Acknowledge readiness', self.startup_prompts(run['alias'])[0][3])
+
+    def test_a_launch_waiting_for_its_startup_prompt_can_be_released(self):
+        self.block_new_agents()
+        org = self.organization()
+        run_id = self.action('launch', organization_id=org, profile_id=self.hire(org))
+        self.drain()
+        alias = self.store.job_record(run_id)['alias']
+        self.action('release', organization_id=org, job_id=run_id)
+        self.agents[alias]['agent_status'] = 'idle'
+        self.store.advance_discussions()
+        self.drain()
+        self.assertEqual(self.store.job_record(run_id)['state'], 'released')
+        self.assertEqual(self.store.job_record(run_id)['startup_prompt']['text'], '')
+        self.assertEqual(self.startup_prompts(alias), [])
+
+    def test_release_can_win_while_a_parked_startup_rechecks_readiness(self):
+        self.block_new_agents()
+        org = self.organization()
+        run_id = self.action('launch', organization_id=org, profile_id=self.hire(org))
+        self.drain()
+        alias = self.store.job_record(run_id)['alias']
+        self.agents[alias]['agent_status'] = 'idle'
+        original = self.store.command
+
+        def release_during_readiness(*args, **kwargs):
+            if args == ('agent', 'get', alias):
+                self.action('release', organization_id=org, job_id=run_id)
+            return original(*args, **kwargs)
+
+        self.store.command = release_during_readiness
+        self.store.resume_startups()
+        self.drain()
+        run = self.store.job_record(run_id)
+        self.assertEqual((run['state'], run['startup_prompt']['state']), ('released', 'cancelled'))
+        self.assertEqual(self.startup_prompts(alias), [])
+
+    def test_startup_wait_expires_even_if_the_terminal_is_now_ready(self):
+        self.block_new_agents()
+        org = self.organization()
+        run_id = self.action('launch', organization_id=org, profile_id=self.hire(org))
+        self.drain()
+        run = self.store.job_record(run_id)
+        self.agents[run['alias']]['agent_status'] = 'idle'
+        self.store.update_job(run_id, startup_prompt=dict(run['startup_prompt'],
+                                                          parked_since='2020-01-01T00:00:00+00:00'))
+        self.store.resume_startups()
+        self.drain()
+        ended = self.store.job_record(run_id)
+        self.assertEqual((ended['state'], ended['startup_prompt']['state']), ('needs_attention', 'expired'))
+        self.assertEqual(ended['startup_prompt']['text'], '')
+        self.assertEqual(self.startup_prompts(run['alias']), [])
+
+    def test_an_interrupted_startup_delivery_is_not_replayed_after_restart(self):
+        self.block_new_agents()
+        org = self.organization()
+        run_id = self.action('launch', organization_id=org, profile_id=self.hire(org))
+        self.drain()
+        run = self.store.job_record(run_id)
+        self.store.update_job(run_id, state='running', startup_prompt=dict(run['startup_prompt'], state='sending'))
+        path = self.store.path
+        self.store.close()
+        self.store = gateway.OrganizationStore(path, self.projects, self.command)
+        self.agents[run['alias']]['agent_status'] = 'idle'
+        self.store.advance_discussions()
+        self.drain()
+        restarted = self.store.job_record(run_id)
+        self.assertEqual((restarted['state'], restarted['startup_prompt']['state'], restarted['startup_prompt']['text']),
+                         ('uncertain', 'unknown', ''))
+        self.assertEqual(self.startup_prompts(run['alias']), [])
+
+    def test_a_startup_prompt_that_may_have_been_sent_is_never_sent_again(self):
+        from herdr_errors import HerdrError
+        self.block_new_agents()
+        org = self.organization()
+        run_id = self.action('launch', organization_id=org, profile_id=self.hire(org))
+        self.drain()
+        alias = self.store.job_record(run_id)['alias']
+        self.agents[alias]['agent_status'] = 'idle'
+        command = self.store.command
+        def stalled(*args, **kwargs):
+            if args[:2] == ('agent', 'prompt'):
+                self.calls.append((args, kwargs))
+                raise HerdrError('The prompt stalled', code='timeout', delivery='unknown')
+            return command(*args, **kwargs)
+        self.store.command = stalled
+        for unused in range(2):
+            self.store.advance_discussions()
+            self.drain()
+        run = self.store.job_record(run_id)
+        self.assertEqual((run['state'], run['startup_prompt']['state'], run['startup_prompt']['text']),
+                         ('needs_attention', 'unknown', ''))
+        self.assertIn('inspect the terminal', run['error'])
+        self.assertEqual(len(self.startup_prompts(alias)), 1)
+
     def test_scratch_activation_failure_never_starts_agent_or_sends_task(self):
         org = self.organization()
         profile = self.hire(org)
