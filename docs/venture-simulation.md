@@ -535,7 +535,12 @@ consulting, where the market grows, whether customers with no system yet are a
 better start, what revenue grows with the customer's activity, whether the
 leader could copy the idea within a quarter, how big it realistically gets,
 and which reframe was weighed; the Skeptic advances only when price, delivery
-and the copy question hold. The checklist lives beside the evidence rather
+and the copy question hold. Held ideas are returned too, with their dissent,
+so the stakeholder panel and the operator see them (autonomous mode never
+creates one). The scout omits rejected ideas and returns up to the round cap.
+Ideas already in the pack's
+`existing` list are not audited again: the scout looks elsewhere or returns a
+revision with `revises`. The checklist lives beside the evidence rather
 than in the prompt, so it reaches existing studio teams and costs little of
 the prompt budget; unlike the evidence it is rewritten when a newer gateway
 changes it. Alternative prices may state a `period`.
@@ -641,9 +646,16 @@ tab shows every stakeholder's model and warns when all of them run on the
 studio's own model. A changed model hires a new stakeholder agent. The group's
 chair runs on the first stakeholder's model.
 
-After every scout round that proposes ideas, the gateway pitches them to the
-panel in a `pitch` run: a pitch pack (each idea's case, the gateway economics,
-warnings and review notes, and the pages it cites) and a prompt that sets the
+After every scout round, the gateway pitches up to six ideas, starting with
+new ideas and filling the remaining slots with open ideas that have no usable
+review and no unresolved pitch. A round that proposes nothing can still
+trigger a pitch. When the candidate backlog is full, the Studio can pitch
+those open ideas without starting a scout meeting. If a pack is too large,
+ideas at the end of the batch can go to the next pitch. The maximum daily
+load on the Studio tab counts the panel meeting, and panel setup checks it
+against the session cap. A pitch includes each idea's case, gateway economics,
+warnings, review notes, and citations from the idea's originating scout round.
+The prompt sets the
 method. In round 1 each stakeholder reviews every idea alone, without seeing
 the others; in an optional round 2 it hears their objections without names and
 may change its verdict. Each review is `back`, `hold` or `pass` with 1-5

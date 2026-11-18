@@ -306,7 +306,7 @@ Component venturesStudio({
         if (schedule[kind] is Map) _scheduleLine(kind, schedule[kind] as Map),
       notice(
         'Projected per day: ${budget['daily_meetings'] ?? 0} guaranteed meeting(s), up to '
-        '${budget['max_daily_meetings'] ?? budget['daily_meetings'] ?? 0} with news-only ventures; '
+        '${budget['max_daily_meetings'] ?? budget['daily_meetings'] ?? 0} with news-only ventures and stakeholder pitches; '
         '${budget['projected_agent_sessions'] ?? 0} to ${budget['max_agent_sessions'] ?? 0} agent sessions. '
         'Studio runs per week: ${budget['studio_runs_per_week'] ?? 0}. '
         'Limits: ${_limit(budget['max_active_meetings'], 'active meetings')}, '

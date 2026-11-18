@@ -1528,6 +1528,10 @@ class VentureTests(unittest.TestCase):
         self.assertEqual(checklist.read_text(encoding='utf-8'), ventures.STUDIO_REVIEW_CHECKLIST)
         self.assertIn('review checklist review.md beside that file', run['prompt'])
         self.assertIn('Can the leader copy it within a quarter?', ventures.STUDIO_REVIEW_CHECKLIST)
+        self.assertIn('Return held ideas too', ventures.STUDIO_REVIEW_CHECKLIST)
+        self.assertIn('auditing them again', ventures.STUDIO_REVIEW_CHECKLIST)
+        self.assertIn('Return advanced and held ideas; omit rejected ideas.', run['prompt'])
+        self.assertIn('"revises":"<its exact name>"', run['prompt'])
         unlisted = self.web_candidate('Dock Ledger', evidence=['W2'])
         unlisted['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
         done = self.complete_studio(run, {
@@ -2355,6 +2359,147 @@ class VentureTests(unittest.TestCase):
                                    spoke=['investor', 'customer'])
         self.assertEqual((done['state'], done['review_count'], done['unverified']), ('ready', 2, []))
 
+    def test_an_empty_round_still_pitches_open_ideas_the_panel_never_reviewed(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.scout_with(candidate('Carrier Desk'))  # Proposed before there was a panel.
+        policy = dict(self.ventures._studio_policy('org'), studio_scout_cadence='daily',
+                      studio_portfolio_cadence='off')
+        before = self.ventures._studio_budget('org', policy)
+        self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        after = self.ventures._studio_budget('org', policy)
+        # The pitch after a scout round counts toward the maximum, not the guaranteed load.
+        self.assertEqual((after['daily_meetings'], after['max_daily_meetings']),
+                         (before['daily_meetings'], before['max_daily_meetings'] + 1))
+        self.assertEqual(after['max_agent_sessions'], before['max_agent_sessions'] + 3)
+
+        stored, = self.stored_candidates()
+        done = self.scout_with()
+        self.assertEqual((done['state'], done['candidates']), ('ready', []))
+        pitch, = self.pitch_runs()
+        self.assertEqual((pitch['state'], pitch['candidate_ids']), ('meeting', [stored['id']]))
+        # While that pitch is open, and once it has settled, the idea is not pitched again.
+        with self.assertRaisesRegex(ValueError, 'pitch studio run is still in its meeting'):
+            self.scout_with()
+        self.complete_pitch(pitch, [self.review('Carrier Desk', 'investor', 'hold'),
+                                    self.review('Carrier Desk', 'customer', 'pass')],
+                            spoke=['investor', 'customer'])
+        self.scout_with()
+        self.assertEqual(len(self.pitch_runs()), 1)
+
+    def test_a_mixed_pitch_keeps_sources_from_each_originating_scout_round(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        first = self.studio(mode='studio_run', kind='scout')
+        earlier = self.web_candidate('Carrier Desk')
+        earlier['buyer']['evidence'] = ['W2']
+        old_page = dict(self.RESEARCH[0], id='W2', url='https://trade.example/buyer')
+        self.complete_studio(first, {'candidates': [earlier], 'research': self.RESEARCH + [old_page]})
+
+        self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        second = self.studio(mode='studio_run', kind='scout')
+        fresh = self.web_candidate('Dock Ledger')
+        fresh['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
+        new_page = dict(self.RESEARCH[0], url='https://yard.example/docks', title='A different W1')
+        self.complete_studio(second, {'candidates': [fresh], 'research': [new_page]})
+
+        pitch, = self.pitch_runs()
+        pack = json.loads(Path(pitch['evidence_file']).read_text(encoding='utf-8'))
+        current_idea, backlog_idea = pack['ideas']
+        self.assertEqual((current_idea['name'], backlog_idea['name']), ('Dock Ledger', 'Carrier Desk'))
+        self.assertNotEqual(current_idea['source_scope'], backlog_idea['source_scope'])
+        self.assertEqual(backlog_idea['buyer']['evidence'], ['W2'])
+        sources = {(entry['source_scope'], entry['id']): entry['url'] for entry in pack['sources']}
+        self.assertEqual(sources, {
+            (current_idea['source_scope'], 'W1'): new_page['url'],
+            (backlog_idea['source_scope'], 'W1'): self.RESEARCH[0]['url'],
+            (backlog_idea['source_scope'], 'W2'): old_page['url'],
+        })
+
+    def test_an_oversize_batch_defers_the_backlog_idea_to_the_next_pitch(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        earlier = candidate()
+        earlier['product'] += ' Reconcile freight forwarder invoices.' * 30
+        first = self.scout_with(earlier)
+        old, = self.stored_candidates()
+        one_idea = self.ventures._pitch_pack(first, [old])
+        limit = len(json.dumps(one_idea, ensure_ascii=False).encode()) + 200
+        self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        fresh = candidate('Dock Ledger')
+        fresh['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
+        fresh['product'] += ' Coordinate warehouse dock scheduling.' * 30
+        with patch('venture_panel.PANEL_PACK_LIMIT', limit):
+            self.scout_with(fresh)
+        pitch, = self.pitch_runs()
+        self.assertEqual(pitch['state'], 'meeting', pitch['error'])
+        self.assertEqual([idea['name'] for idea in pitch['evidence']['ideas']], ['Dock Ledger'])
+        self.complete_pitch(pitch, [self.review('Dock Ledger', 'investor', 'hold')], spoke=['investor'])
+        self.scout_with()
+        self.assertEqual(self.pitch_runs()[-1]['candidate_ids'], [old['id']])
+
+    def test_a_held_revision_of_an_unreviewed_idea_is_pitched_in_its_place(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.scout_with(candidate())
+        self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        self.studio(mode='studio_policy', studio_mode='autonomous', studio_auto_min_confidence=10)
+        revision = candidate('Carrier Desk Micro', 'N1')
+        revision.update(revises='Carrier Desk', revision_note='Limit the pilot to one site.')
+        revision['dissent']['verdict'] = 'hold'
+        done = self.scout_with(revision)
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        ideas = {item['name']: item for item in self.stored_candidates()}
+        self.assertEqual((ideas['Carrier Desk']['state'], ideas['Carrier Desk Micro']['state']),
+                         ('superseded', 'proposed'))
+        pitch, = self.pitch_runs()
+        self.assertEqual(pitch['candidate_ids'], [ideas['Carrier Desk Micro']['id']])
+        self.complete_pitch(pitch, [self.review('Carrier Desk Micro', role, 'back')
+                                    for role in ('investor', 'customer')], spoke=['investor', 'customer'])
+        stored = self.ventures.get_candidate('org', ideas['Carrier Desk Micro']['id'])
+        self.assertEqual(stored['state'], 'proposed')
+        self.assertIn('The Skeptic would hold', stored['auto']['reason'])
+
+    def test_a_full_backlog_can_be_pitched_without_another_scout_meeting(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.scout_with(candidate())
+        self.studio(mode='studio_policy', studio_candidate_backlog=1, studio_scout_cadence='daily')
+        self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        self.due('scout')
+        run = self.studio(mode='studio_run', kind='scout')
+        self.assertEqual((run['state'], run.get('job_id')), ('skipped', None))
+        pitch, = self.pitch_runs()
+        self.assertEqual((pitch['state'], pitch['scout_run_id']), ('meeting', run['id']))
+        self.assertGreater(ventures.moment(self.ventures._studio_policy('org')['studio_next_scout_at']),
+                           ventures.now())
+        self.complete_pitch(pitch, [self.review('Carrier Desk', 'investor', 'hold')], spoke=['investor'])
+        with self.assertRaisesRegex(ValueError, 'The venture candidate backlog is full'):
+            self.studio(mode='studio_run', kind='scout')
+
+    def test_panel_setup_and_reenable_check_the_combined_session_cap_before_hiring(self):
+        self.setup_studio_manual()
+        policy = self.studio(mode='studio_policy', studio_scout_cadence='daily', studio_portfolio_cadence='off')
+        base = self.ventures._studio_budget('org', policy)['max_agent_sessions']
+        stakeholders = [dict(role='investor'), dict(role='customer')]
+        self.service.patch_policy('org', dict(daily_session_cap=int(base) + 2), 'test')
+        hired = len(self.profiles)
+        with self.assertRaisesRegex(ValueError, 'above the organization cap'):
+            self.setup_panel(stakeholders=stakeholders)
+        self.assertEqual(len(self.profiles), hired)
+
+        self.service.patch_policy('org', dict(daily_session_cap=int(base) + 3), 'test')
+        self.setup_panel(stakeholders=stakeholders)
+        hired = len(self.profiles)
+        with self.assertRaisesRegex(ValueError, 'above the organization cap'):
+            self.setup_panel(stakeholders=stakeholders + [dict(role='operator')])
+        self.assertEqual(len(self.profiles), hired)
+        self.service.patch_policy('org', dict(daily_session_cap=int(base) + 2), 'test')
+        self.studio(mode='studio_panel', enabled=False)
+        with self.assertRaisesRegex(ValueError, 'above the organization cap'):
+            self.studio(mode='studio_panel')
+        self.assertFalse(self.ventures._panel_enabled('org'))
+
     def test_a_panel_on_the_studio_s_own_model_says_so_and_can_be_switched_off(self):
         self.setup_studio_manual()
         same = dict(runtime='opencode', provider='opencode-go', model='deepseek-v4')
@@ -2415,6 +2560,8 @@ class VentureTests(unittest.TestCase):
         self.assertIn('no usable review', empty['error'])
         self.assertEqual(len(empty['missing']), 4)
         self.assertEqual([idea['panel']['reviewers'] for idea in self.stored_candidates()], [0, 0])
+        self.scout_with()
+        self.assertEqual(len(self.pitch_runs()), 1)  # Still awaiting recovery.
 
         self.complete_pitch(pitch, [self.review('Carrier Desk', 'investor', 'hold')], spoke=['investor'])
         settled = self.studio(mode='studio_recover', run_id=pitch['id'], inspected=True)
@@ -2428,6 +2575,12 @@ class VentureTests(unittest.TestCase):
         self.assertEqual([item['name'] for item in self.ventures._panel_feedback('org')], ['Carrier Desk'])
         page = self.studio(mode='candidate_brief', candidate_id=idea['id'])['html']
         self.assertIn('Pitched, no reviews.', page)
+        self.scout_with()
+        retry = self.pitch_runs()[-1]
+        self.assertEqual(retry['candidate_ids'], [idea['id']])
+        self.complete_pitch(retry, [self.review('Dock Ledger', 'investor', 'hold')], spoke=['investor'])
+        self.scout_with()
+        self.assertEqual(len(self.pitch_runs()), 2)
 
     def test_approval_without_attaching_leaves_an_idea_s_feeds_alone(self):
         self.setup_studio_manual()
