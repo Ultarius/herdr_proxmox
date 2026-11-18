@@ -62,6 +62,21 @@ class FeedParseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'entity'):
             venture_feeds.parse(b'<!DOCTYPE x [<!ENTITY y "z">]><rss/>', 'https://news.example/feed', venture_feeds.now())
 
+    def test_declarations_are_refused_in_any_encoding_the_parser_reads(self):
+        declared = ('<?xml version="1.0" encoding="{0}"?><!DOCTYPE rss [<!ENTITY x "y">]>'
+                    '<rss><channel><item><title>&x;</title><link>https://news.example/1</link></item></channel></rss>')
+        plain = ('<?xml version="1.0" encoding="{0}"?><rss><channel><item><title>Plain</title>'
+                 '<link>https://news.example/1</link></item></channel></rss>')
+        for encoding in ('UTF-8', 'UTF-16'):
+            with self.subTest(encoding=encoding):
+                codec = encoding.lower()
+                with self.assertRaisesRegex(ValueError, 'entity declarations'):
+                    venture_feeds.parse(declared.format(encoding).encode(codec), 'https://news.example/feed',
+                                        venture_feeds.now())
+                items = venture_feeds.parse(plain.format(encoding).encode(codec), 'https://news.example/feed',
+                                            venture_feeds.now())
+                self.assertEqual([item['title'] for item in items], ['Plain'])
+
     def test_atom_items_and_filtering(self):
         body = b'''<feed xmlns="http://www.w3.org/2005/Atom"><entry>
             <title>Settlement product launch</title><link rel="alternate" href="https://news.example/atom"/>

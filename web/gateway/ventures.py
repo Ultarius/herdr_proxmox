@@ -97,6 +97,8 @@ SCOUT_MAX_RUNWAY_MONTHS = 12
 # What one scout candidate may carry. The research list holds at most twelve
 # pages, so a candidate may cite all of them.
 SCOUT_MAX_EVIDENCE = 12
+# The states the active venture limit counts.
+ACTIVE_VENTURE_STATES = ('running', 'paused', 'qualified')
 SCOUT_MAX_POINTS = 8
 SCOUT_POINT_LENGTH = 300
 # A scout proposal has to state the case against itself as well as the case for
@@ -309,6 +311,24 @@ def _strings(value, limit, count, label):
             seen.add(key)
             result.append(item)
     return result
+
+
+def merge_config(previous, supplied):
+    """A partial configuration applied to a stored one, before normalising.
+
+    Each supplied layer updates only the fields it names: a market-only edit
+    keeps the burn, capital and every other field it did not mention. A list
+    (feeds, burn lines) is replaced as a whole. The result still goes through
+    ``normalize_config``, so it is validated like a full configuration."""
+    if not isinstance(supplied, dict):
+        raise ValueError('Venture configuration must be an object.')
+    merged = json.loads(json.dumps(previous or {}))
+    for layer, value in supplied.items():
+        if isinstance(value, dict) and isinstance(merged.get(layer), dict):
+            merged[layer] = {**merged[layer], **value}
+        else:
+            merged[layer] = value
+    return merged
 
 
 def normalize_config(value):
@@ -704,21 +724,35 @@ _PROXY = re.compile(r'\b(guidance|template|templates|rank|ranks|ranking|survey|i
 _EXPLANATION = re.compile(r'\b(because|means|would|lose|loses|cannot|so that|which means|why|leaves?)\b')
 
 
+def _month(word):
+    """The month a name or its three-letter abbreviation stands for, or None."""
+    month = _MONTHS.get(word[:3].lower())
+    if not month or (len(word) > 3 and not datetime(2000, month, 1).strftime('%B').lower()
+                     .startswith(word.lower())):
+        return None
+    return month
+
+
 def _kill_dates(text):
-    """Every date in a criterion: ISO, ``31 Mar 2027``, ``31 March 2027`` or
-    ``March 2027`` (the end of that month). Raises on an impossible date."""
+    """Every date in a criterion: ISO, ``31 Mar 2027``, ``31 March 2027``,
+    ``March 31, 2027``, ``Mar 31 2027`` or ``March 2027`` (the end of that
+    month). Raises on an impossible date."""
     from calendar import monthrange
     found = []
     for match in re.finditer(r'\b(20\d{2})-(\d{2})-(\d{2})\b', text):
         found.append(datetime(int(match[1]), int(match[2]), int(match[3])).date())
     for match in re.finditer(r'\b(?:(\d{1,2})\s+)?([A-Za-z]{3,9})\.?\s+(20\d{2})\b', text):
-        month = _MONTHS.get(match[2][:3].lower())
-        if not month or (len(match[2]) > 3 and not datetime(2000, month, 1).strftime('%B').lower()
-                         .startswith(match[2].lower())):
+        month = _month(match[2])
+        if not month:
             continue
         year = int(match[3])
         day = int(match[1]) if match[1] else monthrange(year, month)[1]
         found.append(datetime(year, month, day).date())
+    # Month first, as agents often write it in English: "March 31, 2027".
+    for match in re.finditer(r'\b([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b,?\s+(20\d{2})\b', text):
+        month = _month(match[1])
+        if month:
+            found.append(datetime(int(match[3]), month, int(match[2])).date())
     return found
 
 
@@ -2367,60 +2401,65 @@ class Ventures(StudioOperations, StakeholderPanel):
                 self.save_candidate(previous)
 
     def advance_studio(self):
+        from contributions import Busy
         with closing(self.service.connect()) as db:
             runs = [json.loads(row[0]) for row in db.execute(
                 "SELECT data FROM venture_studio_runs WHERE json_extract(data, '$.state')='meeting' LIMIT 30")]
         jobs = {item['id']: item for item in self.service.store.snapshot(live_status=False).get('jobs', [])}
         for saved in runs:
-            with self.service.operation('studio:' + saved['organization_id']):
-                with closing(self.service.connect()) as db:
-                    row = db.execute('SELECT data FROM venture_studio_runs WHERE id=?', (saved['id'],)).fetchone()
-                run = json.loads(row[0]) if row else None
-                if not run or run.get('state') != 'meeting':
-                    continue
-                job = jobs.get(run.get('job_id'))
-                if not job:
-                    job = next((item for item in self.service.store.snapshot(live_status=False).get('jobs', [])
-                                if item.get('id') == run.get('job_id')), None)
-                if not job:
-                    run.update(state='needs_attention', error='Studio discussion record unavailable.',
-                               failure=self._failure('The studio discussion record is gone.', 'meeting'))
-                    self.save_studio_run(run)
-                elif job.get('state') == 'artifact_ready':
-                    try:
-                        self._studio_settle(run, self._studio_parse(run, job))
-                    except Exception as error:
-                        message = str(error) or error.__class__.__name__
-                        run.update(state='needs_attention', error=redact(message)[:500],
-                                   failure=self._failure(message, 'validation', job, category='result'))
+            # Never wait on the shared poll thread: a run whose studio is busy is settled next pass.
+            try:
+                with self.service.operation('studio:' + saved['organization_id'], timeout=0):
+                    with closing(self.service.connect()) as db:
+                        row = db.execute('SELECT data FROM venture_studio_runs WHERE id=?', (saved['id'],)).fetchone()
+                    run = json.loads(row[0]) if row else None
+                    if not run or run.get('state') != 'meeting':
+                        continue
+                    job = jobs.get(run.get('job_id'))
+                    if not job:
+                        job = next((item for item in self.service.store.snapshot(live_status=False).get('jobs', [])
+                                    if item.get('id') == run.get('job_id')), None)
+                    if not job:
+                        run.update(state='needs_attention', error='Studio discussion record unavailable.',
+                                   failure=self._failure('The studio discussion record is gone.', 'meeting'))
                         self.save_studio_run(run)
-                elif job.get('state') in ('error', 'needs_attention', 'uncertain'):
-                    # The discussion's own error says what happened; the phase
-                    # says whether a prompt was sent before it stopped.
-                    message = str(job.get('error') or '') or 'The studio group meeting stopped.'
-                    phase = 'meeting' if job.get('discussion_submitted_at') else 'preparation'
-                    run.update(state='needs_attention', error=redact(message)[:500], waiting=None,
-                               failure=self._failure(message, phase, job, saved['organization_id']))
-                    self.save_studio_run(run)
-                else:
-                    # Still meeting. Say what it waits on, so a blocked agent
-                    # is visible in the studio instead of looking like progress.
-                    waiting = None
-                    if job.get('state') == 'waiting_for_input':
-                        waiting = self._failure(str(job.get('progress') or job.get('error') or '')
-                                                or 'An agent stopped on a decision.', 'meeting', job,
-                                                saved['organization_id'], category='permission')
-                    elif job.get('state') == 'waiting_for_members' and job.get('progress'):
-                        message = str(job['progress'])
-                        category = classify(message)
-                        waiting = dict(category=category if category in ('limits', 'herdr') else 'waiting',
-                                       phase='preparation', title='Waiting to start', action='',
-                                       help='The meeting starts by itself when this clears.',
-                                       message=redact(message)[:300], job_id=job.get('id', ''),
-                                       group_id=job.get('group_id', ''), agent='')
-                    if (waiting or {}).get('message') != (run.get('waiting') or {}).get('message'):
-                        run['waiting'] = waiting
+                    elif job.get('state') == 'artifact_ready':
+                        try:
+                            self._studio_settle(run, self._studio_parse(run, job))
+                        except Exception as error:
+                            message = str(error) or error.__class__.__name__
+                            run.update(state='needs_attention', error=redact(message)[:500],
+                                       failure=self._failure(message, 'validation', job, category='result'))
+                            self.save_studio_run(run)
+                    elif job.get('state') in ('error', 'needs_attention', 'uncertain'):
+                        # The discussion's own error says what happened; the phase
+                        # says whether a prompt was sent before it stopped.
+                        message = str(job.get('error') or '') or 'The studio group meeting stopped.'
+                        phase = 'meeting' if job.get('discussion_submitted_at') else 'preparation'
+                        run.update(state='needs_attention', error=redact(message)[:500], waiting=None,
+                                   failure=self._failure(message, phase, job, saved['organization_id']))
                         self.save_studio_run(run)
+                    else:
+                        # Still meeting. Say what it waits on, so a blocked agent
+                        # is visible in the studio instead of looking like progress.
+                        waiting = None
+                        if job.get('state') == 'waiting_for_input':
+                            waiting = self._failure(str(job.get('progress') or job.get('error') or '')
+                                                    or 'An agent stopped on a decision.', 'meeting', job,
+                                                    saved['organization_id'], category='permission')
+                        elif job.get('state') == 'waiting_for_members' and job.get('progress'):
+                            message = str(job['progress'])
+                            category = classify(message)
+                            waiting = dict(category=category if category in ('limits', 'herdr') else 'waiting',
+                                           phase='preparation', title='Waiting to start', action='',
+                                           help='The meeting starts by itself when this clears.',
+                                           message=redact(message)[:300], job_id=job.get('id', ''),
+                                           group_id=job.get('group_id', ''), agent='')
+                        if (waiting or {}).get('message') != (run.get('waiting') or {}).get('message'):
+                            run['waiting'] = waiting
+                            self.save_studio_run(run)
+            except Busy:
+                continue
 
     def _studio_stale(self, organization, urls):
         for url in urls:
@@ -2652,7 +2691,10 @@ class Ventures(StudioOperations, StakeholderPanel):
                 candidate[key] = _value(body.get(key), limit, 'candidate ' + key,
                                         required=key in ('name', 'thesis', 'product'))
         if 'configuration' in body:
-            configuration = normalize_config(body.get('configuration') or {})
+            # A partial edit changes only what it names; the economics read
+            # the burn and capital the operator did not touch.
+            previous = normalize_config(candidate.get('configuration') or {})
+            configuration = normalize_config(merge_config(previous, body.get('configuration') or {}))
             policy = self._studio_policy(organization)
             allowed = set(policy.get('studio_sources') or [])
             if any(feed not in allowed for feed in configuration['sources']['feeds']):
@@ -2795,17 +2837,15 @@ class Ventures(StudioOperations, StakeholderPanel):
         organizations = [dict(id=item['id'], name=item['name']) for item in directory.get('organizations', [])]
         with closing(self.service.connect()) as db:
             ventures = [json.loads(row[0]) for row in db.execute('SELECT data FROM ventures ORDER BY rowid DESC LIMIT 100')]
-            for record in ventures:
-                row = db.execute('SELECT data FROM venture_ticks WHERE venture_id=? ORDER BY rowid DESC LIMIT 1',
-                                 (record['id'],)).fetchone()
-                if row:
-                    tick = json.loads(row[0])
-                    record['last_tick'] = {key: tick.get(key) for key in
-                                           ('simulated_date', 'state', 'ledger', 'events', 'product_changes',
-                                            'review_kind', 'quiet', 'judged')}
-        selected = next((record for record in ventures if record['id'] == venture_id), None) if venture_id else None
-        if venture_id and not selected:
-            raise ValueError('Venture not found in this organization.')
+            selected = next((record for record in ventures if record['id'] == venture_id), None) if venture_id else None
+            if venture_id and not selected:
+                # The list holds the newest 100; an older venture is still
+                # opened by its id.
+                row = db.execute('SELECT data FROM ventures WHERE id=?', (venture_id,)).fetchone()
+                if not row:
+                    raise ValueError('Venture not found in this organization.')
+                selected = json.loads(row[0])
+            self._attach_last_ticks(db, ventures + ([selected] if selected and selected not in ventures else []))
         names = {profile['id']: profile.get('name', profile['id']) for profile in directory.get('profiles', [])}
         payload = dict(organizations=organizations, ventures=[_summary(record) for record in ventures],
                        groups=[dict({key: group.get(key) for key in ('id', 'name', 'organization_id', 'facilitator_id', 'members')},
@@ -2845,6 +2885,25 @@ class Ventures(StudioOperations, StakeholderPanel):
         payload.update(herdr=self._herdr_state(), runtimes=self._runtimes())
         payload.update(enabled=True, module=module, options=options())
         return payload
+
+    @staticmethod
+    def _attach_last_ticks(db, records):
+        """Each venture's latest tick, in one query instead of one per venture."""
+        if not records:
+            return
+        identities = [record['id'] for record in records]
+        rows = db.execute(
+            'SELECT tick.venture_id, tick.data FROM venture_ticks AS tick JOIN ('
+            'SELECT venture_id, MAX(rowid) AS latest FROM venture_ticks WHERE venture_id IN ('
+            + ','.join('?' * len(identities)) + ') GROUP BY venture_id) AS newest '
+            'ON tick.rowid = newest.latest', identities).fetchall()
+        latest = {row[0]: json.loads(row[1]) for row in rows}
+        for record in records:
+            tick = latest.get(record['id'])
+            if tick:
+                record['last_tick'] = {key: tick.get(key) for key in
+                                       ('simulated_date', 'state', 'ledger', 'events', 'product_changes',
+                                        'review_kind', 'quiet', 'judged')}
 
     def _tick_summary(self, tick):
         return {key: tick.get(key) for key in
@@ -3034,7 +3093,7 @@ class Ventures(StudioOperations, StakeholderPanel):
         # Normalising the stored layers first lets records written by an
         # earlier version compare equal when nothing was changed.
         previous = normalize_config(record.get('configuration', {}))
-        configuration = normalize_config({**previous, **supplied})
+        configuration = normalize_config(merge_config(previous, supplied))
         changes = [layer for layer in LAYERS if configuration.get(layer) != previous.get(layer)]
         if record.get('state') == 'qualified' or record.get('qualified_at'):
             frozen = lambda value: {key: item for key, item in value['simulation'].items()
@@ -3086,13 +3145,28 @@ class Ventures(StudioOperations, StakeholderPanel):
             raise ValueError('This venture cannot be paused.')
         if state == 'running' and record.get('qualified_at'):
             state = 'qualified'  # Qualification is sticky across a pause.
+        entering = record.get('state') not in ACTIVE_VENTURE_STATES and state in ACTIVE_VENTURE_STATES
         record['state'] = state
         if state == 'archived' and reason:
             record['outcome_reason'] = redact(str(reason))[:500]
         if state in ('running', 'qualified'):
             record.pop('retry_at', None)
             record['schedule_error'] = ''
-        return self.save(record)
+        if not entering:
+            return self.save(record)
+        # A draft becomes active here (Resume or Pause both count). The check
+        # and the save share one organization lock, so two drafts resumed at
+        # once cannot both take the last place.
+        with self.service.operation('venture-active:' + record['organization_id'], timeout=10):
+            self._require_active_place(record)
+            return self.save(record)
+
+    def _require_active_place(self, record):
+        active = {item['id'] for item in self._active(record['organization_id'])}
+        limit = self.limit(record['organization_id'])
+        if record['id'] not in active and len(active) >= limit:
+            raise ValueError('The active venture limit of ' + str(limit) + ' is reached (running, paused and '
+                             'qualified ventures count). Archive a venture or raise the limit first.')
 
     def run(self, record, actor, fetch=True):
         """Start today's tick. ``fetch=False`` (the scheduler) reads only what is cached."""
@@ -3110,6 +3184,13 @@ class Ventures(StudioOperations, StakeholderPanel):
         if record['id'] not in active and len(active) >= self.limit(record['organization_id']):
             self._skip_review(record, date, 'news', 'Active venture limit is full.', actor)
             raise ValueError('The active venture limit for this organization is full.')
+        if record.get('state') == 'draft':
+            # The first run makes a draft active: claim its place now, under
+            # the same lock as Resume, instead of when the tick settles.
+            with self.service.operation('venture-active:' + record['organization_id'], timeout=10):
+                self._require_active_place(record)
+                record['state'] = 'running'
+                self.save(record)
         # The next scheduled slot moves on whatever this call does, so a blocked
         # or repeated run never turns into a tight retry loop.
         record['next_at'] = engine.next_slot(record['configuration']['simulation']['tick_hour_utc'], now()).isoformat()
@@ -3227,8 +3308,8 @@ class Ventures(StudioOperations, StakeholderPanel):
     def _active(self, organization):
         with closing(self.service.connect()) as db:
             return [json.loads(row[0]) for row in db.execute(
-                "SELECT data FROM ventures WHERE organization_id=? AND json_extract(data, '$.state') IN ('running','paused','qualified')",
-                (organization,))]
+                "SELECT data FROM ventures WHERE organization_id=? AND json_extract(data, '$.state') IN ("
+                + ','.join("'" + state + "'" for state in ACTIVE_VENTURE_STATES) + ')', (organization,))]
 
     def _feed_state(self, organization, url):
         with closing(self.service.connect()) as db:
@@ -3962,40 +4043,45 @@ class Ventures(StudioOperations, StakeholderPanel):
         return self._complete(record, tick, job)
 
     def advance(self):
+        from contributions import Busy
         with closing(self.service.connect()) as db:
             ticks = [json.loads(row[0]) for row in db.execute(
                 "SELECT data FROM venture_ticks WHERE json_extract(data, '$.state')='meeting' LIMIT 30")]
         jobs = {item['id']: item for item in self.service.store.snapshot(live_status=False).get('jobs', [])}
         for saved in ticks:
-            with self.service.operation('venture:' + saved['venture_id']):
-                with closing(self.service.connect()) as db:
-                    row = db.execute('SELECT data FROM venture_ticks WHERE id=?', (saved['id'],)).fetchone()
-                tick = json.loads(row[0]) if row else None
-                if not tick or tick.get('state') != 'meeting':
-                    continue
-                try:
-                    record = self.get(tick['venture_id'], tick['organization_id'])
-                except ValueError:
-                    continue
-                job = jobs.get(tick.get('job_id'))
-                if not job:
-                    job = next((item for item in self.service.store.snapshot(live_status=False).get('jobs', [])
-                                if item.get('id') == tick.get('job_id')), None)
-                if not job:
-                    tick.update(state='needs_attention', error='Discussion record unavailable; inspect the group before retrying.')
-                    self.save_tick(tick)
-                    self._touch_review(tick, 'needs_attention', error=tick['error'])
-                elif job.get('state') == 'artifact_ready':
+            # Never wait on the shared poll thread: a tick whose venture is busy is settled next pass.
+            try:
+                with self.service.operation('venture:' + saved['venture_id'], timeout=0):
+                    with closing(self.service.connect()) as db:
+                        row = db.execute('SELECT data FROM venture_ticks WHERE id=?', (saved['id'],)).fetchone()
+                    tick = json.loads(row[0]) if row else None
+                    if not tick or tick.get('state') != 'meeting':
+                        continue
                     try:
-                        self._complete(record, tick, job)
-                    except Exception as error:  # Untrusted artifact must not stop the poller.
-                        tick.update(state='needs_attention', error=redact(str(error) or error.__class__.__name__)[:500])
+                        record = self.get(tick['venture_id'], tick['organization_id'])
+                    except ValueError:
+                        continue
+                    job = jobs.get(tick.get('job_id'))
+                    if not job:
+                        job = next((item for item in self.service.store.snapshot(live_status=False).get('jobs', [])
+                                    if item.get('id') == tick.get('job_id')), None)
+                    if not job:
+                        tick.update(state='needs_attention', error='Discussion record unavailable; inspect the group before retrying.')
                         self.save_tick(tick)
                         self._touch_review(tick, 'needs_attention', error=tick['error'])
-                elif job.get('state') in ('error', 'needs_attention', 'uncertain'):
-                    tick.update(state='needs_attention', error='Inspect the group meeting; the venture tick will not resend it.')
-                    self.save_tick(tick)
-                    self._touch_review(tick, 'needs_attention', error=tick['error'])
+                    elif job.get('state') == 'artifact_ready':
+                        try:
+                            self._complete(record, tick, job)
+                        except Exception as error:  # Untrusted artifact must not stop the poller.
+                            tick.update(state='needs_attention', error=redact(str(error) or error.__class__.__name__)[:500])
+                            self.save_tick(tick)
+                            self._touch_review(tick, 'needs_attention', error=tick['error'])
+                    elif job.get('state') in ('error', 'needs_attention', 'uncertain'):
+                        tick.update(state='needs_attention', error='Inspect the group meeting; the venture tick will not resend it.')
+                        self.save_tick(tick)
+                        self._touch_review(tick, 'needs_attention', error=tick['error'])
+            except Busy:
+                continue
         self.advance_studio()
         self.schedule()
         self._studio_schedule()

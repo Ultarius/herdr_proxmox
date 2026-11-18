@@ -112,5 +112,7 @@ void main() {
       throwsA(isA<DashboardRequestException>()),
     );
     expect(bloc.state.error, contains('Venture refused'));
+    expect(bloc.pending, isNull);
+    expect(bloc.state.busy, isFalse);
   });
 }

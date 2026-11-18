@@ -111,6 +111,28 @@ class CIPolicyTests(unittest.TestCase):
         self.assertEqual(min(plan, key=weight), plan[0])
         self.assertEqual(plan, ci.browser_shards(self.root / 'test', 3))  # Every shard job sees the same plan.
 
+    def test_browser_shards_never_leave_the_keyboard_shard_empty_on_skewed_sizes(self):
+        # One heavy suite and three small ones: greedy placement alone gave
+        # every small suite to the other shards and left shard 0 empty.
+        for name, size in (('a_dom_test', 400_000), ('b_dom_test', 1_000), ('c_dom_test', 1_000),
+                           ('d_dom_test', 1_000)):
+            self.suite(name + '.dart', size)
+        plan = ci.browser_shards(self.root / 'test', 3)
+        self.assertTrue(all(plan), plan)
+        self.assertEqual(sorted(name for shard in plan for name in shard),
+                         ['a_dom_test.dart', 'b_dom_test.dart', 'c_dom_test.dart', 'd_dom_test.dart'])
+        self.assertNotIn('a_dom_test.dart', plan[0])  # The keyboard shard does not take the heavy suite.
+
+    def test_browser_shards_accept_either_quote_style_but_only_the_browser(self):
+        self.suite('a_dom_test.dart', 10, annotation='@TestOn("browser")')
+        self.suite('b_dom_test.dart', 10, annotation="@TestOn( 'browser' )")
+        self.assertEqual(ci.browser_shards(self.root / 'test', 1), [['a_dom_test.dart', 'b_dom_test.dart']])
+        for selector in ('@TestOn("chrome")', '@TestOn("vm || browser")', '@TestOn(platform)'):
+            with self.subTest(selector=selector):
+                self.suite('c_dom_test.dart', 10, annotation=selector)
+                with self.assertRaisesRegex(ValueError, 'c_dom_test.dart.*run in no CI job'):
+                    ci.browser_shards(self.root / 'test', 1)
+
     def test_browser_shards_refuse_a_suite_that_would_run_nowhere(self):
         self.suite('a_dom_test.dart', 10)
         self.suite('b_dom_test.dart', 10, annotation="@TestOn('chrome')")

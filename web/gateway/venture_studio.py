@@ -960,7 +960,9 @@ class StudioOperations:
                 reason = 'The active venture limit of ' + str(self.limit(organization)) + ' is reached.'
             if not reason:
                 try:
-                    with self.service.operation('candidate:' + candidate['id']):
+                    # Settlement runs on the shared poll thread: never wait for an
+                    # operator deciding this idea; it is left to them, with the reason.
+                    with self.service.operation('candidate:' + candidate['id'], timeout=0):
                         self.candidate_decide(organization, candidate['id'], dict(
                             decision='approve', confirmed=True, create_team=True, start_daily=True,
                             meeting_cadence='news_only'), AUTO_ACTOR)

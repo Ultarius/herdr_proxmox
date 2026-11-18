@@ -70,11 +70,22 @@ class _ReadFeature extends EventBase {
 }
 
 class _MutateFeature extends EventBase {
-  _MutateFeature(this.key, this.work, this.epoch, this.serial, this.start);
+  _MutateFeature(
+    this.key,
+    this.work,
+    this.epoch,
+    this.serial,
+    this.start, [
+    this.failure = const {},
+  ]);
   final String key;
   final FutureOr<FeatureResult<dynamic>> Function() work;
   final int epoch, serial;
   final Map<String, dynamic> start;
+
+  /// Applied when the work fails, so an in-flight marker set by [start]
+  /// does not outlive the request.
+  final Map<String, dynamic> failure;
   final completed = Completer<dynamic>();
 }
 
@@ -205,6 +216,7 @@ class FeatureBloc extends JuiceBloc<FeatureState> {
     bool admin = false,
     bool rethrowErrors = false,
     Map<String, dynamic> start = const {},
+    Map<String, dynamic> failure = const {},
   }) async {
     if (!available || _mutating || (admin && !this.admin)) return null;
     _mutating = true;
@@ -219,6 +231,7 @@ class FeatureBloc extends JuiceBloc<FeatureState> {
       connection.generation,
       _serial,
       start,
+      failure,
     );
     final result = event.completed.future;
     result.ignore();
@@ -364,8 +377,11 @@ class _MutateFeatureUseCase extends BlocUseCase<FeatureBloc, _MutateFeature> {
         event.completed.complete(null);
         return;
       }
+      // Still this request's state (checked above), so clearing its
+      // in-flight marker cannot clear a newer action's.
       emitFailure(
         newState: bloc.state.changed(
+          patch: event.failure,
           writing: {},
           errors: {...bloc.state.errors, event.key: '$error'},
         ),

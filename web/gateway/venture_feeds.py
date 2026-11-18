@@ -233,9 +233,30 @@ def canonical_link(value):
     return urlunsplit((parts.scheme.lower(), netloc, parts.path or '/', parts.query, ''))
 
 
+def _refuse_declarations(body):
+    """Refuse a DTD or entity declaration in any encoding the parser accepts.
+
+    The byte check in ``parse`` sees ASCII-compatible text only: a UTF-16
+    document spells ``<!DOCTYPE`` with zero bytes between the letters. Expat
+    detects the encoding first, so its declaration handlers see every one."""
+    from xml.parsers import expat
+
+    def refuse(*_):
+        raise ValueError('Feed rejected a document with entity declarations.')
+
+    parser = expat.ParserCreate()
+    parser.StartDoctypeDeclHandler = refuse
+    parser.EntityDeclHandler = refuse
+    try:
+        parser.Parse(body, True)
+    except expat.ExpatError as error:
+        raise ValueError('Feed is not valid XML.') from error
+
+
 def parse(body, source, fetched_at):
     if b'<!DOCTYPE' in body.upper() or b'<!ENTITY' in body.upper():
         raise ValueError('Feed rejected a document with entity declarations.')
+    _refuse_declarations(body)
     try:
         root = ElementTree.fromstring(body)
     except ElementTree.ParseError as error:

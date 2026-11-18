@@ -57,6 +57,8 @@ def summarize(report, destination, label):
 # Every browser suite is compiled on its own before it runs, whatever its
 # length, so a suite's cost is its size plus this fixed share.
 SUITE_OVERHEAD = 20_000
+# The one platform selector the browser shards run: 'browser' or "browser".
+BROWSER_SELECTOR = re.compile(r"""\s*(['"])browser\1\s*,?\s*""")
 
 
 def browser_shards(directory, total):
@@ -67,7 +69,9 @@ def browser_shards(directory, total):
     other ``@TestOn`` is refused, because such a suite would run in neither
     place without anyone noticing. Largest suites are placed first, each on the
     lightest shard, and the first shard starts with one average suite of load
-    because it also runs the keyboard-navigation check. The result depends only
+    because it also runs the keyboard-navigation check. Each shard is seeded
+    with one suite first, the keyboard shard with the lightest of them, so
+    skewed sizes never leave a shard empty. The result depends only
     on file names and sizes, so every shard job computes the same plan.
     """
     directory = Path(directory)
@@ -76,7 +80,9 @@ def browser_shards(directory, total):
         annotations = re.findall(r'@TestOn\(([^)]*)\)', path.read_text(encoding='utf-8'))
         if not annotations:
             continue
-        if annotations != ["'browser'"]:
+        # Either quote style and surrounding spaces; still only the browser.
+        if (len(annotations) != 1
+                or not re.fullmatch(BROWSER_SELECTOR, annotations[0])):
             raise ValueError(f"{path.name}: only @TestOn('browser') is planned for the browser shards; "
                              'another platform selector would run in no CI job.')
         suites.append((path.stat().st_size + SUITE_OVERHEAD, path.name))
@@ -87,7 +93,13 @@ def browser_shards(directory, total):
     loads = [0] * total
     loads[0] = sum(weight for weight, _ in suites) // len(suites)
     shards = [[] for _ in range(total)]
-    for weight, name in sorted(suites, key=lambda suite: (-suite[0], suite[1])):
+    ordered = sorted(suites, key=lambda suite: (-suite[0], suite[1]))
+    # Every shard gets one suite first, so a heavy suite cannot leave the
+    # keyboard shard empty. The keyboard shard takes the lightest of these.
+    for (weight, name), index in zip(ordered, [*range(1, total), 0]):
+        loads[index] += weight
+        shards[index].append(name)
+    for weight, name in ordered[total:]:
         lightest = min(range(total), key=lambda index: (loads[index], index))
         loads[lightest] += weight
         shards[lightest].append(name)

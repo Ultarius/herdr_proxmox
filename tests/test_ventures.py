@@ -1,5 +1,5 @@
 import base64
-from datetime import timedelta
+from datetime import date, timedelta
 import hashlib
 import html
 import json
@@ -9,7 +9,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from unittest.mock import MagicMock, patch
 import uuid
 
@@ -662,6 +662,74 @@ class VentureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'administrator'):
             self.ventures.action(dict(mode='limits', organization_id='org', max_active_ventures=5), 'viewer', 'operator')
 
+    def test_resume_cannot_take_a_venture_past_the_active_limit(self):
+        self.ventures.action(dict(mode='limits', organization_id='org', max_active_ventures=1), 'admin', 'admin')
+        first = self.create(request_id='cap-one', name='Cap one')
+        second = self.create(request_id='cap-two', name='Cap two')
+        self.ventures.action(dict(mode='resume', organization_id='org', venture_id=first['id']), 'admin', 'admin')
+        # Drafts may still be created; only becoming active is capped.
+        for mode in ('resume', 'pause'):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(ValueError, 'active venture limit of 1'):
+                    self.ventures.action(dict(mode=mode, organization_id='org', venture_id=second['id']),
+                                         'admin', 'admin')
+        self.assertEqual(self.ventures.get(second['id'], 'org')['state'], 'draft')
+        self.assertEqual(len(self.ventures._active('org')), 1)
+        # Pausing and resuming the active one is not a new place.
+        self.ventures.action(dict(mode='pause', organization_id='org', venture_id=first['id']), 'admin', 'admin')
+        self.ventures.action(dict(mode='resume', organization_id='org', venture_id=first['id']), 'admin', 'admin')
+        self.assertEqual(self.ventures.get(first['id'], 'org')['state'], 'running')
+        # Archiving frees the place.
+        self.ventures.action(dict(mode='archive', organization_id='org', venture_id=first['id']), 'admin', 'admin')
+        self.ventures.action(dict(mode='resume', organization_id='org', venture_id=second['id']), 'admin', 'admin')
+        self.assertEqual(self.ventures.get(second['id'], 'org')['state'], 'running')
+
+    def test_an_older_venture_still_opens_and_latest_ticks_load_in_one_query(self):
+        old = self.create(request_id='old-venture', name='Old venture')
+        with closing(self.service.connect()) as db, db:
+            for index in range(100):
+                identity = uuid.uuid4().hex
+                db.execute('INSERT INTO ventures VALUES (?,?,?)', (identity, 'org', json.dumps(dict(
+                    self.ventures.get(old['id'], 'org'), id=identity, name='Filler ' + str(index)))))
+        snapshot = self.ventures.snapshot(old['id'])
+        self.assertNotIn(old['id'], [item['id'] for item in snapshot['ventures']])
+        self.assertEqual(snapshot['selected']['id'], old['id'])
+        with self.assertRaisesRegex(ValueError, 'not found'):
+            self.ventures.snapshot('f' * 32)
+        statements = []
+        connect = self.service.connect
+
+        def counting():
+            db = connect()
+            db.set_trace_callback(statements.append)
+            return db
+        with patch.object(self.service, 'connect', counting):
+            self.ventures.snapshot()
+        # One query for every venture's latest tick, not one per venture.
+        self.assertEqual(len([sql for sql in statements if 'FROM venture_ticks' in sql and 'venture_id' in sql]), 1)
+
+    def test_a_busy_venture_or_studio_does_not_hold_up_the_poll_thread(self):
+        from contributions import Busy
+        record = self.create()
+        tick = dict(id=uuid.uuid4().hex, venture_id=record['id'], organization_id='org', state='meeting',
+                    job_id='missing')
+        self.ventures.save_tick(tick)
+        calls = []
+
+        @contextmanager
+        def operation(key, timeout=30):
+            calls.append((key, timeout))
+            if key.startswith('venture:'):
+                raise Busy('held elsewhere')
+            yield
+        with patch.object(self.service, 'operation', operation):
+            self.ventures.advance()
+        self.assertIn(('venture:' + record['id'], 0), calls)
+        # Skipped this pass, untouched for the next one.
+        with closing(self.service.connect()) as db:
+            saved = json.loads(db.execute('SELECT data FROM venture_ticks WHERE id=?', (tick['id'],)).fetchone()[0])
+        self.assertEqual(saved['state'], 'meeting')
+
     def test_restore_promotion_restores_the_previous_discovery_configuration(self):
         record = self.attach_group(self.create())
         existing = self.projects / 'existing'
@@ -1228,6 +1296,45 @@ class VentureTests(unittest.TestCase):
                         kill_criteria=['No pilot after 90 days.'])
         self.assertEqual(self.stored_candidates()[0]['kill_criteria'],
                          ['No paid pilot signed within 90 days.'])
+
+    def test_a_partial_candidate_edit_keeps_the_fields_it_does_not_name(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.scout_with(candidate())
+        stored = self.stored_candidates()[0]
+        before = stored['economics']
+        self.assertGreater(before['monthly_burn'], 0)
+        # Only the market's sales cycle: burn, capital and the rest of the market stay.
+        edited = self.studio(mode='candidate_update', candidate_id=stored['id'],
+                             configuration=dict(market=dict(sales_cycle=4)))
+        self.assertEqual(edited['configuration']['market']['sales_cycle'], 4)
+        self.assertEqual(edited['configuration']['market']['currency'], stored['configuration']['market']['currency'])
+        self.assertEqual(edited['configuration']['simulation']['burn'], stored['configuration']['simulation']['burn'])
+        self.assertEqual(edited['configuration']['simulation']['capital'],
+                         stored['configuration']['simulation']['capital'])
+        for key in ('monthly_burn', 'runway_months', 'break_even_customers'):
+            self.assertEqual(edited['economics'].get(key), before.get(key), key)
+        # A list is replaced as a whole, and the result is still validated.
+        edited = self.studio(mode='candidate_update', candidate_id=stored['id'], configuration=dict(
+            simulation=dict(burn=[dict(label='hosting', amount=1000, currency='USD')])))
+        self.assertEqual(edited['configuration']['simulation']['burn'],
+                         [dict(label='hosting', amount=1000, currency='USD')])
+        self.assertNotEqual(edited['economics']['monthly_burn'], before['monthly_burn'])
+        with self.assertRaises(ValueError):
+            self.studio(mode='candidate_update', candidate_id=stored['id'],
+                        configuration=dict(market=dict(sales_cycle=9)))
+
+    def test_a_partial_venture_configuration_keeps_the_fields_it_does_not_name(self):
+        record = self.create()
+        before = self.ventures.get(record['id'], 'org')['configuration']
+        updated = self.ventures.action(dict(mode='configure', organization_id='org', venture_id=record['id'],
+                                            configuration=dict(simulation=dict(survival_threshold=55))),
+                                       'admin', 'admin')
+        after = updated['configuration'] if 'configuration' in updated else self.ventures.get(
+            record['id'], 'org')['configuration']
+        self.assertEqual(after['simulation']['survival_threshold'], 55)
+        self.assertEqual(after['simulation']['burn'], before['simulation']['burn'])
+        self.assertEqual(after['market'], before['market'])
 
     def test_daily_reviews_need_a_team_and_nothing_is_created_without_one(self):
         self.setup_studio_manual()
@@ -2018,6 +2125,26 @@ class VentureTests(unittest.TestCase):
             ['Fewer than 3 paid pilots by ' + soon.strftime('%d %B %Y') + '.'], economics)), 1)
         with self.assertRaisesRegex(ValueError, 'in the past'):
             ventures.scout_kill_criteria(['No paid pilot by 2020-01-01.'], economics)
+
+    def test_month_first_kill_dates_are_checked_like_any_other(self):
+        # "March 31, 2031" found no date at all, so the window checks were skipped.
+        economics = dict(runway_months=8.2)
+        soon = ventures.now().date() + timedelta(days=40)
+        late = ventures.now().date() + timedelta(days=200)
+        for form in ('%B %d, %Y', '%b %d %Y', '%B %d %Y'):
+            with self.subTest(form=form):
+                self.assertEqual(ventures._kill_dates('by ' + soon.strftime(form)), [soon])
+                self.assertEqual(len(ventures.scout_kill_criteria(
+                    ['Fewer than 3 paid pilots by ' + soon.strftime(form) + '.'], economics)), 1)
+                with self.assertRaisesRegex(ValueError, 'beyond the first gate'):
+                    ventures.scout_kill_criteria(['No signed contract by ' + late.strftime(form) + '.'], economics)
+        self.assertEqual(ventures._kill_dates('Paid pilot by May 3rd, 2027.'), [date(2027, 5, 3)])
+        with self.assertRaisesRegex(ValueError, 'in the past'):
+            ventures.scout_kill_criteria(['No paid pilot by March 31, 2020.'], economics)
+        with self.assertRaises(ValueError):
+            ventures.scout_kill_criteria(['No paid pilot by February 30, 2027.'], economics)
+        # A word that only starts like a month is not a date.
+        self.assertEqual(ventures._kill_dates('The Mayor 12 2027 budget'), [])
 
     def test_a_missing_diligence_field_or_unpaid_kill_criterion_refuses_the_idea(self):
         self.setup_studio_manual()

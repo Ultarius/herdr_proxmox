@@ -131,6 +131,7 @@ class VenturesBloc extends FeatureBloc {
       admin: true,
       rethrowErrors: true,
       start: {'pending': request},
+      failure: {'pending': null},
     );
     if (done == true) await refresh();
     return done == true;

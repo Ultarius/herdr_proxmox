@@ -997,6 +997,9 @@ formula.
   `studio_panel` (`stakeholders`: 2-4 `{role, settings}`, or `enabled`) runs
   under the `studio:` lock and sets up the stakeholder panel.
   `candidate_update` and `candidate_decide` run under the candidate's lock;
+  a `configuration` in `candidate_update` or `configure` is partial: each
+  layer changes only the fields it names, and a list (feeds, burn lines) is
+  replaced whole, so a market-only edit keeps the burn and capital;
   `candidate_brief` (`candidate_id`) is read-only and returns the printable
   brief as `html` with a `filename`.
   `studio_policy`, `studio_limits` and `studio_source_add` (`url`) run under
@@ -1071,8 +1074,11 @@ without waiting for a poll.
   request error, and live FX falls back to the manual rate.
 - **Budgets.** Ticks count against `max_active_meetings` and
   `daily_session_cap`. `max_active_ventures` (default 3, editable 1–20 per
-  organization) bounds running, paused and qualified ventures. The
-  organization `paused` switch stops new ticks.
+  organization) bounds running, paused and qualified ventures. Drafts may
+  still be created. The cap applies when a venture becomes active, by Resume,
+  Pause or its first run, under one organization lock, so two drafts cannot
+  take the last place at once. The organization `paused` switch stops new
+  ticks.
 - **FX fetching.** One constant https URL through the same address checks as
   feeds, at most once per twelve hours.
 - **Cost.** Worst case is one four-member meeting per running venture per day.
