@@ -124,7 +124,7 @@ def _rows(rows):
             + '</dl>') if rows else ''
 
 
-def _cited(candidate):
+def cited_evidence_ids(candidate):
     """Every evidence id the candidate cites, in first-seen order."""
     seen = []
     def add(ids):
@@ -176,7 +176,7 @@ def _sources(candidate, run):
                                                   title=item.get('title') or 'Lesson from an earlier venture',
                                                   claim='Lesson from this studio\'s own ventures'))
     lines = []
-    for identity in _cited(candidate):
+    for identity in cited_evidence_ids(candidate):
         link = known.get(identity)
         if not link:
             lines.append('<li><b>' + _e(identity) + '</b> <span class="muted">not in the saved research</span></li>')
@@ -284,6 +284,9 @@ def _economics(candidate):
         rows.append(('First payment', _e(economics['time_to_first_payment_days']) + ' days after starting'))
     out.append(_rows(rows))
     out.extend('<div class="warn">' + _e(warning) + '</div>' for warning in economics.get('warnings') or [])
+    # The checkable review questions: advisory, so styled as notes.
+    out.extend('<div class="note"><b>Review:</b> ' + _e(note) + '</div>'
+               for note in candidate.get('review_notes') or [] if note)
     out.append('<p class="muted">Break-even is a floor: costs beyond the stated delivery effort are not counted.</p>')
     return ''.join(out)
 
@@ -408,6 +411,8 @@ def render(candidate, organization_name='', run=None, prepared=None, dimensions=
         ('Product', _e(candidate.get('product'))),
         ('First offer', _e(candidate.get('first_offer'))),
         ('Pricing', _e(candidate.get('pricing'))),
+        ('Revised', ('Round ' + _e(candidate.get('round') or 2) + ': ' + _e(candidate['revision_note']))
+         if candidate.get('revision_note') else ''),
     ]))
 
     if prior:
@@ -460,6 +465,26 @@ def render(candidate, organization_name='', run=None, prepared=None, dimensions=
         if dissent:
             body.append('<p><b>Skeptic (' + _e(verdict) + '):</b> ' + _e(dissent.get('summary'))
                         + _cite(dissent.get('evidence')) + '</p>')
+
+    panel = candidate.get('panel') if isinstance(candidate.get('panel'), dict) else None
+    latest = [review for review in candidate.get('stakeholder_reviews') or []
+              if isinstance(review, dict) and panel and review.get('run_id') == panel.get('run_id')]
+    if latest:
+        body.append('<h2>What the stakeholders said</h2><p class="muted">Round ' + _e(panel.get('round') or 1)
+                    + ': ' + _e(panel.get('back', 0)) + ' back, ' + _e(panel.get('hold', 0)) + ' hold, '
+                    + _e(panel.get('pass', 0)) + ' pass. Each reviewed on its own model before hearing the '
+                    'others.</p>')
+        if panel.get('independent') is False:
+            body.append('<div class="note">Every stakeholder ran on the studio\'s own model; this critique may '
+                        'echo the studio.</div>')
+        body.append('<ul>' + ''.join(
+            '<li><b>' + _e(review.get('label') or review.get('stakeholder')) + '</b> <span class="muted">('
+            + _e(review.get('model')) + ')</span>: ' + _e(review.get('verdict'))
+            + ('; '.join([''] + [_e(item) for item in review.get('objections') or []]))
+            + ('<br><span class="muted">Would change its mind: ' + _e(review['would_change_mind']) + '</span>'
+               if review.get('would_change_mind') else '') + '</li>' for review in latest) + '</ul>')
+    elif panel and panel.get('reviewers') == 0:
+        body.append('<h2>Stakeholder panel</h2><p class="muted">Pitched, no reviews.</p>')
 
     ratings = candidate.get('confidence_dimensions')
     if isinstance(ratings, dict) and ratings:

@@ -213,6 +213,12 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
             }, organization: _studioOrganization),
             herdr: bloc.herdr,
             runtimes: bloc.runtimes,
+            onPanel: () => _setupPanel(_studioOrganization),
+            onPanelSwitch: (enabled) => _submit(
+              'studio_panel',
+              enabled ? {} : {'enabled': false},
+              organization: _studioOrganization,
+            ),
           ),
       ],
       callout(
@@ -438,10 +444,7 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
               variant: 'danger',
             ),
             // Closes the stuck tick so the day can be run again.
-            button(
-              'Dismiss tick',
-              busy ? null : () => _dismissTick(venture),
-            ),
+            button('Dismiss tick', busy ? null : () => _dismissTick(venture)),
           ],
           if ((venture['assumptions'] as List? ?? const []).isNotEmpty)
             button(
@@ -1088,6 +1091,25 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
 
   /// One form and one request: organization (when none exists), notebook,
   /// agents, group, starter policy and the first scout.
+  /// Set up or change the stakeholder panel the studio pitches to.
+  Future<void> _setupPanel(String organization) async {
+    final summary = bloc.studioFor(organization);
+    final value = await showDialog<Map<String, dynamic>>(
+      'Stakeholder panel',
+      (close) => _PanelForm(
+        runtimes: bloc.runtimes,
+        panel: summary?['panel'] is Map
+            ? Map<String, dynamic>.from(summary!['panel'] as Map)
+            : null,
+        projectsRoot: '${bloc.data['projects_root'] ?? ''}',
+        onCancel: () => close(null),
+        onSave: (body) => close(body),
+      ),
+    );
+    if (value == null || !mounted) return;
+    await _submit('studio_panel', value, organization: organization);
+  }
+
   Future<void> _setupStudio(String organization) async {
     final value = await showDialog<Map<String, dynamic>>(
       'Set up the Venture Studio',
@@ -1130,7 +1152,8 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
   /// Whether a scout would be accepted now. A snapshot without readiness
   /// (an older gateway) blocks nothing.
   bool get _canScout =>
-      (bloc.studioFor(_studioOrganization)?['readiness'] as Map?)?['can_scout'] !=
+      (bloc.studioFor(_studioOrganization)?['readiness']
+          as Map?)?['can_scout'] !=
       false;
 
   /// The AI path from anywhere on the page: open the Studio tab and either
@@ -1502,7 +1525,8 @@ class _CandidateApprovalFormState extends State<_CandidateApprovalForm> {
   bool _attach = true;
   String _cadence = 'every_day';
   bool get _noFeeds =>
-      (((component.candidate['configuration'] as Map?)?['sources'] as Map?)?['feeds']
+      (((component.candidate['configuration'] as Map?)?['sources']
+                      as Map?)?['feeds']
                   as List? ??
               const [])
           .isEmpty;
@@ -1539,13 +1563,18 @@ class _CandidateApprovalFormState extends State<_CandidateApprovalForm> {
     ),
     if (_team)
       for (final entry in roles.entries)
-        select(entry.value, _templates[entry.key]!, {
-          '': 'First available agent',
-          for (final agent in component.agents)
-            '${agent['id']}':
-                '${agent['name']} (${agent['runtime']}'
-                '${'${agent['model'] ?? ''}'.isEmpty ? '' : '/' + '${agent['model']}'})',
-        }, (value) => setState(() => _templates[entry.key] = value)),
+        select(
+          entry.value,
+          _templates[entry.key]!,
+          {
+            '': 'First available agent',
+            for (final agent in component.agents)
+              '${agent['id']}':
+                  '${agent['name']} (${agent['runtime']}'
+                  '${'${agent['model'] ?? ''}'.isEmpty ? '' : '/' + '${agent['model']}'})',
+          },
+          (value) => setState(() => _templates[entry.key] = value),
+        ),
     switchField(
       'Start daily reviews immediately',
       _daily,
@@ -1720,11 +1749,12 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
   @override
   Component build(BuildContext context) => stack([
     if (_error != null) notice(_error!, error: true),
-    select('Portfolio review cadence', _portfolio, const {
-      'off': 'Off',
-      'daily': 'Daily',
-      'weekly': 'Weekly',
-    }, (value) => setState(() => _portfolio = value)),
+    select(
+      'Portfolio review cadence',
+      _portfolio,
+      const {'off': 'Off', 'daily': 'Daily', 'weekly': 'Weekly'},
+      (value) => setState(() => _portfolio = value),
+    ),
     select('Scout cadence', _scout, const {
       'off': 'Off',
       'daily': 'Daily',
@@ -1760,10 +1790,15 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
       (value) => setState(() => _sources = value),
       rows: 4,
     ),
-    select('What the studio may do with an idea', _mode, const {
-      'proposal': 'Proposal: it suggests, you approve',
-      'autonomous': 'Autonomous: it creates ventures within the caps',
-    }, (value) => setState(() => _mode = value)),
+    select(
+      'What the studio may do with an idea',
+      _mode,
+      const {
+        'proposal': 'Proposal: it suggests, you approve',
+        'autonomous': 'Autonomous: it creates ventures within the caps',
+      },
+      (value) => setState(() => _mode = value),
+    ),
     if (_mode == 'autonomous') ...[
       field(
         'Minimum confidence to create a venture (0-100)',
@@ -1797,6 +1832,172 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
       button('Save studio policy', _save, primary: true),
     ]),
   ]);
+}
+
+/// Stakeholders the studio pitches to, each on its own CLI and model.
+const panelRoleLabels = {
+  'investor': 'Investor',
+  'customer': 'Target customer',
+  'operator': 'Industry operator',
+  'competitor': 'Market leader',
+};
+
+class _PanelForm extends StatefulComponent {
+  const _PanelForm({
+    required this.runtimes,
+    required this.panel,
+    required this.onSave,
+    required this.onCancel,
+    this.projectsRoot = '',
+  });
+  final List<Map<String, dynamic>> runtimes;
+  final Map<String, dynamic>? panel;
+  final String projectsRoot;
+  final void Function(Map<String, dynamic>) onSave;
+  final void Function() onCancel;
+  @override
+  State<_PanelForm> createState() => _PanelFormState();
+}
+
+/// Choose 2-4 stakeholders and, for each, a CLI and model. Automatic picks a
+/// CLI and model the studio and the other stakeholders do not use, so the
+/// critique does not come from the model that wrote the idea.
+class _PanelFormState extends State<_PanelForm> {
+  // role -> 'off', 'auto' or a runtime id.
+  final Map<String, String> _cli = {};
+  final Map<String, Map<String, dynamic>> _settings = {};
+  late final OrganizationToolsBloc _tools;
+  StreamSubscription? _catalogSubscription;
+  ModelCatalog _catalog = const ModelCatalog({});
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    final panel = component.panel ?? const {};
+    final roles = (panel['roles'] as List? ?? const [])
+        .map((value) => '$value')
+        .toList();
+    final saved = panel['settings'] as Map? ?? const {};
+    for (final role in panelRoleLabels.keys) {
+      final current = saved[role] as Map?;
+      final chosen = roles.isEmpty
+          ? const {'investor', 'customer', 'competitor'}.contains(role)
+          : roles.contains(role);
+      _cli[role] = !chosen
+          ? 'off'
+          : current != null && current['source'] == 'chosen'
+          ? '${current['runtime']}'
+          : 'auto';
+      _settings[role] = {
+        for (final key in const ['provider', 'model', 'reasoning'])
+          key: current != null && current['source'] == 'chosen'
+              ? '${current[key] ?? ''}'
+              : '',
+      };
+    }
+    _tools = OrganizationToolsBloc(dashboardConnection);
+    _catalogSubscription = _tools.stream.listen((_) {
+      if (mounted) {
+        setState(() => _catalog = ModelCatalog.fromJson(_tools.catalog));
+      }
+    });
+    unawaited(_loadCatalog());
+  }
+
+  Future<void> _loadCatalog() async {
+    try {
+      await _tools.loadCatalog();
+    } catch (_) {
+      // Automatic still works; a chosen CLI falls back to its default model.
+    }
+  }
+
+  @override
+  void dispose() {
+    _catalogSubscription?.cancel();
+    _tools.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    final chosen = [
+      for (final role in panelRoleLabels.keys)
+        if (_cli[role] != 'off') role,
+    ];
+    if (chosen.length < 2 || chosen.length > 4) {
+      setState(() => _error = 'Choose 2 to 4 stakeholders.');
+      return;
+    }
+    component.onSave({
+      'stakeholders': [
+        for (final role in chosen)
+          {
+            'role': role,
+            if (_cli[role] != 'auto')
+              'settings': {
+                'runtime': _cli[role],
+                for (final key in const ['provider', 'model', 'reasoning'])
+                  if ('${_settings[role]![key] ?? ''}'.trim().isNotEmpty)
+                    key: '${_settings[role]![key]}'.trim(),
+              },
+          },
+      ],
+    });
+  }
+
+  @override
+  Component build(BuildContext context) {
+    final ready = component.runtimes
+        .where((item) => item['ready'] == true)
+        .toList();
+    return stack([
+      if (_error != null) notice(_error!, error: true),
+      paragraph(
+        'After every scout round the studio pitches its new ideas to these stakeholders. Each reviews on its '
+        'own first, then may change its verdict once after hearing the others\' objections. Their verdicts '
+        'and objections go into the next scout round, which revises or drops the idea.',
+      ),
+      paragraph(
+        'Put stakeholders on other models than the studio: a model judging its own ideas tends to agree. '
+        'Automatic picks a CLI and model the studio and the other stakeholders do not use.',
+      ),
+      for (final entry in panelRoleLabels.entries) ...[
+        select(
+          entry.value,
+          _cli[entry.key] ?? 'off',
+          {
+            'off': 'Not on the panel',
+            'auto': 'Automatic: a model the studio does not use',
+            for (final item in ready) '${item['runtime']}': '${item['name']}',
+          },
+          (value) => setState(() {
+            _cli[entry.key] = value;
+            for (final key in const ['provider', 'model', 'reasoning']) {
+              _settings[entry.key]![key] = '';
+            }
+          }),
+        ),
+        if (_cli[entry.key] != 'off' && _cli[entry.key] != 'auto')
+          ModelFields(
+            key: ValueKey('panel-model-${entry.key}-${_cli[entry.key]}'),
+            runtime: _cli[entry.key]!,
+            project: component.projectsRoot,
+            catalog: _catalog,
+            values: _settings[entry.key]!,
+            onChanged: () => setState(() {}),
+          ),
+      ],
+      paragraph(
+        'A changed model hires a new stakeholder agent. Each pitch is one more meeting per scout round, '
+        'with one session per stakeholder plus its chair.',
+      ),
+      actions([
+        button('Cancel', component.onCancel),
+        button('Save stakeholder panel', _save, primary: true),
+      ]),
+    ]);
+  }
 }
 
 class _StudioSetupForm extends StatefulComponent {
@@ -1941,20 +2142,24 @@ class _StudioSetupFormState extends State<_StudioSetupForm> {
           (value) => setState(() => _name = value),
           required: true,
         ),
-      select('Agent CLI for the four agents', _cli, {
-        '':
-            'Automatic: ${ready.isEmpty ? 'the first ready CLI' : ready.first['name']} on its default model',
-        for (final item in ready) '${item['runtime']}': '${item['name']}',
-        for (final agent in component.agents)
-          'agent:${agent['id']}':
-              'Copy from ${agent['name']} (${agent['runtime']}'
-              '${'${agent['model'] ?? ''}'.isEmpty ? '' : '/${agent['model']}'})',
-      }, (value) => setState(() {
-        _cli = value;
-        for (final key in const ['provider', 'model', 'reasoning']) {
-          _settings[key] = '';
-        }
-      })),
+      select(
+        'Agent CLI for the four agents',
+        _cli,
+        {
+          '': 'Automatic: ${ready.isEmpty ? 'the first ready CLI' : ready.first['name']} on its default model',
+          for (final item in ready) '${item['runtime']}': '${item['name']}',
+          for (final agent in component.agents)
+            'agent:${agent['id']}':
+                'Copy from ${agent['name']} (${agent['runtime']}'
+                '${'${agent['model'] ?? ''}'.isEmpty ? '' : '/${agent['model']}'})',
+        },
+        (value) => setState(() {
+          _cli = value;
+          for (final key in const ['provider', 'model', 'reasoning']) {
+            _settings[key] = '';
+          }
+        }),
+      ),
       if (_cli.isEmpty)
         paragraph(
           'Automatic picks a ready CLI and detects a suitable model among those its account offers. '
@@ -2006,10 +2211,15 @@ class _StudioSetupFormState extends State<_StudioSetupForm> {
         'daily': 'Daily',
         'off': 'Manual only',
       }, (value) => setState(() => _portfolio = value)),
-      select('What the studio may do with an idea', _mode, const {
-        'proposal': 'Proposal: it suggests, you approve',
-        'autonomous': 'Autonomous: it creates ventures within the caps',
-      }, (value) => setState(() => _mode = value)),
+      select(
+        'What the studio may do with an idea',
+        _mode,
+        const {
+          'proposal': 'Proposal: it suggests, you approve',
+          'autonomous': 'Autonomous: it creates ventures within the caps',
+        },
+        (value) => setState(() => _mode = value),
+      ),
       if (_mode == 'autonomous')
         notice(
           'Autonomous mode creates at most one venture per scout run, only from an idea that cites an outside '
@@ -2429,15 +2639,20 @@ class _VentureFormState extends State<VentureForm> {
           'Auto assigns by agent name (analyst, founder, red team, outreach), then spreads the rest.',
         ),
         for (final member in _members.entries)
-          select(member.value, _roleOverrides[member.key] ?? 'auto', {
-            'auto': 'Auto',
-            ..._choices('roles', const {
-              'analyst': 'Analyst',
-              'founder': 'Founder',
-              'red_team': 'Red Team',
-              'outreach': 'Outreach writer',
-            }),
-          }, (value) => setState(() => _roleOverrides[member.key] = value)),
+          select(
+            member.value,
+            _roleOverrides[member.key] ?? 'auto',
+            {
+              'auto': 'Auto',
+              ..._choices('roles', const {
+                'analyst': 'Analyst',
+                'founder': 'Founder',
+                'red_team': 'Red Team',
+                'outreach': 'Outreach writer',
+              }),
+            },
+            (value) => setState(() => _roleOverrides[member.key] = value),
+          ),
       ]),
     disclosure('Sources', [
       textarea(
@@ -2464,10 +2679,12 @@ class _VentureFormState extends State<VentureForm> {
         _keepTerms,
         (value) => setState(() => _keepTerms = value),
       ),
-      select('Translate headlines', _translation ? 'yes' : 'no', const {
-        'no': 'No',
-        'yes': 'Yes',
-      }, (value) => setState(() => _translation = value == 'yes')),
+      select(
+        'Translate headlines',
+        _translation ? 'yes' : 'no',
+        const {'no': 'No', 'yes': 'Yes'},
+        (value) => setState(() => _translation = value == 'yes'),
+      ),
     ]),
     disclosure('Market', [
       field(
@@ -2501,20 +2718,18 @@ class _VentureFormState extends State<VentureForm> {
         _fxRate,
         (value) => setState(() => _fxRate = value),
       ),
-      select('Sales-cycle friction', _salesCycle, const {
-        '1': '1',
-        '2': '2',
-        '3': '3',
-        '4': '4',
-        '5': '5',
-      }, (value) => setState(() => _salesCycle = value)),
-      select('Legacy-workflow bias', _legacyBias, const {
-        '1': '1',
-        '2': '2',
-        '3': '3',
-        '4': '4',
-        '5': '5',
-      }, (value) => setState(() => _legacyBias = value)),
+      select(
+        'Sales-cycle friction',
+        _salesCycle,
+        const {'1': '1', '2': '2', '3': '3', '4': '4', '5': '5'},
+        (value) => setState(() => _salesCycle = value),
+      ),
+      select(
+        'Legacy-workflow bias',
+        _legacyBias,
+        const {'1': '1', '2': '2', '3': '3', '4': '4', '5': '5'},
+        (value) => setState(() => _legacyBias = value),
+      ),
       textarea(
         'Regulatory baseline',
         _regulatory,
@@ -2575,10 +2790,12 @@ class _VentureFormState extends State<VentureForm> {
           small: true,
         ),
       ]),
-      select('Daily ticks', _dailyTicks ? 'yes' : 'no', const {
-        'no': 'Manual only',
-        'yes': 'Run every day',
-      }, (value) => setState(() => _dailyTicks = value == 'yes')),
+      select(
+        'Daily ticks',
+        _dailyTicks ? 'yes' : 'no',
+        const {'no': 'Manual only', 'yes': 'Run every day'},
+        (value) => setState(() => _dailyTicks = value == 'yes'),
+      ),
       select(
         'Meeting cadence',
         _meetingCadence,
@@ -2727,13 +2944,18 @@ class _TeamFormState extends State<_TeamForm> {
         'the four members start when a meeting needs them.',
       ),
       for (final entry in roles.entries)
-        select(entry.value, _templates[entry.key]!, {
-          '': 'First available agent',
-          for (final agent in component.agents)
-            '${agent['id']}':
-                '${agent['name']} (${agent['runtime']}'
-                '${'${agent['model'] ?? ''}'.isEmpty ? '' : '/' + '${agent['model']}'})',
-        }, (value) => setState(() => _templates[entry.key] = value)),
+        select(
+          entry.value,
+          _templates[entry.key]!,
+          {
+            '': 'First available agent',
+            for (final agent in component.agents)
+              '${agent['id']}':
+                  '${agent['name']} (${agent['runtime']}'
+                  '${'${agent['model'] ?? ''}'.isEmpty ? '' : '/' + '${agent['model']}'})',
+          },
+          (value) => setState(() => _templates[entry.key] = value),
+        ),
       actions([
         button('Cancel', component.onCancel),
         button(

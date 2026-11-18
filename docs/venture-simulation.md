@@ -527,6 +527,28 @@ regulation), asks it to weigh three times as many ideas as it may return and
 keep the strongest, and warns it that ratings are checked against citations.
 The Ideas tab lists open ideas by confidence, highest first.
 
+Every scout run also gets a review checklist, `review.md`, written by the
+gateway beside its evidence file, and the prompt tells the Skeptic and the
+Research Analyst to work through it for every idea. It asks how the price
+compares with the cheapest cited alternative, whether the business is mostly
+consulting, where the market grows, whether customers with no system yet are a
+better start, what revenue grows with the customer's activity, whether the
+leader could copy the idea within a quarter, how big it realistically gets,
+and which reframe was weighed; the Skeptic advances only when price, delivery
+and the copy question hold. The checklist lives beside the evidence rather
+than in the prompt, so it reaches existing studio teams and costs little of
+the prompt budget; unlike the evidence it is rewritten when a newer gateway
+changes it. Alternative prices may state a `period`.
+
+The questions the gateway can check become `review_notes` on the candidate,
+shown on the card and in the brief. Like kill-criteria notes they never refuse
+or hold an idea: a price more than 10% above the cheapest cited software
+alternative with a period, delivery costing more than half of a customer's
+first-year revenue, and no per-unit or take-rate revenue. For service models,
+the delivery note compares the cost per project with the project price.
+Services with recurring revenue also get the price and usage-based revenue checks.
+The gateway recomputes these notes when the operator edits the idea.
+
 The gateway, not the agent, derives the summary confidence from the dimensions
 (weak 0, medium 50, strong 100, weighted) and computes the unit economics, per
 month in the market currency:
@@ -606,6 +628,53 @@ no network requests and only the hashed print script. The brief is shown from
 a blob of the dashboard's origin, so this policy, not the escaping alone, is
 what keeps a hostile scout answer from running in it. Exporting changes
 nothing and takes no lock; it is available for decided candidates too.
+
+### Stakeholder panel
+
+The studio's four agents share one model, and a model judging its own ideas
+tends to agree with them. The stakeholder panel is a second, separate
+read-only group (`venture_panel.py`): two to four stakeholders chosen from an
+investor, the target customer, an industry operator and the market leader,
+each on its own CLI and model. **Automatic** picks a ready CLI the studio and
+the other stakeholders do not use, then a model nobody uses on it; the Studio
+tab shows every stakeholder's model and warns when all of them run on the
+studio's own model. A changed model hires a new stakeholder agent. The group's
+chair runs on the first stakeholder's model.
+
+After every scout round that proposes ideas, the gateway pitches them to the
+panel in a `pitch` run: a pitch pack (each idea's case, the gateway economics,
+warnings and review notes, and the pages it cites) and a prompt that sets the
+method. In round 1 each stakeholder reviews every idea alone, without seeing
+the others; in an optional round 2 it hears their objections without names and
+may change its verdict. Each review is `back`, `hold` or `pass` with 1-5
+objections, up to 3 questions and the evidence that would change its mind.
+
+The gateway accepts a review only from a stakeholder that spoke in the meeting
+transcript, so the chair cannot write one for a stakeholder; reviews in the
+name of a silent stakeholder are dropped and listed as not counted, and
+missing reviews are listed too. Accepted reviews are stored on the idea
+(`stakeholder_reviews`, with each stakeholder's model) with a round summary
+(`panel`), shown on the Ideas card and in the brief. When a pitch returns no
+usable reviews for an idea, both show “Pitched, no reviews.” A result with
+no usable reviews for any idea still needs attention.
+
+The next scout round's evidence carries `stakeholder_feedback`: the latest
+round on up to six recent ideas. The scout is told to answer it: an idea it
+improves comes back with `revises` (the earlier idea's name) and a
+`revision_note`. The revision is not refused as a duplicate of the idea it
+revises; it carries the next round number and the previous objections
+(`previous_feedback`), the earlier idea becomes `superseded`, and the panel
+sees in the next pitch whether each objection was answered.
+
+One meeting runs at a time, so the next scout waits for the pitch: each round
+is scout, then panel. In autonomous mode with a panel, a scout round creates
+nothing; the pitch decides, and an idea is created only when most stakeholders
+assigned to that pitch back it, on top of the other caps. Missing reviews
+count toward the panel size. A pitch that could not start is prepared
+when it is recovered: it goes to the panel as it is set up then, with the
+ideas that are still open, as edited. `studio_panel` with `enabled: false`
+switches pitching off and keeps the agents; without `stakeholders` it switches
+the existing panel back on.
 
 ### Where the evidence file goes
 
@@ -870,6 +939,8 @@ formula.
   Studio modes run under the organization's `studio:` lock: `studio_setup`,
   `studio_run` (`kind`, optional `override`), `studio_recover`,
   `studio_dismiss`, `studio_repair` (optional `confirmed`) and `studio_team`.
+  `studio_panel` (`stakeholders`: 2-4 `{role, settings}`, or `enabled`) runs
+  under the `studio:` lock and sets up the stakeholder panel.
   `candidate_update` and `candidate_decide` run under the candidate's lock;
   `candidate_brief` (`candidate_id`) is read-only and returns the printable
   brief as `html` with a `filename`.
@@ -974,6 +1045,9 @@ without waiting for a poll.
 | Feeds | `web/gateway/venture_feeds.py` | SSRF-safe fetch, XML parsing, UTC timestamps, filtering |
 | FX | `web/gateway/venture_fx.py` | ECB reference-rate parsing and cross rates |
 | Notebook | `web/gateway/venture_notebook.py` | Notebook repository, tick commits, approved outreach files |
+| Studio | `web/gateway/venture_studio.py` | Studio readiness, repair, setup and autonomous creation |
+| Panel | `web/gateway/venture_panel.py` | Stakeholder panel setup, pitch runs and feedback for the next round |
+| Brief | `web/gateway/venture_brief.py` | The printable brief of one idea |
 | State | `web/dashboard_state/lib/ventures_bloc.dart` | Snapshot and actions |
 | Page | `web/jaspr_dashboard/lib/pages/ventures_page.dart` | Portfolio, detail, form, outreach review, limits |
 | Flutter page | `web/dashboard/lib/ventures_page.dart` | Portfolio, run tick, pause, draft review |

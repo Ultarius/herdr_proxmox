@@ -388,6 +388,20 @@ Component candidateDiligence(Map<String, dynamic> item) {
       .map((value) => '$value')
       .where((value) => value.isNotEmpty)
       .toList();
+  // The stakeholder panel's latest round on this idea.
+  final panel = item['panel'] as Map?;
+  final pitchedWithoutReviews = panel?['reviewers'] == 0;
+  final stakeholderReviews = [
+    for (final review
+        in (item['stakeholder_reviews'] as List? ?? const []).whereType<Map>())
+      if (panel != null && review['run_id'] == panel['run_id']) review,
+  ];
+  final revisionNote = '${item['revision_note'] ?? ''}';
+  // The review questions the gateway can check; advisory like the notes.
+  final review = (item['review_notes'] as List? ?? const [])
+      .map((value) => '$value')
+      .where((value) => value.isNotEmpty)
+      .toList();
   final rows = <(String, Component)>[
     if (firstOffer.isNotEmpty) ('First offer', text(firstOffer)),
     if (prior != null)
@@ -514,12 +528,53 @@ Component candidateDiligence(Map<String, dynamic> item) {
       dissent == null &&
       dimensions == null &&
       warnings.isEmpty &&
+      review.isEmpty &&
+      stakeholderReviews.isEmpty &&
+      !pitchedWithoutReviews &&
+      revisionNote.isEmpty &&
       notes.isEmpty) {
     return el('span', []);
   }
   return el('section', [
     if (rows.isNotEmpty) facts(rows),
     for (final warning in warnings) notice(warning, error: true),
+    if (revisionNote.isNotEmpty)
+      paragraph(
+        'Revised for round ${item['round'] ?? 2} after the stakeholders\' feedback: $revisionNote',
+      ),
+    if (pitchedWithoutReviews)
+      paragraph('Pitched, no reviews.')
+    else if (panel != null && stakeholderReviews.isNotEmpty)
+      disclosure(
+        'Stakeholders, round ${panel['round'] ?? 1}: ${panel['back'] ?? 0} back · '
+        '${panel['hold'] ?? 0} hold · ${panel['pass'] ?? 0} pass',
+        [
+          if (panel['independent'] == false)
+            notice(
+              'Every stakeholder ran on the studio\'s own model; this critique may echo the studio.',
+              error: true,
+            ),
+          for (final entry in stakeholderReviews)
+            el('article', [
+              paragraph(
+                '${entry['label'] ?? entry['stakeholder']} (${entry['model'] ?? ''}): '
+                '${entry['verdict'] ?? ''}'
+                '${entry['round'] == 2 ? ' after hearing the others' : ''}',
+              ),
+              for (final objection
+                  in (entry['objections'] as List? ?? const []))
+                paragraph('• $objection'),
+              if ('${entry['would_change_mind'] ?? ''}'.isNotEmpty)
+                paragraph(
+                  'Would change its mind: ${entry['would_change_mind']}',
+                ),
+            ], classes: 'stack'),
+        ],
+      ),
+    if (review.isNotEmpty)
+      disclosure('Review notes (${review.length})', [
+        for (final note in review) paragraph(note),
+      ]),
     if (notes.isNotEmpty)
       disclosure('Kill criteria to tighten (${notes.length})', [
         for (final note in notes) paragraph(note),

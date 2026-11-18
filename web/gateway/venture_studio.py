@@ -19,6 +19,7 @@ import uuid
 from discovery import redact
 from project_files import project_directory
 from repository_lock import repository_lock
+from venture_panel import panel_backs
 
 # Four role agents and the group facilitator.
 STUDIO_PARTICIPANTS = 5
@@ -520,8 +521,13 @@ class StudioOperations:
                                  or (run.get('profile') or {}).get('project', '')), True
 
     @staticmethod
-    def _write_pack(checkout, prepared, folder, identity, content, limit, label):
-        """Write one evidence file atomically; refuse a changed copy."""
+    def _write_pack(checkout, prepared, folder, identity, content, limit, label, companions=None):
+        """Write one evidence file atomically; refuse a changed copy.
+
+        ``companions`` maps a file name to gateway-written guidance (a review
+        checklist) placed beside the evidence. Unlike the evidence it is
+        rewritten when it differs, so an upgraded gateway can still retry a
+        frozen run."""
         data = json.dumps(content, ensure_ascii=False).encode()
         if len(data) > limit:
             raise ValueError(label + ' evidence exceeds its byte budget.')
@@ -552,6 +558,19 @@ class StudioOperations:
                         stream.flush()
                         os.fsync(stream.fileno())
                     os.replace(temporary, target)
+                finally:
+                    Path(temporary).unlink(missing_ok=True)
+            for name, text in (companions or {}).items():
+                companion = destination / name
+                if companion.is_symlink() or (companion.exists() and not companion.is_file()):
+                    raise ValueError(label + ' guidance file must be a regular file.')
+                if companion.exists() and companion.read_text(encoding='utf-8') == text:
+                    continue
+                descriptor, temporary = tempfile.mkstemp(prefix='.guidance-', dir=destination)
+                try:
+                    with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+                        stream.write(text)
+                    os.replace(temporary, companion)
                 finally:
                     Path(temporary).unlink(missing_ok=True)
             return target
@@ -839,11 +858,24 @@ class StudioOperations:
         """
         organization = run['organization_id']
         policy = self._studio_policy(organization)
-        if run.get('kind') != 'scout' or policy.get('studio_mode') != 'autonomous':
+        if run.get('kind') not in ('scout', 'pitch') or policy.get('studio_mode') != 'autonomous':
             return []
+        pitch = run['kind'] == 'pitch'
+        if not pitch and self._panel_enabled(organization):
+            return []  # The stakeholder panel reviews the round first; its pitch decides.
         minimum = policy['studio_auto_min_confidence']
         outcomes, created = [], 0
-        proposed = [item for item in run.get('candidates') or [] if item.get('state') == 'proposed']
+        if pitch:
+            proposed = []
+            for identity in run.get('candidate_ids') or []:
+                try:
+                    stored = self.get_candidate(organization, identity)
+                except ValueError:
+                    continue
+                if stored.get('state') == 'proposed':
+                    proposed.append(stored)
+        else:
+            proposed = [item for item in run.get('candidates') or [] if item.get('state') == 'proposed']
         for candidate in sorted(proposed, key=lambda item: (-int(item.get('confidence') or 0), item['id'])):
             reason = ''
             if int(candidate.get('confidence') or 0) < minimum:
@@ -854,6 +886,11 @@ class StudioOperations:
                 # Only an idea the Skeptic would advance is created unattended.
                 reason = ('The Skeptic would ' + candidate['dissent']['verdict'] + ' this idea; approve it '
                           'yourself if you disagree.')
+            elif pitch and not panel_backs(candidate):
+                counts = candidate.get('panel') or {}
+                reason = ('Most stakeholders did not back it (' + str(counts.get('back', 0)) + ' back, '
+                          + str(counts.get('hold', 0)) + ' hold, ' + str(counts.get('pass', 0)) + ' pass); '
+                          'approve it yourself if you disagree.')
             elif (candidate.get('economics') if isinstance(candidate.get('economics'), dict) else {}).get(
                     'warnings'):
                 reason = ('The gateway economics flag a problem: '

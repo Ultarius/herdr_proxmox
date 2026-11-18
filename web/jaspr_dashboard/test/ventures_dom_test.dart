@@ -196,6 +196,29 @@ void main() {
           ],
         },
         'market_ceiling': {'count': 4000, 'segment': 'US forwarders'},
+        'panel': {
+          'run_id': 'pitch-1',
+          'round': 1,
+          'back': 1,
+          'hold': 0,
+          'pass': 1,
+          'independent': true,
+        },
+        'stakeholder_reviews': [
+          {
+            'run_id': 'pitch-1',
+            'stakeholder': 'investor',
+            'label': 'Investor',
+            'model': 'claude/default',
+            'verdict': 'pass',
+            'round': 1,
+            'objections': ['Too small a market.'],
+            'would_change_mind': 'Ten paid pilots.',
+          },
+        ],
+        'review_notes': [
+          'Delivery costs 1800 USD per new customer, more than half of its first-year revenue.',
+        ],
         'dissent': {
           'verdict': 'hold',
           'summary': 'The workflow may not be painful enough to pay for.',
@@ -244,6 +267,7 @@ void main() {
         'organization_id': 'org',
         'name': 'Rejected Desk',
         'state': 'rejected',
+        'panel': {'run_id': 'pitch-1', 'reviewers': 0, 'stakeholders': 2},
       },
       {
         'id': '22222222222222222222222222222222',
@@ -339,7 +363,8 @@ void main() {
             'recover': {
               'action': 'retry',
               'label': 'Retry preparation',
-              'detail': 'Retry preparing the scout meeting; no prompt was sent yet',
+              'detail':
+                  'Retry preparing the scout meeting; no prompt was sent yet',
             },
           },
         ],
@@ -525,6 +550,9 @@ void main() {
     expect(page, contains('sites: 200 USD per site a month × 3'));
     expect(page, contains('600 USD per unit'));
     expect(page, contains('Upside, not counted in break-even'));
+    expect(page, contains('Review notes (1)'));
+    expect(page, contains('Stakeholders, round 1: 1 back · 0 hold · 1 pass'));
+    expect(page, contains('Pitched, no reviews.'));
     // Another organization's candidate is not listed; a decided one is filed apart.
     expect(page, isNot(contains('Foreign Desk')));
     expect(page, contains('Decided (1)'));

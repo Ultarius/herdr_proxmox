@@ -1523,6 +1523,11 @@ class VentureTests(unittest.TestCase):
         self.assertIn('RESEARCH THE WEB YOURSELF', run['prompt'])
         self.assertIn('suggested_sources', run['prompt'])
         self.assertTrue(json.loads(Path(run['evidence_file']).read_text(encoding='utf-8'))['web_research'])
+        # The review checklist sits beside the evidence, and the prompt sends the team to it.
+        checklist = Path(run['evidence_file']).with_name(ventures.STUDIO_REVIEW_FILE)
+        self.assertEqual(checklist.read_text(encoding='utf-8'), ventures.STUDIO_REVIEW_CHECKLIST)
+        self.assertIn('review checklist review.md beside that file', run['prompt'])
+        self.assertIn('Can the leader copy it within a quarter?', ventures.STUDIO_REVIEW_CHECKLIST)
         unlisted = self.web_candidate('Dock Ledger', evidence=['W2'])
         unlisted['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
         done = self.complete_studio(run, {
@@ -1907,6 +1912,68 @@ class VentureTests(unittest.TestCase):
                       'Upside, not counted in break-even', 'Fuel dock POS'):
             self.assertIn(shown, page)
 
+    def test_review_notes_put_the_checkable_review_questions_in_front_of_the_operator(self):
+        configuration = ventures.normalize_config(candidate()['configuration'])
+        subscription = ventures.scout_business_model(dict(type='hybrid', revenue_lines=[
+            dict(kind='one_off', label='migration', amount=1250, currency='USD'),
+            dict(kind='recurring', label='base', amount=299, currency='USD', period='month')]))
+        heavy = ventures.scout_delivery_effort(dict(expert_days=15, day_rate=dict(amount=500, currency='USD')))
+        economics = ventures.candidate_economics(configuration, subscription, heavy, dict(count=747), 30)
+        alternatives = ventures.scout_alternatives([
+            dict(name='Cheap Local', kind='software', price=dict(amount=600, currency='USD', period='year'),
+                 evidence=['V1']),
+            dict(name='Unpriced period', kind='software', price=dict(amount=10, currency='USD'), evidence=['V1']),
+            dict(name='Consultant', kind='service', price=dict(amount=20, currency='USD', period='month'),
+                 evidence=['V1']),
+            dict(name='Spreadsheet', kind='in_house')], lambda value, limit: value)
+        self.assertEqual(alternatives[0]['price']['period'], 'year')
+        notes = ventures.candidate_review_notes(configuration, alternatives, economics)
+        # Only software with a period is compared: 600 a year is 50 a month.
+        self.assertIn('above the cheapest cited software alternative (Cheap Local at 50 USD a month)', notes[0])
+        # 15 days at 500 is 7,500 against 1,250 + 12 x 299 = 4,838 in the first year.
+        self.assertIn('Delivery costs 7500 USD per new customer', notes[1])
+        self.assertIn('No revenue grows with the customer', notes[2])
+        page = ventures.venture_brief.render(dict(name='Storage Desk', economics=economics, review_notes=notes))
+        self.assertEqual(page.count('<b>Review:</b>'), 3)
+        # A per-unit price that undercuts the alternative, light delivery: nothing to note.
+        units = ventures.scout_business_model(dict(type='saas', revenue_lines=[
+            dict(kind='per_unit', label='units', amount=1, currency='USD', period='month', unit='unit', units=40)]))
+        light = ventures.scout_delivery_effort(dict(expert_days=1, day_rate=dict(amount=100, currency='USD')))
+        fine = ventures.candidate_economics(configuration, units, light, dict(count=747), 30)
+        self.assertEqual(ventures.candidate_review_notes(configuration, alternatives, fine), [])
+        with self.assertRaisesRegex(ValueError, 'price period'):
+            ventures.scout_alternatives([
+                dict(name='A', kind='software', price=dict(amount=1, currency='USD', period='week'), evidence=['V1']),
+                dict(name='B', kind='service', evidence=['V1']), dict(name='C', kind='in_house')],
+                lambda value, limit: value)
+
+    def test_project_review_notes_compare_delivery_with_the_project_price(self):
+        configuration = ventures.normalize_config(candidate()['configuration'])
+        alternatives = [dict(name='Cheap Local', kind='software',
+                             price=dict(amount=600, currency='USD', period='year'), evidence=['V1'])]
+        project = dict(kind='one_off', label='project', amount=1000, currency='USD')
+        support = dict(kind='recurring', label='support', amount=2400, currency='USD', period='year')
+        per_unit = dict(kind='per_unit', label='sites', amount=40, currency='USD', period='month',
+                        unit='site', units=1)
+        price_note = 'Priced at 200 USD a month per customer, above the cheapest cited software alternative'
+        delivery_note = 'Delivery costs 1000 USD per project, more than half of the project price (1000 USD)'
+        growth_note = 'No revenue grows with the customer'
+        for model in ('service', 'productised_service'):
+            for lines, days, expected in (
+                    ([project], 2, [delivery_note]),
+                    ([project, support], 1, [price_note, growth_note]),
+                    ([project, support], 2, [price_note, delivery_note, growth_note]),
+                    ([project, per_unit], 2, [delivery_note])):
+                with self.subTest(model=model, lines=lines, days=days):
+                    business = ventures.scout_business_model(dict(type=model, revenue_lines=lines))
+                    effort = ventures.scout_delivery_effort(dict(
+                        expert_days=days, day_rate=dict(amount=500, currency='USD')))
+                    economics = ventures.candidate_economics(configuration, business, effort, dict(count=747), 30)
+                    notes = ventures.candidate_review_notes(configuration, alternatives, economics)
+                    self.assertEqual(len(notes), len(expected))
+                    for note, fragment in zip(notes, expected):
+                        self.assertIn(fragment, note)
+
     def test_kill_criteria_refuse_only_what_can_be_checked(self):
         economics = dict(runway_months=8.2)
         real = [  # From a real Machinery scout answer.
@@ -2090,19 +2157,277 @@ class VentureTests(unittest.TestCase):
         self.assertIn('every other field cites 1-3', run['prompt'])
         research = [dict(id='W' + str(number), url='https://trade.example/page-' + str(number),
                          title='Page ' + str(number), published='', claim='Claim ' + str(number) + '.')
-                    for number in range(1, 6)]
+                    for number in range(1, 13)]
         wordy = self.web_candidate('Storage Desk', evidence=('W1', 'W2', 'W3', 'W4', 'W5'))
-        wordy['prior_state']['evidence'] = ['W3', 'W4', 'W5', 'W1', 'W2']
+        citations = ['W3', 'W4', 'W5', 'W1', 'W2'] + [page['id'] for page in research[5:]] + ['V1']
+        wordy['prior_state']['evidence'] = citations
         invented = self.web_candidate('Dock Ledger', evidence=('W1',))
         invented['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
-        invented['prior_state']['evidence'] = ['W1', 'W9']
+        invented['prior_state']['evidence'] = citations + ['W99']
         done = self.complete_studio(run, {'candidates': [wordy, invented], 'research': research})
         self.assertEqual(done['state'], 'ready', done.get('error'))
-        self.assertEqual([(item['name'], 'W9' in item['error']) for item in done['refused_candidates']],
+        self.assertEqual([(item['name'], 'W99' in item['error']) for item in done['refused_candidates']],
                          [('Dock Ledger', True)])
         stored = self.stored_candidates()[0]
         self.assertEqual((stored['name'], stored['prior_state']['evidence']), ('Storage Desk', ['W3', 'W4', 'W5']))
         self.assertEqual(stored['evidence'], ['W1', 'W2', 'W3', 'W4', 'W5'])
+
+    def setup_panel(self, **body):
+        studio = self.ventures._studio('org')
+        studio['team'] = dict(settings_by_role=dict(scout=dict(runtime='opencode', provider='opencode-go',
+                                                                model='deepseek-v4')))
+        self.ventures.save_studio('org', studio)
+        self.store.runtime_ready = lambda runtime: None if runtime in ('claude', 'codex', 'opencode') else 'no'
+        self.store.template_catalog = lambda project: None
+        return self.studio(mode='studio_panel', **body)
+
+    def pitch_runs(self):
+        return [run for run in self.studio_runs() if run['kind'] == 'pitch']
+
+    def complete_pitch(self, run, reviews, spoke, summary='They disagree on paid demand.'):
+        job = next(job for job in self.jobs if job['id'] == run['job_id'])
+        members = run['panel']['members']
+        job.update(state='artifact_ready',
+                   result='```json\n' + json.dumps(dict(reviews=reviews, summary=summary)) + '\n```',
+                   contributions=[dict(profile_id=members[role], name=role, round=1, content='My review.')
+                                  for role in spoke])
+        self.ventures.advance()
+        with closing(self.service.connect()) as db:
+            return json.loads(db.execute('SELECT data FROM venture_studio_runs WHERE id=?',
+                                         (run['id'],)).fetchone()[0])
+
+    @staticmethod
+    def review(idea, stakeholder, verdict, objection='The buyer already pays a cheaper tool.'):
+        return dict(idea=idea, stakeholder=stakeholder, round=1, verdict=verdict, objections=[objection],
+                    questions=['Who signs?'], would_change_mind='Three paid pilots.')
+
+    def test_a_stakeholder_panel_on_other_models_reviews_each_round_and_feeds_the_next(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        # Detected settings prefer CLIs the studio (OpenCode) and the others do not use.
+        panel = self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer'),
+                                               dict(role='competitor')])
+        self.assertEqual([panel['settings'][role]['runtime'] for role in panel['roles']],
+                         ['claude', 'codex', 'opencode'])
+        self.assertEqual((panel['independent'], panel['distinct_models'], panel['warning']), (True, 3, ''))
+        hired = [profile for profile in self.profiles if profile.get('role') == 'stakeholder']
+        self.assertEqual(sorted(profile['name'] for profile in hired),
+                         ['Investor (stakeholder)', 'Market leader (stakeholder)', 'Target customer (stakeholder)'])
+        group = next(item for item in self.groups if item['id'] == panel['group_id'])
+        self.assertEqual(group['members'], [panel['members'][role] for role in panel['roles']])
+        self.assertEqual(self.ventures._studio_summary('org')['panel']['roles'], panel['roles'])
+
+        # Round 1: the scout's new idea is pitched to the panel's own group.
+        done = self.scout_with(candidate('Carrier Desk', 'N1'))
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        pitch = self.pitch_runs()[0]
+        self.assertEqual((pitch['state'], pitch['scout_run_id']), ('meeting', done['id']))
+        job = next(job for job in self.jobs if job['id'] == pitch['job_id'])
+        self.assertEqual(job['group_id'], panel['group_id'])
+        for rule in ('VENTURE STUDIO PITCH TO STAKEHOLDERS', 'one stakeholder at a time',
+                     'never write a review for a stakeholder that did not answer', 'Carrier Desk'):
+            self.assertIn(rule, job['prompt'])
+        pack = json.loads(Path(pitch['evidence_file']).read_text(encoding='utf-8'))
+        self.assertEqual(pack['ideas'][0]['name'], 'Carrier Desk')
+        self.assertEqual(pack['ideas'][0]['evidence'], ['N1'])
+        self.assertEqual([(source['id'], source['link']) for source in pack['sources']],
+                         [('N1', 'https://news.example/item-1')])
+        self.assertIn('economics', pack['ideas'][0])
+        # The next scout waits for the panel: one meeting at a time.
+        with self.assertRaisesRegex(ValueError, 'pitch studio run is still in its meeting'):
+            self.studio(mode='studio_run', kind='scout')
+
+        # Only a stakeholder that spoke in the transcript can have reviewed.
+        settled = self.complete_pitch(pitch, [
+            self.review('Carrier Desk', 'investor', 'back'),
+            self.review('Carrier Desk', 'customer', 'hold'),
+            self.review('Carrier Desk', 'competitor', 'pass'),
+            self.review('Carrier Desk', 'operator', 'back'),
+            self.review('Unknown Idea', 'investor', 'back')], spoke=['investor', 'customer'])
+        self.assertEqual(settled['state'], 'ready', settled.get('error'))
+        self.assertEqual((settled['review_count'], settled['unverified'], len(settled['problems'])),
+                         (2, ['competitor'], 2))
+        self.assertEqual(settled['missing'], [dict(idea='Carrier Desk', stakeholder='competitor')])
+        stored = self.stored_candidates()[0]
+        self.assertEqual({key: stored['panel'][key] for key in ('back', 'hold', 'pass', 'round', 'reviewers')},
+                         dict(back=1, hold=1, **{'pass': 0}, round=1, reviewers=2))
+        self.assertEqual(sorted(review['model'] for review in stored['stakeholder_reviews']),
+                         ['claude/default', 'codex/default'])
+        page = self.studio(mode='candidate_brief', candidate_id=stored['id'])['html']
+        for shown in ('What the stakeholders said', 'Round 1: 1 back, 1 hold, 0 pass', 'claude/default',
+                      'The buyer already pays a cheaper tool.'):
+            self.assertIn(shown, page)
+
+        # Round 2: the feedback is in the next scout's pack, and a revision replaces the idea.
+        self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'], studio_max_candidates=3)
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            second = self.studio(mode='studio_run', kind='scout')
+        feedback = json.loads(Path(second['evidence_file']).read_text(encoding='utf-8'))['stakeholder_feedback']
+        self.assertEqual((feedback[0]['name'], feedback[0]['back'], feedback[0]['hold']), ('Carrier Desk', 1, 1))
+        self.assertIn('"revises"', second['prompt'])
+        revised = candidate('Carrier Desk Pilot')
+        revised.update(revises='carrier desk', revision_note='Priced below the cheaper tool; three paid pilots.')
+        unknown = candidate('Dock Ledger')
+        unknown.update(revises='Nothing Here',
+                       thesis='Warehouse docks double-book trailers because yard schedules live in spreadsheets.')
+        done = self.complete_studio(second, {'candidates': [revised, unknown]})
+        self.assertEqual([item['name'] for item in done['refused_candidates']], ['Dock Ledger'])
+        self.assertIn('revises names no open idea', done['refused_candidates'][0]['error'])
+        stored = {item['name']: item for item in self.stored_candidates()}
+        old, new = stored['Carrier Desk'], stored['Carrier Desk Pilot']
+        self.assertEqual((old['state'], old['superseded_by']), ('superseded', new['id']))
+        # Not excluded as a duplicate of the idea it revises.
+        self.assertEqual((new['state'], new['round'], new['revision_of']), ('proposed', 2, old['id']))
+        self.assertEqual(new['previous_feedback'][0]['objections'], ['The buyer already pays a cheaper tool.'])
+        second_pitch = self.pitch_runs()[-1]
+        pack = json.loads(Path(second_pitch['evidence_file']).read_text(encoding='utf-8'))
+        self.assertEqual((pack['ideas'][0]['round'], len(pack['ideas'][0]['previous_feedback'])), (2, 2))
+
+    def test_pitch_pack_includes_nested_research_citations_and_can_recover_preparation(self):
+        from venture_panel import PANEL_PACK_LIMIT
+
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        run = self.studio(mode='studio_run', kind='scout')
+        proposal = self.web_candidate()
+        proposal['incumbent'] = dict(name='Legacy Carrier', complaints=[
+            dict(claim='Reports cannot be exported.', evidence=['W2'])])
+        research = self.RESEARCH + [
+            dict(self.RESEARCH[0], id='W2', url='https://trade.example/complaints'),
+            dict(self.RESEARCH[0], id='W3', url='https://trade.example/unused')]
+        with patch('venture_panel.PANEL_PACK_LIMIT', 64):
+            done = self.complete_studio(run, {'candidates': [proposal], 'research': research})
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        pitch, = self.pitch_runs()
+        self.assertEqual((pitch['state'], pitch['dispatch_failed']), ('needs_attention', True))
+        self.assertIn('byte budget', pitch['error'])
+        self.assertEqual(pitch['candidate_ids'], [self.stored_candidates()[0]['id']])
+
+        recovered = self.studio(mode='studio_recover', run_id=pitch['id'], inspected=True)
+        self.assertEqual((recovered['id'], recovered['state']), (pitch['id'], 'meeting'))
+        evidence_file = Path(recovered['evidence_file'])
+        pack = json.loads(evidence_file.read_text(encoding='utf-8'))
+        self.assertLessEqual(evidence_file.stat().st_size, PANEL_PACK_LIMIT)
+        self.assertEqual(pack['ideas'][0]['evidence'], ['W1'])
+        self.assertEqual([(source['id'], source['url']) for source in pack['sources']],
+                         [('W1', self.RESEARCH[0]['url']), ('W2', 'https://trade.example/complaints')])
+
+    def test_an_unexpected_pitch_start_failure_leaves_the_scout_ready(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        with patch.object(self.ventures, '_pitch_prepare', side_effect=RuntimeError('Pitch preparation failed.')):
+            done = self.scout_with(candidate())
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        pitch, = self.pitch_runs()
+        self.assertEqual((pitch['state'], pitch['dispatch_failed'], pitch['error']),
+                         ('needs_attention', True, 'Pitch preparation failed.'))
+        recovered = self.studio(mode='studio_recover', run_id=pitch['id'], inspected=True)
+        self.assertEqual((recovered['id'], recovered['state']), (pitch['id'], 'meeting'))
+
+    def test_a_recovered_pitch_goes_to_the_current_panel_with_the_ideas_still_open(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        first = self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        doubted = candidate('Dock Ledger', 'N1')
+        doubted['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
+        with patch('venture_panel.PANEL_PACK_LIMIT', 64):
+            self.scout_with(candidate('Carrier Desk'), doubted)
+        pitch, = self.pitch_runs()
+        self.assertEqual(pitch['state'], 'needs_attention')
+        stored = {item['name']: item for item in self.stored_candidates()}
+        # Before recovering, the operator decides one idea and swaps the stakeholders' models.
+        self.studio(mode='candidate_decide', candidate_id=stored['Dock Ledger']['id'], decision='reject',
+                    reason='Not now.')
+        second = self.setup_panel(stakeholders=[dict(role='investor', settings=first['settings']['customer']),
+                                                dict(role='customer', settings=first['settings']['investor'])])
+        self.assertNotEqual(second['members'], first['members'])
+
+        recovered = self.studio(mode='studio_recover', run_id=pitch['id'], inspected=True)
+        self.assertEqual(recovered['state'], 'meeting')
+        self.assertEqual(recovered['panel']['members'], second['members'])
+        self.assertEqual(recovered['candidate_ids'], [stored['Carrier Desk']['id']])
+        pack = json.loads(Path(recovered['evidence_file']).read_text(encoding='utf-8'))
+        self.assertEqual([idea['name'] for idea in pack['ideas']], ['Carrier Desk'])
+        done = self.complete_pitch(recovered, [self.review('Carrier Desk', 'investor', 'back'),
+                                               self.review('Carrier Desk', 'customer', 'hold')],
+                                   spoke=['investor', 'customer'])
+        self.assertEqual((done['state'], done['review_count'], done['unverified']), ('ready', 2, []))
+
+    def test_a_panel_on_the_studio_s_own_model_says_so_and_can_be_switched_off(self):
+        self.setup_studio_manual()
+        same = dict(runtime='opencode', provider='opencode-go', model='deepseek-v4')
+        panel = self.setup_panel(stakeholders=[dict(role='investor', settings=same),
+                                               dict(role='customer', settings=same)])
+        self.assertFalse(panel['independent'])
+        self.assertIn('own model (opencode/deepseek-v4)', panel['warning'])
+        with self.assertRaisesRegex(ValueError, '2 to 4'):
+            self.studio(mode='studio_panel', stakeholders=[dict(role='investor')])
+        with self.assertRaisesRegex(ValueError, 'only once'):
+            self.studio(mode='studio_panel', stakeholders=[dict(role='investor'), dict(role='investor')])
+        off = self.studio(mode='studio_panel', enabled=False)
+        self.assertFalse(off['enabled'])
+        self.add_venture_group(self.create())
+        self.scout_with(candidate('Carrier Desk'))
+        self.assertEqual(self.pitch_runs(), [])  # Switched off: no pitch.
+        # Back on keeps the same agents and models; nobody new is hired.
+        hired = len(self.profiles)
+        on = self.studio(mode='studio_panel')
+        self.assertEqual((on['enabled'], on['members'], len(self.profiles)), (True, off['members'], hired))
+
+    def test_autonomous_mode_waits_for_the_panel_and_needs_most_stakeholders_to_back(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer'), dict(role='operator')])
+        self.studio(mode='studio_policy', studio_mode='autonomous', studio_auto_min_confidence=10)
+        backed, doubted = candidate('Carrier Desk'), candidate('Dock Ledger', 'N1')
+        doubted['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
+        incomplete = candidate('Clinic Rota', 'N1')
+        incomplete['thesis'] = 'Small clinics lose appointment revenue to unfilled last-minute cancellations.'
+        done = self.scout_with(backed, doubted, incomplete)
+        self.assertNotIn('auto', done)  # The scout round leaves the decision to the panel.
+        self.studio(mode='studio_panel', enabled=False)
+        self.complete_pitch(self.pitch_runs()[0], [
+            self.review('Carrier Desk', 'investor', 'back'), self.review('Carrier Desk', 'customer', 'back'),
+            self.review('Dock Ledger', 'investor', 'back'), self.review('Dock Ledger', 'customer', 'pass'),
+            self.review('Dock Ledger', 'operator', 'hold'), self.review('Clinic Rota', 'investor', 'back')],
+            spoke=['investor', 'customer', 'operator'])
+        stored = {item['name']: item for item in self.stored_candidates()}
+        self.assertIn('Most stakeholders did not back it (1 back, 1 hold, 1 pass)', stored['Dock Ledger']['auto']['reason'])
+        self.assertIn('Most stakeholders did not back it (1 back, 0 hold, 0 pass)', stored['Clinic Rota']['auto']['reason'])
+        self.assertEqual(stored['Clinic Rota']['state'], 'proposed')
+        # Backed by the panel, it meets the next cap instead: these sources are internal history.
+        self.assertIn('no outside source', stored['Carrier Desk']['auto']['reason'])
+
+    def test_a_pitched_idea_with_no_usable_reviews_has_a_zero_vote_summary(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        self.studio(mode='studio_policy', studio_mode='autonomous', studio_auto_min_confidence=10)
+        unreviewed = candidate('Dock Ledger', 'N1')
+        unreviewed['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
+        self.scout_with(candidate(), unreviewed)
+        pitch, = self.pitch_runs()
+
+        empty = self.complete_pitch(pitch, [], spoke=[])
+        self.assertEqual((empty['state'], empty['review_count']), ('needs_attention', 0))
+        self.assertIn('no usable review', empty['error'])
+        self.assertEqual(len(empty['missing']), 4)
+        self.assertEqual([idea['panel']['reviewers'] for idea in self.stored_candidates()], [0, 0])
+
+        self.complete_pitch(pitch, [self.review('Carrier Desk', 'investor', 'hold')], spoke=['investor'])
+        settled = self.studio(mode='studio_recover', run_id=pitch['id'], inspected=True)
+        self.assertEqual((settled['state'], settled['review_count']), ('ready', 1))
+        stored = {item['name']: item for item in self.stored_candidates()}
+        idea = stored['Dock Ledger']
+        self.assertEqual({key: idea['panel'][key] for key in ('back', 'hold', 'pass', 'reviewers', 'stakeholders')},
+                         dict(back=0, hold=0, **{'pass': 0}, reviewers=0, stakeholders=2))
+        self.assertEqual(idea['state'], 'proposed')
+        self.assertIn('Most stakeholders did not back it', idea['auto']['reason'])
+        self.assertEqual([item['name'] for item in self.ventures._panel_feedback('org')], ['Carrier Desk'])
+        page = self.studio(mode='candidate_brief', candidate_id=idea['id'])['html']
+        self.assertIn('Pitched, no reviews.', page)
 
     def test_approval_without_attaching_leaves_an_idea_s_feeds_alone(self):
         self.setup_studio_manual()

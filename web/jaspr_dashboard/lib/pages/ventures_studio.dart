@@ -47,6 +47,8 @@ Component venturesStudio({
   String herdr = '',
   List<Map<String, dynamic>> runtimes = const [],
   Map<String, String> ventureNames = const {},
+  void Function()? onPanel,
+  void Function(bool enabled)? onPanelSwitch,
 }) {
   final record = Map<String, dynamic>.from(
     studio?['studio'] as Map? ?? const {},
@@ -194,7 +196,8 @@ Component venturesStudio({
         (
           'Group',
           text(
-            '${(record['team'] as Map? ?? const {})['group_name'] ?? ''}'.isEmpty
+            '${(record['team'] as Map? ?? const {})['group_name'] ?? ''}'
+                    .isEmpty
                 ? groupId
                 : '${(record['team'] as Map)['group_name']}',
           ),
@@ -290,6 +293,15 @@ Component venturesStudio({
           'Save the studio settings to repair them.',
           error: true,
         ),
+      _panelSection(
+        studio?['panel'] is Map
+            ? Map<String, dynamic>.from(studio!['panel'] as Map)
+            : null,
+        runs.where((item) => item['kind'] == 'pitch').firstOrNull,
+        busy,
+        onPanel,
+        onPanelSwitch,
+      ),
       for (final kind in const ['portfolio', 'scout'])
         if (schedule[kind] is Map) _scheduleLine(kind, schedule[kind] as Map),
       notice(
@@ -306,7 +318,12 @@ Component venturesStudio({
           'Over the daily session cap: changes that add meetings are refused until it is raised.',
         ),
       for (final run in meeting)
-        _waiting(run, Map<String, dynamic>.from(run['waiting'] as Map), busy, act),
+        _waiting(
+          run,
+          Map<String, dynamic>.from(run['waiting'] as Map),
+          busy,
+          act,
+        ),
       if (attention.isNotEmpty)
         disclosure('Needs attention (${attention.length})', [
           paragraph(
@@ -444,6 +461,89 @@ Component venturesStudio({
   );
 }
 
+const _stakeholderLabels = {
+  'investor': 'Investor',
+  'customer': 'Target customer',
+  'operator': 'Industry operator',
+  'competitor': 'Market leader',
+};
+
+/// The stakeholders the studio pitches to, the model each runs on, and what
+/// the latest pitch returned.
+Component _panelSection(
+  Map<String, dynamic>? panel,
+  Map<String, dynamic>? pitch,
+  bool busy,
+  void Function()? onPanel,
+  void Function(bool enabled)? onPanelSwitch,
+) {
+  if (panel == null) {
+    return el('section', [
+      paragraph(
+        'Stakeholder panel: none. Add stakeholders (an investor, the target customer, an operator, the '
+        'market leader) on other models to review every scout round independently.',
+      ),
+      if (onPanel != null)
+        actions([
+          button(
+            'Set up stakeholder panel',
+            busy ? null : onPanel,
+            small: true,
+          ),
+        ]),
+    ], classes: 'stack');
+  }
+  final enabled = panel['enabled'] == true;
+  final models = panel['models'] as Map? ?? const {};
+  final roles = (panel['roles'] as List? ?? const []).map((v) => '$v');
+  final missing = List<Map<String, dynamic>>.from(
+    (pitch?['missing'] as List? ?? const []).whereType<Map>(),
+  );
+  final unverified = (pitch?['unverified'] as List? ?? const [])
+      .map((value) => _stakeholderLabels['$value'] ?? '$value')
+      .toList();
+  return disclosure(
+    'Stakeholder panel · ${enabled ? '${roles.length} stakeholders' : 'off'}',
+    [
+      facts([
+        for (final role in roles)
+          (_stakeholderLabels[role] ?? role, text('${models[role] ?? ''}')),
+        ('Studio model', text('${panel['studio_model'] ?? ''}')),
+      ]),
+      if ('${panel['warning'] ?? ''}'.isNotEmpty)
+        notice('${panel['warning']}', error: true),
+      if (pitch != null) ...[
+        paragraph(
+          'Latest pitch · ${pitch['state'] ?? ''} · ${displayTime(pitch['created_at'])}'
+          '${pitch['review_count'] == null ? '' : ' · ${pitch['review_count']} review(s)'}',
+        ),
+        if ('${pitch['panel_summary'] ?? ''}'.isNotEmpty)
+          paragraph('${pitch['panel_summary']}'),
+        if (unverified.isNotEmpty)
+          notice(
+            'Not counted: ${unverified.join(', ')} did not speak in the meeting transcript, so the reviews '
+            'given in their name were dropped.',
+            error: true,
+          ),
+        if (missing.isNotEmpty)
+          paragraph(
+            'Missing reviews: ${missing.map((item) => '${_stakeholderLabels['${item['stakeholder']}'] ?? item['stakeholder']} on ${item['idea']}').join('; ')}.',
+          ),
+      ],
+      actions([
+        if (onPanel != null)
+          button('Change panel', busy ? null : onPanel, small: true),
+        if (onPanelSwitch != null)
+          button(
+            enabled ? 'Switch panel off' : 'Switch panel on',
+            busy ? null : () => onPanelSwitch(!enabled),
+            small: true,
+          ),
+      ]),
+    ],
+  );
+}
+
 /// The CLI and model the studio agents were created with, and how it was chosen.
 String _agentSettings(Map<String, dynamic> record) {
   final team = record['team'] as Map? ?? const {};
@@ -520,7 +620,8 @@ List<Component> _failure(
 ) {
   final action = '${failure['action'] ?? ''}';
   final agent = '${failure['agent'] ?? ''}';
-  final phase = _phaseLabels['${failure['phase']}'] ?? '${failure['phase'] ?? ''}';
+  final phase =
+      _phaseLabels['${failure['phase']}'] ?? '${failure['phase'] ?? ''}';
   return [
     paragraph(
       '${failure['title'] ?? 'The run stopped'} · $phase'
