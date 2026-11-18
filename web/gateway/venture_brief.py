@@ -101,7 +101,9 @@ def _e(value):
 def _money(amount, currency):
     if not isinstance(amount, (int, float)):
         return _e(amount) if amount not in (None, '') else '-'
-    return _e(str(currency or '') + ' ' + format(round(amount), ',')).strip()
+    # Cents matter for a per-unit price (EUR 0.89 a box); whole amounts stay whole.
+    text = format(round(amount), ',') if round(amount, 2) == round(amount) else format(amount, ',.2f')
+    return _e(str(currency or '') + ' ' + text).strip()
 
 
 def _price(price):

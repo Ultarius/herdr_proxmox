@@ -271,7 +271,12 @@ Component venturesIdeas({
 }
 
 String _moneyText(Object? value, Object? currency) {
-  final amount = value is num ? value.toStringAsFixed(0) : '${value ?? 0}';
+  // Cents matter for a per-unit price (EUR 0.89 a box); whole amounts stay whole.
+  final amount = value is num
+      ? (value == value.roundToDouble()
+            ? value.toStringAsFixed(0)
+            : value.toStringAsFixed(2))
+      : '${value ?? 0}';
   final code = '${currency ?? ''}';
   return '$amount${code.isEmpty ? '' : ' $code'}';
 }

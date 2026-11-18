@@ -395,10 +395,18 @@ def _confidence(value):
     raise ValueError('confidence: a whole number 0-100 is needed')
 
 
+def _scout_amount(value, label):
+    """A price as an agent reads it from a page: whole or with cents (29.90, 0.89)."""
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1_000_000_000:
+        raise ValueError('Invalid venture field: ' + label)
+    value = round(value, 2)
+    return int(value) if value == int(value) else value
+
+
 def _scout_money(value, label):
     if not isinstance(value, dict):
         raise ValueError(label + ' must be an amount and three-letter currency')
-    amount = _integer(value.get('amount'), 0, 1_000_000_000, label + ' amount')
+    amount = _scout_amount(value.get('amount'), label + ' amount')
     currency = _value(value.get('currency'), 3, label + ' currency', required=True).upper()
     if not CURRENCY.fullmatch(currency):
         raise ValueError('Invalid venture field: ' + label + ' currency')
@@ -496,7 +504,7 @@ def scout_business_model(value, cite=None):
             entry['volume'] = _integer(line.get('volume'), 1, 1_000_000_000, name + ' monthly volume per customer')
             entry['evidence'] = cite(line.get('evidence'), 3) if cite else []
         else:
-            entry['amount'] = _integer(line.get('amount'), 0, 1_000_000_000, name + ' amount')
+            entry['amount'] = _scout_amount(line.get('amount'), name + ' amount')
         if kind in ('recurring', 'per_unit'):
             # Without a period an annual fee reads as a monthly one, which is
             # twelve times the revenue.
@@ -1447,10 +1455,10 @@ class Ventures(StudioOperations, StakeholderPanel):
         # does what fits: re-send a prompt that never left, retry a meeting
         # whose preparation stopped before anything was sent, recover a
         # submitted meeting's output, or read a saved result again.
-        action, _ = self._repair_step(run, True)
+        action, label = self._repair_step(run, True)
         if action == 'dismiss':
-            raise ValueError('The studio discussion record is gone; dismiss this run.')
-        if action in ('redispatch', 'retry'):
+            raise ValueError(label + '; dismiss this run.')
+        if action in ('redispatch', 'retry', 'restart'):
             busy = self._studio_in_flight(organization)
             if busy and busy['id'] != run['id']:
                 raise StudioBusy('A ' + busy['kind'] + ' studio run is still in its meeting; recover this one after it.')

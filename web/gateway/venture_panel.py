@@ -351,6 +351,36 @@ class StakeholderPanel:
                 logging.error('Could not record failure for pitch %s: %s', run['id'], redact(str(recording_error)))
                 return None
 
+    def _pitch_restart(self, organization, run, actor):
+        """Replace a pitch whose meeting used every preparation retry.
+
+        Its meeting is cancelled (nothing was sent), stuck stakeholder
+        sessions and a chair on an old model are released, and a new pitch
+        takes the open ideas the panel has not reviewed yet."""
+        store = self.service.store
+        try:
+            store.action('cancel_discussion', dict(request_id='pitch-cancel-' + run['job_id'],
+                                                   organization_id=organization, job_id=run['job_id'],
+                                                   inspected=True))
+        except ValueError as error:
+            logging.warning('Pitch meeting %s not cancelled: %s', run['job_id'], redact(str(error)))
+        studio = self._studio(organization)
+        for binding in self._panel_bindings(organization, studio):
+            if binding['failed']:
+                store.action('release', dict(request_id='studio-release-' + binding['job_id'],
+                                             organization_id=organization, job_id=binding['job_id']))
+        self._refresh_panel_chair(organization, studio)
+        run.update(state='dismissed', dismissed=dict(by=actor, at=_now().isoformat(),
+                                                     reason='Used its preparation retries; pitched again.'))
+        self.save_studio_run(run)
+        scout = self._studio_run_record(organization, run['scout_run_id'])
+        fresh = self._pitch_start(dict(scout, candidates=[]))
+        if not fresh:
+            return 'Closed the pitch run; no open idea is waiting for the stakeholders.'
+        if fresh.get('state') == 'needs_attention':
+            raise ValueError('The new pitch could not start: ' + str(fresh.get('error') or ''))
+        return 'Started a new pitch meeting for ' + str(len(fresh['candidate_ids'])) + ' open idea(s).'
+
     def _unpitched(self, organization, skip=(), limit=PANEL_PITCH_IDEAS):
         """Oldest open ideas with no accepted review and no pitch awaiting resolution."""
         if limit <= 0:

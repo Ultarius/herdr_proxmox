@@ -603,7 +603,9 @@ class StudioOperations:
                      if item.get('id') == identity), None)
 
     RECOVER_LABELS = dict(settle='Read result again', redispatch='Re-send prompt', retry='Retry preparation',
-                          finalize='Recover result', dismiss='')
+                          restart='Pitch again', finalize='Recover result', dismiss='')
+    # Group discussions refuse a fourth inspected preparation retry.
+    PREPARATION_RETRIES = 3
 
     def _recover_hint(self, run):
         """The one step "recover" takes for this run, for the dashboard button."""
@@ -622,6 +624,12 @@ class StudioOperations:
         if not job:
             return 'dismiss', 'Close the ' + run['kind'] + ' run; its discussion record is gone'
         if not job.get('discussion_submitted_at'):
+            if int(job.get('preparation_attempt') or 0) >= self.PREPARATION_RETRIES:
+                if run['kind'] == 'pitch':
+                    return 'restart', ('Start a new pitch meeting for the open ideas; this one used its '
+                                       + str(self.PREPARATION_RETRIES) + ' preparation retries')
+                return 'dismiss', ('Close the ' + run['kind'] + ' run; it used its preparation retries, and the '
+                                   'next scheduled run starts a new meeting')
             return 'retry', 'Retry preparing the ' + run['kind'] + ' meeting; no prompt was sent yet'
         return 'finalize', 'Recover the saved output of the ' + run['kind'] + ' meeting'
 
@@ -749,6 +757,8 @@ class StudioOperations:
             run.pop('failure', None)
             self._studio_dispatch(organization, run)
             return 'The ' + run['kind'] + ' prompt was sent to the studio group.'
+        if action == 'restart':
+            return self._pitch_restart(organization, run, actor)
         if action == 'retry':
             store.action('retry_discussion', dict(request_id='studio-retry-' + uuid.uuid4().hex,
                                                   organization_id=organization, job_id=run['job_id'],

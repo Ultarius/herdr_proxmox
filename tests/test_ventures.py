@@ -208,6 +208,10 @@ class VentureTests(unittest.TestCase):
                 raise ValueError('Only a preparation needing attention can be retried.')
             job.update(state='queued', error='')
             return {'id': job['id']}
+        if action == 'cancel_discussion':
+            job = next(job for job in self.jobs if job['id'] == body['job_id'])
+            job.update(state='cancelled')
+            return {'id': job['id']}
         if action == 'recover':
             return {'id': body['job_id']}
         if action == 'launch':
@@ -2723,6 +2727,47 @@ class VentureTests(unittest.TestCase):
         self.assertEqual(chair_run['state'], 'released')
         self.assertTrue(any('panel chair, which ran on opencode/deepseek-v4.1-flash' in item['detail']
                             for item in result['steps']), result['steps'])
+
+    def test_a_pitch_out_of_preparation_retries_is_pitched_again_with_its_open_ideas(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        panel = self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        self.scout_with(candidate('Carrier Desk'))
+        pitch, = self.pitch_runs()
+        job = next(item for item in self.jobs if item['id'] == pitch['job_id'])
+        job.update(state='needs_attention', preparation_attempt=3,
+                   error='Preparation retry limit reached; inspect and create a new meeting.')
+        self.jobs.append(dict(id='d' * 32, kind='launch', state='needs_attention', organization_id='org',
+                              profile_id=panel['members']['investor'], error='Needs a decision.'))
+        self.ventures.advance()
+        hint = self.ventures._recover_hint(self.pitch_runs()[0])
+        self.assertEqual((hint['action'], hint['label']), ('restart', 'Pitch again'))
+        self.studio(mode='studio_recover', run_id=pitch['id'], inspected=True)
+        old, fresh = sorted(self.pitch_runs(), key=lambda item: item['id'] != pitch['id'])
+        self.assertEqual((old['state'], job['state']), ('dismissed', 'cancelled'))
+        self.assertEqual((fresh['state'], fresh['candidate_ids']), ('meeting', pitch['candidate_ids']))
+        self.assertEqual(next(item for item in self.jobs if item['id'] == 'd' * 32)['state'], 'released')
+
+    def test_scout_prices_may_have_cents(self):
+        alternatives = ventures.scout_alternatives([
+            dict(name='Carsu', kind='software', price=dict(amount=29.9, currency='EUR', period='month'),
+                 evidence=['W1']),
+            dict(name='Bookkeeper', kind='service', evidence=['W2']), dict(name='Spreadsheet', kind='in_house')],
+            lambda value, limit: value)
+        self.assertEqual(alternatives[0]['price']['amount'], 29.9)
+        business = ventures.scout_business_model(dict(type='saas', revenue_lines=[
+            dict(kind='per_unit', label='box', amount=0.89, currency='EUR', period='month', unit='box', units=100),
+            dict(kind='recurring', label='base', amount=50.0, currency='EUR', period='month')]))
+        self.assertEqual([line['amount'] for line in business['revenue_lines']], [0.89, 50])
+        for bad in (-1, float('nan'), '29.90', True):
+            with self.subTest(amount=bad), self.assertRaisesRegex(ValueError, 'alternative 1 price amount'):
+                ventures.scout_alternatives([dict(name='X', kind='software', evidence=['W1'],
+                                                  price=dict(amount=bad, currency='EUR', period='month')),
+                                             dict(name='Y', kind='service', evidence=['W2']), dict(name='Z', kind='in_house')],
+                                            lambda value, limit: value)
+        from venture_brief import _money
+        self.assertEqual((_money(0.89, 'EUR'), _money(29.9, 'EUR'), _money(1250, 'EUR')),
+                         ('EUR 0.89', 'EUR 29.90', 'EUR 1,250'))
 
     def test_repair_starts_herdr_and_sends_a_prompt_that_never_arrived(self):
         self.setup_studio_manual()
