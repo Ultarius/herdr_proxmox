@@ -1777,7 +1777,7 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
       required: true,
     ),
     textarea(
-      'Focus areas (comma separated)',
+      'Focus areas (comma separated, up to 6 of 200 characters each)',
       _focus,
       (value) => setState(() => _focus = value),
       rows: 2,
@@ -2230,7 +2230,7 @@ class _StudioSetupFormState extends State<_StudioSetupForm> {
             'Industry news, regulator announcements, trade press or funding feeds',
       ),
       textarea(
-        'Focus areas (comma separated)',
+        'Focus areas (comma separated, up to 6 of 200 characters each)',
         _focus,
         (value) => setState(() => _focus = value),
         rows: 2,

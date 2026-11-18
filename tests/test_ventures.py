@@ -2126,6 +2126,32 @@ class VentureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'in the past'):
             ventures.scout_kill_criteria(['No paid pilot by 2020-01-01.'], economics)
 
+    def test_a_focus_area_may_be_a_sentence_and_never_overflows_the_scout_prompt(self):
+        self.setup_studio_manual()
+        focus = ['Fragmented small-business industries with more than 10000 independent operators still running '
+                 'on-premise or legacy software', 'Booking and capacity management for independent operators',
+                 'Software that takes customer payments for small service businesses',
+                 'Independent operators in Belgium the Netherlands and Germany']
+        saved = self.studio(mode='studio_policy', studio_focus=focus,
+                            studio_exclude=['CRA', 'Machinery Regulation', 'NIS2', 'crypto', 'consumer app'])
+        self.assertEqual(saved['studio_focus'], focus)
+        with self.assertRaisesRegex(ValueError, 'at most 200 characters; this one has 201'):
+            self.studio(mode='studio_policy', studio_focus=['x' * 201])
+        with self.assertRaisesRegex(ValueError, 'at most 6 focus areas; 7 were given'):
+            self.studio(mode='studio_policy', studio_focus=['area ' + str(index) for index in range(7)])
+        # The longest focus list with every exclusion still fits: the prompt
+        # then names them by reference and the pack carries them in full.
+        longest = ['segment ' + str(index) + ' ' + 'y' * 180 for index in range(6)]
+        exclusions = ['excluded term ' + str(index) for index in range(ventures.MAX_STUDIO_EXCLUDE)]
+        self.studio(mode='studio_policy', studio_focus=longest, studio_exclude=exclusions,
+                    studio_web_research=True, studio_sources=[])
+        run = self.studio(mode='studio_run', kind='scout')
+        job = next(job for job in self.jobs if job['id'] == run['job_id'])
+        self.assertLessEqual(len(job['prompt']), ventures.PROMPT_LIMIT)
+        self.assertIn('policy.focus and policy.exclusions in the pack', job['prompt'])
+        pack = json.loads(Path(run['evidence_file']).read_text(encoding='utf-8'))
+        self.assertEqual((pack['policy']['focus'], pack['policy']['exclusions']), (longest, exclusions))
+
     def test_month_first_kill_dates_are_checked_like_any_other(self):
         # "March 31, 2031" found no date at all, so the window checks were skipped.
         economics = dict(runway_months=8.2)
