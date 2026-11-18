@@ -9,6 +9,16 @@ int openCandidateCount(Iterable<Map<String, dynamic>> candidates) => candidates
     .where((item) => openCandidateStates.contains('${item['state']}'))
     .length;
 
+const _stakeholderLabels = {
+  'investor': 'Investor',
+  'customer': 'Target customer',
+  'operator': 'Industry operator',
+  'competitor': 'Market leader',
+};
+
+String _stakeholderLabel(Object? role) =>
+    _stakeholderLabels['$role'] ?? '$role';
+
 const _barLabels = {
   'survival_threshold': 'Survival threshold',
   'consecutive_days': 'Qualifying days',
@@ -402,6 +412,10 @@ Component candidateDiligence(Map<String, dynamic> item) {
       if (panel != null && review['run_id'] == panel['run_id']) review,
   ];
   final revisionNote = '${item['revision_note'] ?? ''}';
+  // What the stakeholders said about the rough shortlist during the scout.
+  final screen = (item['stakeholder_screen'] as List? ?? const [])
+      .whereType<Map>()
+      .toList();
   // The review questions the gateway can check; advisory like the notes.
   final review = (item['review_notes'] as List? ?? const [])
       .map((value) => '$value')
@@ -535,6 +549,7 @@ Component candidateDiligence(Map<String, dynamic> item) {
       warnings.isEmpty &&
       review.isEmpty &&
       stakeholderReviews.isEmpty &&
+      screen.isEmpty &&
       !pitchedWithoutReviews &&
       revisionNote.isEmpty &&
       notes.isEmpty) {
@@ -576,6 +591,20 @@ Component candidateDiligence(Map<String, dynamic> item) {
             ], classes: 'stack'),
         ],
       ),
+    if (screen.isNotEmpty)
+      disclosure('Screened during the scout (${screen.length})', [
+        for (final entry in screen)
+          el('article', [
+            paragraph(
+              '${_stakeholderLabel(entry['stakeholder'])}: '
+              '${entry['objection'] ?? 'no objection given'}',
+            ),
+            if ('${entry['would_change_view'] ?? ''}'.isNotEmpty)
+              paragraph('Would change its view: ${entry['would_change_view']}'),
+            if ('${entry['response'] ?? ''}'.isNotEmpty)
+              paragraph('What the studio did: ${entry['response']}'),
+          ], classes: 'stack'),
+      ]),
     if (review.isNotEmpty)
       disclosure('Review notes (${review.length})', [
         for (final note in review) paragraph(note),

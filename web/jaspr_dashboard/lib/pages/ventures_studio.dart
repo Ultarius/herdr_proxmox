@@ -49,6 +49,7 @@ Component venturesStudio({
   Map<String, String> ventureNames = const {},
   void Function()? onPanel,
   void Function(bool enabled)? onPanelSwitch,
+  void Function(bool consult)? onScoutConsult,
 }) {
   final record = Map<String, dynamic>.from(
     studio?['studio'] as Map? ?? const {},
@@ -155,6 +156,8 @@ Component venturesStudio({
   // A snapshot from an older gateway has no readiness: nothing is blocked.
   final canRun = readiness['can_run'] != false;
   final canScout = readiness['can_scout'] != false;
+  final scoutBlocked =
+      (readiness['scout_blocking'] as List? ?? const []).isNotEmpty;
   // Running without sources skips sources, never the focus area.
   final canScoutOverride = readiness['can_scout_override'] == true;
   final coverage = Map<String, dynamic>.from(
@@ -268,6 +271,11 @@ Component venturesStudio({
           'The studio cannot start a meeting yet. Fix the items marked above; each has its own action.',
           error: true,
         )
+      else if (scoutBlocked)
+        notice(
+          'The scout with advisors cannot start yet. See the checklist above.',
+          error: true,
+        )
       else if (!canScout)
         notice(
           'Evidence coverage: ${coverage['sources'] ?? 0} source(s), '
@@ -301,6 +309,15 @@ Component venturesStudio({
         busy,
         onPanel,
         onPanelSwitch,
+        scout: runs
+            .where(
+              (item) =>
+                  item['kind'] == 'scout' &&
+                  item['state'] == 'ready' &&
+                  item['consult_roles'] is List,
+            )
+            .firstOrNull,
+        onScoutConsult: onScoutConsult,
       ),
       for (final kind in const ['portfolio', 'scout'])
         if (schedule[kind] is Map) _scheduleLine(kind, schedule[kind] as Map),
@@ -475,8 +492,10 @@ Component _panelSection(
   Map<String, dynamic>? pitch,
   bool busy,
   void Function()? onPanel,
-  void Function(bool enabled)? onPanelSwitch,
-) {
+  void Function(bool enabled)? onPanelSwitch, {
+  Map<String, dynamic>? scout,
+  void Function(bool consult)? onScoutConsult,
+}) {
   if (panel == null) {
     return el('section', [
       paragraph(
@@ -502,6 +521,14 @@ Component _panelSection(
   final unverified = (pitch?['unverified'] as List? ?? const [])
       .map((value) => _stakeholderLabels['$value'] ?? '$value')
       .toList();
+  final consult = panel['scout_consult'] != false;
+  final explored = (scout?['stakeholder_exploration'] as List? ?? const [])
+      .whereType<Map>()
+      .toList();
+  final consulted = (scout?['consulted'] as List? ?? const []).length;
+  final invited = (scout?['consult_roles'] as List? ?? const []).length;
+  final screened = (pitch?['pre_screened_ideas'] as List? ?? const [])
+      .whereType<String>();
   return disclosure(
     'Stakeholder panel · ${enabled ? '${roles.length} stakeholders' : 'off'}',
     [
@@ -509,6 +536,14 @@ Component _panelSection(
         for (final role in roles)
           (_stakeholderLabels[role] ?? role, text('${models[role] ?? ''}')),
         ('Studio model', text('${panel['studio_model'] ?? ''}')),
+        (
+          'During the scout',
+          text(
+            consult
+                ? 'The scout explores with the stakeholders and screens its shortlist with them'
+                : 'Stakeholders only review the pitch',
+          ),
+        ),
       ]),
       if ('${panel['warning'] ?? ''}'.isNotEmpty)
         notice('${panel['warning']}', error: true),
@@ -517,6 +552,8 @@ Component _panelSection(
           'Latest pitch · ${pitch['state'] ?? ''} · ${displayTime(pitch['created_at'])}'
           '${pitch['review_count'] == null ? '' : ' · ${pitch['review_count']} review(s)'}',
         ),
+        if (screened.isNotEmpty)
+          paragraph('Pre-screened ideas: ${screened.join(', ')}'),
         if ('${pitch['panel_summary'] ?? ''}'.isNotEmpty)
           paragraph('${pitch['panel_summary']}'),
         if (unverified.isNotEmpty)
@@ -530,9 +567,38 @@ Component _panelSection(
             'Missing reviews: ${missing.map((item) => '${_stakeholderLabels['${item['stakeholder']}'] ?? item['stakeholder']} on ${item['idea']}').join('; ')}.',
           ),
       ],
+      if (scout != null)
+        disclosure('Stakeholder exploration from the latest consulted scout', [
+          paragraph('$consulted of $invited invited advisors spoke.'),
+          if (explored.isEmpty)
+            paragraph('No exploration notes were recorded.'),
+          for (final entry in explored)
+            el('article', [
+              paragraph(
+                _stakeholderLabels['${entry['stakeholder']}'] ??
+                    '${entry['stakeholder']}',
+              ),
+              for (final (key, label) in const [
+                ('spend', 'Where buyers spend'),
+                ('segments', 'Segments with the most pain'),
+                ('workarounds', 'Tools and workarounds today'),
+                ('overlooked', 'Overlooked segment'),
+              ])
+                if ('${entry[key] ?? ''}'.isNotEmpty)
+                  paragraph('$label: ${entry[key]}'),
+            ], classes: 'stack'),
+        ]),
       actions([
         if (onPanel != null)
           button('Change panel', busy ? null : onPanel, small: true),
+        if (onScoutConsult != null && enabled)
+          button(
+            consult
+                ? 'Keep stakeholders to the pitch'
+                : 'Talk to stakeholders during the scout',
+            busy ? null : () => onScoutConsult(!consult),
+            small: true,
+          ),
         if (onPanelSwitch != null)
           button(
             enabled ? 'Switch panel off' : 'Switch panel on',

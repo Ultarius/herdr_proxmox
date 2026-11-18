@@ -402,22 +402,34 @@ class StudioOperations:
                         'Not set up yet: one click creates the notebook, the agents and the group.'),
             'repair' if configured else 'setup')
         failed = [binding for binding in bindings if binding['failed']]
+        consult = (self._scout_consult(organization, studio) or {}) if configured else {}
+        advisor_ids = set(consult.get('members', {}).values())
+        scout_blocking = []
         if configured:
             add('sessions', 'No agent session is stuck', not failed,
                 '; '.join(binding['name'] + ' did not start' + (': ' + binding['error'] if binding['error'] else '')
                           for binding in failed) if failed else
                 'Agents start by themselves when a meeting needs them.', 'repair')
-            # A stuck stakeholder holds up the pitch, not the studio's own runs.
             stuck = [binding for binding in self._panel_bindings(organization, studio) if binding['failed']]
             if stuck:
                 add('panel_sessions', 'No stakeholder session is stuck', False,
                     '; '.join(binding['name'] + ' did not start' + (': ' + binding['error'] if binding['error'] else '')
                               for binding in stuck), 'repair')
+                if any(binding['profile_id'] in advisor_ids for binding in stuck):
+                    scout_blocking.append('panel_sessions')
         people = len(bindings) or STUDIO_PARTICIPANTS
+        advisors = len(advisor_ids)
         limits = self._limit_problems(organization, people)
         add('limits', 'The organization limits allow a studio meeting', not limits,
             ('; '.join(limits).capitalize() + '.') if limits else
             'A studio meeting uses ' + str(people) + ' sessions.', 'limits')
+        if advisors:
+            scout_limits = self._limit_problems(organization, people + advisors)
+            add('scout_limits', 'The organization limits allow a scout with advisors', not scout_limits,
+                ('; '.join(scout_limits).capitalize() + '.') if scout_limits else
+                'A scout with the stakeholders uses ' + str(people + advisors) + ' sessions.', 'limits')
+            if scout_limits:
+                scout_blocking.append('scout_limits')
         sources, focus = policy['studio_sources'], policy['studio_focus']
         health = self._source_health(organization, sources)
         broken = [item for item in health if item['error']]
@@ -436,9 +448,10 @@ class StudioOperations:
         failing = {check['id'] for check in checks if not check['ok']}
         blocking = [identity for identity in ('herdr', 'provider', 'team', 'sessions', 'limits') if identity in failing]
         return dict(herdr=herdr, checks=checks, blocking=blocking, can_run=not blocking,
-                    can_scout=not blocking and 'focus' not in failing and (usable or web),
+                    scout_blocking=scout_blocking,
+                    can_scout=not blocking and not scout_blocking and 'focus' not in failing and (usable or web),
                     # "Run scout without sources" skips sources, never the focus.
-                    can_scout_override=not blocking and bool(focus),
+                    can_scout_override=not blocking and not scout_blocking and bool(focus),
                     coverage=dict(sources=len(sources), focus=len(focus), readable=len(sources) - len(broken),
                                   web_research=web and not usable),
                     sources=health,
@@ -483,11 +496,20 @@ class StudioOperations:
         """Refuse a run that cannot work, before anything is recorded or started."""
         if self._herdr_state(fresh=manual) == 'stopped':
             raise StudioWaiting('Herdr is stopped. Start Herdr to run the ' + kind + ' review.', 'herdr')
-        failed = [binding['name'] for binding in self._studio_bindings(organization, studio) if binding['failed']]
+        bindings = self._studio_bindings(organization, studio)
+        failed = [binding['name'] for binding in bindings if binding['failed']]
         if failed:
             raise StudioWaiting(', '.join(failed) + ' did not start. Repair the studio team first.', 'team')
-        limits = self._limit_problems(organization, len(self._studio_bindings(organization, studio))
-                                      or STUDIO_PARTICIPANTS)
+        people = len(bindings) or STUDIO_PARTICIPANTS
+        if kind == 'scout':
+            # The scout talks to the stakeholders, so their sessions must start too.
+            advisors = self._scout_advisor_bindings(organization, studio)
+            stuck = [binding['name'] for binding in advisors if binding['failed']]
+            if stuck:
+                raise StudioWaiting(', '.join(stuck) + ' did not start. Repair the studio first: the scout talks '
+                                    'to the stakeholders.', 'team')
+            people += len((self._scout_consult(organization, studio) or {}).get('roles') or [])
+        limits = self._limit_problems(organization, people)
         if limits:
             raise StudioWaiting('A studio meeting cannot start: ' + '; '.join(limits) + '.', 'limits')
         if kind == 'scout' and not override:
@@ -795,6 +817,7 @@ class StudioOperations:
     def studio_limits(self, organization, actor):
         """Raise the session limits to what one studio meeting needs; never lower one."""
         people = len(self._studio_bindings(organization)) or STUDIO_PARTICIPANTS
+        people += len((self._scout_consult(organization) or {}).get('roles', []))
         policy = self._policy(organization)
         changes = {}
         for key in ('max_active_sessions', 'daily_session_cap'):

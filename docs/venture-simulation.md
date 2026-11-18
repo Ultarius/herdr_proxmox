@@ -688,6 +688,49 @@ ideas that are still open, as edited. `studio_panel` with `enabled: false`
 switches pitching off and keeps the agents; without `stakeholders` it switches
 the existing panel back on.
 
+#### Talking to the stakeholders during the scout
+
+While the panel is on, the stakeholders also attend each scout meeting as
+advisors. The `discuss` request names them in `advisors`. They are prepared,
+reserved and listed in the roster like members for that one meeting, and the
+group itself does not change. A meeting takes up to four advisors who are not
+already in the group. The scout prompt points the chair to `stakeholders.md`,
+written beside the evidence file like the review checklist, which sets the
+method:
+
+1. **Explore first.** Before choosing ideas, the chair asks every stakeholder
+   on its own: where buyers already spend money, which segments feel the
+   pain most, which tools or workarounds they use today, and one segment the
+   studio may be overlooking.
+2. **Screen a rough shortlist.** For each idea, every stakeholder gives its
+   biggest objection and one piece of evidence that would change its view.
+   The studio spends its remaining research on that evidence.
+3. **Pivot.** A stronger segment is investigated in the same session. A
+   rating rises only with a cited page, never because a stakeholder liked
+   the idea. A promising idea with a named evidence gap can come back held.
+
+The answer returns `stakeholder_exploration` (one entry per stakeholder) and
+each candidate's `stakeholder_screen` (objection, `would_change_view`, and the
+studio's `response`). Both are advisory: an unusable entry is dropped, never
+a reason to refuse an idea. As with pitch reviews, an entry from a stakeholder
+that did not speak in the transcript is dropped. The run keeps the
+exploration and the roles that spoke (`consulted`). The Studio tab shows the
+latest completed exploration and how many invited advisors spoke. The Ideas
+card shows the screen. A pitch labels an idea pre-screened when a member of
+that pitch panel also screened it. The chair shares the final case and
+sources for the first review, then can share anonymized earlier objections
+in the optional second round.
+
+Each scout meeting needs one more session per stakeholder. Panel setup and
+the scout preflight check that against the organization limits. The daily
+projection counts both the advisor sessions and the follow-up pitch. A stuck
+stakeholder session holds up a scout that talks
+to it: repair it, or keep the stakeholders to the pitch. Panel setup lets
+you choose either participation mode. `studio_panel` with
+`scout_consult: false` does that (**Keep stakeholders to the pitch** on the
+Studio tab), and `true` turns it back on. The scout prompt is close to its
+8,000-character budget, which is why the method lives in the file.
+
 ### Where the evidence file goes
 
 The facilitator runs in its own worktree, so a file written into the source

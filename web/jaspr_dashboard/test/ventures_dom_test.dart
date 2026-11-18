@@ -10,6 +10,34 @@ import 'package:jaspr/client.dart';
 import 'package:web/web.dart' as web;
 import 'package:herdr_jaspr_dashboard/pages/ventures_page.dart';
 import 'package:herdr_jaspr_dashboard/services.dart';
+import 'package:herdr_jaspr_dashboard/ui.dart' as ui;
+
+class _VenturesWithDialogs extends StatefulComponent {
+  const _VenturesWithDialogs();
+
+  @override
+  State<_VenturesWithDialogs> createState() => _VenturesWithDialogsState();
+}
+
+class _VenturesWithDialogsState extends State<_VenturesWithDialogs> {
+  void changed() => setState(() {});
+
+  @override
+  void initState() {
+    super.initState();
+    ui.dialogChanges.addListener(changed);
+  }
+
+  @override
+  void dispose() {
+    ui.dialogChanges.removeListener(changed);
+    super.dispose();
+  }
+
+  @override
+  Component build(BuildContext context) =>
+      ui.el('div', [const VenturesPage(), ui.buildDialogs()]);
+}
 
 Future<void> settle() => Future<void>.delayed(const Duration(milliseconds: 50));
 Iterable<web.HTMLElement> nodes(String selector) sync* {
@@ -442,7 +470,7 @@ void main() {
     web.document.body!.appendChild(web.HTMLDivElement()..id = 'ventures-test');
     binding = ClientAppBinding();
     binding.attachRootComponent(
-      const VenturesPage(),
+      const _VenturesWithDialogs(),
       attachTo: '#ventures-test',
     );
     await settle();
@@ -605,6 +633,28 @@ void main() {
     expect(requests.single['mode'], 'studio_run');
     expect(requests.single['kind'], 'scout');
   });
+
+  test('panel setup can keep stakeholders to the pitch', () async {
+    await click('Studio');
+    await until(
+      () => nodes('button').any(
+        (button) => button.textContent!.contains('Set up stakeholder panel'),
+      ),
+    );
+    await click('Set up stakeholder panel');
+    const participation = 'dialog select:has(option[value="scout_and_pitch"])';
+    await until(() => nodes(participation).isNotEmpty);
+    final picker = nodes(participation).single as web.HTMLSelectElement;
+    expect(picker.value, 'scout_and_pitch');
+    picker.value = 'pitch';
+    picker.dispatchEvent(web.Event('change'));
+    await settle();
+    await click('Save stakeholder panel');
+    await until(() => requests.isNotEmpty);
+    expect(requests.single['mode'], 'studio_panel');
+    expect(requests.single['scout_consult'], isFalse);
+  });
+
   test('reference price input rejects typos instead of becoming zero', () {
     expect(parseReferencePrice(''), 0);
     expect(parseReferencePrice('  '), 0);

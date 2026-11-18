@@ -136,6 +136,25 @@ def launch_group(store, db, group, org):
     return run
 
 
+MAX_ADVISORS = 4
+
+
+def meeting_advisors(store, db, value, group, org_id):
+    """Extra agents one meeting brings in beside the group's members."""
+    if value in (None, []):
+        return []
+    if (not isinstance(value, list) or len(value) > MAX_ADVISORS
+            or not all(isinstance(item, str) and item for item in value) or len(set(value)) != len(value)):
+        raise ValueError(f'Choose up to {MAX_ADVISORS} distinct advisor agents.')
+    for identity in value:
+        if identity in group['members'] or identity == group.get('facilitator_id'):
+            raise ValueError('An advisor is already in this group.')
+        profile = store.get(db, 'profiles', identity, org_id)
+        if profile.get('group_id') or profile.get('archived'):
+            raise ValueError('Advisors must be active member agents, not group conversations.')
+    return list(value)
+
+
 def action(store, db, name, body, org):
     org_id = org['id']
     if name in ('retry_discussion', 'cancel_discussion'):
@@ -243,17 +262,29 @@ def action(store, db, name, body, org):
             raise ValueError('Original task conversation changed; no inspection prompt was sent.')
     else:
         group = store.get(db, 'groups', text(body, 'group_id', 40), org_id)
+        advisors = meeting_advisors(store, db, body.get('advisors'), group, org_id)
+        roster = [*group['members'], *advisors]
+        scope = group.get('review_scope', 'topic') if not body.get('prompt') else 'topic'
         if body.get('purpose') == 'release_review':
             repository = Path(text(body, 'review_repository', 2000)).resolve()
-            for identifier in group['members']:
+            for identifier in roster:
                 member = store.get(db, 'profiles', identifier, org_id)
                 if (member.get('archived') or not member.get('project') or
                         Path(member['project']).resolve() != repository):
                     raise ValueError('Release review participants changed repository; inspect the group.')
+        elif advisors and scope == 'repository':
+            projects = [store.get(db, 'profiles', identity, org_id).get('project') for identity in roster]
+            if not all(projects) or len({Path(project).resolve() for project in projects}) != 1:
+                raise ValueError('Repository review advisors must share the group’s configured project.')
         # Preparation happens outside this transaction, under participant locks.
         # The roster is frozen on the discussion; no member must be turned on manually.
         runs = []
         group_run = launch_group(store, db, group, org)
+        if advisors:
+            # Advisors attend this meeting only: the frozen roster gains them,
+            # so they are prepared, reserved and listed like members, while the
+            # group itself is unchanged.
+            group = dict(group, members=roster, advisors=advisors)
     if name == 'inspect':
         # One targeted row instead of every job in the organization: this path
         # runs on the console refresh interval, and the cost would otherwise
@@ -318,7 +349,7 @@ def action(store, db, name, body, org):
     else:
         item.update(group_id=group['id'], group=group, group_run=group_run,
                     prompt=text(body, 'prompt', 8000, optional=True) or group['description'],
-                    discussion_scope=group.get('review_scope', 'topic') if not body.get('prompt') else 'topic',
+                    discussion_scope=scope,
                     contributions=[], progress='Preparing discussion sessions', preparation={}, preparation_version=1)
         if body.get('purpose') == 'release_review':
             # Release advice is never a proposal source, including when the

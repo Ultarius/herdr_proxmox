@@ -145,7 +145,8 @@ class VentureTests(unittest.TestCase):
     def store_action(self, action, body):
         if action == 'discuss':
             job = dict(id=uuid.uuid4().hex, kind='discussion', state='queued',
-                       organization_id=body['organization_id'], group_id=body['group_id'], prompt=body['prompt'])
+                       organization_id=body['organization_id'], group_id=body['group_id'], prompt=body['prompt'],
+                       advisors=list(body.get('advisors') or []))
             self.jobs.append(job)
             return {'id': job['id']}
         # Mirror the organization store's contract: a request ID is required and
@@ -2377,7 +2378,14 @@ class VentureTests(unittest.TestCase):
         # The pitch after a scout round counts toward the maximum, not the guaranteed load.
         self.assertEqual((after['daily_meetings'], after['max_daily_meetings']),
                          (before['daily_meetings'], before['max_daily_meetings'] + 1))
-        self.assertEqual(after['max_agent_sessions'], before['max_agent_sessions'] + 3)
+        # Three for the pitch (two stakeholders and the chair), and the two
+        # stakeholders again in the scout meeting itself, where they advise.
+        self.assertEqual(after['max_agent_sessions'], before['max_agent_sessions'] + 3 + 2)
+        self.assertEqual(after['projected_agent_sessions'], before['projected_agent_sessions'] + 2)
+        self.setup_panel(scout_consult=False)
+        kept = self.ventures._studio_budget('org', policy)
+        self.assertEqual(kept['max_agent_sessions'], before['max_agent_sessions'] + 3)
+        self.setup_panel(scout_consult=True)
 
         stored, = self.stored_candidates()
         done = self.scout_with()
@@ -2495,13 +2503,19 @@ class VentureTests(unittest.TestCase):
         self.assertEqual(len(self.profiles), hired)
 
         self.service.patch_policy('org', dict(daily_session_cap=int(base) + 3), 'test')
-        self.setup_panel(stakeholders=stakeholders)
+        self.setup_panel(stakeholders=stakeholders, scout_consult=False)
+        with self.assertRaisesRegex(ValueError, 'above the organization cap'):
+            self.setup_panel(scout_consult=True)
+        self.assertFalse(self.ventures._panel('org')['scout_consult'])
+        self.service.patch_policy('org', dict(daily_session_cap=int(base) + 5), 'test')
+        self.setup_panel(scout_consult=True)
         hired = len(self.profiles)
         with self.assertRaisesRegex(ValueError, 'above the organization cap'):
             self.setup_panel(stakeholders=stakeholders + [dict(role='operator')])
         self.assertEqual(len(self.profiles), hired)
         self.service.patch_policy('org', dict(daily_session_cap=int(base) + 2), 'test')
         self.studio(mode='studio_panel', enabled=False)
+        self.assertFalse(self.studio(mode='studio_panel', scout_consult=False)['enabled'])
         with self.assertRaisesRegex(ValueError, 'above the organization cap'):
             self.studio(mode='studio_panel')
         self.assertFalse(self.ventures._panel_enabled('org'))
@@ -2749,6 +2763,111 @@ class VentureTests(unittest.TestCase):
         self.assertEqual(chair_run['state'], 'released')
         self.assertTrue(any('panel chair, which ran on opencode/deepseek-v4.1-flash' in item['detail']
                             for item in result['steps']), result['steps'])
+
+    def test_the_scout_explores_and_screens_with_the_stakeholders_before_proposing(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        panel = self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        self.assertIs(panel['scout_consult'], True)
+        self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'], studio_max_candidates=3)
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            run = self.studio(mode='studio_run', kind='scout')
+        job = next(job for job in self.jobs if job['id'] == run['job_id'])
+        # The stakeholders attend the scout meeting as advisors, in panel order.
+        self.assertEqual(job['advisors'], [panel['members'][role] for role in panel['roles']])
+        self.assertIn('Stakeholder advisors attend: work with them as stakeholders.md', job['prompt'])
+        method = (Path(run['evidence_file']).parent / ventures.STUDIO_CONSULT_FILE).read_text(encoding='utf-8')
+        method = ' '.join(method.split())
+        for rule in ('Explore first', 'one segment the studio may be overlooking', 'Screen a rough shortlist',
+                     'one piece of evidence', 'Pivot when a segment looks stronger',
+                     'never because a stakeholder liked the idea', 'Never show one stakeholder'):
+            self.assertIn(rule, method)
+        self.assertIn('investor: ' + panel['members']['investor'], method)
+        idea = dict(candidate('Carrier Desk', 'N1'), stakeholder_screen=[
+            dict(stakeholder='investor', objection='Buyers already pay a cheaper tool.',
+                 would_change_view='Three paid pilots.', response='Found a segment the tool cannot serve.'),
+            # The customer never spoke in the meeting: its screen is not counted.
+            dict(stakeholder='customer', objection='Too expensive.'),
+            dict(stakeholder='competitor', objection='Not on this panel.'),
+            dict(stakeholder=['investor'], objection='Malformed.'),
+            'not an entry'])
+        job.update(state='artifact_ready', result='```json\n' + json.dumps(dict(
+            candidates=[idea], stakeholder_exploration=[
+                dict(stakeholder='investor', spend='Carrier fees', segments='Small fleets',
+                     workarounds='Spreadsheets', overlooked='Freight brokers'),
+                dict(stakeholder='customer', spend='Invented.'),
+                dict(stakeholder={'role': 'investor'}, spend='Malformed.')])) + '\n```',
+            contributions=[dict(profile_id=panel['members']['investor'], name='investor', round=1,
+                                content='Small fleets pay carrier fees.')])
+        self.ventures.advance()
+        done = next(item for item in self.studio_runs() if item['id'] == run['id'])
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        self.assertEqual(done['consulted'], ['investor'])
+        self.assertEqual([entry['stakeholder'] for entry in done['stakeholder_exploration']], ['investor'])
+        self.assertEqual(done['stakeholder_exploration'][0]['overlooked'], 'Freight brokers')
+        stored, = [item for item in self.stored_candidates() if item['name'] == 'Carrier Desk']
+        self.assertEqual(stored['stakeholder_screen'], [dict(
+            stakeholder='investor', objection='Buyers already pay a cheaper tool.',
+            would_change_view='Three paid pilots.', response='Found a segment the tool cannot serve.')])
+        # The pitch shows the panel what it said on the shortlist and asks whether it is answered.
+        pitch, = self.pitch_runs()
+        pitch_job = next(item for item in self.jobs if item['id'] == pitch['job_id'])
+        self.assertEqual(pitch_job['advisors'], [])
+        self.assertIn('say whether each screened objection is answered', pitch_job['prompt'])
+        self.assertIn('stays with the chair until all first-round reviews are in', pitch_job['prompt'])
+        pack = json.loads(Path(pitch['evidence_file']).read_text(encoding='utf-8'))
+        self.assertEqual(pack['ideas'][0]['stakeholder_screen'], stored['stakeholder_screen'])
+        self.assertTrue(pack['ideas'][0]['pre_screened'])
+        other_panel = dict(members=dict(investor='replacement', customer=panel['members']['customer']))
+        self.assertNotIn('pre_screened', self.ventures._pitch_pack(done, [stored], panel=other_panel)['ideas'][0])
+        summaries = {item['id']: item for item in self.ventures._studio_summary('org')['runs']}
+        self.assertEqual(summaries[run['id']]['consult_roles'], ['investor', 'customer'])
+        self.assertEqual(summaries[run['id']]['stakeholder_exploration'], done['stakeholder_exploration'])
+        self.assertEqual(summaries[run['id']]['consulted'], ['investor'])
+        self.assertEqual(summaries[pitch['id']]['pre_screened_ideas'], ['Carrier Desk'])
+
+    def test_the_stakeholders_can_be_kept_to_the_pitch(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        panel = self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')], scout_consult=False)
+        self.assertIs(panel['scout_consult'], False)
+        with self.assertRaisesRegex(ValueError, 'true or false'):
+            self.setup_panel(scout_consult='yes')
+        self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'], studio_max_candidates=3)
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            run = self.studio(mode='studio_run', kind='scout')
+        job = next(job for job in self.jobs if job['id'] == run['job_id'])
+        self.assertEqual(job['advisors'], [])
+        self.assertNotIn('advisors', job['prompt'])
+        self.assertFalse((Path(run['evidence_file']).parent / ventures.STUDIO_CONSULT_FILE).exists())
+        # Switching it back on keeps the stakeholders and models already chosen.
+        again = self.setup_panel(scout_consult=True)
+        self.assertEqual((again['scout_consult'], again['members']), (True, panel['members']))
+
+    def test_a_stuck_stakeholder_holds_up_a_scout_that_talks_to_it(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        panel = self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        self.jobs.append(dict(id='d' * 32, kind='launch', state='needs_attention', organization_id='org',
+                              profile_id=panel['members']['investor'], error='Stopped on a question.'))
+        self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'], studio_max_candidates=3)
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            with self.assertRaisesRegex(ValueError, 'Investor \\(stakeholder\\) did not start'):
+                self.studio(mode='studio_run', kind='scout')
+        readiness = self.readiness()
+        self.assertTrue(readiness['can_run'])
+        self.assertFalse(readiness['can_scout'])
+        self.assertIn('panel_sessions', readiness['scout_blocking'])
+        self.service.patch_policy('org', dict(max_active_sessions=readiness['participants']), 'test')
+        limited = self.readiness()
+        self.assertTrue(limited['can_run'])
+        self.assertIn('scout_limits', limited['scout_blocking'])
+        fixed = self.studio(mode='studio_limits')
+        self.assertEqual(fixed['changed']['max_active_sessions'], readiness['participants'] + 2)
+        self.assertNotIn('scout_limits', self.readiness()['scout_blocking'])
+        self.setup_panel(scout_consult=False)
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            self.assertEqual(self.studio(mode='studio_run', kind='scout')['state'], 'meeting')
 
     def test_a_chair_with_outdated_command_approvals_or_folder_access_is_released(self):
         self.setup_studio_manual()

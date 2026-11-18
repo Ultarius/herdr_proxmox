@@ -220,6 +220,9 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
               enabled ? {} : {'enabled': false},
               organization: _studioOrganization,
             ),
+            onScoutConsult: (consult) => _submit('studio_panel', {
+              'scout_consult': consult,
+            }, organization: _studioOrganization),
           ),
       ],
       callout(
@@ -1870,12 +1873,14 @@ class _PanelFormState extends State<_PanelForm> {
   late final OrganizationToolsBloc _tools;
   StreamSubscription? _catalogSubscription;
   ModelCatalog _catalog = const ModelCatalog({});
+  late bool _scoutConsult;
   String? _error;
 
   @override
   void initState() {
     super.initState();
     final panel = component.panel ?? const {};
+    _scoutConsult = panel['scout_consult'] != false;
     final roles = (panel['roles'] as List? ?? const [])
         .map((value) => '$value')
         .toList();
@@ -1932,6 +1937,7 @@ class _PanelFormState extends State<_PanelForm> {
       return;
     }
     component.onSave({
+      'scout_consult': _scoutConsult,
       'stakeholders': [
         for (final role in chosen)
           {
@@ -1965,6 +1971,15 @@ class _PanelFormState extends State<_PanelForm> {
       paragraph(
         'Put stakeholders on other models than the studio: a model judging its own ideas tends to agree. '
         'Automatic picks a CLI and model the studio and the other stakeholders do not use.',
+      ),
+      select(
+        'Stakeholder participation',
+        _scoutConsult ? 'scout_and_pitch' : 'pitch',
+        const {
+          'scout_and_pitch': 'Advise the scout and review the pitch',
+          'pitch': 'Review the pitch only',
+        },
+        (value) => setState(() => _scoutConsult = value == 'scout_and_pitch'),
       ),
       for (final entry in panelRoleLabels.entries) ...[
         select(
@@ -2003,8 +2018,9 @@ class _PanelFormState extends State<_PanelForm> {
           ),
       ],
       paragraph(
-        'A changed model hires a new stakeholder agent. Each pitch is one more meeting per scout round, '
-        'with one session per stakeholder plus its chair.',
+        'A changed model hires a new stakeholder agent. A pitch uses one '
+        'session per stakeholder plus its chair. Scout consultation also '
+        'uses one advisor session per stakeholder during the scout meeting.',
       ),
       actions([
         button('Cancel', component.onCancel),

@@ -229,6 +229,47 @@ class CollaborationTests(unittest.TestCase):
         for job_id in set(ids) - recoverable:
             self.assertEqual(self.job(job_id)['state'], 'uncertain')
 
+    def test_an_advisor_attends_one_meeting_without_joining_the_group(self):
+        group_id = self.group()
+        advisor = self.hire(self.org, 'Ada')
+        for wrong, message in (([self.max], 'already in this group'), ([advisor, advisor], 'distinct'),
+                               ([{'id': advisor}], 'distinct'),
+                               ('Ada', 'distinct'), (['missing'], 'not found|Unknown|missing')):
+            with self.subTest(advisors=wrong):
+                with self.assertRaisesRegex(ValueError, message):
+                    self.action('discuss', organization_id=self.org, group_id=group_id, advisors=wrong)
+        discussion = self.action('discuss', organization_id=self.org, group_id=group_id, advisors=[advisor])
+        self.drain()
+        job = self.job(discussion)
+        self.assertEqual(job['state'], 'artifact_ready', job.get('error'))
+        # Prepared, reserved and listed like a member for this meeting only.
+        self.assertEqual([run['profile_id'] for run in job['runs']], [self.max, self.iris, advisor])
+        self.assertIn(advisor, job['participants'])
+        self.assertEqual(job['group']['advisors'], [advisor])
+        prompt = next(args[3] for args, _ in self.calls
+                      if args[:2] == ('agent', 'prompt') and args[2] == job['group_run']['alias']
+                      and 'Selected members' in args[3])
+        roster = prompt.split('Selected members (live Herdr aliases):', 1)[1].split('\n\n', 1)[0]
+        self.assertIn('Ada', roster)
+        group = next(item for item in self.store.snapshot()['groups'] if item['id'] == group_id)
+        self.assertEqual(group['members'], [self.max, self.iris])
+        self.assertNotIn('advisors', group)
+
+    def test_repository_review_validates_advisor_projects_before_preparation(self):
+        group_id = self.action('group', organization_id=self.org, name='Review',
+                               description='Review the repository', members=[self.max, self.iris],
+                               review_scope='repository')
+        self.drain()
+        other = self.projects / 'another-project'
+        other.mkdir()
+        advisor = self.hire(self.org, 'Ada', project=str(other))
+        with self.assertRaisesRegex(ValueError, 'advisors must share'):
+            self.action('discuss', organization_id=self.org, group_id=group_id, advisors=[advisor])
+        with self.assertRaisesRegex(ValueError, 'Release review participants changed repository'):
+            self.action('discuss', organization_id=self.org, group_id=group_id, prompt='Review this release',
+                        advisors=[advisor], purpose='release_review', review_repository=str(self.projects))
+        self.assertFalse(any(job['kind'] == 'discussion' for job in self.store.job_records()))
+
     def test_removal_preserves_artifacts_and_members_but_closes_facilitator(self):
         group_id = self.group()
         discussion = self.action('discuss', organization_id=self.org, group_id=group_id)

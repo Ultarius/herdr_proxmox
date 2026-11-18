@@ -173,6 +173,30 @@ class StakeholderPanel:
         panel = self._panel(organization)
         return bool(panel.get('enabled') and panel.get('group_id'))
 
+    def _scout_consult(self, organization, studio=None):
+        """The stakeholders a scout meeting brings in as advisors, or None.
+
+        On while the panel is: the scout explores with them and screens its
+        shortlist before proposing. ``scout_consult: false`` keeps them to
+        the pitch only."""
+        studio = studio if studio is not None else self._studio(organization)
+        panel = studio.get('panel') or {}
+        if not (panel.get('enabled') and panel.get('group_id')) or panel.get('scout_consult') is False:
+            return None
+        roles = [role for role in panel.get('roles') or [] if (panel.get('members') or {}).get(role)]
+        if not roles:
+            return None
+        return dict(roles=roles, members={role: panel['members'][role] for role in roles})
+
+    def _scout_advisor_bindings(self, organization, studio=None):
+        """Stakeholder sessions a scout meeting would bring in, with their state."""
+        consult = self._scout_consult(organization, studio)
+        if not consult:
+            return []
+        members = set(consult['members'].values())
+        return [binding for binding in self._panel_bindings(organization, studio)
+                if binding['profile_id'] in members]
+
     def panel_view(self, organization, studio=None):
         """The panel with what the operator needs to judge it: the model each
         stakeholder runs on and whether any differs from the studio's."""
@@ -198,6 +222,8 @@ class StakeholderPanel:
         and model as for the studio, or are omitted to detect one, preferring
         a CLI and model the studio and the other stakeholders do not use.
         ``enabled: false`` switches pitching off and keeps the agents.
+        ``scout_consult`` (default true) brings the stakeholders into each
+        scout meeting as advisors, besides the pitch that follows it.
         """
         studio = self._studio(organization)
         if not studio.get('group_id'):
@@ -209,12 +235,18 @@ class StakeholderPanel:
                 studio['panel'] = panel
                 self.save_studio(organization, studio)
             return self.panel_view(organization, studio)
+        consult = body.get('scout_consult')
+        if consult is not None and not isinstance(consult, bool):
+            raise ValueError('Talking to the stakeholders during the scout must be true or false.')
+        if consult is None:
+            consult = panel.get('scout_consult', True) is not False
         requested = body.get('stakeholders')
         if requested is None and panel.get('roles') and panel.get('group_id'):
-            # Switching back on keeps the agents and models already chosen.
-            if not panel.get('enabled'):
-                self._check_panel_capacity(organization, len(panel['roles']) + 1)
-            panel.update(enabled=True, updated_at=_now().isoformat(), actor=actor)
+            # An explicit consultation-only change preserves the panel switch.
+            enabled = bool(panel.get('enabled') or body.get('enabled') is True or 'scout_consult' not in body)
+            if enabled and (not panel.get('enabled') or (consult and panel.get('scout_consult') is False)):
+                self._check_panel_capacity(organization, studio, len(panel['roles']), consult)
+            panel.update(enabled=enabled, scout_consult=consult, updated_at=_now().isoformat(), actor=actor)
             studio['panel'] = panel
             self.save_studio(organization, studio)
             return self.panel_view(organization, studio)
@@ -227,7 +259,7 @@ class StakeholderPanel:
             if item['role'] in roles:
                 raise ValueError('Each stakeholder can appear only once.')
             roles.append(item['role'])
-        self._check_panel_capacity(organization, len(roles) + 1)
+        self._check_panel_capacity(organization, studio, len(roles), consult)
         notebook = str(self._studio_notebook(studio))
         studio_settings = ((studio.get('team') or {}).get('settings_by_role') or {}).get('scout') or {}
         chosen = {}
@@ -276,17 +308,24 @@ class StakeholderPanel:
         group = self.service.store.action('group', group_body)
         panel.update(enabled=True, roles=roles, members={role: members[role] for role in roles},
                      settings={role: hired[role] for role in roles}, group_id=group['id'],
-                     updated_at=_now().isoformat(), actor=actor)
+                     scout_consult=consult, updated_at=_now().isoformat(), actor=actor)
         studio['panel'] = panel
         self.save_studio(organization, studio)
         return self.panel_view(organization, studio)
 
-    def _check_panel_capacity(self, organization, people):
-        problems = self._limit_problems(organization, people)
+    def _check_panel_capacity(self, organization, studio, stakeholders, consult):
+        problems = self._limit_problems(organization, stakeholders + 1)
         if problems:
             raise ValueError('The stakeholder panel cannot meet: ' + '; '.join(problems)
                              + '. Raise the organization limits first.')
-        self._check_budget(organization, panel_people=people)
+        self._check_budget(organization, panel_people=stakeholders + 1,
+                           scout_advisors=stakeholders if consult else 0)
+        if consult:
+            people = (len(self._studio_bindings(organization, studio)) or 5) + stakeholders
+            problems = self._limit_problems(organization, people)
+            if problems:
+                raise ValueError('A scout meeting with the stakeholders cannot meet: ' + '; '.join(problems)
+                                 + '. Raise the organization limits, or keep the stakeholders to the pitch.')
 
     def _diverse_settings(self, project, studio_settings, taken):
         """A ready CLI and model unlike the studio's and the other stakeholders'.
@@ -465,7 +504,7 @@ class StakeholderPanel:
         scout = self._studio_run_record(organization, run['scout_run_id'])
         while True:
             try:
-                run['evidence'] = self._pitch_pack(scout, ideas)
+                run['evidence'] = self._pitch_pack(scout, ideas, panel=run['panel'])
                 break
             except PitchPackTooLarge:
                 if len(ideas) == 1:
@@ -473,6 +512,7 @@ class StakeholderPanel:
                 # Keep the earliest ideas in this batch. Deferred ideas stay eligible for the next pitch.
                 ideas.pop()
         run['candidate_ids'] = [item['id'] for item in ideas]
+        run['pre_screened_ideas'] = [idea['name'] for idea in run['evidence']['ideas'] if idea.get('pre_screened')]
 
     @staticmethod
     def _pitch_idea(candidate):
@@ -485,7 +525,8 @@ class StakeholderPanel:
             'confidence_dimensions', 'buyer', 'reachable_accounts', 'business_model', 'delivery_effort',
             'alternatives', 'evidence', 'evidence_against',
             'dissent', 'analogue', 'incumbent', 'market_ceiling', 'expansion', 'prior_state', 'assumptions',
-            'kill_criteria', 'review_notes', 'revision_note') if candidate.get(key) not in (None, '', [])}
+            'kill_criteria', 'review_notes', 'revision_note', 'stakeholder_screen')
+            if candidate.get(key) not in (None, '', [])}
         idea['round'] = int(candidate.get('round') or 1)
         idea['economics'] = {key: economics.get(key) for key in keep if key in economics}
         market = ((candidate.get('configuration') or {}).get('market') or {})
@@ -497,12 +538,13 @@ class StakeholderPanel:
             idea['previous_feedback'] = previous
         return idea
 
-    def _pitch_pack(self, scout_run, ideas):
+    def _pitch_pack(self, scout_run, ideas, *, panel=None):
         pitches = [self._pitch_idea(idea) for idea in ideas]
         rounds = {}
         for candidate, idea in zip(ideas, pitches):
             rounds.setdefault(candidate.get('run_id') or '', []).append((candidate, idea))
         sources = []
+        reviewers = set(((panel or {}).get('members') or {}).values())
         for scope, (origin_id, entries) in enumerate(rounds.items(), 1):
             origin = scout_run if origin_id == scout_run['id'] else {}
             if origin_id and not origin:
@@ -510,6 +552,13 @@ class StakeholderPanel:
                     origin = self._studio_run_record(scout_run['organization_id'], origin_id)
                 except ValueError:
                     pass  # Older ideas may only have the pages saved on the candidate.
+            advisors = (origin.get('consult') or {}).get('members') or {}
+            for _, idea in entries:
+                if any(advisors.get(note.get('stakeholder')) in reviewers
+                       for note in idea.get('stakeholder_screen') or []
+                       if isinstance(note, dict) and isinstance(note.get('stakeholder'), str)
+                       and (note.get('objection') or note.get('would_change_view'))):
+                    idea['pre_screened'] = True
             cited = {identity for _, idea in entries for identity in cited_evidence_ids(idea)}
             pages = {page['id']: page for page in origin.get('research') or []
                      if isinstance(page, dict) and page.get('id') in cited}
@@ -532,7 +581,7 @@ class StakeholderPanel:
                          'computed by the gateway from the prices, costs and reach the agents stated.')
         size = lambda: len(json.dumps(pack, ensure_ascii=False).encode())
         # Keep the source evidence when the optional proposal details can make room.
-        for key in ('assumptions', 'expansion', 'prior_state', 'kill_criteria', 'alternatives'):
+        for key in ('assumptions', 'expansion', 'prior_state', 'stakeholder_screen', 'kill_criteria', 'alternatives'):
             if size() <= PANEL_PACK_LIMIT:
                 break
             for idea in pack['ideas']:
@@ -553,10 +602,11 @@ class StakeholderPanel:
             'scout rounds (' + ', '.join(names) + '). When source_scope is present, match an idea\'s citations '
             'to sources with the same source_scope. '
             'Stakeholders: ' + ', '.join(role + ' (' + PANEL_ROLES[role][0] + ')' for role in roles) + '. '
-            'METHOD. Round 1: send every stakeholder the pack and ask for its own review of every idea, one '
-            'stakeholder at a time; do not show a stakeholder any other stakeholder\'s view in round 1. '
-            'Round 2, at most once: share the round-1 objections without saying who raised them and let each '
-            'stakeholder keep or change its verdict, saying why. Record every stakeholder\'s own replies in the '
+            'METHOD. Round 1: share the final idea details and cited sources and ask for a review of every idea, '
+            'one stakeholder at a time. The full pack, including stakeholder_screen and previous_feedback, '
+            'stays with the chair until all first-round reviews are in. '
+            'Round 2, at most once: share round-1 and earlier objections anonymously and let each stakeholder '
+            'keep or change its verdict, saying why. Record every stakeholder\'s own replies in the '
             'transcript. You chair: do not review, do not soften, summarise or merge the reviews, never write '
             'a review for a stakeholder that did not answer, and do not force consensus. '
             'Return one fenced json object: {"reviews":[{"idea":"<exact idea name>","stakeholder":"'
@@ -566,8 +616,12 @@ class StakeholderPanel:
             'the next 120 days; hold: not yet, name what is missing; pass: would not. 1-'
             + str(PANEL_MAX_OBJECTIONS) + ' objections and 0-' + str(PANEL_MAX_QUESTIONS) + ' questions of at '
             'most ' + str(PANEL_POINT) + ' characters each; would_change_mind names the evidence that would '
-            'change the verdict. An idea in round 2 or later lists previous_feedback: say for each earlier '
-            'objection whether the revision answers it. summary states where the stakeholders disagree.')
+            'change the verdict. In round 2, use any previous_feedback to check whether the revision answers '
+            'earlier objections. summary states where the stakeholders disagree.')
+        if any(item.get('stakeholder_screen') for item in run['evidence']['ideas']):
+            prompt += (' Some ideas list stakeholder_screen: the objections the stakeholders raised on a rough '
+                       'shortlist during the scout, with what the studio did about them. In round 2, '
+                       'say whether each screened objection is answered.')
         if len(prompt) > PANEL_PROMPT_LIMIT:
             raise ValueError('The pitch prompt exceeds the discussion budget.')
         return prompt

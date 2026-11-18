@@ -96,6 +96,44 @@ void main() {
     'budget': <String, dynamic>{},
   };
 
+  test('advisor notes stay visible during a new scout', () async {
+    await mount({
+      ...configured(
+        runs: const [
+          {'kind': 'scout', 'state': 'meeting', 'consult_roles': ['investor']},
+          {
+            'kind': 'pitch',
+            'state': 'ready',
+            'pre_screened_ideas': ['Carrier Desk'],
+          },
+          {
+            'kind': 'scout',
+            'state': 'ready',
+            'consult_roles': ['investor', 'customer'],
+            'consulted': ['investor'],
+            'stakeholder_exploration': [
+              {'stakeholder': 'investor', 'overlooked': 'Freight brokers'},
+            ],
+          },
+        ],
+        readiness: const {
+          'can_run': true,
+          'can_scout': false,
+          'scout_blocking': ['panel_sessions'],
+        },
+      ),
+      'panel': {
+        'enabled': true,
+        'roles': ['investor', 'customer'],
+      },
+    });
+    expect(button('Run portfolio now').disabled, isFalse);
+    expect(button('Run scout now').disabled, isTrue);
+    expect(page(), contains('Pre-screened ideas: Carrier Desk'));
+    expect(page(), contains('1 of 2 invited advisors spoke.'));
+    expect(page(), contains('Overlooked segment: Freight brokers'));
+  });
+
   test('a fresh installation is offered the studio, not an organization', () async {
     await mount(
       null,

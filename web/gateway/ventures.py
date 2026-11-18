@@ -170,6 +170,53 @@ replaces the earlier idea.
     Return the strongest eligible ideas up to the round's cap. Omit rejected
     ideas and return an empty list if none qualify.
 '''
+# How the scout uses the stakeholder panel while it researches. Written beside
+# the evidence file, like the checklist, so the prompt stays within budget.
+STUDIO_CONSULT_FILE = 'stakeholders.md'
+STUDIO_CONSULT_METHOD = '''# Talking to the stakeholders during the scout
+
+Written by the gateway for this scout run. The stakeholder agents in the roster
+are identified by the profile IDs below. They attend as advisors. They know their
+markets; they do not write ideas or candidates. The studio members still do
+the research, and the Skeptic still gives the verdict. Ask each stakeholder
+separately with herdr agent prompt, one at a time. Never show one stakeholder
+another's answers. Record every stakeholder's own words in the transcript.
+Treat their answers as research leads. Follow the scout prompt's evidence
+rules: cite supplied evidence in a feed-only run and list any pages you
+use in a web research run. Report a gap when the available evidence leaves
+a question open.
+
+1. **Explore first, before choosing ideas.** Ask every stakeholder, for the
+   focus areas: where do buyers already spend money; which customer segments
+   feel the pain most; which tools or workarounds they use today; and one
+   segment the studio may be overlooking. Leave room for an answer outside
+   the focus list. Use the answers to choose where to look.
+2. **Screen a rough shortlist.** When the studio has a shortlist (a name, one
+   line and the key numbers per idea), send it to every stakeholder and ask
+   for its biggest objection to each idea, and one piece of evidence that
+   would change its view. Use the answers to decide where to spend the
+   remaining research time: look for exactly that evidence.
+3. **Pivot when a segment looks stronger.** If an answer points to a stronger
+   segment or idea, investigate it in this same session and drop the weaker
+   idea. Respect the configured exclusions. Raise a confidence rating only
+   when cited evidence supports it, never because a stakeholder liked the
+   idea. A promising idea with a clear evidence gap can still come back held,
+   with the gap named.
+4. **Report what they said.** In the answer, under "stakeholder_exploration",
+   give one entry per stakeholder:
+   {"stakeholder":"<role>","spend":"...","segments":"...","workarounds":"...",
+   "overlooked":"..."}. Under each candidate, "stakeholder_screen" lists one
+   entry per stakeholder that screened it:
+   {"stakeholder":"<role>","objection":"...","would_change_view":"...",
+   "response":"what the studio found or changed"}. Each text is at most 300
+   characters. Leave out a stakeholder that did not answer: never write an
+   answer for it.
+
+The stakeholders review the final ideas again in the pitch that follows this
+round. That review is theirs, so do not ask them to approve an idea now.
+'''
+SCOUT_EXPLORE_FIELDS = ('spend', 'segments', 'workarounds', 'overlooked')
+SCOUT_SCREEN_FIELDS = ('objection', 'would_change_view', 'response')
 SCOUT_MAX_COMPLAINTS = 5
 # Alternatives that need no page to exist: the buyer's own fallback.
 SCOUT_UNCITED_ALTERNATIVES = ('in_house', 'do_nothing')
@@ -1318,7 +1365,10 @@ class Ventures(StudioOperations, StakeholderPanel):
         enabled = [kind for kind in ('portfolio', 'scout')
                    if policy['studio_' + kind + '_cadence'] != 'off' and before.get('studio_' + kind + '_cadence') == 'off']
         if enabled:
-            problems = self._limit_problems(organization, len(self._studio_bindings(organization)) or 5)
+            people = len(self._studio_bindings(organization)) or 5
+            if 'scout' in enabled:
+                people += len((self._scout_consult(organization) or {}).get('roles', []))
+            problems = self._limit_problems(organization, people)
             if problems:
                 raise ValueError('A scheduled studio meeting could not start: ' + '; '.join(problems)
                                  + '. Raise the limits for the studio first.')
@@ -1390,6 +1440,10 @@ class Ventures(StudioOperations, StakeholderPanel):
                                            + [item['id'] for item in evidence['ventures']]
                                            + [item['id'] for item in evidence['lessons']]),
                    recommendations=[], candidates=[], error='', manual=manual, web_research=bool(web))
+        consult = self._scout_consult(organization, studio) if kind == 'scout' else None
+        if consult:
+            # Frozen with the run: a retry asks the same stakeholders.
+            run['consult'] = consult
         self.save_studio_run(run)
         try:
             result = self._studio_dispatch(organization, run)
@@ -1562,17 +1616,28 @@ class Ventures(StudioOperations, StakeholderPanel):
             if pitch:
                 self._pitch_prepare(organization, run, studio)
             checkout, prepared = self._evidence_checkout(organization, group_id, self._studio_notebook(studio))
+            companions = None
+            if run['kind'] == 'scout':
+                companions = {STUDIO_REVIEW_FILE: STUDIO_REVIEW_CHECKLIST}
+                if run.get('consult'):
+                    companions[STUDIO_CONSULT_FILE] = (
+                        STUDIO_CONSULT_METHOD + '\nUse these exact stakeholder role keys in the answer. '
+                        'Match each profile ID to its alias in the meeting roster.\n\n'
+                        + '\n'.join(role + ': ' + run['consult']['members'][role] for role in run['consult']['roles'])
+                        + '\n')
             target = self._write_pack(checkout, prepared, 'pitch' if pitch else 'studio', run['id'],
                                       run['evidence'], STUDIO_EVIDENCE_LIMIT, 'Venture Studio',
-                                      companions=({STUDIO_REVIEW_FILE: STUDIO_REVIEW_CHECKLIST}
-                                                  if run['kind'] == 'scout' else None))
+                                      companions=companions)
             run['evidence_file'] = str(target)
             run['prompt'] = (self._pitch_prompt(run, target) if pitch
                              else self._studio_prompt(organization, run, target))
         self.save_studio_run(run)  # Frozen: a retry or recovery reuses the exact request.
-        response = self.service.store.action('discuss', dict(
-            request_id='studio-' + run['id'], organization_id=organization,
-            group_id=group_id, prompt=run['prompt']))
+        request = dict(request_id='studio-' + run['id'], organization_id=organization,
+                       group_id=group_id, prompt=run['prompt'])
+        if run.get('consult'):
+            # The stakeholders attend the scout meeting as advisors.
+            request['advisors'] = [run['consult']['members'][role] for role in run['consult']['roles']]
+        response = self.service.store.action('discuss', request)
         self.service.store.update_job(response['id'], studio_run_id=run['id'])
         run.update(job_id=response['id'], state='meeting', error='', failure=None, waiting=None)
         return self.save_studio_run(run)
@@ -1837,6 +1902,9 @@ class Ventures(StudioOperations, StakeholderPanel):
                     '"revises":"<its exact name>" and explain the change in "revision_note". '
                     + ('stakeholder_feedback in the pack is the stakeholder panel critique of earlier ideas: '
                        'use it when weighing a revision. ' if run['evidence'].get('stakeholder_feedback') else '') +
+                    # The method and its answer fields are in the file: the prompt is near its budget.
+                    ('Stakeholder advisors attend: work with them as ' + STUDIO_CONSULT_FILE
+                     + ' beside the pack says. ' if run.get('consult') else '') +
                     'Focus: ' + focus + '. Permanent exclusions: ' + exclusions + '. '
                     'Return one fenced json object: '
                     '{"candidates":[{"name":"...","thesis":"...","product":"...","pricing":"...",'
@@ -2009,19 +2077,30 @@ class Ventures(StudioOperations, StakeholderPanel):
         exclusions = self._studio_policy(run['organization_id'])['studio_exclude']
         revisable = self._revisable(run['organization_id'])
         refused = []
+        consult = run.get('consult') if isinstance(run.get('consult'), dict) else None
+        spoke = self._consult_spoke(consult, result) if consult else set()
         for item in candidates:
             # One invalid candidate is refused on its own, with its reason on
             # the run; it does not discard the valid ones or stall the studio.
             try:
                 parsed.append(self._scout_candidate(run, item, scout_cited, allowed_sources, known + parsed,
                                                     exclusions, revisable))
+                if consult:
+                    screen = self._stakeholder_notes(item.get('stakeholder_screen'), spoke, SCOUT_SCREEN_FIELDS)
+                    if screen:
+                        parsed[-1]['stakeholder_screen'] = screen
             except ValueError as error:
                 label = item.get('name') if isinstance(item, dict) and isinstance(item.get('name'), str) else ''
                 refused.append(dict(name=label[:120], error=redact(str(error))[:800]))
         for candidate in parsed:
             # The pages behind a web-researched idea travel with it, marked as unverified.
             candidate['evidence_links'] = [research[item] for item in candidate['evidence'] if item in research]
-        return dict(summary='', recommendations=[], candidates=parsed, refused_candidates=refused,
+        consulted = {}
+        if consult:
+            consulted = dict(stakeholder_exploration=self._stakeholder_notes(
+                data.get('stakeholder_exploration'), spoke, SCOUT_EXPLORE_FIELDS),
+                consulted=sorted(spoke))
+        return dict(summary='', recommendations=[], candidates=parsed, refused_candidates=refused, **consulted,
                     research=list(research.values()),
                     research_note=redact(str(data.get('research_note') or ''))[:600]
                     if isinstance(data.get('research_note'), str) else '',
@@ -2073,6 +2152,37 @@ class Ventures(StudioOperations, StakeholderPanel):
                 continue
             if url not in seen:
                 seen.add(url)
+                result.append(entry)
+        return result
+
+    @staticmethod
+    def _consult_spoke(consult, job):
+        """The stakeholder roles with their own words in the scout transcript."""
+        contributions = job.get('contributions') if isinstance(job, dict) else None
+        spoke = {item['profile_id'] for item in contributions or []
+                 if isinstance(item, dict) and isinstance(item.get('profile_id'), str)
+                 and isinstance(item.get('content'), str) and item['content'].strip()}
+        return {role for role in consult.get('roles') or [] if (consult.get('members') or {}).get(role) in spoke}
+
+    @staticmethod
+    def _stakeholder_notes(value, spoke, fields):
+        """What stakeholders told the scout, one entry per stakeholder.
+
+        Advisory: an unusable entry is dropped, never a reason to refuse the
+        idea or the run. A stakeholder that did not speak in the meeting
+        cannot have said anything, so its entry is dropped too."""
+        result, seen = [], set()
+        for item in value if isinstance(value, list) else []:
+            role = item.get('stakeholder') if isinstance(item, dict) else None
+            if not isinstance(role, str) or role not in spoke or role in seen:
+                continue
+            entry = dict(stakeholder=role)
+            for field in fields:
+                text = item.get(field)
+                if isinstance(text, str) and text.strip():
+                    entry[field] = redact(' '.join(text.split()))[:SCOUT_POINT_LENGTH]
+            if len(entry) > 1:
+                seen.add(role)
                 result.append(entry)
         return result
 
@@ -2387,7 +2497,7 @@ class Ventures(StudioOperations, StakeholderPanel):
                         'studio_' + kind + '_failures': failures,
                         next_key: (now() + delay).isoformat()}, 'venture_studio_scheduler')
 
-    def _studio_budget(self, organization, policy, extra_daily=0, *, panel_people=None):
+    def _studio_budget(self, organization, policy, extra_daily=0, *, panel_people=None, scout_advisors=None):
         """Projected meetings and agent sessions per day for one organization.
 
         Participants come from the real groups (members plus the facilitator);
@@ -2427,6 +2537,9 @@ class Ventures(StudioOperations, StakeholderPanel):
             group_id = panel.get('group_id')
             panel_people = (participants(group_id, len(panel.get('roles') or []) + 1)
                             if panel.get('enabled') and group_id else 0)
+        # Stakeholders attend the scout meeting as advisors while the panel is on.
+        if scout_advisors is None:
+            scout_advisors = len((self._scout_consult(organization, studio) or {}).get('roles', []))
         weekly = 0
         for kind in ('portfolio', 'scout'):
             cadence = policy.get('studio_' + kind + '_cadence')
@@ -2434,8 +2547,9 @@ class Ventures(StudioOperations, StakeholderPanel):
             weekly += 7 * share
             guaranteed += share
             possible += share
-            sessions_guaranteed += share * studio_people
-            sessions_possible += share * studio_people
+            people = studio_people + (scout_advisors if kind == 'scout' else 0)
+            sessions_guaranteed += share * people
+            sessions_possible += share * people
             if kind == 'scout' and panel_people:
                 # A stakeholder pitch follows a scout round that has ideas to show.
                 possible += share
@@ -2449,14 +2563,15 @@ class Ventures(StudioOperations, StakeholderPanel):
                     over_cap=bool(cap and sessions_possible > cap),
                     active_ventures=len(self._studio_ventures(organization)))
 
-    def _check_budget(self, organization, policy=None, extra_daily=0, *, panel_people=None):
+    def _check_budget(self, organization, policy=None, extra_daily=0, *, panel_people=None, scout_advisors=None):
         """Refuse a change that would push the projected daily sessions past the
         organization's ``daily_session_cap`` (0 keeps the cap off). Only an
         increase is refused, so an organization already over its cap can still
         turn things off."""
         saved_policy = self._studio_policy(organization)
         current = self._studio_budget(organization, saved_policy)
-        budget = self._studio_budget(organization, policy or saved_policy, extra_daily, panel_people=panel_people)
+        budget = self._studio_budget(organization, policy or saved_policy, extra_daily,
+                                     panel_people=panel_people, scout_advisors=scout_advisors)
         if budget['over_cap'] and budget['max_agent_sessions'] > current['max_agent_sessions']:
             raise ValueError('This would project up to ' + str(budget['max_agent_sessions'])
                              + ' agent sessions a day, above the organization cap of '
@@ -2484,7 +2599,9 @@ class Ventures(StudioOperations, StakeholderPanel):
                      'refused_candidates', 'failure', 'waiting', 'auto', 'auto_error', 'manual',
                      'web_research', 'research', 'research_note', 'suggested_sources', 'reread',
                      'scout_run_id', 'candidate_ids', 'review_count', 'missing', 'unverified', 'problems',
-                     'panel_summary')}
+                     'panel_summary', 'consulted', 'stakeholder_exploration', 'pre_screened_ideas')}
+            if run.get('consult'):
+                item['consult_roles'] = run['consult']['roles']
             item['candidates'] = [{key: candidate.get(key) for key in ('id', 'name', 'state', 'confidence')}
                                   for candidate in run.get('candidates') or []]
             if run.get('state') == 'needs_attention':
