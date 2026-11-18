@@ -32,6 +32,9 @@ AUTO_CREATE_PER_RUN = 1
 AUTO_ACTOR = 'venture_studio_auto'
 # A launch binding in one of these states never becomes a live session by itself.
 FAILED_BINDINGS = ('needs_attention', 'uncertain', 'error')
+# Every other unreleased launch state is one meeting preparation refuses to
+# reuse ("inspect the existing session"), so repair treats it as failed too.
+LIVE_BINDINGS = ('not_started', 'queued', 'running', 'persona_sent', 'waiting_for_input', 'waiting_environment')
 HERDR_CACHE_SECONDS = 5
 RUNTIME_CACHE_SECONDS = 60
 
@@ -338,7 +341,7 @@ class StudioOperations:
                                facilitator=identity == group.get('facilitator_id'),
                                state=run.get('state') or 'not_started', job_id=run.get('id', ''),
                                error=redact(str(run.get('error') or ''))[:300],
-                               failed=run.get('state') in FAILED_BINDINGS))
+                               failed=(run.get('state') or 'not_started') not in LIVE_BINDINGS))
         return result
 
     def _limit_problems(self, organization, people):
@@ -692,6 +695,12 @@ class StudioOperations:
                 record('sessions', True, 'Released the failed session of ' + binding['name'] + '.')
             except (ValueError, OSError) as error:
                 record('sessions', False, binding['name'] + ': ' + str(error))
+        try:
+            chair = self._refresh_panel_chair(organization, studio)
+            if chair:
+                record('sessions', True, chair)
+        except (ValueError, OSError) as error:
+            record('sessions', False, 'Stakeholder panel chair: ' + str(error))
         if any(not item['ok'] for item in done):
             return finish()
         if getattr(store, 'supports_discussion_preparation', False) is True:

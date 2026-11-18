@@ -116,6 +116,39 @@ class StakeholderPanel:
         studio = studio if studio is not None else self._studio(organization)
         return self._group_bindings((studio.get('panel') or {}).get('group_id'))
 
+    def _refresh_panel_chair(self, organization, studio=None):
+        """Release the chair's session when it runs on another model than the
+        first stakeholder's, so the next pitch starts it on the right one.
+
+        The chair runs on the first stakeholder's CLI and model, but a session
+        keeps the model it started with: after the panel is set up again, the
+        old chair would go on chairing (and writing the transcript) on the old
+        model. Returns what was done, or '' when nothing was needed."""
+        studio = studio if studio is not None else self._studio(organization)
+        group_id = (studio.get('panel') or {}).get('group_id')
+        if not group_id:
+            return ''
+        store = self.service.store
+        snapshot = store.snapshot(live_status=False)
+        group = next((item for item in snapshot.get('groups', [])
+                      if item.get('id') == group_id and not item.get('removed_at')), None)
+        if not group or not group.get('members') or not group.get('facilitator_id'):
+            return ''
+        first = next((item for item in snapshot.get('profiles', []) if item.get('id') == group['members'][0]), None)
+        run = next((job for job in reversed(snapshot.get('jobs', [])) if job.get('kind') == 'launch'
+                    and job.get('profile_id') == group['facilitator_id']
+                    and job.get('state') not in ('released', 'finished')), None)
+        if not first or not run or run.get('state') != 'persona_sent':
+            return ''
+        started = run.get('profile') if isinstance(run.get('profile'), dict) else {}
+        keys = ('runtime', 'provider', 'model', 'reasoning')
+        if all((started.get(key) or '') == (first.get(key) or '') for key in keys):
+            return ''
+        store.action('release', dict(request_id='panel-chair-release-' + run['id'], organization_id=organization,
+                                     job_id=run['id']))
+        return ('Released the stakeholder panel chair, which ran on ' + model_key(started) + '; the next pitch '
+                'starts it on ' + model_key(first) + '.')
+
     def _panel_enabled(self, organization):
         panel = self._panel(organization)
         return bool(panel.get('enabled') and panel.get('group_id'))
@@ -354,6 +387,10 @@ class StakeholderPanel:
         transcript. The pack is built once, from the ideas as they are now:
         an idea edited since the scout round is pitched as edited, and one
         decided or removed meanwhile is left out."""
+        try:
+            self._refresh_panel_chair(organization, studio)
+        except ValueError as error:  # Owned by another meeting: chair on the old session this time.
+            logging.warning('Stakeholder panel chair not refreshed: %s', redact(str(error)))
         panel = self.panel_view(organization, studio)
         run['panel'] = dict(roles=panel['roles'], members=panel['members'], settings=panel['settings'],
                             models=panel['models'], independent=panel['independent'])

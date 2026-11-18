@@ -2693,9 +2693,17 @@ class VentureTests(unittest.TestCase):
         self.scout_with(candidate('Carrier Desk'))
         pitch, = self.pitch_runs()
         # The investor's session stopped on a startup question; preparation refused to reuse it.
-        self.jobs.append(dict(id='d' * 32, kind='launch', state='needs_attention', organization_id='org',
+        # Any unreleased state preparation will not reuse counts as stuck, not only needs_attention.
+        self.jobs.append(dict(id='d' * 32, kind='launch', state='cancelled', organization_id='org',
                               profile_id=panel['members']['investor'],
                               error='The agent needs a decision; no prompt input was sent.'))
+        # The chair still runs on the model the first stakeholder had before the panel changed.
+        group = next(item for item in self.groups if item['id'] == panel['group_id'])
+        chair = next(item for item in self.profiles if item['id'] == group['facilitator_id'])
+        chair.update(runtime=panel['settings']['investor']['runtime'],
+                     model=panel['settings']['investor'].get('model', ''))
+        self.jobs.append(dict(id='e' * 32, kind='launch', state='persona_sent', organization_id='org',
+                              profile_id=chair['id'], profile=dict(chair, runtime='opencode', model='deepseek-v4.1-flash')))
         job = next(item for item in self.jobs if item['id'] == pitch['job_id'])
         job.update(state='needs_attention',
                    error='Investor (stakeholder): inspect the existing session before meeting preparation')
@@ -2711,6 +2719,10 @@ class VentureTests(unittest.TestCase):
         self.assertTrue(result['healthy'], result['steps'])
         launch = next(item for item in self.jobs if item['id'] == 'd' * 32)
         self.assertEqual((launch['state'], job['state'], self.pitch_runs()[0]['state']), ('released', 'queued', 'meeting'))
+        chair_run = next(item for item in self.jobs if item['id'] == 'e' * 32)
+        self.assertEqual(chair_run['state'], 'released')
+        self.assertTrue(any('panel chair, which ran on opencode/deepseek-v4.1-flash' in item['detail']
+                            for item in result['steps']), result['steps'])
 
     def test_repair_starts_herdr_and_sends_a_prompt_that_never_arrived(self):
         self.setup_studio_manual()
