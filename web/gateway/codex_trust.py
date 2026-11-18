@@ -10,6 +10,7 @@ An existing entry for the root, trusted or not, is left alone so an operator's
 own choice wins, and a configuration file that does not parse, or is a
 symbolic link, is never rewritten.
 """
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -48,8 +49,24 @@ def trust_root(project, projects):
     return source
 
 
+@dataclass(frozen=True)
+class ChildrenOf:
+    """Every project root directly inside ``path``, as ``"ventures/*"`` approves.
+
+    The gateway creates a new notebook for every venture and for the studio,
+    each a new root Codex asks about. One folder entry approves them all,
+    without approving the folder itself or anything deeper."""
+    path: Path
+
+
+def is_approved(root, roots):
+    return root in roots or any(isinstance(entry, ChildrenOf) and root.parent == entry.path for entry in roots)
+
+
 def approved_roots(value, projects):
-    """Read exact project roots from a deployment setting, relative to the managed directory or absolute."""
+    """Read project roots from a deployment setting, relative to the managed
+    directory or absolute. An entry ending in ``/*`` approves each project
+    directly inside that folder."""
     if not value:
         return frozenset()
     managed = Path(projects).resolve()
@@ -58,12 +75,24 @@ def approved_roots(value, projects):
         if not isinstance(names, list) or any(not isinstance(name, str) or not name.strip() or '\0' in name
                                                for name in names):
             raise ValueError
-        roots = frozenset((managed / name).resolve() for name in names)
-        if any(root == managed or not root.is_relative_to(managed) for root in roots):
-            raise ValueError
+        roots = set()
+        for name in names:
+            folder = name.strip().rstrip('/')
+            if folder.endswith('/*'):
+                parent = (managed / folder[:-2]).resolve()
+                # A folder of projects, never the projects directory itself.
+                if parent == managed or not parent.is_relative_to(managed) or '*' in folder[:-2]:
+                    raise ValueError
+                roots.add(ChildrenOf(parent))
+                continue
+            root = (managed / folder).resolve()
+            if root == managed or not root.is_relative_to(managed) or '*' in folder:
+                raise ValueError
+            roots.add(root)
     except (OSError, ValueError, RuntimeError) as error:
-        raise ValueError('HERDR_CODEX_TRUST_PROJECTS must be a JSON list of project roots inside HERDR_PROJECTS.') from error
-    return roots
+        raise ValueError('HERDR_CODEX_TRUST_PROJECTS must be a JSON list of project roots inside HERDR_PROJECTS, '
+                         'or folders of them written as "ventures/*".') from error
+    return frozenset(roots)
 
 
 def ensure_trusted(project, projects, home=None, *, approved=(), codex_home=None):
@@ -71,7 +100,7 @@ def ensure_trusted(project, projects, home=None, *, approved=(), codex_home=None
     if not approved:
         return False
     root = trust_root(project, projects)
-    if root not in approved:
+    if root is None or not is_approved(root, approved):
         return False
     directory = Path(codex_home) if codex_home else Path(home or Path.home()) / '.codex'
     if not directory.is_absolute():

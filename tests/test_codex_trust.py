@@ -78,6 +78,27 @@ class CodexTrustTests(unittest.TestCase):
         self.assertFalse(self.ensure(self.repository, approved=approved))
         self.assertEqual(self.config.read_bytes(), refused.encode())
 
+    def test_a_folder_entry_trusts_each_project_directly_inside_it(self):
+        # Every venture and the studio get their own generated notebook.
+        approved = approved_roots('["ventures/*"]', self.projects)
+        notebook = self.projects / 'ventures' / 'studio-venture-studio-96bef5ee'
+        (notebook / '.git').mkdir(parents=True)
+        self.assertTrue(self.ensure(self.repository / 'docs', approved=approved))
+        self.assertTrue(self.ensure(notebook, approved=approved))
+        self.assertEqual(set(self.trusted()), {str(self.repository), str(notebook)})
+        # Not the folder itself, nothing deeper and nothing beside it.
+        deeper = self.projects / 'ventures' / 'group' / 'inner'
+        beside = self.projects / 'other'
+        for folder in (deeper, beside):
+            folder.mkdir(parents=True)
+            self.assertFalse(self.ensure(folder, approved=approved))
+        self.assertFalse(self.ensure(self.projects / 'ventures', approved=approved))
+        self.assertEqual(set(self.trusted()), {str(self.repository), str(notebook)})
+        for wrong in ('["*"]', '["/*"]', '["../*"]', '["ven*/studio"]', '["ventures/*/*"]'):
+            with self.subTest(setting=wrong):
+                with self.assertRaisesRegex(ValueError, 'folders of them'):
+                    approved_roots(wrong, self.projects)
+
     def test_custom_codex_home_with_non_ascii_project_and_crlf_configuration(self):
         directory = self.home / 'codex-custom'
         directory.mkdir(parents=True)

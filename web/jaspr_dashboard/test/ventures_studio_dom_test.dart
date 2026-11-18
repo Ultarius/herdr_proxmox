@@ -96,6 +96,33 @@ void main() {
     'budget': <String, dynamic>{},
   };
 
+  test('usage status shows the affected meeting and both times', () async {
+    const hold = {
+      'name': 'Skeptic',
+      'reset_at': '2026-11-18T22:31:00Z',
+      'retry_at': '2026-11-18T22:28:00Z',
+    };
+    await mount({
+      ...configured(
+        runs: const [
+          {
+            'kind': 'scout',
+            'state': 'ready',
+            'skeptic_silent': true,
+            'skeptic_usage': hold,
+          },
+        ],
+      ),
+      'usage_holds': const {'scout': hold},
+    });
+    expect(page(), contains('Scout uses Skeptic, which hit its usage limit.'));
+    expect(page(), contains('Estimated provider reset at'));
+    expect(page(), contains('Next CLI retry at'));
+    expect(page(), contains('Ideas from this scout need manual approval.'));
+    expect(page(), contains('A provider usage limit was observed.'));
+    expect(button('Run portfolio now').disabled, isFalse);
+  });
+
   test('advisor notes stay visible during a new scout', () async {
     await mount({
       ...configured(

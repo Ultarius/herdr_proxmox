@@ -1,5 +1,5 @@
 import base64
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import hashlib
 import html
 import json
@@ -18,6 +18,7 @@ from contributions import Contributions
 import project_git
 import venture_feeds
 import venture_notebook
+import venture_studio
 import ventures
 
 
@@ -1011,6 +1012,175 @@ class VentureTests(unittest.TestCase):
         self.assertEqual(policy['studio_portfolio_cadence'], 'daily')
         summary = self.ventures._studio_summary('org')
         self.assertIn('daily_meetings', summary['budget'])
+    def live_studio_sessions(self, screens):
+        """A persona_sent session for every studio agent; ``screens`` maps a
+        profile id to what its terminal shows."""
+        for profile in self.profiles:
+            self.jobs.append(dict(id=uuid.uuid4().hex, kind='launch', state='persona_sent', organization_id='org',
+                                  profile_id=profile['id'], alias='alias-' + profile['id'][:4]))
+        aliases = {'alias-' + identity[:4]: screen for identity, screen in screens.items()}
+
+        def command(*args, **kwargs):
+            if args[:2] == ('agent', 'read'):
+                return dict(output=aliases.get(args[2], 'Waiting for input'))
+            return {}
+        self.store.command.side_effect = command
+        return aliases
+
+    @contextmanager
+    def usage_clock(self):
+        start = ventures.now()
+        elapsed = timedelta()
+
+        def advance(delta):
+            nonlocal elapsed
+            elapsed += delta
+
+        with patch.object(venture_studio, 'datetime', wraps=datetime) as wall, \
+                patch.object(venture_studio, 'time') as clock:
+            wall.now.side_effect = lambda tz: (start + elapsed).astimezone(tz)
+            clock.monotonic.side_effect = lambda: elapsed.total_seconds()
+            yield advance
+
+    def test_a_scheduled_usage_hold_rechecks_and_releases_early(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.studio(mode='studio_policy', studio_portfolio_cadence='daily')
+        screens = self.live_studio_sessions({'r' * 32: (
+            '5 hour usage limit reached. It will reset in 4 hours 31 minutes. [retrying in 4h 28m attempt #1]')})
+        self.due('portfolio')
+        with self.usage_clock() as elapse:
+            self.ventures.advance()
+            self.assertEqual(self.studio_runs(), [])  # Nothing started while the Skeptic cannot answer.
+            policy = self.ventures._studio_policy('org')
+            self.assertIn('Skeptic hit its usage limit', policy['studio_portfolio_waiting'])
+            self.assertIn('Estimated provider reset', policy['studio_portfolio_waiting'])
+            self.assertIn('Next CLI retry', policy['studio_portfolio_waiting'])
+            self.assertFalse(policy.get('studio_portfolio_failures'))
+            hold = self.ventures._studio_summary('org')['usage_holds']['portfolio']
+            self.assertEqual(hold['name'], 'Skeptic')
+            self.assertEqual(datetime.fromisoformat(hold['reset_at']) - datetime.fromisoformat(hold['retry_at']),
+                             timedelta(minutes=3))
+            with self.assertRaisesRegex(ValueError, 'Skeptic hit its usage limit'):
+                self.studio(mode='studio_run', kind='portfolio')
+            elapse(timedelta(minutes=1))
+            self.ventures.advance()
+            self.assertEqual(self.ventures._studio_summary('org')['usage_holds']['portfolio'], hold)
+            # The real scheduler rechecks and starts early when the screen clears.
+            screens.clear()
+            elapse(timedelta(minutes=1))
+            self.ventures.advance()
+            self.ventures.advance()
+            self.assertEqual([run['state'] for run in self.studio_runs()], ['meeting'])
+            self.assertEqual(self.ventures._studio_policy('org')['studio_portfolio_waiting'], '')
+
+    def test_a_static_usage_countdown_does_not_postpone_a_due_run_past_its_reset(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.studio(mode='studio_policy', studio_portfolio_cadence='daily')
+        self.live_studio_sessions({'r' * 32: 'Usage limit reached. It will reset in 2 hours.'})
+        self.due('portfolio')
+        with self.usage_clock() as elapse:
+            self.ventures.advance()
+            self.assertEqual(self.studio_runs(), [])
+            elapse(timedelta(hours=2, seconds=1))
+            self.ventures.advance()
+            self.assertEqual([run['state'] for run in self.studio_runs()], ['meeting'])
+
+    def test_a_limit_with_no_stated_reset_holds_briefly_and_a_stale_screen_stops_holding(self):
+        self.setup_studio_manual()
+        self.live_studio_sessions({'q' * 32: "You've hit your usage limit. Try again at 3:05 PM."})
+        targets = self.ventures._usage_targets('org', 'portfolio')
+        with self.usage_clock() as elapse:
+            self.ventures._usage_probe(targets)
+            hold = self.ventures._usage_hold(targets)
+            self.assertIsNone(hold['reset_at'])
+            self.assertIsNone(hold['retry_at'])
+            elapse(timedelta(hours=7))
+            self.ventures._usage_probe(targets)
+            self.assertIsNone(self.ventures._usage_hold(targets))
+
+    def test_due_scout_checks_advisors_even_after_a_portfolio_probe(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        panel = self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        self.studio(mode='studio_policy', studio_scout_cadence='daily')
+        advisor = panel['members']['investor']
+        self.live_studio_sessions({advisor: 'Usage limit reached. It will reset in 2 hours.'})
+        self.due('scout')
+        portfolio = self.ventures._usage_targets('org', 'portfolio')
+        with self.usage_clock():
+            self.assertTrue(self.ventures._usage_probe_soon(portfolio))
+            self.ventures.advance()
+            self.assertEqual(self.studio_runs(), [])
+            self.assertIn('Investor (stakeholder) hit its usage limit',
+                          self.ventures._studio_policy('org')['studio_scout_waiting'])
+            holds = self.ventures._studio_summary('org')['usage_holds']
+            self.assertNotIn('portfolio', holds)
+            self.assertEqual(holds['scout']['profile_id'], advisor)
+            self.assertEqual(self.studio(mode='studio_run', kind='portfolio')['state'], 'meeting')
+
+    def test_a_meeting_waiting_on_a_limited_agent_says_so(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='portfolio')
+        self.live_studio_sessions({'r' * 32: 'usage limit reached. It will reset in 2 hours.'})
+        job = next(job for job in self.jobs if job['id'] == run['job_id'])
+        job.update(state='waiting_for_members', progress='Skeptic: waiting for current execution')
+        self.ventures.advance()
+        waiting = self.studio_runs()[0]['waiting']
+        self.assertEqual((waiting['category'], waiting['agent']), ('usage', 'Skeptic'))
+        self.assertIn('automatically', waiting['help'])
+
+    def test_a_waiting_scout_uses_its_frozen_advisors_after_the_setting_changes(self):
+        studio = self.setup_studio_manual()
+        panel = self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        advisor = panel['members']['investor']
+        run = self.studio(mode='studio_run', kind='scout')
+        job = next(job for job in self.jobs if job['id'] == run['job_id'])
+        studio_group = next(group for group in self.groups if group['id'] == studio['group_id'])
+        job.update(state='waiting_for_members', progress='Waiting for current execution',
+                   group=dict(studio_group, members=studio_group['members'] + job['advisors']))
+        self.setup_panel(scout_consult=False)
+        self.live_studio_sessions({advisor: 'Usage limit reached. It will reset in 2 hours.'})
+        self.ventures.advance_studio()
+        waiting = self.studio_runs()[0]['waiting']
+        self.assertEqual((waiting['category'], waiting['profile_id']), ('usage', advisor))
+        self.assertNotIn('scout', self.ventures._studio_summary('org')['usage_holds'])
+
+    def test_a_scout_whose_skeptic_never_spoke_is_flagged_and_never_created_unattended(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        studio = self.ventures._studio('org')
+        studio['team'] = dict(members=dict(portfolio='p' * 32, scout='q' * 32, critic='r' * 32, analyst='s' * 32))
+        self.ventures.save_studio('org', studio)
+        self.studio(mode='studio_policy', studio_mode='autonomous', studio_auto_min_confidence=0,
+                    studio_sources=['https://news.example/feed'], studio_max_candidates=3)
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            run = self.studio(mode='studio_run', kind='scout')
+        # The result is judged against the Skeptic who was invited. Saving a
+        # different Skeptic now should not change how we read that transcript.
+        self.assertEqual(run['skeptic_id'], 'r' * 32)
+        studio = self.ventures._studio('org')
+        studio['team']['members']['critic'] = 's' * 32
+        self.ventures.save_studio('org', studio)
+        self.live_studio_sessions({'r' * 32: 'Usage limit reached. It will reset in 2 hours.'})
+        job = next(job for job in self.jobs if job['id'] == run['job_id'])
+        job.update(state='artifact_ready', result='```json\n' + json.dumps(dict(
+            candidates=[candidate('Carrier Desk', 'N1')])) + '\n```',
+            contributions=[dict(profile_id='s' * 32, name='Research Analyst', round=1, content='Carrier Desk.')])
+        self.ventures.advance()
+        done = next(item for item in self.studio_runs() if item['id'] == run['id'])
+        self.assertTrue(done['skeptic_silent'])
+        self.assertEqual(done['skeptic_usage']['profile_id'], 'r' * 32)
+        summary = self.ventures._studio_summary('org')['runs'][0]
+        self.assertTrue(summary['skeptic_silent'])
+        self.assertEqual(summary['skeptic_usage']['profile_id'], 'r' * 32)
+        stored, = [item for item in self.stored_candidates() if item['name'] == 'Carrier Desk']
+        self.assertTrue(stored['skeptic_silent'])
+        self.assertEqual(stored['state'], 'proposed')
+        self.assertIn('Skeptic did not speak', json.dumps(done.get('auto') or []))
+
     def test_studio_schedule_starts_one_due_run_and_advances_the_window(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())
@@ -2252,6 +2422,34 @@ class VentureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Only a studio run needing attention'):
             self.studio(mode='studio_recover', run_id=run['id'], inspected=True)
 
+    def test_a_service_idea_without_its_pilot_fee_is_refused_and_the_scout_is_told_why(self):
+        # FysioFront: a productised service with a success fee only; its
+        # EUR 1,800 pilot was in the first offer but not in revenue_lines.
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='scout')
+        job = next(item for item in self.jobs if item['id'] == run['job_id'])
+        prompt = ' '.join(job['prompt'].split())
+        self.assertIn('service and productised_service a one_off one (the first offer\'s fee)', prompt)
+        checklist = (Path(run['evidence_file']).parent / ventures.STUDIO_REVIEW_FILE).read_text(encoding='utf-8')
+        self.assertIn('a pilot or setup fee is a `one_off` line', ' '.join(checklist.split()))
+        idea = self.web_candidate('FysioFront')
+        currency = idea['configuration']['market']['currency']
+        idea['business_model'] = dict(type='productised_service', revenue_lines=[dict(
+            kind='per_unit', label='Verified filled appointment', amount=6, currency=currency, period='month',
+            unit='filled appointment', units=30)])
+        done = self.complete_studio(run, {'candidates': [idea], 'research': self.RESEARCH})
+        self.assertIn('needs a one-off revenue line', done['refused_candidates'][0]['error'])
+        # Reading the same answer again under the same rules adds nothing, and says so.
+        again = self.studio(mode='studio_recover', run_id=run['id'], inspected=True)
+        self.assertEqual((again['reread']['added'], again['reread']['still_refused']), ([], ['FysioFront']))
+        # With the pilot fee as a one_off line, the same idea passes.
+        idea['business_model']['revenue_lines'].append(dict(kind='one_off', label='90-day pilot', amount=1800,
+                                                            currency=currency))
+        job['result'] = '```json\n' + json.dumps({'candidates': [idea], 'research': self.RESEARCH}) + '\n```'
+        fixed = self.studio(mode='studio_recover', run_id=run['id'], inspected=True)
+        self.assertEqual(fixed['reread']['added'], ['FysioFront'])
+
     def test_approval_can_attach_the_studio_sources_to_an_idea_without_feeds(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())
@@ -2921,6 +3119,9 @@ class VentureTests(unittest.TestCase):
         self.setup_studio_manual()
         self.add_venture_group(self.create())
         panel = self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        studio = self.ventures._studio('org')
+        studio['team']['members'] = {'critic': 'r' * 32}
+        self.ventures.save_studio('org', studio)
         self.assertIs(panel['scout_consult'], True)
         self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'], studio_max_candidates=3)
         with self.news(feed_item(venture_feeds.now().isoformat())):
@@ -2955,6 +3156,7 @@ class VentureTests(unittest.TestCase):
         self.ventures.advance()
         done = next(item for item in self.studio_runs() if item['id'] == run['id'])
         self.assertEqual(done['state'], 'ready', done.get('error'))
+        self.assertTrue(done['skeptic_silent'])
         self.assertEqual(done['consulted'], ['investor'])
         self.assertEqual([entry['stakeholder'] for entry in done['stakeholder_exploration']], ['investor'])
         self.assertEqual(done['stakeholder_exploration'][0]['overlooked'], 'Freight brokers')

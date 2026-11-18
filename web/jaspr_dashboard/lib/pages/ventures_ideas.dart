@@ -100,17 +100,30 @@ List<Component> _refusals(
   );
   if (refused.isEmpty) return const [];
   final one = refused.length == 1;
+  // Reading again applies the gateway's current rules to the same saved
+  // answer: without saying what it found, an unchanged result looks as if
+  // the button did nothing.
+  final reread = scout?['reread'] is Map
+      ? Map<String, dynamic>.from(scout!['reread'] as Map)
+      : null;
+  final added = (reread?['added'] as List? ?? const []).map((v) => '$v');
   return [
     notice(
       'The last scout review proposed ${refused.length} ${one ? 'idea' : 'ideas'} '
       'the gateway refused, so ${one ? 'it is' : 'they are'} not in this queue. '
-      'If the gateway has since been updated, read the saved answer again; otherwise run the scout '
-      'again, as its prompt states the rules that were broken.',
+      'Reading the saved answer again only helps after a gateway update changed the rules; '
+      'otherwise run the scout again, as its prompt states the rules that were broken.',
       error: true,
     ),
     for (final item in refused)
       paragraph(
         '${item['name'] ?? 'Unnamed'}: ${item['error'] ?? 'no reason recorded'}',
+      ),
+    if (reread != null)
+      paragraph(
+        'Read again ${displayTime(reread['at'])}: '
+        '${added.isEmpty ? 'nothing new passed under the current rules' : 'added ${added.join(', ')}'}. '
+        '${refused.isEmpty ? '' : 'The same answer will be refused again; run the scout for a new one.'}',
       ),
     if (onReread != null && scout != null)
       actions([
@@ -215,19 +228,15 @@ Component venturesIdeas({
     ..._refusals(latestScout, busy: busy, onReread: onReread),
   ];
   if (candidates.isEmpty) {
-    return card(
-      'Ideas',
-      [
-        ...refusals,
-        emptyState(
-          refusals.isEmpty && latestScout == null
-              ? 'No venture candidates yet for $organizationName. Set up the Venture Studio and run a scout review.'
-              : 'No venture candidates waiting for $organizationName.',
-          iconName: 'lightbulb',
-        ),
-      ],
-      subtitle: 'Candidates stay proposals until an administrator creates one.',
-    );
+    return card('Ideas', [
+      ...refusals,
+      emptyState(
+        refusals.isEmpty && latestScout == null
+            ? 'No venture candidates yet for $organizationName. Set up the Venture Studio and run a scout review.'
+            : 'No venture candidates waiting for $organizationName.',
+        iconName: 'lightbulb',
+      ),
+    ], subtitle: 'Candidates stay proposals until an administrator creates one.');
   }
   // Strongest first, so the most promising idea is the one read first.
   final open =
@@ -640,6 +649,12 @@ Component candidateDiligence(Map<String, dynamic> item) {
     if (dissent != null)
       paragraph(
         'Skeptic: ${dissent['verdict'] ?? ''} — ${dissent['summary'] ?? ''}',
+      ),
+    if (item['skeptic_silent'] == true)
+      notice(
+        'The Skeptic did not speak in this scout meeting, so this verdict was written for it. '
+        'The studio never creates this idea by itself.',
+        error: true,
       ),
     if (dimensions != null)
       disclosure('Confidence dimensions', [

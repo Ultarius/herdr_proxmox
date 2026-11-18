@@ -26,6 +26,24 @@ const _modeLabels = {
   'autonomous': 'Autonomous: the studio creates ventures within the caps',
 };
 
+const _usageMeetingLabels = {
+  'portfolio': 'Portfolio review',
+  'scout': 'Scout',
+  'pitch': 'Stakeholder pitch',
+};
+
+String _usageTiming(Map hold) {
+  final reset = hold['reset_at'];
+  final retry = hold['retry_at'];
+  return [
+    if (reset != null)
+      'Estimated provider reset at ${displayTime(reset)}.'
+    else
+      'Provider reset time unavailable.',
+    if (retry != null) 'Next CLI retry at ${displayTime(retry)}.',
+  ].join(' ');
+}
+
 /// Portfolio review and venture scouting, separate from the operating loop.
 Component venturesStudio({
   required Map<String, dynamic>? studio,
@@ -301,6 +319,13 @@ Component venturesStudio({
           'Save the studio settings to repair them.',
           error: true,
         ),
+      if (studio?['usage_holds'] case final Map holds)
+        for (final entry in _usageMeetingLabels.entries)
+          if (holds[entry.key] case final Map hold)
+            notice(
+              '${entry.value} uses ${hold['name'] ?? 'an agent'}, which hit its usage limit. '
+              '${_usageTiming(hold)} The studio checks again automatically.',
+            ),
       _panelSection(
         studio?['panel'] is Map
             ? Map<String, dynamic>.from(studio!['panel'] as Map)
@@ -384,6 +409,12 @@ Component venturesStudio({
         paragraph('No scout review yet.')
       else
         disclosure('Scout review · ${latestScout['state']}', [
+          if (latestScout['skeptic_silent'] == true)
+            notice([
+              'The Skeptic did not contribute. Ideas from this scout need manual approval.',
+              if (latestScout['skeptic_usage'] case final Map hold)
+                'A provider usage limit was observed. ${_usageTiming(hold)}',
+            ].join(' ')),
           if ('${latestScout['error'] ?? ''}'.isNotEmpty)
             notice('${latestScout['error']}', error: true)
           else

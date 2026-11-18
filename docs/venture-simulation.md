@@ -757,6 +757,7 @@ error text, the agent it names and one recovery action.
 | `model` | The model is not offered | Open CLI accounts |
 | `team` | An agent session did not start | Repair studio |
 | `limits` | An organization limit blocks the meeting | Raise limits |
+| `usage` | An agent hit its provider usage limit | None: runs continue after the reset |
 | `evidence` | The evidence file could not be prepared | Repair studio |
 | `result` | The answer did not validate | Dismiss run |
 | `meeting` | The meeting stopped for another reason | Open the studio group |
@@ -765,6 +766,33 @@ The category is derived from the error text, so an unusual message falls back
 to `meeting`. A meeting that is still running but waits (a member blocked on a
 decision, a session budget) shows that as `waiting` on the run instead of
 looking like progress.
+
+### Provider usage limits
+
+A provider can leave its CLI waiting for usage to reset while Herdr still
+reports the session as working or idle. The gateway reads the visible terminal
+for recognizable provider status messages with an associated reset or retry.
+
+- **Scheduled runs defer and recheck automatically.** A background check
+  reads the live sessions for the due meeting, including advisors only when
+  they join the scout. The check repeats about once a minute while the meeting
+  is due. An unchanged countdown keeps its original deadline, and a cleared
+  screen lets a run start early. The Studio tab shows an estimated provider
+  reset and a CLI retry separately. If the only timing shown is a local clock
+  time with no time zone, an unchanged notice stops deferring the run after
+  six hours. Usage deferrals leave the scheduler's failure and backoff counts alone.
+- **An operator's run checks its sessions immediately.** It reports any active
+  usage limit affecting its participants.
+- **A meeting already waiting or running** is checked against the roster that
+  was saved when it was queued. The run shows the affected agent and timing
+  when the gateway detects a limit.
+
+A scout meeting can still finish without a limited member. The Skeptic's
+verdict on each idea (`dissent`) is written by the chair. When the transcript
+has the other agents' words but none of the Skeptic's, every idea from that
+round is marked `skeptic_silent`. The scout keeps the expected Skeptic's ID
+and shows any observed usage limit alongside the completed result. The Ideas
+card flags the missing review, and those ideas require manual approval.
 
 ### Repair
 

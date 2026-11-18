@@ -386,8 +386,23 @@ Codex folder trust is recorded only for project roots that the deployment
 operator has approved in `HERDR_CODEX_TRUST_PROJECTS`. Set it in the gateway
 service environment as a JSON array, for example `["ventures/studio"]`.
 Entries are exact roots under `HERDR_PROJECTS` and may be relative to that
-directory or absolute. The gateway uses the service's `CODEX_HOME` if set.
-Existing trust entries and explicit refusals take precedence.
+directory or absolute. An entry ending in `/*` approves each project root
+directly inside that folder: `["ventures/*"]` covers the studio notebook and
+every venture notebook the gateway creates, but not the `ventures` folder
+itself, anything deeper, or other projects. `*` on its own is refused. The
+gateway uses the service's `CODEX_HOME` if set. Existing trust entries and
+explicit refusals take precedence.
+
+Codex also asks you to review hooks when one is new or changed. Herdr's own
+Codex integration installs one (`herdr-agent-state.sh`, which reports agent
+status), so the prompt appears after the integration is installed or
+updated. Codex records hook trust against each hook's hash and documents no
+configuration key to pre-record it. The gateway does not pass
+`--dangerously-bypass-hook-trust`, because that would also run hooks an agent
+could add to a trusted project. Trust the hook once in Codex instead: answer
+the parked session's prompt over SSH, or run `codex` as the gateway user and
+use `/hooks`. Every session for that user then shares the decision until the
+hook changes again.
 
 Choose **Workspace sandbox, no command prompts** in a Codex agent's
 permissions, a Codex-led group's facilitator permissions, or explicitly

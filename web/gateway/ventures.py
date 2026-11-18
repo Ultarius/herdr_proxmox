@@ -41,7 +41,7 @@ import venture_engine as engine
 import venture_feeds
 import venture_fx
 import venture_notebook
-from venture_studio import STUDIO_MODES, StudioOperations, StudioWaiting, classify
+from venture_studio import STUDIO_MODES, USAGE_RESULT_PROBE_SECONDS, StudioOperations, StudioWaiting, classify
 from venture_panel import StakeholderPanel
 
 EVIDENCE_LIMIT = 14000
@@ -142,7 +142,10 @@ replaces the earlier idea.
 2. **What is actually sold.** If delivery (expert days times the day rate) is
    more than half of a customer's first-year revenue, it is a consulting
    business. Price the first offer to cover delivery, cut the delivery, or say
-   so plainly.
+   so plainly. Every fee the first offer names is also a revenue line: a pilot
+   or setup fee is a `one_off` line. A `service` or `productised_service`
+   model is refused without one, `saas` without a recurring line, and
+   `hybrid` without both.
 3. **Where the market grows.** Is the target segment gaining or losing share
    (sites, accounts, revenue), and who buys the new capacity? Prefer the
    segment that is growing.
@@ -1121,6 +1124,9 @@ class Ventures(StudioOperations, StakeholderPanel):
         self._refreshing = set()
         self._studio_refreshing = set()
         self._refresh_lock = threading.Lock()
+        self._usage_lock = threading.Lock()
+        self._usage_observations = {}
+        self._usage_probing = set()
         # Herdr status and start, for the preflight and the guided repair.
         # Tests replace this with a fake that reports a stopped server.
         self.herdr = HerdrServer(service.store.command)
@@ -1490,6 +1496,8 @@ class Ventures(StudioOperations, StakeholderPanel):
                                            + [item['id'] for item in evidence['lessons']]),
                    recommendations=[], candidates=[], error='', manual=manual, web_research=bool(web))
         consult = self._scout_consult(organization, studio) if kind == 'scout' else None
+        if kind == 'scout':
+            run['skeptic_id'] = ((studio.get('team') or {}).get('members') or {}).get('critic')
         if consult:
             # Frozen with the run: a retry asks the same stakeholders.
             run['consult'] = consult
@@ -1995,7 +2003,9 @@ class Ventures(StudioOperations, StakeholderPanel):
                     'a service, and doing nothing or in-house, each with a price when public, searched for '
                     'independently with the same scrutiny for every idea. buyer names the '
                     'signing role and its budget. reachable_accounts cites a count and segment. business_model '
-                    'names its revenue lines; delivery_effort gives expert days and a day rate. evidence_against '
+                    'names its revenue lines: saas needs a recurring one, service and productised_service a '
+                    'one_off one (the first offer\'s fee), hybrid both. delivery_effort gives expert days and a '
+                    'day rate. evidence_against '
                     'needs at least one cited page or reason. dissent is the Skeptic verdict. '
                     'Return advanced and held ideas; omit rejected ideas. Rate the '
                     + str(len(SCOUT_CONFIDENCE)) + ' '
@@ -2151,12 +2161,21 @@ class Ventures(StudioOperations, StakeholderPanel):
         for candidate in parsed:
             # The pages behind a web-researched idea travel with it, marked as unverified.
             candidate['evidence_links'] = [research[item] for item in candidate['evidence'] if item in research]
+        # The Skeptic's verdict ("dissent") is written by the chair. When the
+        # transcript has the others' words but none of the Skeptic's (a usage
+        # limit, a stuck session), that verdict was not its own.
+        skeptic_id = self._scout_skeptic(run, result)
+        silent = bool(skeptic_id) and skeptic_id not in self._speaker_ids(result)
+        if silent:
+            for candidate in parsed:
+                candidate['skeptic_silent'] = True
         consulted = {}
         if consult:
             consulted = dict(stakeholder_exploration=self._stakeholder_notes(
                 data.get('stakeholder_exploration'), spoke, SCOUT_EXPLORE_FIELDS),
                 consulted=sorted(spoke))
-        return dict(summary='', recommendations=[], candidates=parsed, refused_candidates=refused, **consulted,
+        return dict(summary='', recommendations=[], candidates=parsed, refused_candidates=refused,
+                    skeptic_silent=silent, **consulted,
                     research=list(research.values()),
                     research_note=redact(str(data.get('research_note') or ''))[:600]
                     if isinstance(data.get('research_note'), str) else '',
@@ -2211,13 +2230,27 @@ class Ventures(StudioOperations, StakeholderPanel):
                 result.append(entry)
         return result
 
+    def _scout_skeptic(self, run, job):
+        if run.get('skeptic_id'):
+            return run['skeptic_id']
+        # An older run can still identify the Skeptic from its prepared roster.
+        if isinstance(job, dict):
+            for member in job.get('runs') or []:
+                if (member.get('profile') or {}).get('role') == 'critic':
+                    return member['profile_id']
+        return None
+
     @staticmethod
-    def _consult_spoke(consult, job):
-        """The stakeholder roles with their own words in the scout transcript."""
+    def _speaker_ids(job):
         contributions = job.get('contributions') if isinstance(job, dict) else None
-        spoke = {item['profile_id'] for item in contributions or []
-                 if isinstance(item, dict) and isinstance(item.get('profile_id'), str)
-                 and isinstance(item.get('content'), str) and item['content'].strip()}
+        return {item['profile_id'] for item in contributions or []
+                if isinstance(item, dict) and isinstance(item.get('profile_id'), str)
+                and isinstance(item.get('content'), str) and item['content'].strip()}
+
+    @classmethod
+    def _consult_spoke(cls, consult, job):
+        """The stakeholder roles with their own words in the scout transcript."""
+        spoke = cls._speaker_ids(job)
         return {role for role in consult.get('roles') or [] if (consult.get('members') or {}).get(role) in spoke}
 
     @staticmethod
@@ -2427,7 +2460,8 @@ class Ventures(StudioOperations, StakeholderPanel):
         with closing(self.service.connect()) as db:
             runs = [json.loads(row[0]) for row in db.execute(
                 "SELECT data FROM venture_studio_runs WHERE json_extract(data, '$.state')='meeting' LIMIT 30")]
-        jobs = {item['id']: item for item in self.service.store.snapshot(live_status=False).get('jobs', [])}
+        snapshot = self.service.store.snapshot(live_status=False)
+        jobs = {item['id']: item for item in snapshot.get('jobs', [])}
         for saved in runs:
             # Never wait on the shared poll thread: a run whose studio is busy is settled next pass.
             try:
@@ -2447,7 +2481,21 @@ class Ventures(StudioOperations, StakeholderPanel):
                         self.save_studio_run(run)
                     elif job.get('state') == 'artifact_ready':
                         try:
-                            self._studio_settle(run, self._studio_parse(run, job))
+                            parsed = self._studio_parse(run, job)
+                            if parsed.get('skeptic_silent') and not run.get('skeptic_usage'):
+                                skeptic_id = self._scout_skeptic(run, job)
+                                targets = self._usage_targets(saved['organization_id'], 'scout', job=job,
+                                                              snapshot=snapshot)
+                                targets = {key: target for key, target in targets.items()
+                                           if target['profile_id'] == skeptic_id}
+                                # A short partial scout can finish before the
+                                # regular probe catches its missing member.
+                                if not self._usage_probe_soon(targets, every=USAGE_RESULT_PROBE_SECONDS):
+                                    continue
+                                hold = self._usage_hold(targets)
+                                if hold:
+                                    run['skeptic_usage'] = hold
+                            self._studio_settle(run, parsed)
                         except Exception as error:
                             message = str(error) or error.__class__.__name__
                             run.update(state='needs_attention', error=redact(message)[:500],
@@ -2465,6 +2513,7 @@ class Ventures(StudioOperations, StakeholderPanel):
                         # Still meeting. Say what it waits on, so a blocked agent
                         # is visible in the studio instead of looking like progress.
                         waiting = None
+                        previous_usage = run.get('skeptic_usage')
                         if job.get('state') == 'waiting_for_input':
                             waiting = self._failure(str(job.get('progress') or job.get('error') or '')
                                                     or 'An agent stopped on a decision.', 'meeting', job,
@@ -2477,7 +2526,17 @@ class Ventures(StudioOperations, StakeholderPanel):
                                            help='The meeting starts by itself when this clears.',
                                            message=redact(message)[:300], job_id=job.get('id', ''),
                                            group_id=job.get('group_id', ''), agent='')
-                        if (waiting or {}).get('message') != (run.get('waiting') or {}).get('message'):
+                        if job.get('state') in ('waiting_for_members', 'running', 'queued'):
+                            targets = self._usage_targets(saved['organization_id'], run['kind'], job=job,
+                                                          snapshot=snapshot)
+                            self._usage_probe_soon(targets)
+                            hold = self._usage_hold(targets)
+                            if hold:
+                                waiting = self._usage_waiting(hold, job)
+                            skeptic_id = self._scout_skeptic(run, job) if run['kind'] == 'scout' else None
+                            if skeptic_id and (skeptic_hold := self._usage_hold(targets, skeptic_id)):
+                                run['skeptic_usage'] = skeptic_hold
+                        if waiting != run.get('waiting') or run.get('skeptic_usage') != previous_usage:
                             run['waiting'] = waiting
                             self.save_studio_run(run)
             except Busy:
@@ -2660,7 +2719,8 @@ class Ventures(StudioOperations, StakeholderPanel):
                      'refused_candidates', 'failure', 'waiting', 'auto', 'auto_error', 'manual',
                      'web_research', 'research', 'research_note', 'suggested_sources', 'reread',
                      'scout_run_id', 'candidate_ids', 'review_count', 'missing', 'unverified', 'problems',
-                     'panel_summary', 'consulted', 'stakeholder_exploration', 'pre_screened_ideas')}
+                     'panel_summary', 'consulted', 'stakeholder_exploration', 'pre_screened_ideas',
+                     'skeptic_silent', 'skeptic_usage')}
             if run.get('consult'):
                 item['consult_roles'] = run['consult']['roles']
             item['candidates'] = [{key: candidate.get(key) for key in ('id', 'name', 'state', 'confidence')}
@@ -2682,7 +2742,8 @@ class Ventures(StudioOperations, StakeholderPanel):
                     panel=self.panel_view(organization, studio), runs=run_summaries, candidates=summaries, lessons=self._studio_lessons_summary(organization),
                     invalid_policy=policy.get('invalid') or [], mode=policy['studio_mode'],
                     readiness=self._studio_readiness(organization, policy, studio),
-                    budget=self._studio_budget(organization, policy))
+                    budget=self._studio_budget(organization, policy),
+                    usage_holds=self._usage_holds(organization, studio))
 
     def _studio_lessons_summary(self, organization):
         return self._studio_lessons(organization)[:12]

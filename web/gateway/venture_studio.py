@@ -7,9 +7,10 @@ setup and the autonomous-creation policy. ``ventures.Ventures`` mixes this in;
 the simulation itself stays in ``ventures``.
 """
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import tempfile
@@ -17,6 +18,7 @@ import time
 import uuid
 
 from discovery import redact
+import usage_limits
 from project_files import project_directory
 from repository_lock import repository_lock
 from venture_panel import panel_backs
@@ -37,6 +39,10 @@ FAILED_BINDINGS = ('needs_attention', 'uncertain', 'error')
 LIVE_BINDINGS = ('not_started', 'queued', 'running', 'persona_sent', 'waiting_for_input', 'waiting_environment')
 HERDR_CACHE_SECONDS = 5
 RUNTIME_CACHE_SECONDS = 60
+# Recheck a deferred or in-progress meeting even before the estimated reset.
+USAGE_PROBE_SECONDS = 60
+USAGE_RESULT_PROBE_SECONDS = 10
+USAGE_STALE = timedelta(hours=6)
 
 # One primary recovery action per kind of failure. ``action`` is what the
 # dashboard offers: start_herdr, repair, open_group, cli_accounts, limits,
@@ -54,6 +60,8 @@ FAILURES = dict(
               help='Nothing was sent to the group yet. Repair prepares the meeting again once the agent is idle.'),
     team=dict(title='A studio agent did not start', action='repair',
               help='Repair releases the failed session and starts the team again.'),
+    usage=dict(title='An agent hit its usage limit', action='',
+               help='The studio rechecks the session automatically. A meeting can start when its members are available.'),
     limits=dict(title='An organization limit blocks the meeting', action='limits',
                 help='Raise the session limits, or wait for other work to finish.'),
     inputs=dict(title='The scout has nothing to read', action='configure',
@@ -74,6 +82,9 @@ _RULES = (
     ('permission', ('permission', 'waiting for a decision', 'waiting_for_input', 'approval', 'agent_blocked')),
     ('model', ('provider/model', 'model is unavailable', 'unsupported model', 'model not found', 'unknown model',
                'reasoning variant')),
+    # Before provider and limits: a plan's usage limit is neither a broken
+    # account nor an organization limit, and it clears by itself.
+    ('usage', ('usage limit',)),
     ('provider', ('not signed in', 'sign in', 'herdr integration', 'not installed', 'cli account', 'api key',
                   'unauthorized', 'authentication', 'quota', 'rate limit')),
     ('limits', ('budget', 'session cap', 'meeting limit', 'limit reached', 'daily session', 'backlog')),
@@ -522,6 +533,163 @@ class StudioOperations:
                 raise StudioWaiting('The scout has no market evidence to work from: add ' + ' and '.join(missing)
                                     + ' in the studio settings'
                                     + ('' if not manual else ', or run it once without them') + '.', 'inputs')
+        # Read only the sessions required by this meeting. Manual runs can
+        # check immediately, and the shared poll thread waits for the worker.
+        targets = self._usage_targets(organization, kind, studio)
+        if manual:
+            self._usage_probe(targets)
+            checked = True
+        else:
+            checked = self._usage_probe_soon(targets)
+        hold = self._usage_hold(targets)
+        if hold:
+            raise StudioWaiting(self._usage_message(hold), 'usage')
+        if not checked:
+            raise StudioWaiting('Checking the studio sessions for provider usage limits.', 'usage')
+
+    # --- Provider usage limits ---------------------------------------------
+
+    def _usage_hold(self, targets, profile_id=None):
+        """The active limit with the latest deadline among these sessions."""
+        now = datetime.now(timezone.utc)
+        with self._usage_lock:
+            holds = [(seen, target) for key, target in targets.items()
+                     if (profile_id is None or target['profile_id'] == profile_id)
+                     and (seen := self._usage_observations.get(key, (0, None))[1]) and seen['until'] > now]
+        if not holds:
+            return None
+        seen, target = max(holds, key=lambda item: item[0]['until'])
+        return dict(name=target['name'], profile_id=target['profile_id'], message=seen['message'],
+                    until=seen['until'].isoformat(),
+                    reset_at=seen['reset_at'].isoformat() if seen['reset_at'] else None,
+                    retry_at=(seen['retry_at'].isoformat() if seen['retry_at'] and seen['retry_at'] > now else None))
+
+    @staticmethod
+    def _usage_message(hold):
+        detail = [] if hold.get('reset_at') else ['Provider reset time unavailable.']
+        for key, label in (('reset_at', 'Estimated provider reset'), ('retry_at', 'Next CLI retry')):
+            if hold.get(key):
+                detail.append(label + ' at ' + datetime.fromisoformat(hold[key]).strftime('%Y-%m-%d %H:%M UTC') + '.')
+        return ' '.join([hold['name'] + ' hit its usage limit.', *detail,
+                         'Checking the session again automatically.'])
+
+    def _usage_targets(self, organization, kind, studio=None, *, job=None, snapshot=None):
+        """Live launch sessions for the prospective or frozen meeting roster."""
+        if snapshot is None:
+            snapshot = self.service.store.snapshot(live_status=False)
+        roster = (job or {}).get('group')
+        if roster:
+            facilitator = ((job or {}).get('group_run') or {}).get('profile_id') or roster.get('facilitator_id')
+            participants = {*roster.get('members', []), facilitator}
+        else:
+            studio = studio if studio is not None else self._studio(organization)
+            panel = studio.get('panel') or {}
+            if kind == 'pitch' and not panel.get('enabled'):
+                return {}
+            group_id = panel.get('group_id') if kind == 'pitch' else studio.get('group_id')
+            group = next((item for item in snapshot.get('groups', [])
+                          if item['id'] == group_id and not item.get('removed_at')), {})
+            participants = {*group.get('members', []), group.get('facilitator_id')}
+            if kind == 'scout':
+                participants.update((self._scout_consult(organization, studio) or {}).get('members', {}).values())
+        participants.discard(None)
+        pinned = {}
+        if job and job.get('discussion_submitted_at'):
+            pinned = {item['profile_id']: item for item in job.get('runs') or []}
+            if job.get('group_run'):
+                pinned[job['group_run']['profile_id']] = job['group_run']
+        names = {profile['id']: profile['name'] for profile in snapshot.get('profiles', []) if 'name' in profile}
+        latest = {item['profile_id']: item for item in snapshot.get('jobs', [])
+                  if item.get('kind') == 'launch' and item.get('organization_id') == organization
+                  and item.get('profile_id') in participants and item['state'] not in ('released', 'finished')}
+        targets = {}
+        for identity, session in latest.items():
+            fixed = pinned.get(identity)
+            if (session['state'] == 'persona_sent' and session.get('alias')
+                    and (not fixed or (fixed['id'] == session['id'] and fixed.get('pane_id') == session.get('pane_id')))):
+                key = (session['id'], session.get('pane_id'), (session.get('session_starts') or [None])[-1])
+                targets[key] = dict(alias=session['alias'], profile_id=identity, name=names.get(identity, 'An agent'))
+        return targets
+
+    def _usage_probe(self, targets):
+        for key, target in targets.items():
+            started = time.monotonic()
+            output = None
+            try:
+                result = self.service.store.command(
+                    'agent', 'read', target['alias'], '--source', 'visible', '--lines', '60', timeout=2)
+                output = result.get('output') if isinstance(result, dict) else None
+            except (ValueError, OSError):
+                pass  # An unreadable screen does not clear a known limit.
+            observed_at = datetime.now(timezone.utc)
+            hit = usage_limits.detect(output)
+            if hit:
+                hit['message'] = redact(hit['message'])[:240]
+            with self._usage_lock:
+                last, previous = self._usage_observations.get(key, (float('-inf'), None))
+                if started >= last:
+                    seen = usage_limits.observe(hit, previous, observed_at, USAGE_STALE) if isinstance(output, str) else previous
+                    self._usage_observations[key] = (started, seen)
+
+    def _usage_probe_soon(self, targets, every=USAGE_PROBE_SECONDS):
+        """Probe stale sessions off the poll thread. True when all were checked recently."""
+        def stale():
+            cutoff = time.monotonic() - every
+            return {key: target for key, target in targets.items()
+                    if self._usage_observations.get(key, (float('-inf'), None))[0] <= cutoff}
+
+        with self._usage_lock:
+            pending = stale()
+            if not pending:
+                return True
+            fresh_work = {key: target for key, target in pending.items() if key not in self._usage_probing}
+            if not fresh_work:
+                return False
+            self._usage_probing.update(fresh_work)
+
+        def unavailable():
+            # A transient read or worker failure should not stall a meeting.
+            # Keep any existing deadline while throttling the next attempt.
+            with self._usage_lock:
+                checked = time.monotonic()
+                for key in fresh_work:
+                    last, seen = self._usage_observations.get(key, (float('-inf'), None))
+                    if checked - last >= every:
+                        self._usage_observations[key] = (checked, seen)
+
+        def work():
+            try:
+                self._usage_probe(fresh_work)
+            except Exception as error:  # A probe must never stop the scheduler.
+                logging.warning('Usage-limit probe failed: %s', redact(str(error)))
+                unavailable()
+            finally:
+                with self._usage_lock:
+                    self._usage_probing.difference_update(fresh_work)
+        try:
+            self.background(work)
+        except RuntimeError:
+            unavailable()
+            with self._usage_lock:
+                self._usage_probing.difference_update(fresh_work)
+        with self._usage_lock:
+            return not stale()
+
+    def _usage_holds(self, organization, studio):
+        now = datetime.now(timezone.utc)
+        with self._usage_lock:
+            if not any(seen and seen['until'] > now for _, seen in self._usage_observations.values()):
+                return {}
+        snapshot = self.service.store.snapshot(live_status=False)
+        return {kind: hold for kind in ('portfolio', 'scout', 'pitch')
+                if (hold := self._usage_hold(self._usage_targets(organization, kind, studio, snapshot=snapshot)))}
+
+    def _usage_waiting(self, hold, job):
+        failure = self._failure(self._usage_message(hold), 'preparation' if job.get('state') == 'waiting_for_members'
+                                else 'meeting', job, category='usage')
+        failure.update(agent=hold['name'], profile_id=hold['profile_id'], until=hold['until'],
+                       reset_at=hold['reset_at'], retry_at=hold['retry_at'])
+        return failure
 
     def _failure(self, message, phase, job=None, organization=None, category=None):
         """A named failure with its phase and its one recovery action."""
@@ -934,6 +1102,9 @@ class StudioOperations:
             if int(candidate.get('confidence') or 0) < minimum:
                 reason = ('Confidence ' + str(candidate.get('confidence')) + ' is below the minimum of '
                           + str(minimum) + '.')
+            elif candidate.get('skeptic_silent'):
+                reason = ('The Skeptic did not speak in the scout meeting, so its verdict was not its own; '
+                          'approve it yourself if you agree.')
             elif (isinstance(candidate.get('dissent'), dict)
                   and candidate['dissent'].get('verdict') in ('hold', 'reject')):
                 # Only an idea the Skeptic would advance is created unattended.
