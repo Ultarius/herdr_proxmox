@@ -2686,6 +2686,32 @@ class VentureTests(unittest.TestCase):
         self.assertTrue(result['readiness']['can_run'])
         self.assertEqual(self.complete_studio(run, self.portfolio_answer(record))['state'], 'ready')
 
+    def test_repair_releases_a_stuck_stakeholder_session_so_the_pitch_can_retry(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        panel = self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        self.scout_with(candidate('Carrier Desk'))
+        pitch, = self.pitch_runs()
+        # The investor's session stopped on a startup question; preparation refused to reuse it.
+        self.jobs.append(dict(id='d' * 32, kind='launch', state='needs_attention', organization_id='org',
+                              profile_id=panel['members']['investor'],
+                              error='The agent needs a decision; no prompt input was sent.'))
+        job = next(item for item in self.jobs if item['id'] == pitch['job_id'])
+        job.update(state='needs_attention',
+                   error='Investor (stakeholder): inspect the existing session before meeting preparation')
+        self.ventures.advance()
+        self.assertEqual(self.pitch_runs()[0]['state'], 'needs_attention')
+        self.assertEqual((self.check('panel_sessions')['ok'], self.check('panel_sessions')['action']), (False, 'repair'))
+        self.assertIn('Investor (stakeholder) did not start', self.check('panel_sessions')['detail'])
+        self.assertTrue(self.check('sessions')['ok'])  # The studio's own runs are not held up.
+        steps = {item['step']: item for item in self.studio(mode='studio_repair')['steps']}
+        self.assertEqual((steps['sessions']['needed'], steps['run']['action']), (True, 'retry'))
+        self.assertIn('Investor (stakeholder)', steps['sessions']['detail'])
+        result = self.studio(mode='studio_repair', confirmed=True)
+        self.assertTrue(result['healthy'], result['steps'])
+        launch = next(item for item in self.jobs if item['id'] == 'd' * 32)
+        self.assertEqual((launch['state'], job['state'], self.pitch_runs()[0]['state']), ('released', 'queued', 'meeting'))
+
     def test_repair_starts_herdr_and_sends_a_prompt_that_never_arrived(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())

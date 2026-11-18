@@ -111,6 +111,11 @@ class StakeholderPanel:
     def _panel(self, organization):
         return dict(self._studio(organization).get('panel') or {})
 
+    def _panel_bindings(self, organization, studio=None):
+        """Each stakeholder and the panel's chair, with its session binding."""
+        studio = studio if studio is not None else self._studio(organization)
+        return self._group_bindings((studio.get('panel') or {}).get('group_id'))
+
     def _panel_enabled(self, organization):
         panel = self._panel(organization)
         return bool(panel.get('enabled') and panel.get('group_id'))

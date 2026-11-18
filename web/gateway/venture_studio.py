@@ -313,11 +313,15 @@ class StudioOperations:
     def _studio_bindings(self, organization, studio=None):
         """Each studio agent with the state of its session binding."""
         studio = studio if studio is not None else self._studio(organization)
-        if not studio.get('group_id'):
+        return self._group_bindings(studio.get('group_id'))
+
+    def _group_bindings(self, group_id):
+        """Each member and the facilitator of one group, with its session binding."""
+        if not group_id:
             return []
         snapshot = self.service.store.snapshot(live_status=False)
         group = next((item for item in snapshot.get('groups', [])
-                      if item.get('id') == studio['group_id'] and not item.get('removed_at')), None)
+                      if item.get('id') == group_id and not item.get('removed_at')), None)
         if not group:
             return []
         profiles = {profile['id']: profile for profile in snapshot.get('profiles', [])}
@@ -400,6 +404,12 @@ class StudioOperations:
                 '; '.join(binding['name'] + ' did not start' + (': ' + binding['error'] if binding['error'] else '')
                           for binding in failed) if failed else
                 'Agents start by themselves when a meeting needs them.', 'repair')
+            # A stuck stakeholder holds up the pitch, not the studio's own runs.
+            stuck = [binding for binding in self._panel_bindings(organization, studio) if binding['failed']]
+            if stuck:
+                add('panel_sessions', 'No stakeholder session is stuck', False,
+                    '; '.join(binding['name'] + ' did not start' + (': ' + binding['error'] if binding['error'] else '')
+                              for binding in stuck), 'repair')
         people = len(bindings) or STUDIO_PARTICIPANTS
         limits = self._limit_problems(organization, people)
         add('limits', 'The organization limits allow a studio meeting', not limits,
@@ -618,7 +628,7 @@ class StudioOperations:
         if not studio.get('group_id'):
             return [dict(step='setup', label='Set up the Venture Studio first', needed=True, detail='')]
         bindings = self._studio_bindings(organization, studio)
-        failed = [binding for binding in bindings if binding['failed']]
+        failed = [binding for binding in bindings + self._panel_bindings(organization, studio) if binding['failed']]
         herdr = self._herdr_state(fresh=True)
         facilitator = next((binding for binding in bindings if binding['facilitator']), None)
         steps = [
@@ -672,7 +682,8 @@ class StudioOperations:
                           'Herdr is still starting; run the repair again in a moment.'):
                 return finish()
         studio = self._studio(organization)
-        for binding in self._studio_bindings(organization, studio):
+        # Stakeholder sessions too: a stuck one makes every pitch retry fail.
+        for binding in self._studio_bindings(organization, studio) + self._panel_bindings(organization, studio):
             if not binding['failed']:
                 continue
             try:
