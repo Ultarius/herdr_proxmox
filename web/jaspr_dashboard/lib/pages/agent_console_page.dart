@@ -111,11 +111,10 @@ class _AgentConsolePageState extends State<AgentConsolePage> {
   }
 
   void restoreExpansionFocus() {
-    Timer.run(() {
-      if (!mounted) return;
-      (web.document.getElementById('$consoleId-expand') as web.HTMLElement?)
-          ?.focus(web.FocusOptions(preventScroll: expanded));
-    });
+    // The portal retains this button. Assign focus in the same event so a
+    // later callback cannot pull it back after the user has moved on with Tab.
+    (web.document.getElementById('$consoleId-expand') as web.HTMLElement?)
+        ?.focus(web.FocusOptions(preventScroll: expanded));
   }
 
   void closeExpanded(web.Event event) {

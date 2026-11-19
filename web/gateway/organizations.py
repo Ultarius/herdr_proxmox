@@ -785,10 +785,10 @@ class OrganizationStore:
         self.put(db, table, item)
         return item
 
-    def action(self, action, body):
+    def action(self, action, body, *, studio_run_id=None):
         guard = self.capacity_guard() if self.capacity_guard and action in ('launch', 'group', 'discuss') else nullcontext()
         with guard:
-            return self._action(action, body)
+            return self._action(action, body, studio_run_id=studio_run_id)
 
     def team_plan(self, body):
         return self._team_plan(*self.resolve_team_body(body))
@@ -819,7 +819,7 @@ class OrganizationStore:
             [policy, result['members'], result['workflow_plan'], result['resource_limits'], source], sort_keys=True).encode()).hexdigest()
         return result
 
-    def _action(self, action, body):
+    def _action(self, action, body, *, studio_run_id=None):
         if not isinstance(body, dict):
             raise ValueError('Expected a JSON object.')
         key = text(body, 'request_id', 80)
@@ -864,7 +864,17 @@ class OrganizationStore:
             if existing:
                 if existing['fingerprint'] != fingerprint:
                     raise ValueError('Request ID already used for different content.')
-                return json.loads(existing['response'])
+                response = json.loads(existing['response'])
+                if action == 'discuss' and studio_run_id is not None:
+                    # An older gateway could commit the enqueue and stop before
+                    # recording its studio link. Reattach it without queuing twice.
+                    row = db.execute('SELECT data FROM jobs WHERE id=?', (response['id'],)).fetchone()
+                    if row:
+                        job = json.loads(row['data'])
+                        if job.get('studio_run_id') is None:
+                            job['studio_run_id'] = studio_run_id
+                            self.put(db, 'jobs', job)
+                return response
             if action == 'save':
                 item_id = text(body, 'id', 40, optional=True) or uuid.uuid4().hex
                 previous_org = None
@@ -897,7 +907,8 @@ class OrganizationStore:
                 org = self.get(db, 'organizations', org_id)
                 if action in ('group', 'discuss', 'chat', 'inspect', 'input', 'recover', 'transcript', 'retry_discussion', 'cancel_discussion'):
                     from collaboration import action as collaboration_action
-                    item = collaboration_action(self, db, action, body, org)
+                    # The studio owns this link and sets it before any worker is queued.
+                    item = collaboration_action(self, db, action, body, org, studio_run_id=studio_run_id)
                     if action == 'group':
                         submitted = item.get('launch_job_id')
                     if action in ('chat', 'discuss', 'input', 'retry_discussion'):

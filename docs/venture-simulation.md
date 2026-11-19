@@ -538,6 +538,33 @@ and which reframe was weighed; the Skeptic advances only when price, delivery
 and the copy question hold. Held ideas are returned too, with their dissent,
 so the stakeholder panel and the operator see them (autonomous mode never
 creates one). The scout omits rejected ideas and returns up to the round cap.
+
+The answer rules are written beside the evidence file in `answer-rules.md`.
+The file starts with how to find and rate ideas, then separates four kinds of
+rule:
+
+- **required fields**, which refuse an idea when missing;
+- **checked rules**, which refuse an idea when broken;
+- **optional fields** such as `analogue` and `expansion`;
+- **advice**, which only adds notes for the operator, such as a kill criterion
+  without a baseline.
+
+The prompt keeps the answer's JSON shape. It sends the chair to one entry file,
+`scout-brief.md`, before any research or delegation. That file lists the
+evidence, the review checklist, the answer rules and, when stakeholders
+advise, `stakeholders.md`, with who needs each one. If a member cannot read
+the chair's files, the chair quotes the relevant rules in its message.
+The gateway pins the bundle, the evidence and the original prompt to the run.
+Before submitting the prompt, including after a preparation retry, it
+restores missing evidence and missing or damaged guidance in the selected
+facilitator's checkout. If the checkout moved, the delivered prompt points
+to the new copy. The saved request keeps its original prompt for replay.
+The rules used to fill
+half of the 8,000-character prompt, so longer focus areas, more exclusions or
+advising stakeholders refused the run. The prompt now keeps 400 characters for
+the evidence index. If focus areas and exclusions would take that room, the
+prompt names them by reference to the pack's `policy`, which holds them in
+full.
 Ideas already in the pack's
 `existing` list are not audited again: the scout looks elsewhere or returns a
 revision with `revises`. The checklist lives beside the evidence rather
@@ -739,9 +766,7 @@ The gateway now prepares the facilitator session first and writes the file
 inside that worktree, next to its guidance bundle
 (`.ci-cache/herdr-guidance/studio-<run id>/evidence.json`, already ignored by
 Git). Product Discovery does the same. Venture ticks use
-`venture-<tick id>` in their own facilitator's worktree. If a prompt was never
-accepted and its file is gone (the facilitator has a new worktree), the file
-and the prompt are written again.
+`venture-<tick id>` in their own facilitator's worktree.
 
 ### Failures name their cause
 

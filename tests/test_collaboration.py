@@ -1317,6 +1317,60 @@ class CollaborationTests(unittest.TestCase):
         self.assertEqual(self.job(meeting)['state'], 'artifact_ready')
         self.assertEqual(len([a for a, _ in self.calls if a[:2] == ('agent', 'prompt')]), count)
 
+    def test_studio_preparation_retry_restores_pinned_files_before_prompting(self):
+        from contributions import Contributions
+        from ventures import STUDIO_RULES_FILE
+
+        group = self.group()
+        # The prepared facilitator is in the source checkout. Simulate a
+        # frozen prompt pointing into a previous checkout that has gone away.
+        subprocess.run(['git', 'init', str(self.projects)], check=True, capture_output=True)
+        contributions = Contributions(self.root / 'contributions.sqlite3', self.projects, self.store, Mock())
+        self.addCleanup(contributions.close)
+        studio = contributions.ventures
+        run_id = uuid.uuid4().hex
+        old_target = self.projects / 'gone' / 'evidence.json'
+        topic = 'Read the evidence at ' + str(old_target) + '.'
+        evidence = {'items': [{'id': 'N1', 'title': 'Pinned evidence'}]}
+        pinned = studio._scout_bundle({'id': run_id})
+        studio.save_studio_run(dict(id=run_id, organization_id=self.org, kind='scout', state='pending',
+                                    evidence_file=str(old_target), evidence=evidence, bundle=pinned, prompt=topic))
+        body = dict(request_id='studio-' + run_id, organization_id=self.org, group_id=group, prompt=topic)
+        with patch('discussion_scheduler.prepare_locked', side_effect=OSError('Simulated preparation failure')):
+            meeting = self.store.action('discuss', body, studio_run_id=run_id)['id']
+            self.drain()
+        failed = self.job(meeting)
+        self.assertEqual((failed['studio_run_id'], failed['state']), (run_id, 'needs_attention'))
+        self.assertFalse(failed.get('discussion_submitted_at'))
+        self.store.update_job(meeting, studio_run_id=None)  # Legacy enqueue interrupted before linking the studio run.
+        self.assertEqual(self.store.action('discuss', body, studio_run_id=run_id)['id'], meeting)
+        self.assertEqual(self.job(meeting)['studio_run_id'], run_id)
+        target = self.projects / '.ci-cache' / 'herdr-guidance' / ('studio-' + run_id) / 'evidence.json'
+        target.parent.mkdir(parents=True)
+        target.with_name(STUDIO_RULES_FILE).write_bytes(b'\xffdamaged rules')
+        sent = []
+
+        def check_files(*args, **kwargs):
+            if args[:2] == ('agent', 'prompt') and 'Discussion directory:' in args[3]:
+                self.assertIn(str(target), args[3])
+                self.assertNotIn(str(old_target), args[3])
+                self.assertEqual(json.loads(target.read_bytes()), evidence)
+                self.assertEqual({name: target.with_name(name).read_bytes() for name in pinned},
+                                 {name: text.encode('utf-8') for name, text in pinned.items()})
+                sent.append(args[3])
+            return self.simulate(*args, **kwargs)
+
+        with patch.object(self.store, 'command', side_effect=check_files), \
+                patch('ventures.scout_answer_rules', return_value='# Rules from a newer gateway\n'):
+            self.action('retry_discussion', organization_id=self.org, job_id=meeting, inspected=True)
+            self.drain()
+            self.assertEqual(self.store.action('discuss', body, studio_run_id=run_id)['id'], meeting)
+            self.drain()
+        self.assertEqual(self.job(meeting)['state'], 'artifact_ready', self.job(meeting).get('error'))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(self.job(meeting)['prompt'], topic.replace(str(old_target), str(target)))
+        self.assertEqual(studio._studio_run_record(self.org, run_id)['prompt'], topic)
+
     def test_missing_live_agent_is_off_despite_persisted_launch(self):
         run = next(j for j in self.store.snapshot()['jobs'] if j['kind'] == 'launch' and j['profile_id'] == self.max)
         del self.agents[run['alias']]

@@ -143,11 +143,11 @@ class VentureTests(unittest.TestCase):
                             survival_threshold=60, consecutive_days=3, formula_version=1),
             outreach=dict(stage='survey', tone='direct', language='ja', persona='cfo'))
 
-    def store_action(self, action, body):
+    def store_action(self, action, body, *, studio_run_id=None):
         if action == 'discuss':
             job = dict(id=uuid.uuid4().hex, kind='discussion', state='queued',
                        organization_id=body['organization_id'], group_id=body['group_id'], prompt=body['prompt'],
-                       advisors=list(body.get('advisors') or []))
+                       advisors=list(body.get('advisors') or []), studio_run_id=studio_run_id)
             self.jobs.append(job)
             return {'id': job['id']}
         # Mirror the organization store's contract: a request ID is required and
@@ -1274,6 +1274,12 @@ class VentureTests(unittest.TestCase):
         with closing(self.service.connect()) as db:
             return [json.loads(row[0]) for row in db.execute('SELECT data FROM venture_studio_runs ORDER BY rowid')]
 
+    @staticmethod
+    def instructions(run):
+        """A scout's prompt and its answer rules file, as the chair reads them."""
+        rules = Path(run['evidence_file']).with_name(ventures.STUDIO_RULES_FILE)
+        return run['prompt'] + '\n' + rules.read_text(encoding='utf-8')
+
     def due(self, *kinds):
         self.service.patch_policy('org', {'studio_next_' + kind + '_at':
                                           (ventures.now() - timedelta(minutes=1)).isoformat() for kind in kinds}, 'test')
@@ -1315,12 +1321,12 @@ class VentureTests(unittest.TestCase):
         self.add_venture_group(self.create())
         requests = []
         original = self.store.action.side_effect
-        def limited(action, body):
+        def limited(action, body, **kwargs):
             if action == 'discuss':
                 requests.append(body['request_id'])
                 if len(requests) == 1:
                     raise ValueError('Meeting limit reached.')
-            return original(action, body)
+            return original(action, body, **kwargs)
         self.store.action.side_effect = limited
         with self.assertRaisesRegex(ValueError, 'Meeting limit'):
             self.studio(mode='studio_run', kind='portfolio')
@@ -1331,6 +1337,71 @@ class VentureTests(unittest.TestCase):
         self.assertEqual(recovered['state'], 'meeting')
         self.assertEqual(requests, ['studio-' + failed['id']] * 2)  # Same request: no second meeting.
         self.assertEqual(recovered['prompt'], failed['prompt'])
+
+    def test_a_recovered_scout_gets_its_whole_pinned_guidance_bundle_back(self):
+        # The evidence survived a failed dispatch but the guidance beside it
+        # did not; recovery must not send a prompt pointing at missing files.
+        studio = self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        checkout = self.ventures._studio_notebook(studio)
+        original = self.store.action.side_effect
+        attempts = []
+
+        def limited(action, body, **kwargs):
+            if action == 'discuss':
+                attempts.append(body['request_id'])
+                if len(attempts) == 1:
+                    raise ValueError('Meeting limit reached.')
+            return original(action, body, **kwargs)
+        self.store.action.side_effect = limited
+        self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'])
+        with self.news(feed_item(venture_feeds.now().isoformat())), \
+                patch.object(self.ventures, '_evidence_checkout', return_value=(checkout, True)):
+            with self.assertRaisesRegex(ValueError, 'Meeting limit'):
+                self.studio(mode='studio_run', kind='scout')
+        failed = self.studio_runs()[-1]
+        folder = Path(failed['evidence_file']).parent
+        names = {ventures.STUDIO_ENTRY_FILE, ventures.STUDIO_RULES_FILE, ventures.STUDIO_REVIEW_FILE,
+                 ventures.STUDIO_CONSULT_FILE}
+        self.assertEqual(set(failed['bundle']), names)
+        pinned = {name: (folder / name).read_text(encoding='utf-8') for name in names}
+        self.assertEqual(pinned, failed['bundle'])
+        brief = pinned[ventures.STUDIO_ENTRY_FILE]
+        for name in names - {ventures.STUDIO_ENTRY_FILE}:
+            self.assertIn('`' + name + '`', brief)
+        self.assertIn('before any research or delegation', brief)
+        self.assertIn('Start with ' + ventures.STUDIO_ENTRY_FILE, failed['prompt'])
+        for name in (ventures.STUDIO_RULES_FILE, ventures.STUDIO_ENTRY_FILE):
+            (folder / name).unlink()
+        (folder / ventures.STUDIO_REVIEW_FILE).write_bytes(b'\xffedited')
+        # A gateway upgrade between the two dispatches changes the rules; the
+        # frozen prompt still gets the version it was written for.
+        with patch.object(ventures, 'scout_answer_rules', return_value='# New rules\n'):
+            recovered = self.studio(mode='studio_recover', run_id=failed['id'], inspected=True)
+            job = next(item for item in self.jobs if item['id'] == recovered['job_id'])
+            prompt = self.ventures.studio_discussion_prompt(job, {'worktree_path': str(checkout)})
+        self.assertEqual(recovered['state'], 'meeting')
+        self.assertEqual(recovered['prompt'], failed['prompt'])
+        self.assertEqual(prompt, failed['prompt'])
+        self.assertEqual(attempts, ['studio-' + failed['id']] * 2)
+        self.assertEqual({name: (folder / name).read_text(encoding='utf-8') for name in names}, pinned)
+
+    def test_the_answer_rules_separate_refusals_from_optional_fields_and_advice(self):
+        rules = ventures.scout_answer_rules()
+        sections = [line for line in rules.splitlines() if line.startswith('## ')]
+        self.assertEqual(sections, ['## Before research: how to find and rate ideas',
+                                    '## Required: an idea without these is refused',
+                                    '## Checked: an idea breaking one of these is refused whole',
+                                    '## Optional: leave out what you cannot cite',
+                                    '## Advice: shown to the operator as notes, never a refusal'])
+        optional = rules.split('## Optional')[1].split('## Advice')[0]
+        for field in ('analogue', 'expansion', 'market_ceiling', 'incumbent', 'suggested_sources'):
+            self.assertIn(field, optional)
+        advice = rules.split('## Advice')[1]
+        self.assertIn('without the customer\'s current baseline', advice)
+        self.assertNotIn('baseline', rules.split('## Checked')[1].split('## Optional')[0])
+        self.assertLess(rules.index('FIND IDEAS THREE WAYS'), rules.index('## Required'))
 
     def test_an_interrupted_pending_run_stops_blocking_after_ten_minutes(self):
         self.setup_studio_manual()
@@ -1846,7 +1917,7 @@ class VentureTests(unittest.TestCase):
         self.add_venture_group(self.create())
         run = self.studio(mode='studio_run', kind='scout')
         for rule in ('simulation.burn', 'at most 100', '1-8 assumptions', 'cite 1-12', 'refused whole'):
-            self.assertIn(rule, run['prompt'])
+            self.assertIn(rule, self.instructions(run))
         research = [dict(id='W' + str(number), url='https://trade.example/page' + str(number),
                          title='Page ' + str(number), published='', claim='A reported finding.')
                     for number in range(1, 13)]
@@ -2192,7 +2263,7 @@ class VentureTests(unittest.TestCase):
         run = self.studio_runs()[-1]
         for rule in ('FIND IDEAS THREE WAYS', 'paid demand 30%', 'defensibility 15%', 'take_rate', 'market_ceiling',
                      'never inflate a rating'):
-            self.assertIn(rule, run['prompt'])
+            self.assertIn(rule, self.instructions(run))
         self.assertLessEqual(len(run['prompt']), ventures.PROMPT_LIMIT)
         # The brief shows the upside apart from the economics.
         page = self.studio(mode='candidate_brief', candidate_id=stored['id'])['html']
@@ -2309,18 +2380,31 @@ class VentureTests(unittest.TestCase):
             self.studio(mode='studio_policy', studio_focus=['x' * 201])
         with self.assertRaisesRegex(ValueError, 'at most 6 focus areas; 7 were given'):
             self.studio(mode='studio_policy', studio_focus=['area ' + str(index) for index in range(7)])
-        # The longest focus list with every exclusion still fits: the prompt
-        # then names them by reference and the pack carries them in full.
+        # The longest focus list with every exclusion, web research and four
+        # advising stakeholders fits inline, with room for the evidence index:
+        # the answer rules live in their own file beside the pack.
         longest = ['segment ' + str(index) + ' ' + 'y' * 180 for index in range(6)]
         exclusions = ['excluded term ' + str(index) for index in range(ventures.MAX_STUDIO_EXCLUDE)]
+        self.add_venture_group(self.create())
+        self.setup_panel(stakeholders=[dict(role=role) for role in ('investor', 'customer', 'operator', 'competitor')])
         self.studio(mode='studio_policy', studio_focus=longest, studio_exclude=exclusions,
                     studio_web_research=True, studio_sources=[])
         run = self.studio(mode='studio_run', kind='scout')
         job = next(job for job in self.jobs if job['id'] == run['job_id'])
-        self.assertLessEqual(len(job['prompt']), ventures.PROMPT_LIMIT)
-        self.assertIn('policy.focus and policy.exclusions in the pack', job['prompt'])
+        self.assertLessEqual(len(job['prompt']) + ventures.PROMPT_INDEX_RESERVE, ventures.PROMPT_LIMIT)
+        self.assertIn('Focus: ' + longest[0], job['prompt'])
+        self.assertIn('answer-rules.md beside the pack', job['prompt'])
+        rules = Path(run['evidence_file']).with_name(ventures.STUDIO_RULES_FILE).read_text(encoding='utf-8')
+        self.assertEqual(rules, ventures.scout_answer_rules())
         pack = json.loads(Path(run['evidence_file']).read_text(encoding='utf-8'))
         self.assertEqual((pack['policy']['focus'], pack['policy']['exclusions']), (longest, exclusions))
+        # Where the prompt would leave the index no room, focus and exclusions
+        # are named by reference; the pack carries them in full.
+        frozen = dict(run, prompt='')
+        with patch.object(ventures, 'PROMPT_LIMIT', len(job['prompt']) + 100):
+            squeezed = self.ventures._studio_prompt('org', frozen, Path(run['evidence_file']))
+        self.assertIn('policy.focus and policy.exclusions in the pack', squeezed)
+        self.assertNotIn(longest[0], squeezed)
 
     def test_month_first_kill_dates_are_checked_like_any_other(self):
         # "March 31, 2031" found no date at all, so the window checks were skipped.
@@ -2374,7 +2458,7 @@ class VentureTests(unittest.TestCase):
         self.add_venture_group(self.create())
         run = self.studio(mode='studio_run', kind='scout')
         self.assertIn('confidence_dimensions', run['prompt'])
-        self.assertIn('do not return one confidence', run['prompt'])
+        self.assertIn('do not return one confidence', self.instructions(run))
         research = [dict(id='W' + str(number), url='https://eur-lex.example/page-' + str(number),
                          title='Page ' + str(number), published='', claim='Claim ' + str(number) + '. ' + 'x' * 500)
                     for number in range(1, 6)]
@@ -2429,7 +2513,7 @@ class VentureTests(unittest.TestCase):
         self.add_venture_group(self.create())
         run = self.studio(mode='studio_run', kind='scout')
         job = next(item for item in self.jobs if item['id'] == run['job_id'])
-        prompt = ' '.join(job['prompt'].split())
+        prompt = ' '.join(self.instructions(dict(run, prompt=job['prompt'])).split())
         self.assertIn('service and productised_service a one_off one (the first offer\'s fee)', prompt)
         checklist = (Path(run['evidence_file']).parent / ventures.STUDIO_REVIEW_FILE).read_text(encoding='utf-8')
         self.assertIn('a pilot or setup fee is a `one_off` line', ' '.join(checklist.split()))
@@ -2516,7 +2600,7 @@ class VentureTests(unittest.TestCase):
         self.setup_studio_manual()
         self.add_venture_group(self.create())
         run = self.studio(mode='studio_run', kind='scout')
-        self.assertIn('every other field cites 1-3', run['prompt'])
+        self.assertIn('every other field cites 1-3', self.instructions(run))
         research = [dict(id='W' + str(number), url='https://trade.example/page-' + str(number),
                          title='Page ' + str(number), published='', claim='Claim ' + str(number) + '.')
                     for number in range(1, 13)]
@@ -3301,12 +3385,12 @@ class VentureTests(unittest.TestCase):
         original = self.store.action.side_effect
         attempts = []
 
-        def stopped(action, body):
+        def stopped(action, body, **kwargs):
             if action == 'discuss':
                 attempts.append(body['request_id'])
                 if len(attempts) == 1:
                     raise ValueError('server_not_running: start Herdr over SSH first.')
-            return original(action, body)
+            return original(action, body, **kwargs)
         self.store.action.side_effect = stopped
         with self.assertRaisesRegex(ValueError, 'server_not_running'):
             self.studio(mode='studio_run', kind='portfolio')

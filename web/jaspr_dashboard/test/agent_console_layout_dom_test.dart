@@ -298,6 +298,10 @@ void main() {
         'none',
       );
       expand.click();
+      // Opening must finish assigning focus before the next keyboard event.
+      expect(web.document.activeElement, same(expand));
+      final refresh = control('Refresh console');
+      refresh.focus();
       await until(
         () => node('.console-shell').getAttribute('data-expanded') == 'true',
       );
@@ -307,6 +311,7 @@ void main() {
             'hidden',
         diagnostics: measurements,
       );
+      expect(web.document.activeElement, same(refresh));
       final bounds = node('.console-modal').getBoundingClientRect();
       expect(
         bounds.width,
@@ -341,6 +346,7 @@ void main() {
       node(
         '.console-modal',
       ).dispatchEvent(web.Event('cancel', web.EventInit(cancelable: true)));
+      expect(web.document.activeElement, same(expand));
       await until(
         () => node('.console-shell').getAttribute('data-expanded') == 'false',
       );

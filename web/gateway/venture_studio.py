@@ -763,20 +763,30 @@ class StudioOperations:
                     os.replace(temporary, target)
                 finally:
                     Path(temporary).unlink(missing_ok=True)
-            for name, text in (companions or {}).items():
-                companion = destination / name
-                if companion.is_symlink() or (companion.exists() and not companion.is_file()):
-                    raise ValueError(label + ' guidance file must be a regular file.')
-                if companion.exists() and companion.read_text(encoding='utf-8') == text:
-                    continue
-                descriptor, temporary = tempfile.mkstemp(prefix='.guidance-', dir=destination)
-                try:
-                    with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
-                        stream.write(text)
-                    os.replace(temporary, companion)
-                finally:
-                    Path(temporary).unlink(missing_ok=True)
+            StudioOperations._write_companions(destination, companions, label)
             return target
+
+    @staticmethod
+    def _write_companions(destination, companions, label):
+        """Write gateway guidance beside an evidence file, then verify every byte."""
+        files = {name: text.encode('utf-8') for name, text in (companions or {}).items()}
+        for name, data in files.items():
+            companion = destination / name
+            if companion.is_symlink() or (companion.exists() and not companion.is_file()):
+                raise ValueError(label + ' guidance file must be a regular file.')
+            if companion.exists() and companion.read_bytes() == data:
+                continue
+            descriptor, temporary = tempfile.mkstemp(prefix='.guidance-', dir=destination)
+            try:
+                with os.fdopen(descriptor, 'wb') as stream:
+                    stream.write(data)
+                os.replace(temporary, companion)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+        for name, data in files.items():
+            companion = destination / name
+            if companion.is_symlink() or not companion.is_file() or companion.read_bytes() != data:
+                raise ValueError(label + ' guidance file ' + name + ' could not be written; nothing was sent.')
 
     # --- Guided repair -------------------------------------------------------
 
