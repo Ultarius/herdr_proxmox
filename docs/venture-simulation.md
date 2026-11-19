@@ -704,6 +704,10 @@ improves comes back with `revises` (the earlier idea's name) and a
 revises; it carries the next round number and the previous objections
 (`previous_feedback`), the earlier idea becomes `superseded`, and the panel
 sees in the next pitch whether each objection was answered.
+`revises` may name an idea that is not open, because the chair reuses one session
+and remembers earlier rounds. The idea may have been refused or never recorded.
+The candidate then comes in as a new round-1 idea with `revises_unmatched`, and
+the duplicate check still applies. It used to be refused whole.
 
 One meeting runs at a time, so the next scout waits for the pitch: each round
 is scout, then panel. In autonomous mode with a panel, a scout round creates

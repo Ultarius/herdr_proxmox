@@ -567,7 +567,13 @@ Component candidateDiligence(Map<String, dynamic> item) {
   return el('section', [
     if (rows.isNotEmpty) facts(rows),
     for (final warning in warnings) notice(warning, error: true),
-    if (revisionNote.isNotEmpty)
+    if ('${item['revises_unmatched'] ?? ''}'.isNotEmpty)
+      paragraph(
+        'Meant to revise "${item['revises_unmatched']}", which is not an open idea (refused earlier or '
+        'already decided), so it was added as a new idea'
+        '${revisionNote.isEmpty ? '.' : '. What changed: $revisionNote'}',
+      )
+    else if (revisionNote.isNotEmpty)
       paragraph(
         'Revised for round ${item['round'] ?? 2} after the stakeholders\' feedback: $revisionNote',
       ),

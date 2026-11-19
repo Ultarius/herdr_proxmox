@@ -2447,12 +2447,18 @@ class Ventures(StudioOperations, StakeholderPanel):
                                                'time to first payment'))
         evidence = check('evidence', evidence)
         earlier = None
+        unmatched = ''
         if item.get('revises') is not None:
             def revised():
+                nonlocal unmatched
                 wanted = _value(item.get('revises'), 120, 'revises', required=True)
                 found = (revisable or {}).get(wanted.lower())
                 if not found:
-                    raise ValueError('revises names no open idea: ' + wanted)
+                    # Not an open idea: refused or never recorded, or already
+                    # decided. The chair's session remembers earlier rounds,
+                    # so this happens; the idea stands on its own as a new
+                    # one, and the duplicate check still applies to it.
+                    unmatched = wanted
                 return found
             earlier = check('revises', revised)
         revision_note = check('revision_note', lambda: _value(item.get('revision_note'), 600, 'revision note'))
@@ -2469,6 +2475,8 @@ class Ventures(StudioOperations, StakeholderPanel):
         duplicate = '' if excluded_by else self._candidate_duplicate(
             name, thesis, [entry for entry in known if not earlier or entry.get('id') != earlier['id']])
         revision = {}
+        if unmatched:
+            revision = dict(revises_unmatched=unmatched, revision_note=revision_note or '')
         if earlier:
             panel = earlier.get('panel') if isinstance(earlier.get('panel'), dict) else {}
             revision = dict(revision_of=earlier['id'], round=int(earlier.get('round') or 1) + 1,

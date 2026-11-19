@@ -2717,9 +2717,14 @@ class VentureTests(unittest.TestCase):
         unknown.update(revises='Nothing Here',
                        thesis='Warehouse docks double-book trailers because yard schedules live in spreadsheets.')
         done = self.complete_studio(second, {'candidates': [revised, unknown]})
-        self.assertEqual([item['name'] for item in done['refused_candidates']], ['Dock Ledger'])
-        self.assertIn('revises names no open idea', done['refused_candidates'][0]['error'])
+        # Revising an idea that is not open (refused earlier, never recorded)
+        # is not a reason to lose the idea: it comes in as a new one.
+        self.assertEqual(done['refused_candidates'], [])
         stored = {item['name']: item for item in self.stored_candidates()}
+        dock = stored['Dock Ledger']
+        self.assertEqual((dock['state'], dock['revises_unmatched'], dock.get('round', 1)),
+                         ('proposed', 'Nothing Here', 1))
+        self.assertNotIn('revision_of', dock)
         old, new = stored['Carrier Desk'], stored['Carrier Desk Pilot']
         self.assertEqual((old['state'], old['superseded_by']), ('superseded', new['id']))
         # Not excluded as a duplicate of the idea it revises.
