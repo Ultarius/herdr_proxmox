@@ -16,6 +16,8 @@ import ipaddress
 import re
 import socket
 import ssl
+import threading
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import build_opener, HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request
@@ -23,6 +25,9 @@ import xml.etree.ElementTree as ElementTree
 
 FETCH_LIMIT = 1_000_000
 FETCH_TIMEOUT = 10
+# ``FETCH_TIMEOUT`` is per socket operation, so a source that trickles bytes
+# would reset it forever. This bounds one whole request, redirects included.
+FETCH_DEADLINE = 30
 MAX_REDIRECTS = 3
 MAX_ITEMS = 20
 EXCERPT_LIMIT = 300
@@ -38,6 +43,55 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
+class _Deadline:
+    """Shuts a request's socket down once the whole request used its time."""
+
+    def __init__(self, seconds):
+        self.at = time.monotonic() + seconds
+        self.expired = False
+        self._sockets = []
+        self._lock = threading.Lock()
+        self._timer = threading.Timer(max(0, seconds), self._expire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def remaining(self):
+        return max(0.001, self.at - time.monotonic())
+
+    def spent(self):
+        # By the clock: the timer that sets ``expired`` can run a little late.
+        return self.expired or time.monotonic() >= self.at
+
+    def attach(self, sock):
+        with self._lock:
+            self._sockets.append(sock)
+            expired = self.expired
+        if expired:
+            self._shut(sock)
+
+    @staticmethod
+    def _shut(sock):
+        try:
+            # A source still sending bytes fails on its next read, also where
+            # a shutdown does not wake a read already in progress.
+            sock.settimeout(0.001)
+            # The plain socket call: TLS's own shutdown is not safe while
+            # another thread is blocked reading.
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _expire(self):
+        with self._lock:
+            self.expired = True
+            sockets = list(self._sockets)
+        for sock in sockets:
+            self._shut(sock)
+
+    def cancel(self):
+        self._timer.cancel()
+
+
 class _PinnedConnection(http.client.HTTPSConnection):
     """TLS to an address that passed the checks; the host name is still verified.
 
@@ -47,20 +101,32 @@ class _PinnedConnection(http.client.HTTPSConnection):
     reach the IPv4 address.
     """
 
-    def __init__(self, host, *, addresses, context, **options):
+    def __init__(self, host, *, addresses, context, deadline=None, **options):
         super().__init__(host, context=context, **options)
-        self._addresses, self._tls = tuple(addresses), context
+        self._addresses, self._tls, self._deadline = tuple(addresses), context, deadline
 
     def connect(self):
         failure = None
         for address in self._addresses:
+            timeout = self.timeout
+            if self._deadline is not None:
+                if self._deadline.spent():
+                    raise failure or OSError('Feed request used its time before connecting.')
+                timeout = min(timeout, self._deadline.remaining())
             try:
-                sock = socket.create_connection((address, self.port), self.timeout)
+                sock = socket.create_connection((address, self.port), timeout)
             except OSError as error:
                 failure = error
                 continue
             try:
-                self.sock = self._tls.wrap_socket(sock, server_hostname=self.host)
+                if self._deadline is None:
+                    self.sock = self._tls.wrap_socket(sock, server_hostname=self.host)
+                else:
+                    # Watched before the handshake, which can trickle too.
+                    self.sock = self._tls.wrap_socket(sock, server_hostname=self.host,
+                                                      do_handshake_on_connect=False)
+                    self._deadline.attach(self.sock)
+                    self.sock.do_handshake()
             except BaseException:
                 sock.close()
                 raise
@@ -69,13 +135,14 @@ class _PinnedConnection(http.client.HTTPSConnection):
 
 
 class _PinnedHTTPS(HTTPSHandler):
-    def __init__(self, addresses):
+    def __init__(self, addresses, deadline=None):
         self._tls = ssl.create_default_context()
         super().__init__(context=self._tls)
-        self._addresses = tuple(addresses)
+        self._addresses, self._deadline = tuple(addresses), deadline
 
     def https_open(self, req):
-        return self.do_open(partial(_PinnedConnection, addresses=self._addresses, context=self._tls), req)
+        return self.do_open(partial(_PinnedConnection, addresses=self._addresses, context=self._tls,
+                                    deadline=self._deadline), req)
 
 
 def now():
@@ -134,32 +201,74 @@ class Response:
         self.url = url
 
 
-def request(url, headers, *, resolve=resolve_addresses, timeout=FETCH_TIMEOUT, limit=FETCH_LIMIT):
-    """Fetch one URL with manual redirects so every hop is revalidated and pinned."""
+def _within(budget, resolve, message):
+    """``resolve`` bounded by the request's deadline. A system lookup cannot be
+    cancelled, so it finishes on a daemon thread while the request moves on."""
+    if resolve is None:
+        return None
+
+    def bounded(host, port):
+        outcome = {}
+
+        def work():
+            try:
+                outcome['addresses'] = resolve(host, port)
+            except Exception as error:
+                outcome['error'] = error
+        lookup = threading.Thread(target=work, name='feed-dns', daemon=True)
+        lookup.start()
+        lookup.join(budget.remaining())
+        if lookup.is_alive():
+            raise ValueError(message)
+        if 'error' in outcome:
+            raise outcome['error']
+        return outcome['addresses']
+    return bounded
+
+
+def request(url, headers, *, resolve=resolve_addresses, timeout=FETCH_TIMEOUT, limit=FETCH_LIMIT,
+            deadline=FETCH_DEADLINE):
+    """Fetch one URL with manual redirects so every hop is revalidated and pinned.
+
+    ``deadline`` bounds the whole request in seconds: name lookups, every
+    connection attempt, redirects and the response."""
     pinned = []
-    current = validate_url(url, resolve, pinned)
-    for _ in range(MAX_REDIRECTS + 1):
-        handlers = [_NoRedirect(), ProxyHandler({})] + ([_PinnedHTTPS(pinned)] if pinned else [])
-        opener = build_opener(*handlers)
-        try:
-            with opener.open(Request(current, headers=headers), timeout=timeout) as response:
-                body = response.read(limit + 1)
-                if len(body) > limit:
-                    raise ValueError('Feed response exceeds its byte budget.')
-                return Response(response.status, dict(response.headers), body, current)
-        except HTTPError as error:
-            if error.code == 304:
-                return Response(304, dict(error.headers), b'', current)
-            if error.code in (301, 302, 303, 307, 308):
-                location = error.headers.get('Location')
-                if not location:
-                    raise ValueError('Feed redirect did not provide a destination.') from error
-                current = validate_url(urljoin(current, location), resolve, pinned)
-                continue
-            raise ValueError('Feed request failed with HTTP ' + str(error.code) + '.') from error
-        except (URLError, OSError, TimeoutError) as error:
-            raise ValueError('Feed request failed before a response was received.') from error
-    raise ValueError('Feed exceeded its redirect limit.')
+    budget = _Deadline(deadline)
+    late = 'Feed request exceeded its time limit.'
+    resolve = _within(budget, resolve, late)
+    try:
+        current = validate_url(url, resolve, pinned)
+        for _ in range(MAX_REDIRECTS + 1):
+            if budget.spent():
+                raise ValueError(late)
+            handlers = [_NoRedirect(), ProxyHandler({})] + ([_PinnedHTTPS(pinned, budget)] if pinned else [])
+            opener = build_opener(*handlers)
+            try:
+                with opener.open(Request(current, headers=headers),
+                                 timeout=min(timeout, budget.remaining())) as response:
+                    body = response.read(limit + 1)
+                    if budget.expired:  # A shut socket can read as a short, clean body.
+                        raise ValueError(late)
+                    if len(body) > limit:
+                        raise ValueError('Feed response exceeds its byte budget.')
+                    return Response(response.status, dict(response.headers), body, current)
+            except HTTPError as error:
+                if error.code == 304:
+                    return Response(304, dict(error.headers), b'', current)
+                if error.code in (301, 302, 303, 307, 308):
+                    location = error.headers.get('Location')
+                    if not location:
+                        raise ValueError('Feed redirect did not provide a destination.') from error
+                    current = validate_url(urljoin(current, location), resolve, pinned)
+                    continue
+                raise ValueError('Feed request failed with HTTP ' + str(error.code) + '.') from error
+            except (URLError, OSError, TimeoutError, http.client.HTTPException) as error:
+                if budget.spent():
+                    raise ValueError(late) from error
+                raise ValueError('Feed request failed before a response was received.') from error
+        raise ValueError('Feed exceeded its redirect limit.')
+    finally:
+        budget.cancel()
 
 
 def _local(tag):
@@ -233,7 +342,7 @@ def canonical_link(value):
     return urlunsplit((parts.scheme.lower(), netloc, parts.path or '/', parts.query, ''))
 
 
-def _refuse_declarations(body):
+def _refuse_declarations(body, label='Feed'):
     """Refuse a DTD or entity declaration in any encoding the parser accepts.
 
     The byte check in ``parse`` sees ASCII-compatible text only: a UTF-16
@@ -242,7 +351,7 @@ def _refuse_declarations(body):
     from xml.parsers import expat
 
     def refuse(*_):
-        raise ValueError('Feed rejected a document with entity declarations.')
+        raise ValueError(label + ' rejected a document with entity declarations.')
 
     parser = expat.ParserCreate()
     parser.StartDoctypeDeclHandler = refuse
@@ -250,7 +359,7 @@ def _refuse_declarations(body):
     try:
         parser.Parse(body, True)
     except expat.ExpatError as error:
-        raise ValueError('Feed is not valid XML.') from error
+        raise ValueError(label + ' is not valid XML.') from error
 
 
 def parse(body, source, fetched_at):
@@ -285,14 +394,15 @@ def parse(body, source, fetched_at):
     return items
 
 
-def fetch(source, *, resolve=resolve_addresses, etag='', modified='', request_fn=request):
+def fetch(source, *, resolve=resolve_addresses, etag='', modified='', request_fn=request, deadline=None):
     headers = {'User-Agent': 'Herdr venture simulation', 'Accept': 'application/rss+xml, application/atom+xml, application/xml, text/xml'}
     if etag:
         headers['If-None-Match'] = etag
     if modified:
         headers['If-Modified-Since'] = modified
     fetched_at = now()
-    response = request_fn(source, headers, resolve=resolve)
+    limits = {} if deadline is None else dict(deadline=deadline)
+    response = request_fn(source, headers, resolve=resolve, **limits)
     if response.status == 304:
         return dict(status=304, source=source, fetched_at=fetched_at.isoformat(), items=[],
                     etag=response.headers.get('etag', etag), modified=response.headers.get('last-modified', modified))
@@ -307,6 +417,11 @@ def _instant(value):
     except (TypeError, ValueError):
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def has_keyword(text, word):
+    """A whole-word match, plural included: "ai" is not in "said", "invoice" is in "invoices"."""
+    return re.search(r'(?<!\w)' + re.escape(word) + r'(?:s|es)?(?!\w)', text) is not None
 
 
 def filter_items(items, sources, since):
@@ -330,7 +445,7 @@ def filter_items(items, sources, since):
         if tags or keywords:
             text = (item.get('title', '') + ' ' + item.get('excerpt', '')).lower()
             if not ({str(tag).lower() for tag in item.get('tags', [])} & tags
-                    or any(word in text for word in keywords)):
+                    or any(has_keyword(text, word) for word in keywords)):
                 continue
         kept.append(item)
     kept.sort(key=lambda item: _instant(item.get('published')) or datetime.min.replace(tzinfo=timezone.utc),

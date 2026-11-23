@@ -391,7 +391,10 @@ directly inside that folder: `["ventures/*"]` covers the studio notebook and
 every venture notebook the gateway creates, but not the `ventures` folder
 itself, anything deeper, or other projects. `*` on its own is refused. The
 gateway uses the service's `CODEX_HOME` if set. Existing trust entries and
-explicit refusals take precedence.
+explicit refusals take precedence. The gateway re-reads `config.toml` just
+before replacing it and logs why when it records nothing. Codex takes no lock
+on that file, so a Codex process writing it in that last instant can still
+lose its change; the window is the time of one file replace.
 
 Codex also asks you to review hooks when one is new or changed. Herdr's own
 Codex integration installs one (`herdr-agent-state.sh`, which reports agent

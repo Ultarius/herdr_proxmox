@@ -119,6 +119,7 @@ def ensure_trusted(project, projects, home=None, *, approved=(), codex_home=None
             return False
         projects_table = current.get('projects')
         if projects_table is not None and not isinstance(projects_table, dict):
+            logging.warning('Codex trust not recorded: "projects" in %s is not a table.', config)
             return False
         for name, entry in (projects_table or {}).items():
             path = Path(name)
@@ -132,6 +133,8 @@ def ensure_trusted(project, projects, home=None, *, approved=(), codex_home=None
         try:
             tomllib.loads(updated)
         except tomllib.TOMLDecodeError:
+            logging.warning('Codex trust not recorded: %s defines "projects" in a form a new entry cannot '
+                            'be added to, such as an inline table.', config)
             return False
         config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         handle, temporary = tempfile.mkstemp(dir=config.parent, prefix='.config.toml.', suffix='.tmp')
@@ -140,6 +143,8 @@ def ensure_trusted(project, projects, home=None, *, approved=(), codex_home=None
                 stream.write(updated)
             os.chmod(temporary, 0o600)
             if config.is_symlink() or (config.read_bytes() if config.exists() else None) != original:
+                logging.warning('Codex trust not recorded: %s changed during the update; the next launch '
+                                'tries again.', config)
                 return False
             os.replace(temporary, config)
         finally:

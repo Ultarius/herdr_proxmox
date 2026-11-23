@@ -21,7 +21,7 @@ from discovery import redact
 import usage_limits
 from project_files import project_directory
 from repository_lock import repository_lock
-from venture_panel import panel_backs
+from venture_panel import panel_backs, panel_current
 
 # Four role agents and the group facilitator.
 STUDIO_PARTICIPANTS = 5
@@ -84,9 +84,9 @@ _RULES = (
                'reasoning variant')),
     # Before provider and limits: a plan's usage limit is neither a broken
     # account nor an organization limit, and it clears by itself.
-    ('usage', ('usage limit',)),
+    ('usage', ('usage limit', 'rate limit', 'quota')),
     ('provider', ('not signed in', 'sign in', 'herdr integration', 'not installed', 'cli account', 'api key',
-                  'unauthorized', 'authentication', 'quota', 'rate limit')),
+                  'unauthorized', 'authentication')),
     ('limits', ('budget', 'session cap', 'meeting limit', 'limit reached', 'daily session', 'backlog')),
     ('inputs', ('scouting source', 'focus area')),
     ('result', ('json', 'cites evidence', 'recommendation', 'candidate', 'malformed', 'does not validate', 'ranks')),
@@ -100,8 +100,17 @@ def now():
     return datetime.now(timezone.utc)
 
 
-def classify(message):
-    """The failure category of an error message; ``meeting`` when nothing matches."""
+# A Herdr error code says what happened; its text is only for people.
+_CODE_CATEGORIES = dict(server_not_running='herdr', agent_working='busy', agent_not_ready='busy',
+                        agent_blocked='permission', agent_not_found='team', agent_not_running='team',
+                        pane_not_found='team', pane_not_running='team')
+
+
+def classify(message, code=None):
+    """The failure category of an error: its Herdr code when it has one, else
+    its text; ``meeting`` when nothing matches."""
+    if code in _CODE_CATEGORIES:
+        return _CODE_CATEGORIES[code]
     folded = str(message or '').lower()
     for category, fragments in _RULES:
         if any(fragment in folded for fragment in fragments):
@@ -691,9 +700,9 @@ class StudioOperations:
                        reset_at=hold['reset_at'], retry_at=hold['retry_at'])
         return failure
 
-    def _failure(self, message, phase, job=None, organization=None, category=None):
+    def _failure(self, message, phase, job=None, organization=None, category=None, code=None):
         """A named failure with its phase and its one recovery action."""
-        category = category or classify(message)
+        category = category or classify(message, code)
         info = FAILURES[category]
         agent = ''
         if organization:
@@ -838,6 +847,10 @@ class StudioOperations:
         studio = self._studio(organization)
         if not studio.get('group_id'):
             return [dict(step='setup', label='Set up the Venture Studio first', needed=True, detail='')]
+        if self._studio_group_removed(organization, studio):
+            return [dict(step='rebuild', label='Rebuild the studio team', needed=True,
+                         detail='The studio group was removed. Agents still present are kept; missing ones '
+                                'are hired again with the same settings.')]
         bindings = self._studio_bindings(organization, studio)
         failed = [binding for binding in bindings + self._panel_bindings(organization, studio) if binding['failed']]
         herdr = self._herdr_state(fresh=True)
@@ -874,10 +887,20 @@ class StudioOperations:
             raise ValueError('Set up the Venture Studio first.')
         store = self.service.store
         done = []
+        rebuilt = None
+        if plan and plan[0]['step'] == 'rebuild':
+            # Runs before the Herdr step below only needs Herdr to be running.
+            if self._herdr_state(fresh=True) == 'stopped':
+                self.herdr_start()
+            self.setup_studio(organization, dict(confirmed=True), actor)
+            rebuilt = dict(step='team', ok=True, detail='Rebuilt the studio team and its group.')
 
         def record(step, ok, detail, **extra):
             done.append(dict(step=step, ok=bool(ok), detail=redact(str(detail))[:300], **extra))
             return ok
+
+        if rebuilt:
+            done.append(rebuilt)
 
         def finish():
             return dict(preview=False, steps=done, healthy=all(item['ok'] for item in done),
@@ -919,7 +942,8 @@ class StudioOperations:
                                             'when the next meeting needs them.')
                 self._studio_rename_group(organization, studio)
             except (ValueError, OSError) as error:
-                failure = self._failure(str(error), 'preparation', organization=organization)
+                failure = self._failure(str(error), 'preparation', organization=organization,
+                                        code=getattr(error, 'code', None))
                 record('facilitator', False, error, failure=failure)
                 return finish()
         newest = not self._studio_in_flight(organization)
@@ -942,9 +966,12 @@ class StudioOperations:
             return 'Closed the ' + run['kind'] + ' run: ' + reason
 
         def settle():
+            from contributions import Busy
             job = self._job(run.get('job_id'))
             try:
                 self._studio_settle(run, self._studio_parse(run, job))
+            except Busy:
+                raise  # An operator is on one of its ideas: a valid result, for later.
             except ValueError as error:
                 return dismiss('the result did not validate (' + str(error)[:160] + ').')
             return 'The ' + run['kind'] + ' result is in.'
@@ -1120,6 +1147,9 @@ class StudioOperations:
                 # Only an idea the Skeptic would advance is created unattended.
                 reason = ('The Skeptic would ' + candidate['dissent']['verdict'] + ' this idea; approve it '
                           'yourself if you disagree.')
+            elif pitch and not panel_current(candidate):
+                reason = ('It was edited after the panel saw it, so the votes are for an earlier version; '
+                          'it goes back to the next pitch.')
             elif pitch and not panel_backs(candidate):
                 counts = candidate.get('panel') or {}
                 reason = ('Most stakeholders did not back it (' + str(counts.get('back', 0)) + ' back, '
@@ -1137,23 +1167,31 @@ class StudioOperations:
                           'It cites no outside source item, only internal history.')
             elif created >= AUTO_CREATE_PER_RUN:
                 reason = 'Only ' + str(AUTO_CREATE_PER_RUN) + ' venture is created per scout run.'
-            elif len(self._studio_ventures(organization)) >= self.limit(organization):
+            elif self._places_taken(organization) >= self.limit(organization):
                 reason = 'The active venture limit of ' + str(self.limit(organization)) + ' is reached.'
             if not reason:
                 try:
                     # Settlement runs on the shared poll thread: never wait for an
                     # operator deciding this idea; it is left to them, with the reason.
                     with self.service.operation('candidate:' + candidate['id'], timeout=0):
+                        if pitch and not panel_backs(self.get_candidate(organization, candidate['id'])):
+                            raise ValueError('It was edited after the panel saw it, so the votes are for an '
+                                             'earlier version; it goes back to the next pitch.')
                         self.candidate_decide(organization, candidate['id'], dict(
                             decision='approve', confirmed=True, create_team=True, start_daily=True,
                             meeting_cadence='news_only'), AUTO_ACTOR)
                     created += 1
                 except (ValueError, OSError) as error:
                     reason = str(error) or error.__class__.__name__
-            stored = self.get_candidate(organization, candidate['id'])
-            stored['auto'] = dict(at=now().isoformat(), created=not reason, reason=redact(reason)[:300],
-                                  run_id=run['id'], minimum_confidence=minimum)
-            self.save_candidate(stored)
+            from contributions import Busy
+            try:
+                with self.service.operation('candidate:' + candidate['id'], timeout=0):
+                    stored = self.get_candidate(organization, candidate['id'])
+                    stored['auto'] = dict(at=now().isoformat(), created=not reason, reason=redact(reason)[:300],
+                                          run_id=run['id'], minimum_confidence=minimum)
+                    self.save_candidate(stored)
+            except Busy:  # An operator is editing it; the run still records the outcome.
+                stored = self.get_candidate(organization, candidate['id'])
             outcomes.append(dict(candidate_id=candidate['id'], name=candidate.get('name', ''),
                                  created=not reason, reason=redact(reason)[:300],
                                  venture_id=stored.get('venture_id', '')))

@@ -22,6 +22,7 @@ FETCH_LIMIT = 64_000
 def parse_ecb(body):
     if b'<!DOCTYPE' in body.upper() or b'<!ENTITY' in body.upper():
         raise ValueError('FX source rejected a document with entity declarations.')
+    venture_feeds._refuse_declarations(body, 'FX source')  # Also in encodings the byte check cannot read.
     try:
         root = ElementTree.fromstring(body)
     except ElementTree.ParseError as error:

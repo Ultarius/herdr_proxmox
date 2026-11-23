@@ -62,6 +62,7 @@ def provision_studio(root, relative, organization_id):
             raise ValueError('Venture studio notebook already contains files.')
     else:
         target.mkdir(mode=0o700)
+        target.chmod(0o700)  # The mode above is subject to the umask.
         created = True
     try:
         project_git.git(target, 'init', '-b', 'main')
@@ -94,6 +95,7 @@ def provision(root, relative, venture):
             raise ValueError('Venture notebook already contains files; choose a new venture.')
     else:
         target.mkdir(mode=0o700)
+        target.chmod(0o700)  # The mode above is subject to the umask.
         created = True
     try:
         project_git.git(target, 'init', '-b', 'main')
@@ -130,6 +132,75 @@ def _csv_row(text, values):
     return text + stream.getvalue()
 
 
+def _commit_owned(target, paths, message):
+    """Commit only the new files the gateway wrote; True when one of them changed.
+
+    Agents run as the same OS user and a read-only group is an instruction,
+    so a file one drops into the notebook, or stages there, must not enter a
+    commit that reads as gateway output."""
+    project_git.git(target, 'add', '--', *paths)
+    if not project_git.git(target, 'diff', '--cached', '--name-only', '--', *paths).strip():
+        return False
+    project_git.git(target, 'commit', '-m', message, '--', *paths)
+    return True
+
+
+def _committed(target, name, fallback):
+    try:
+        return project_git.git(target, 'show', 'HEAD:' + name)
+    except ValueError:
+        return fallback
+
+
+def _staged_edits(target, names):
+    """``{name: staged text}`` for files whose index entry differs from HEAD.
+
+    None means the index holds no plain version of the file (a staged removal
+    or a conflict), which only its owner can resolve."""
+    staged = {}
+    for name in names:
+        try:
+            text = project_git.git(target, 'show', ':' + name)
+        except ValueError:
+            staged[name] = None
+            continue
+        if text != _committed(target, name, None):
+            staged[name] = text
+    return staged
+
+
+def _commit_contents(target, contents, apply, message):
+    """Commit exact file contents on top of HEAD; returns the commit.
+
+    Built on a private index, so someone's uncommitted edit in the same file
+    stays theirs and enters no gateway commit. An unstaged edit remains in the
+    working tree. A staged one stays staged, with ``apply[name]`` adding the
+    gateway's lines to it, so committing it later keeps both."""
+    head = project_git.git(target, 'rev-parse', 'HEAD').strip()
+    staged = _staged_edits(target, contents)
+    with tempfile.TemporaryDirectory(prefix='herdr-notebook-') as temporary:
+        index, source = Path(temporary) / 'index', Path(temporary) / 'content'
+
+        def blob(text):
+            source.write_bytes(text.encode('utf-8'))
+            return project_git.git(target, 'hash-object', '-w', '--no-filters', '--', str(source)).strip()
+        project_git.git(target, 'read-tree', head, index_file=index)
+        for name, text in contents.items():
+            project_git.git(target, 'update-index', '--add', '--cacheinfo', '100644,' + blob(text) + ',' + name,
+                            index_file=index)
+        tree = project_git.git(target, 'write-tree', index_file=index).strip()
+        commit = project_git.git(target, 'commit-tree', tree, '-p', head, '-m', message).strip()
+        project_git.git(target, 'update-ref', 'HEAD', commit, head)
+        plain = [name for name in contents if name not in staged]
+        if plain:
+            project_git.git(target, 'reset', '-q', '--', *plain)  # The real index follows, the files do not.
+        for name, text in staged.items():
+            if text is not None:
+                project_git.git(target, 'update-index', '--cacheinfo',
+                                '100644,' + blob(apply[name](text)) + ',' + name)
+    return commit
+
+
 def write_outreach(root, relative, draft):
     """Write one approved draft to ``outreach/`` and commit it. Returns the relative path."""
     target = _relative(Path(root), relative)
@@ -148,9 +219,7 @@ def write_outreach(root, relative, draft):
                + '\n- Simulated score when drafted: ' + str(draft.get('score', '')) + '\n\n'
                + 'Review and send this yourself. Replace every {{placeholder}} first.\n\n---\n\n'
                + draft['body'].strip() + '\n')
-        project_git.git(target, 'add', '-A')
-        if project_git.git(target, 'status', '--porcelain').strip():
-            project_git.git(target, 'commit', '-m', 'approve outreach ' + draft['id'][:8])
+        _commit_owned(target, ['outreach/' + name], 'approve outreach ' + draft['id'][:8])
     return 'outreach/' + name
 
 
@@ -164,28 +233,40 @@ def commit_tick(root, relative, tick, product_changes, pricing):
         ledger = target / 'ledger.csv'
         ledger_text = _read(ledger)
         date = tick['simulated_date']
-        existing = [row for row in csv.DictReader(io.StringIO(ledger_text)) if row.get('date') == date]
-        if not existing:
-            ledger_text = _csv_row(ledger_text, [date, tick['ledger']['capital_before'],
-                tick['ledger']['burn'], tick['ledger']['capital_after'],
-                '' if tick['ledger'].get('score') is None else tick['ledger']['score'], tick['id']])
+        row = [date, tick['ledger']['capital_before'], tick['ledger']['burn'], tick['ledger']['capital_after'],
+               '' if tick['ledger'].get('score') is None else tick['ledger']['score'], tick['id']]
+
+        def has_day(text):
+            return any(item.get('date') == date for item in csv.DictReader(io.StringIO(text)))
+        if not has_day(ledger_text):
+            ledger_text = _csv_row(ledger_text, row)
             _write(ledger, ledger_text)
         product = target / 'product.md'
         product_text = _read(product)
-        additions = []
-        for change in product_changes:
-            line = ('- ' + date + ': [' + change['kind'] + '] ' + change['title'] + ' - '
-                    + change['reason'] + ' (evidence: ' + ', '.join(change['evidence']) + ')')
-            if line not in product_text and line not in additions:
-                additions.append(line)
+        lines = ['- ' + date + ': [' + change['kind'] + '] ' + change['title'] + ' - '
+                 + change['reason'] + ' (evidence: ' + ', '.join(change['evidence']) + ')'
+                 for change in product_changes]
         if pricing.get('monthly') is not None:
-            line = '- ' + date + ': pricing ' + str(pricing['monthly']) + ' per month - ' + str(pricing.get('reason', ''))[:600]
-            if line not in product_text and line not in additions:
-                additions.append(line)
-        if additions:
-            _write(product, product_text.rstrip() + '\n' + '\n'.join(additions) + '\n')
-        project_git.git(target, 'add', '-A')
-        if not project_git.git(target, 'status', '--porcelain').strip():
+            lines.append('- ' + date + ': pricing ' + str(pricing['monthly']) + ' per month - '
+                         + str(pricing.get('reason', ''))[:600])
+
+        def with_lines(text):
+            additions = list(dict.fromkeys(line for line in lines if line not in text))
+            return text.rstrip() + '\n' + '\n'.join(additions) + '\n' if additions else text
+        updated = with_lines(product_text)
+        if updated != product_text:
+            _write(product, updated)
+        # Measured against HEAD, so a retry after a crash still commits this
+        # tick, and a local edit in either file is not part of it.
+        contents = {}
+        committed_ledger = _committed(target, 'ledger.csv', ledger_text)
+        if not has_day(committed_ledger):
+            contents['ledger.csv'] = _csv_row(committed_ledger, row)
+        committed_product = _committed(target, 'product.md', updated)
+        if with_lines(committed_product) != committed_product:
+            contents['product.md'] = with_lines(committed_product)
+        if not contents:
             return ''
-        project_git.git(target, 'commit', '-m', 'tick ' + date + ' ' + tick['id'])
-        return project_git.git(target, 'rev-parse', 'HEAD').strip()
+        apply = {'ledger.csv': lambda text: text if has_day(text) else _csv_row(text, row),
+                 'product.md': with_lines}
+        return _commit_contents(target, contents, apply, 'tick ' + date + ' ' + tick['id'])

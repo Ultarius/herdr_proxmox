@@ -209,6 +209,8 @@ def action(store, db, name, body, org, *, studio_run_id=None):
             members.append(member)
         # The Codex option controls the facilitator's launch. Members keep
         # their own permissions, including when the group mixes runtimes.
+        # Accessible paths need no check per member here: only OpenCode takes
+        # them, so the Codex facilitator's own check already refuses any.
         policy_members = members[:1] if body.get('permission_mode') == CODEX_NO_APPROVAL else members
         policies = [(permission_mode(body, member['runtime']),
                      accessible_paths(body, member['runtime'])) for member in policy_members]

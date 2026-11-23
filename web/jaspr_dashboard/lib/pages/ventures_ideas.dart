@@ -584,6 +584,12 @@ Component candidateDiligence(Map<String, dynamic> item) {
         'Stakeholders, round ${panel['round'] ?? 1}: ${panel['back'] ?? 0} back · '
         '${panel['hold'] ?? 0} hold · ${panel['pass'] ?? 0} pass',
         [
+          if (panel['outdated'] == true)
+            notice(
+              'This idea was edited after these reviews, so they are about an earlier version. '
+              'It goes back to the next pitch.',
+              error: true,
+            ),
           if (panel['independent'] == false)
             notice(
               'Every stakeholder ran on the studio\'s own model; this critique may echo the studio.',
@@ -716,6 +722,13 @@ Component _candidate(
       state == 'failed';
   final hasVenture = '${item['venture_id'] ?? ''}'.isNotEmpty;
   final canEdit = !hasVenture && state != 'creating';
+  // The duplicate check compares words, so it can be wrong. An exclusion term
+  // set by the operator cannot be overridden here.
+  final likelyDuplicate =
+      state == 'excluded' &&
+      !hasVenture &&
+      '${item['duplicate_of'] ?? ''}'.isNotEmpty &&
+      '${item['excluded_by'] ?? ''}'.isEmpty;
   return disclosure('${item['name'] ?? 'Untitled candidate'} · $state', [
     facts([
       ('Organization', text(organizationName)),
@@ -791,6 +804,10 @@ Component _candidate(
       ),
     if (item['venture_id'] != null)
       paragraph('Created venture: ${item['venture_id']}'),
+    if (likelyDuplicate)
+      paragraph(
+        'This looks like a duplicate. Edit it to make the difference clear, or create it anyway.',
+      ),
     actions([
       if (canEdit)
         button('Edit', busy ? null : () => onEdit(item), small: true),
@@ -804,6 +821,12 @@ Component _candidate(
           busy ? null : () => onApprove(item),
           small: true,
           primary: true,
+        ),
+      if (likelyDuplicate)
+        button(
+          'Create anyway',
+          busy ? null : () => onApprove(item),
+          small: true,
         ),
       if (canReview && !hasVenture)
         button(

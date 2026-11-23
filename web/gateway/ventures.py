@@ -21,6 +21,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -28,6 +29,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 
 from discovery import redact
@@ -42,7 +44,7 @@ import venture_feeds
 import venture_fx
 import venture_notebook
 from venture_studio import STUDIO_MODES, USAGE_RESULT_PROBE_SECONDS, StudioOperations, StudioWaiting, classify
-from venture_panel import StakeholderPanel
+from venture_panel import StakeholderPanel, pitch_version
 
 EVIDENCE_LIMIT = 14000
 PROMPT_LIMIT = 8000
@@ -51,6 +53,21 @@ MAX_ACTIVE_VENTURES = 3
 MAX_ACTIVE_VENTURES_CEILING = 20
 SCHEDULE_RETRY_MINUTES = 15
 FEED_INTERVAL = timedelta(hours=1)
+# An operator waits on a manual run, so its feed fetches share one budget. A
+# feed not reached stays due for the next background refresh.
+MANUAL_FETCH_SECONDS = 20
+MANUAL_FETCH_MINIMUM = 5
+# Concurrent background refreshes reaching the network.
+REFRESH_SLOTS = 4
+# History retention: settled ticks and runs keep their ledger, results and
+# decisions; only frozen evidence packs and prompts are dropped.
+HISTORY_DETAIL_DAYS = 90
+HISTORY_FULL_RUNS = 50
+HISTORY_INTERVAL_SECONDS = 6 * 3600
+HISTORY_FIRST_DELAY_SECONDS = 600
+LESSON_CACHE_SECONDS = 60
+OUTCOME_REPEAT_WINDOW = timedelta(minutes=1)
+NEEDS_TEAM = 'Daily reviews need a team: create or choose a group for this venture first.'
 LAYERS = ('sources', 'market', 'simulation', 'outreach')
 # A qualified venture keeps its market and rules (they are what it qualified
 # under) but may still move its outreach stage, sources and schedule.
@@ -446,6 +463,17 @@ def _strings(value, limit, count, label):
     return result
 
 
+def flat_revisions(revisions):
+    """An idea's edit history, each entry without the history before it.
+
+    Entries once held a full copy of the idea, history included, which
+    doubled the record with every edit. The older entries are already in the
+    list itself."""
+    return [dict(entry, before={key: value for key, value in (entry.get('before') or {}).items()
+                                if key != 'revisions'})
+            for entry in revisions or [] if isinstance(entry, dict)]
+
+
 def merge_config(previous, supplied):
     """A partial configuration applied to a stored one, before normalising.
 
@@ -590,8 +618,9 @@ def _confidence(value):
         return value
     if type(value) is float and 0 <= value <= 1:
         return int(round(value * 100))
-    if type(value) is float and 1 < value <= 100:
-        return int(round(value))
+    # 1.5 is on neither scale: 2 out of 100, or a mistyped fraction?
+    if type(value) is float and 1 < value <= 100 and value.is_integer():
+        return int(value)
     raise ValueError('confidence: a whole number 0-100 is needed')
 
 
@@ -1239,6 +1268,11 @@ class Ventures(StudioOperations, StakeholderPanel):
         self._refreshing = set()
         self._studio_refreshing = set()
         self._refresh_lock = threading.Lock()
+        self._refresh_slots = threading.BoundedSemaphore(REFRESH_SLOTS)
+        self._batch_cursors = {}
+        self._history_generation = 0
+        self._lesson_cache = {}
+        self._history_due = time.monotonic() + HISTORY_FIRST_DELAY_SECONDS
         self._usage_lock = threading.Lock()
         self._usage_observations = {}
         self._usage_probing = set()
@@ -1274,6 +1308,7 @@ class Ventures(StudioOperations, StakeholderPanel):
         with closing(self.service.connect()) as db, db:
             db.execute('INSERT OR REPLACE INTO ventures VALUES (?,?,?)',
                        (record['id'], record['organization_id'], json.dumps(record)))
+        self._history_generation += 1
         return record
 
     def get(self, identity, organization):
@@ -1290,7 +1325,26 @@ class Ventures(StudioOperations, StakeholderPanel):
         with closing(self.service.connect()) as db, db:
             db.execute('INSERT OR REPLACE INTO venture_ticks VALUES (?,?,?,?)',
                        (tick['id'], tick['venture_id'], tick['organization_id'], json.dumps(tick)))
+        self._history_generation += 1
         return tick
+
+    def _tick_by_id(self, identity, record):
+        with closing(self.service.connect()) as db:
+            row = db.execute('SELECT data FROM venture_ticks WHERE id=? AND venture_id=?',
+                             (identity, record['id'])).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def _rotating(self, name, query, params=(), limit=30):
+        """One page of a poll query, continuing after the previous page, so a
+        long list cannot starve the rows past the first ``limit``."""
+        cursor = self._batch_cursors.get(name, 0)
+        with closing(self.service.connect()) as db:
+            rows = db.execute(query + ' AND rowid>? ORDER BY rowid LIMIT ?', (*params, cursor, limit)).fetchall()
+            if len(rows) < limit and cursor:
+                rows += db.execute(query + ' AND rowid<=? ORDER BY rowid LIMIT ?',
+                                   (*params, cursor, limit - len(rows))).fetchall()
+        self._batch_cursors[name] = rows[-1][0] if len(rows) == limit else 0
+        return [json.loads(row[1]) for row in rows]
 
     def tick_for(self, venture_id, organization, date):
         with closing(self.service.connect()) as db:
@@ -1459,11 +1513,13 @@ class Ventures(StudioOperations, StakeholderPanel):
         if body.get('confirmed') is not True:
             raise ValueError('Confirm creating the Venture Studio notebook, agents and read-only group.')
         studio = self._studio(organization)
-        if studio.get('group_id'):
+        if studio.get('group_id') and not self._studio_group_removed(organization, studio):
             self._studio_group(organization, studio)
             self._studio_rename_group(organization, studio)
             return studio
         self._require_herdr('set up the Venture Studio')
+        if studio.get('group_id'):
+            studio = self._studio_prepare_rebuild(organization, studio)
         relative = studio.get('notebook') or self._studio_notebook_path(organization)
         if not studio.get('notebook'):
             venture_notebook.provision_studio(self.service.projects, relative, organization)
@@ -1485,8 +1541,11 @@ class Ventures(StudioOperations, StakeholderPanel):
         settings_by_role = team['settings_by_role']
 
         def request_id(kind, role=''):
+            # A rebuild must not replay the responses of agents since removed.
+            rebuild = int(team.get('rebuild') or 0)
             return 'studio-' + kind + '-' + hashlib.sha256(
-                (organization + ':' + kind + ':' + role).encode()).hexdigest()[:32]
+                (organization + ':' + kind + ':' + role + (':' + str(rebuild) if rebuild else '')).encode()
+            ).hexdigest()[:32]
 
         specifications = (
             ('Portfolio Manager', 'portfolio', 'Own the portfolio review, rank ventures and recommend continue, pause, kill or investigate.'),
@@ -1517,6 +1576,27 @@ class Ventures(StudioOperations, StakeholderPanel):
         self.save_studio(organization, studio)
         self._studio_group(organization, studio)
         return studio
+    def _studio_group_removed(self, organization, studio):
+        group_id = studio.get('group_id')
+        if not group_id:
+            return False
+        return not any(item.get('id') == group_id and item.get('organization_id') == organization
+                       and not item.get('removed_at')
+                       for item in self.service.store.snapshot(live_status=False).get('groups', []))
+
+    def _studio_prepare_rebuild(self, organization, studio):
+        """Clear a removed group and removed agents; surviving agents stay."""
+        live = {item['id'] for item in self.service.store.snapshot(live_status=False).get('profiles', [])
+                if item.get('organization_id') == organization
+                and not item.get('archived') and not item.get('removed_at')}
+        team = dict(studio.get('team') or {})
+        team['members'] = {role: identity for role, identity in (team.get('members') or {}).items()
+                           if identity in live}
+        team['rebuild'] = int(team.get('rebuild') or 0) + 1
+        studio.update(team=team, group_id='')
+        self.save_studio(organization, studio)
+        return studio
+
     def update_studio_policy(self, organization, body, actor):
         # A stored value that no longer validates falls back to its default
         # here; saving the form therefore repairs it.
@@ -1589,7 +1669,7 @@ class Ventures(StudioOperations, StakeholderPanel):
                 actor=actor, created_at=now().isoformat(), manual=False, recommendations=[], candidates=[],
                 active_venture_ids=[], error='', reason='No active ventures to review; no meeting was started.'))
         if manual and policy['studio_sources']:
-            self._fetch_urls(organization, policy['studio_sources'])
+            self._fetch_urls(organization, policy['studio_sources'], MANUAL_FETCH_SECONDS)
         evidence, active_ids, evidence_index = self._studio_evidence(organization, kind, policy)
         web = kind == 'scout' and policy['studio_web_research'] and not evidence['items']
         if web and not policy['studio_focus']:
@@ -1625,7 +1705,8 @@ class Ventures(StudioOperations, StakeholderPanel):
             # The prompt is frozen on the run; recover re-sends it under the
             # same request id, so a lost response cannot become two meetings.
             run.update(state='needs_attention', error=redact(str(error))[:500], dispatch_failed=True,
-                       failure=self._failure(str(error), 'dispatch', organization=organization))
+                       failure=self._failure(str(error), 'dispatch', organization=organization,
+                                             code=getattr(error, 'code', None)))
             self.save_studio_run(run)
             raise
 
@@ -1693,8 +1774,11 @@ class Ventures(StudioOperations, StakeholderPanel):
                 return self._studio_dispatch(organization, run)
             if action == 'settle':
                 job = self._job(run.get('job_id'))
+                from contributions import Busy
                 try:
                     return self._studio_settle(run, self._studio_parse(run, job))
+                except Busy:
+                    raise  # An operator is on one of its ideas; nothing is wrong with the result.
                 except ValueError as error:
                     raise ValueError(str(error) + ' The result still does not validate; dismiss this run.') from error
             self._repair_run(organization, run, action, actor)
@@ -1720,17 +1804,11 @@ class Ventures(StudioOperations, StakeholderPanel):
         names = {str(item.get('name', '')).lower() for item in kept}
         fresh = [item for item in parsed['candidates'] if item['name'].lower() not in names]
         refused = [item for item in parsed['refused_candidates'] if str(item.get('name', '')).lower() not in names]
-        run.update(candidates=kept + fresh, refused_candidates=refused, reread=dict(
-            at=now().isoformat(), added=[item['name'] for item in fresh],
-            still_refused=[item.get('name', '') for item in refused]))
-        with closing(self.service.connect()) as db, db:
-            for candidate in fresh:
-                db.execute('INSERT OR REPLACE INTO venture_candidates VALUES (?,?,?)',
-                           (candidate['id'], candidate['organization_id'], json.dumps(candidate)))
-            db.execute('INSERT OR REPLACE INTO venture_studio_runs VALUES (?,?,?,?)',
-                       (run['id'], run['organization_id'], run['kind'], json.dumps(run)))
-            notify(db, 'job', run['id'], run['organization_id'])
-        self._supersede(fresh)
+        with self._holding_candidates(self._revised(fresh)):
+            run.update(candidates=kept + fresh, refused_candidates=refused, reread=dict(
+                at=now().isoformat(), added=[item['name'] for item in fresh],
+                still_refused=[item.get('name', '') for item in refused]))
+            self._save_round(run, fresh)
         if fresh:
             self._pitch_start(dict(run, candidates=fresh))
         try:
@@ -2502,6 +2580,12 @@ class Ventures(StudioOperations, StakeholderPanel):
                     duplicate_of=duplicate or '', excluded_by=excluded_by, decision=None,
                     created_at=now().isoformat(), actor=run.get('actor', 'venture_studio'))
 
+    @staticmethod
+    def _only_a_duplicate(candidate):
+        """Excluded by the word-overlap heuristic alone, which can be wrong.
+        A permanent exclusion term stays a hard refusal."""
+        return bool(candidate.get('duplicate_of')) and not candidate.get('excluded_by')
+
     def _candidate_duplicate(self, name, thesis, known):
         wanted_name = set(re.findall(r'[a-z0-9]+', name.lower()))
         wanted_thesis = set(re.findall(r'[a-z0-9]+', thesis.lower()))
@@ -2522,16 +2606,9 @@ class Ventures(StudioOperations, StakeholderPanel):
     def _studio_settle(self, run, parsed):
         if run.get('kind') == 'pitch':
             return self._pitch_settle(run, parsed)
-        run.update(state='ready', processed_at=now().isoformat(), error='', failure=None, waiting=None, **parsed)
-        self._supersede(run.get('candidates') or [])
-        with closing(self.service.connect()) as db, db:
-            for candidate in run.get('candidates') or []:
-                db.execute('INSERT OR REPLACE INTO venture_candidates VALUES (?,?,?)',
-                           (candidate['id'], candidate['organization_id'], json.dumps(candidate)))
-            db.execute('INSERT OR REPLACE INTO venture_studio_runs VALUES (?,?,?,?)',
-                       (run['id'], run['organization_id'], run['kind'], json.dumps(run)))
-            notify(db, 'job', run['id'], run['organization_id'])
-            db.commit()
+        with self._holding_candidates(self._revised(parsed.get('candidates') or [])):
+            run.update(state='ready', processed_at=now().isoformat(), error='', failure=None, waiting=None, **parsed)
+            self._save_round(run, run.get('candidates') or [])
         try:
             created = self._studio_autocreate(run)
         except Exception as error:  # Creation is extra: the settled result stays.
@@ -2544,25 +2621,41 @@ class Ventures(StudioOperations, StakeholderPanel):
         self._pitch_start(run)
         return run
 
-    def _supersede(self, candidates):
-        """A revision replaces the idea it revises, which leaves the queue."""
-        for candidate in candidates:
-            earlier = candidate.get('revision_of')
-            if not earlier or candidate.get('state') != 'proposed':
-                continue
-            try:
-                previous = self.get_candidate(candidate['organization_id'], earlier)
-            except ValueError:
-                continue
-            if previous.get('state') == 'proposed':
-                previous.update(state='superseded', superseded_by=candidate['id'], superseded_at=now().isoformat())
-                self.save_candidate(previous)
+    @staticmethod
+    def _revised(candidates):
+        """The earlier ideas these proposed revisions replace."""
+        return [candidate['revision_of'] for candidate in candidates
+                if candidate.get('revision_of') and candidate.get('state') == 'proposed']
+
+    def _save_round(self, run, candidates):
+        """Save new ideas, retire what they revise and save the run, all or nothing.
+
+        A revision replaces the idea it revises, which leaves the queue. The
+        caller holds the locks of those earlier ideas."""
+        stamp = now().isoformat()
+        with closing(self.service.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            for candidate in candidates:
+                earlier = candidate.get('revision_of')
+                if earlier and candidate.get('state') == 'proposed':
+                    row = db.execute('SELECT data FROM venture_candidates WHERE id=? AND organization_id=?',
+                                     (earlier, candidate['organization_id'])).fetchone()
+                    previous = json.loads(row[0]) if row else None
+                    if previous and previous.get('state') == 'proposed':
+                        previous.update(state='superseded', superseded_by=candidate['id'], superseded_at=stamp,
+                                        updated_at=stamp)
+                        db.execute('INSERT OR REPLACE INTO venture_candidates VALUES (?,?,?)',
+                                   (previous['id'], previous['organization_id'], json.dumps(previous)))
+                db.execute('INSERT OR REPLACE INTO venture_candidates VALUES (?,?,?)',
+                           (candidate['id'], candidate['organization_id'], json.dumps(candidate)))
+            db.execute('INSERT OR REPLACE INTO venture_studio_runs VALUES (?,?,?,?)',
+                       (run['id'], run['organization_id'], run['kind'], json.dumps(run)))
+            notify(db, 'job', run['id'], run['organization_id'])
 
     def advance_studio(self):
         from contributions import Busy
-        with closing(self.service.connect()) as db:
-            runs = [json.loads(row[0]) for row in db.execute(
-                "SELECT data FROM venture_studio_runs WHERE json_extract(data, '$.state')='meeting' LIMIT 30")]
+        runs = self._rotating('studio-runs', "SELECT rowid, data FROM venture_studio_runs "
+                                             "WHERE json_extract(data, '$.state')='meeting'")
         snapshot = self.service.store.snapshot(live_status=False)
         jobs = {item['id']: item for item in snapshot.get('jobs', [])}
         for saved in runs:
@@ -2599,6 +2692,8 @@ class Ventures(StudioOperations, StakeholderPanel):
                                 if hold:
                                     run['skeptic_usage'] = hold
                             self._studio_settle(run, parsed)
+                        except Busy:
+                            continue  # An operator is on one of its ideas: the next pass settles it.
                         except Exception as error:
                             message = str(error) or error.__class__.__name__
                             run.update(state='needs_attention', error=redact(message)[:500],
@@ -2654,9 +2749,10 @@ class Ventures(StudioOperations, StakeholderPanel):
 
     def _studio_refresh(self, organization, urls):
         try:
-            self._fetch_urls(organization, urls)
-        except Exception:
-            pass
+            with self._refresh_slots:
+                self._fetch_urls(organization, urls)
+        except Exception as error:  # Retried by the next schedule pass.
+            logging.warning('Studio feed refresh failed for %s: %s', organization, redact(str(error)))
         finally:
             with self._refresh_lock:
                 self._studio_refreshing.discard(organization)
@@ -2805,15 +2901,16 @@ class Ventures(StudioOperations, StakeholderPanel):
         policy = self._studio_policy(organization)
         studio = self._studio(organization)
         with closing(self.service.connect()) as db:
+            # Every poll reads this: leave the frozen packs and prompts in SQLite.
             runs = [json.loads(row[0]) for row in db.execute(
-                'SELECT data FROM venture_studio_runs WHERE organization_id=? ORDER BY rowid DESC LIMIT 20',
+                "SELECT json_remove(data, '$.evidence', '$.prompt', '$.bundle', '$.evidence_index') "
+                'FROM venture_studio_runs WHERE organization_id=? ORDER BY rowid DESC LIMIT 20',
                 (organization,))]
-            candidates = [json.loads(row[0]) for row in db.execute(
-                'SELECT data FROM venture_candidates WHERE organization_id=? ORDER BY rowid DESC LIMIT 100',
+            fields = ('id', 'name', 'state', 'confidence', 'duplicate_of', 'excluded_by')
+            summaries = [dict(zip(fields, row)) for row in db.execute(
+                'SELECT ' + ', '.join("json_extract(data, '$." + field + "')" for field in fields)
+                + ' FROM venture_candidates WHERE organization_id=? ORDER BY rowid DESC LIMIT 100',
                 (organization,))]
-        summaries = [{key: item.get(key) for key in ('id', 'name', 'state', 'confidence', 'duplicate_of',
-                                                     'excluded_by')}
-                     for item in candidates]
         run_summaries = []
         for run in runs:
             item = {key: run.get(key) for key in
@@ -2849,7 +2946,15 @@ class Ventures(StudioOperations, StakeholderPanel):
                     usage_holds=self._usage_holds(organization, studio))
 
     def _studio_lessons_summary(self, organization):
-        return self._studio_lessons(organization)[:12]
+        """Lessons for the dashboard, which polls: rebuilt when history changed."""
+        cached = self._lesson_cache.get(organization)
+        if (cached and cached[0] == self._history_generation
+                and time.monotonic() - cached[1] < LESSON_CACHE_SECONDS):
+            return cached[2]
+        generation = self._history_generation
+        lessons = self._studio_lessons(organization)[:12]
+        self._lesson_cache[organization] = (generation, time.monotonic(), lessons)
+        return lessons
     def get_candidate(self, organization, identity):
         with closing(self.service.connect()) as db:
             row = db.execute('SELECT data FROM venture_candidates WHERE id=? AND organization_id=?',
@@ -2869,9 +2974,10 @@ class Ventures(StudioOperations, StakeholderPanel):
         candidate = self.get_candidate(organization, identity)
         if candidate.get('venture_id'):
             raise ValueError('This candidate is already linked to a venture and cannot be edited.')
-        if candidate.get('state') not in ('proposed', 'approved', 'failed'):
+        duplicate = candidate.get('state') == 'excluded' and self._only_a_duplicate(candidate)
+        if candidate.get('state') not in ('proposed', 'approved', 'failed') and not duplicate:
             raise ValueError('Only a proposed or approved candidate can be edited.')
-        before = json.loads(json.dumps(candidate))
+        before = json.loads(json.dumps({key: value for key, value in candidate.items() if key != 'revisions'}))
         for key, limit in (('name', 120), ('thesis', 1500), ('product', 1500), ('pricing', 500)):
             if key in body:
                 candidate[key] = _value(body.get(key), limit, 'candidate ' + key,
@@ -2908,8 +3014,21 @@ class Ventures(StudioOperations, StakeholderPanel):
             candidate['kill_criteria'] = scout_kill_criteria(candidate['kill_criteria'],
                                                              candidate.get('economics'))
             candidate['kill_criteria_notes'] = kill_criteria_notes(candidate['kill_criteria'])
-        candidate.setdefault('revisions', []).append(dict(at=now().isoformat(), by=actor, before=before))
-        candidate['revisions'] = candidate['revisions'][-20:]
+        if duplicate:
+            # An edit that makes the idea distinct puts it back in the queue.
+            known = [item for item in self._studio_known(organization) if item.get('id') != candidate['id']]
+            candidate['duplicate_of'] = self._candidate_duplicate(candidate['name'], candidate.get('thesis', ''), known)
+            candidate['excluded_by'] = excluded_term(
+                ' '.join((candidate['name'], candidate.get('thesis', ''), candidate.get('product', ''))),
+                self._studio_policy(organization)['studio_exclude'])
+            if not candidate['duplicate_of'] and not candidate['excluded_by']:
+                candidate['state'] = 'proposed'
+        if isinstance(candidate.get('panel'), dict) and candidate['panel'].get('reviewers'):
+            panel = candidate['panel']
+            panel.setdefault('version', pitch_version(before))  # Reviewed before versions were recorded.
+            panel['outdated'] = panel['version'] != pitch_version(candidate)
+        candidate['revisions'] = (flat_revisions(candidate.get('revisions'))
+                                  + [dict(at=now().isoformat(), by=actor, before=before)])[-20:]
         return self.save_candidate(candidate)
 
     def candidate_brief(self, organization, identity):
@@ -2953,8 +3072,12 @@ class Ventures(StudioOperations, StakeholderPanel):
             raise ValueError('Confirm creating the venture from this candidate.')
         if candidate.get('state') == 'created':
             return candidate
-        if candidate.get('state') in ('rejected', 'excluded'):
-            raise ValueError('This candidate was rejected or excluded.')
+        override = (candidate.get('state') == 'excluded' and self._only_a_duplicate(candidate)
+                    and body.get('override_duplicate') is True)
+        if candidate.get('state') in ('rejected', 'excluded') and not override:
+            raise ValueError('This candidate was rejected or excluded.' + (
+                ' It looks like a duplicate: edit it, or confirm creating it anyway.'
+                if candidate.get('state') == 'excluded' and self._only_a_duplicate(candidate) else ''))
         policy = self._studio_policy(organization)
         allowed = set(policy.get('studio_sources') or [])
         if any(feed not in allowed for feed in candidate['configuration']['sources']['feeds']):
@@ -2980,6 +3103,9 @@ class Ventures(StudioOperations, StakeholderPanel):
                                                feeds=candidate['configuration']['sources']['feeds'])
         configuration = json.loads(json.dumps(candidate['configuration']))
         configuration['simulation']['daily_ticks'] = False  # Only "Start daily reviews" schedules it.
+        if override:
+            candidate['duplicate_override'] = dict(by=actor, at=now().isoformat(),
+                                                   duplicate_of=candidate['duplicate_of'])
         candidate.update(state='creating', error='')
         self.save_candidate(candidate)
         try:
@@ -3008,7 +3134,9 @@ class Ventures(StudioOperations, StakeholderPanel):
                 candidate['daily_started'] = True
                 self.save_candidate(candidate)
             candidate.update(state='created', error='',
-                             decision=dict(by=actor, at=now().isoformat(), decision='approve'))
+                             decision=dict(by=actor, at=now().isoformat(), decision='approve',
+                                           **({'override_duplicate': True} if candidate.get('duplicate_override')
+                                              else {})))
             return self.save_candidate(candidate)
         except Exception as error:
             candidate.update(state='approved', error=redact(str(error) or error.__class__.__name__)[:500])
@@ -3065,8 +3193,8 @@ class Ventures(StudioOperations, StakeholderPanel):
         payload['studio'] = payload['studios'][0] if payload['studios'] else None
         with closing(self.service.connect()) as db:
             payload['candidates'] = [
-                {key: value for key, value in json.loads(row[0]).items() if key != 'revisions'}
-                for row in db.execute('SELECT data FROM venture_candidates ORDER BY rowid DESC LIMIT 100')]
+                json.loads(row[0]) for row in db.execute(
+                    "SELECT json_remove(data, '$.revisions') FROM venture_candidates ORDER BY rowid DESC LIMIT 100")]
         payload['fx'] = self._fx_status()
         payload.update(herdr=self._herdr_state(), runtimes=self._runtimes())
         payload.update(enabled=True, module=module, options=options())
@@ -3206,8 +3334,8 @@ class Ventures(StudioOperations, StakeholderPanel):
                 return self.promote(record, body, actor)
             if mode == 'restore_promotion':
                 return self.restore_promotion(record, body, actor)
-            raise ValueError('Choose create, configure, run, pause, resume, recover, outreach, assumptions, '
-                             'team, promote, restore_promotion or archive.')
+            raise ValueError('Choose create, configure, run, pause, resume, recover, dismiss_tick, outreach, '
+                             'assumptions, team, promote, restore_promotion or archive.')
 
     def limit(self, organization):
         value = self._policy(organization).get('max_active_ventures', MAX_ACTIVE_VENTURES)
@@ -3238,6 +3366,8 @@ class Ventures(StudioOperations, StakeholderPanel):
         pricing = _value(body.get('pricing'), 500, 'pricing summary')
         group_id = _value(body.get('group_id'), 64, 'group') if body.get('group_id') else ''
         configuration = normalize_config(body.get('configuration') or {})
+        if configuration['simulation']['daily_ticks'] and not group_id:
+            raise ValueError(NEEDS_TEAM)
         relative = 'ventures/' + venture_notebook.slug(name) + '-' + identity[:8]
         simulation = configuration['simulation']
         source = body.get('source') or {}
@@ -3295,6 +3425,7 @@ class Ventures(StudioOperations, StakeholderPanel):
             record['product'] = _value(body.get('product'), 1500, 'product summary')
         if 'pricing' in body:
             record['pricing'] = _value(body.get('pricing'), 500, 'pricing summary')
+        previous_group = record.get('group_id')
         if 'group_id' in body:
             record['group_id'] = _value(body.get('group_id'), 64, 'group')
         if 'role_overrides' in body:
@@ -3302,6 +3433,10 @@ class Ventures(StudioOperations, StakeholderPanel):
         record['configuration'] = configuration
         old_simulation = previous.get('simulation', {})
         new_simulation = configuration['simulation']
+        # Clearing the team is fine in the same request that stops the schedule.
+        if new_simulation['daily_ticks'] and not record.get('group_id') and (
+                not old_simulation.get('daily_ticks') or previous_group):
+            raise ValueError(NEEDS_TEAM)
         if new_simulation['daily_ticks'] and not old_simulation.get('daily_ticks') and record.get('group_id'):
             # Starting a schedule adds a daily meeting: same cap as approval.
             self._check_budget(record['organization_id'], extra_daily=1)
@@ -3389,7 +3524,7 @@ class Ventures(StudioOperations, StakeholderPanel):
         previous_review = self.review_for(record['id'], record['organization_id'], date)
         if previous_review and previous_review.get('state') not in ('skipped',):
             if previous_review.get('tick_id'):
-                existing = self.tick_for(record['id'], record['organization_id'], date)
+                existing = self._tick_by_id(previous_review['tick_id'], record)
                 if existing:
                     self.save(record)
                     return existing
@@ -3423,13 +3558,14 @@ class Ventures(StudioOperations, StakeholderPanel):
         since = (previous or {}).get('simulated_at') or (now() - timedelta(days=1)).isoformat()
         configuration, fx = self._live_configuration(record['configuration'], fetch)
         if fetch:
-            self._fetch(record)
+            self._fetch(record, MANUAL_FETCH_SECONDS)
         items, cursor = self._recent_items(record['organization_id'], since, configuration['sources'],
                                            record.get('feed_cursor') or 0)
-        # Everything stored up to here has now been offered to this venture;
-        # rows stored later (a late fetch, another venture's feed) come next tick.
+        # Everything stored up to here is offered to this tick; rows stored later
+        # (a late fetch, another venture's feed) come next tick. The cursor moves
+        # only once a tick durably holds the items, so a day that could not
+        # meet offers them again.
         offered_from = record.get('feed_cursor') or 0
-        record['feed_cursor'] = cursor
         cadence = configuration['simulation'].get('meeting_cadence', 'news_only')
         base = dict(venture_id=record['id'], organization_id=record['organization_id'], actor=actor,
                     simulated_date=date, simulated_at=now().isoformat(), created_at=now().isoformat(),
@@ -3444,13 +3580,13 @@ class Ventures(StudioOperations, StakeholderPanel):
                         evidence=dict(items=[], coverage='No filtered news items.'))
             self.save_tick(tick)
             self._touch_review(tick, 'pending')
+            record['feed_cursor'] = cursor
             return self._settle(record, tick, self._quiet_result())
         review_kind = 'news' if items else 'strategy'
         if self._herdr_state(fresh=actor != 'venture_scheduler') == 'stopped':
             # A doomed meeting would end as a generic needs-attention tick.
             reason = 'Herdr is stopped. Start Herdr, then run the review.'
             self._skip_review(record, date, review_kind, reason, actor)
-            record['feed_cursor'] = offered_from  # These items were not used; offer them again.
             self.save(record)
             raise ValueError(reason)
         try:
@@ -3470,6 +3606,7 @@ class Ventures(StudioOperations, StakeholderPanel):
                     judged=bool(items))
         self.save_tick(tick)
         self._touch_review(tick, 'pending', reason='')
+        record['feed_cursor'] = cursor
         try:
             tick = self._dispatch(record, tick, actor)
         except (ValueError, OSError) as error:
@@ -3478,6 +3615,7 @@ class Ventures(StudioOperations, StakeholderPanel):
                 tick.update(state='skipped', error=message)
                 self.save_tick(tick)
                 self._touch_review(tick, 'skipped', reason=message)
+                record['feed_cursor'] = offered_from  # Nobody met: the next run gets these items.
             else:
                 tick.update(state='needs_attention', error=message)
                 self.save_tick(tick)
@@ -3495,7 +3633,16 @@ class Ventures(StudioOperations, StakeholderPanel):
         with closing(self.service.connect()) as db:
             return [json.loads(row[0]) for row in db.execute(
                 "SELECT data FROM ventures WHERE organization_id=? AND json_extract(data, '$.state') IN ("
-                + ','.join("'" + state + "'" for state in ACTIVE_VENTURE_STATES) + ')', (organization,))]
+                + ','.join('?' * len(ACTIVE_VENTURE_STATES)) + ')', (organization, *ACTIVE_VENTURE_STATES))]
+
+    def _places_taken(self, organization):
+        """Ventures holding a place under the active limit, now or at their
+        first scheduled tick. A plain draft holds none."""
+        with closing(self.service.connect()) as db:
+            scheduled = db.execute(
+                "SELECT COUNT(*) FROM ventures WHERE organization_id=? AND json_extract(data, '$.state')='draft' "
+                "AND json_extract(data, '$.configuration.simulation.daily_ticks')=1", (organization,)).fetchone()[0]
+        return len(self._active(organization)) + scheduled
 
     def _feed_state(self, organization, url):
         with closing(self.service.connect()) as db:
@@ -3518,28 +3665,38 @@ class Ventures(StudioOperations, StakeholderPanel):
     def _refresh(self, record):
         """Background work for a due venture: its feeds and, when used, the FX rates."""
         try:
-            self._fetch(record)
-            if record['configuration']['market'].get('fx_source', 'manual') == venture_fx.SOURCE:
-                self._rates()
-        except Exception:  # A failed refresh is retried by the next schedule pass.
-            pass
+            with self._refresh_slots:
+                self._fetch(record)
+                if record['configuration']['market'].get('fx_source', 'manual') == venture_fx.SOURCE:
+                    self._rates()
+        except Exception as error:  # A failed refresh is retried by the next schedule pass.
+            logging.warning('Venture refresh failed for %s: %s', record['id'], redact(str(error)))
         finally:
             with self._refresh_lock:
                 self._refreshing.discard(record['id'])
 
-    def _fetch(self, record):
-        self._fetch_urls(record['organization_id'], record['configuration']['sources']['feeds'])
+    def _fetch(self, record, seconds=None):
+        self._fetch_urls(record['organization_id'], record['configuration']['sources']['feeds'], seconds)
 
-    def _fetch_urls(self, organization, urls):
+    def _fetch_urls(self, organization, urls, seconds=None):
+        """Fetch the feeds that are due. ``seconds`` bounds all of them together."""
         fetched = False
+        ends = time.monotonic() + seconds if seconds else None
         for url in urls:
             state = self._feed_state(organization, url)
             fetched_at = moment(state.get('last_fetch'))
             if fetched_at and now() - fetched_at < FEED_INTERVAL:
                 continue
+            limits = {}
+            if ends is not None:
+                left = ends - time.monotonic()
+                if left < MANUAL_FETCH_MINIMUM:
+                    break  # Left due, with no error recorded: the next refresh gets it.
+                limits['deadline'] = min(venture_feeds.FETCH_DEADLINE, left)
             fetched = True
             try:
-                result = venture_feeds.fetch(url, etag=state.get('etag', ''), modified=state.get('modified', ''))
+                result = venture_feeds.fetch(url, etag=state.get('etag', ''), modified=state.get('modified', ''),
+                                             **limits)
                 with closing(self.service.connect()) as db, db:
                     for item in result['items']:
                         db.execute('INSERT OR IGNORE INTO venture_feed_items VALUES (?,?,?)',
@@ -3578,10 +3735,11 @@ class Ventures(StudioOperations, StakeholderPanel):
     def _prune(self, organization):
         cutoff = now() - timedelta(days=90)
         with closing(self.service.connect()) as db:
-            cited = set()
-            for row in db.execute('SELECT data FROM venture_ticks WHERE organization_id=?', (organization,)):
-                tick = json.loads(row[0])
-                cited.update(tick.get('evidence_item_ids') or [])
+            # Only the ids leave SQLite: a tick also carries its evidence and prompt.
+            cited = {row[0] for row in db.execute(
+                "SELECT DISTINCT cited.value FROM venture_ticks AS tick, "
+                "json_each(tick.data, '$.evidence_item_ids') AS cited WHERE tick.organization_id=?",
+                (organization,))}
             # Venture cursors are row ids. SQLite gives a new row max(rowid) + 1,
             # so deleting the highest row would let a later item reuse an id at
             # or below some cursor and never be offered. Keep that one row.
@@ -3595,6 +3753,83 @@ class Ventures(StudioOperations, StakeholderPanel):
             with closing(self.service.connect()) as db, db:
                 db.executemany('DELETE FROM venture_feed_items WHERE organization_id=? AND id=?',
                                [(organization, item) for item in stale])
+
+    def _history_soon(self):
+        """Compact old history in the background, a few times a day."""
+        if time.monotonic() < self._history_due:
+            return
+        self._history_due = time.monotonic() + HISTORY_INTERVAL_SECONDS
+
+        def work():
+            try:
+                self._compact_history()
+            except Exception as error:  # Tried again at the next interval.
+                logging.warning('Venture history compaction failed: %s', redact(str(error)))
+        try:
+            self.background(work)
+        except RuntimeError:
+            self._history_due = time.monotonic() + HISTORY_FIRST_DELAY_SECONDS
+
+    def _compact_history(self):
+        """Drop what old settled records no longer need.
+
+        Ledgers, scores, results, reviews, decisions and outreach stay. A tick
+        older than ``HISTORY_DETAIL_DAYS`` loses its frozen evidence and prompt,
+        which also lets the feed items it cited age out. A settled studio run
+        past the newest ``HISTORY_FULL_RUNS`` loses its pack, unless an open
+        idea, or a likely duplicate that can be reopened, still cites it. A long-decided idea loses its edit history."""
+        from contributions import Busy
+        moment_now = now()
+        cutoff = moment_now - timedelta(days=HISTORY_DETAIL_DAYS)
+        stamp = moment_now.isoformat()
+        with closing(self.service.connect()) as db:
+            nested = [row[0] for row in db.execute(
+                "SELECT id FROM venture_candidates WHERE EXISTS (SELECT 1 FROM "
+                "json_each(venture_candidates.data, '$.revisions') AS entry "
+                "WHERE json_type(entry.value, '$.before.revisions') IS NOT NULL)")]
+        histories = 0
+        for identity in nested:
+            try:
+                with self.service.operation('candidate:' + identity, timeout=0):
+                    with closing(self.service.connect()) as db, db:
+                        row = db.execute('SELECT organization_id, data FROM venture_candidates WHERE id=?',
+                                         (identity,)).fetchone()
+                        if row:
+                            candidate = json.loads(row[1])
+                            candidate['revisions'] = flat_revisions(candidate.get('revisions'))
+                            db.execute('INSERT OR REPLACE INTO venture_candidates VALUES (?,?,?)',
+                                       (identity, row[0], json.dumps(candidate)))
+                            histories += 1
+            except Busy:
+                continue  # In use: the next compaction gets it.
+        with closing(self.service.connect()) as db, db:
+            ticks = db.execute(
+                "UPDATE venture_ticks SET data=json_set(json_remove(data, '$.evidence', '$.prompt', "
+                "'$.evidence_index', '$.delivered_evidence_ids', '$.evidence_item_ids'), '$.compacted_at', ?) "
+                "WHERE json_extract(data, '$.compacted_at') IS NULL "
+                "AND json_extract(data, '$.state') IN ('ready', 'quiet', 'skipped', 'superseded') "
+                "AND json_extract(data, '$.simulated_date') < ?", (stamp, cutoff.date().isoformat())).rowcount
+            runs = db.execute(
+                "UPDATE venture_studio_runs SET data=json_set(json_remove(data, '$.evidence', '$.prompt', "
+                "'$.bundle', '$.evidence_index'), '$.compacted_at', ?) "
+                "WHERE json_extract(data, '$.compacted_at') IS NULL "
+                "AND json_extract(data, '$.state') IN ('ready', 'skipped', 'dismissed') "
+                "AND id NOT IN (SELECT json_extract(data, '$.run_id') FROM venture_candidates "
+                "WHERE json_extract(data, '$.run_id') IS NOT NULL "
+                "AND (json_extract(data, '$.state') IN ('proposed', 'approved', 'creating', 'failed') "
+                # A likely duplicate can still be edited back into the queue.
+                "OR (json_extract(data, '$.state')='excluded' "
+                "AND COALESCE(json_extract(data, '$.duplicate_of'), '')<>'' "
+                "AND COALESCE(json_extract(data, '$.excluded_by'), '')=''))) "
+                "AND id NOT IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER "
+                "(PARTITION BY organization_id ORDER BY rowid DESC) AS position FROM venture_studio_runs) "
+                "WHERE position <= ?)", (stamp, HISTORY_FULL_RUNS)).rowcount
+            candidates = db.execute(
+                "UPDATE venture_candidates SET data=json_remove(data, '$.revisions') "
+                "WHERE json_extract(data, '$.revisions') IS NOT NULL "
+                "AND json_extract(data, '$.state') IN ('created', 'rejected', 'excluded', 'superseded') "
+                "AND json_extract(data, '$.updated_at') < ?", (cutoff.isoformat(),)).rowcount
+        return dict(ticks=ticks, runs=runs, candidates=candidates, histories=histories)
 
     def _evidence(self, record, configuration, items):
         knowledge = self.service.knowledge.context(record['organization_id'], [record['notebook']],
@@ -4026,8 +4261,14 @@ class Ventures(StudioOperations, StakeholderPanel):
             if draft['state'] not in ('ready', 'sent'):
                 raise ValueError('Record outcomes on approved messages you have sent yourself.')
             result = _choice(body.get('outcome'), OUTCOMES, 'outreach outcome')
-            draft.setdefault('outcomes', []).append(dict(stamp, outcome=result,
-                                                         note=redact(_value(body.get('note'), 300, 'outcome note'))))
+            note = redact(_value(body.get('note'), 300, 'outcome note'))
+            latest = (draft.get('outcomes') or [{}])[-1]
+            when = moment(latest.get('at'))
+            if latest.get('outcome') == result and latest.get('note') == note and when \
+                    and now() - when < OUTCOME_REPEAT_WINDOW:
+                # A double click: outcomes are the only real signal agents see.
+                return draft
+            draft.setdefault('outcomes', []).append(dict(stamp, outcome=result, note=note))
             draft['outcomes'] = draft['outcomes'][-20:]
             draft['state'] = 'sent'
             signals = dict({key: 0 for key in OUTCOMES}, **(record.get('signals') or {}))
@@ -4042,6 +4283,7 @@ class Ventures(StudioOperations, StakeholderPanel):
             record['updated_at'] = now().isoformat()
             db.execute('INSERT OR REPLACE INTO ventures VALUES (?,?,?)',
                        (record['id'], record['organization_id'], json.dumps(record)))
+        self._history_generation += 1
         return draft
 
     def assumptions(self, record, body, actor):
@@ -4230,9 +4472,8 @@ class Ventures(StudioOperations, StakeholderPanel):
 
     def advance(self):
         from contributions import Busy
-        with closing(self.service.connect()) as db:
-            ticks = [json.loads(row[0]) for row in db.execute(
-                "SELECT data FROM venture_ticks WHERE json_extract(data, '$.state')='meeting' LIMIT 30")]
+        ticks = self._rotating('ticks', "SELECT rowid, data FROM venture_ticks "
+                                        "WHERE json_extract(data, '$.state')='meeting'")
         jobs = {item['id']: item for item in self.service.store.snapshot(live_status=False).get('jobs', [])}
         for saved in ticks:
             # Never wait on the shared poll thread: a tick whose venture is busy is settled next pass.
@@ -4271,6 +4512,7 @@ class Ventures(StudioOperations, StakeholderPanel):
         self.advance_studio()
         self.schedule()
         self._studio_schedule()
+        self._history_soon()
 
     def schedule(self):
         """Start due daily ticks. Opt-in per venture (``simulation.daily_ticks``).
@@ -4279,10 +4521,10 @@ class Ventures(StudioOperations, StakeholderPanel):
         are not backfilled: a simulated day is a real day of news.
         """
         from contributions import Busy
-        with closing(self.service.connect()) as db:
-            due = [json.loads(row[0]) for row in db.execute(
-                "SELECT data FROM ventures WHERE json_extract(data, '$.state') IN ('draft','running','paused','qualified') "
-                "AND json_extract(data, '$.configuration.simulation.daily_ticks')=1 LIMIT 100")]
+        due = self._rotating('due-ventures',
+                             "SELECT rowid, data FROM ventures WHERE json_extract(data, '$.state') IN "
+                             "('draft','running','paused','qualified') "
+                             "AND json_extract(data, '$.configuration.simulation.daily_ticks')=1", limit=100)
         for saved in due:
             if not saved.get('next_at') and not saved.get('retry_at'):
                 # First schedule after enabling daily ticks: wait for the chosen
@@ -4355,6 +4597,8 @@ class Ventures(StudioOperations, StakeholderPanel):
                         record['schedule_failures'] = 0
                         self.save(record)
                     except Exception as error:  # One broken venture must not stop the others.
+                        if not isinstance(error, (ValueError, OSError)):
+                            logging.exception('Scheduled tick failed unexpectedly for venture %s', saved['id'])
                         record = self.get(saved['id'], saved['organization_id'])
                         failures = int(record.get('schedule_failures', 0)) + 1
                         delay = min(24 * 60, SCHEDULE_RETRY_MINUTES * (2 ** min(failures - 1, 7)))

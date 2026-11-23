@@ -48,6 +48,11 @@ Future<void> downloadTaskBackupLink(Uri uri) async {
   link.remove();
 }
 
+/// Object URLs of the latest shown documents. A tab reloads from its URL, so
+/// it stays valid; only the oldest are released, which bounds the memory.
+final _shownDocuments = <String>[];
+const _keptDocuments = 8;
+
 /// Shows an HTML document in a tab reserved with `window.open('about:blank')`.
 ///
 /// The document comes from a blob of this origin, so it must carry its own
@@ -60,8 +65,10 @@ void showHtmlDocument(web.Window tab, String content) {
     ),
   );
   tab.location.replace(url);
-  // The tab keeps the loaded document; the URL is only needed to load it.
-  Timer(const Duration(seconds: 60), () => web.URL.revokeObjectURL(url));
+  _shownDocuments.add(url);
+  while (_shownDocuments.length > _keptDocuments) {
+    web.URL.revokeObjectURL(_shownDocuments.removeAt(0));
+  }
 }
 
 Future<void> downloadArtifact(String content, String filename) async {

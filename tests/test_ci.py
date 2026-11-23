@@ -133,6 +133,17 @@ class CIPolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'c_dom_test.dart.*run in no CI job'):
                     ci.browser_shards(self.root / 'test', 1)
 
+    def test_browser_shards_plan_suites_in_subdirectories(self):
+        self.suite('a_dom_test.dart', 10)
+        nested = self.root / 'test' / 'pages'
+        nested.mkdir()
+        (nested / 'b_dom_test.dart').write_text("@TestOn('browser')\n" + 'x' * 10, encoding='utf-8')
+        plan = ci.browser_shards(self.root / 'test', 1)
+        self.assertEqual(plan, [['a_dom_test.dart', 'pages/b_dom_test.dart']])
+        (nested / 'c_dom_test.dart').write_text("@TestOn('chrome')\n", encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'pages/c_dom_test.dart.*run in no CI job'):
+            ci.browser_shards(self.root / 'test', 1)
+
     def test_browser_shards_refuse_a_suite_that_would_run_nowhere(self):
         self.suite('a_dom_test.dart', 10)
         self.suite('b_dom_test.dart', 10, annotation="@TestOn('chrome')")

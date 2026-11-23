@@ -1141,8 +1141,44 @@ without waiting for a poll.
 - **Cost.** Worst case is one four-member meeting per running venture per day.
   Quiet days cost nothing.
 - **Content.** Excerpts are capped and feed items older than ninety days are
-  pruned, except those cited by a tick.
+  pruned, except those cited by a tick that still holds its evidence.
+- **Retention.** A few times a day the gateway compacts old history in the
+  background. A settled tick older than ninety days loses its frozen evidence
+  and prompt and keeps its ledger, results and review. A settled studio run
+  past the newest fifty per organization loses its evidence pack and prompt,
+  unless an open idea, or a likely duplicate that can be reopened, came from it. An idea decided over ninety days ago loses
+  its edit history. Ledgers, reviews, decisions and outreach are never removed.
+- **Fetch time.** One feed request has 30 seconds in total: name lookups, every
+  connection attempt, redirects and the response, however slowly a source
+  sends its bytes. A manual run gives all its feeds 20
+  seconds together; a feed it did not reach stays due for the background
+  refresh, which runs at most four at a time.
 - **Access.** All reads and actions are administrator-only, like discovery.
+- **Likely duplicates.** The duplicate check compares words, so it can be wrong.
+  An idea it excluded can be edited, which returns it to the queue once it is
+  distinct, or created anyway with `override_duplicate`; the override is
+  recorded on the decision. An operator's permanent exclusion term cannot be
+  overridden.
+- **Daily reviews need a team.** `create` and `configure` refuse to turn on
+  `daily_ticks` for a venture without a group, or to clear the group of a
+  scheduled venture unless the same request turns `daily_ticks` off.
+- **Concurrent edits.** A pitch settles under the same candidate locks as edits
+  and approvals, and merges its reviews into the idea as it is then. If an
+  operator is on one of its ideas, the next poll settles it.
+- **Votes belong to a version.** A pitch records a fingerprint of each idea it
+  sends. If the idea's substance changes, during the meeting or afterwards, the
+  votes stay as feedback on the earlier version, cannot create a venture, and
+  the idea returns to the next pitch. Undoing the edit restores them.
+- **Revisions are atomic.** A new revision, the idea it replaces and the scout
+  result are saved in one transaction under the candidate locks.
+- **Notebook commits** contain only what the gateway itself changed: a tick's
+  ledger row and product lines, or the approved outreach file. They are built
+  on top of the last commit, so an uncommitted edit, even in `ledger.csv` or
+  `product.md`, enters no gateway commit. An unstaged edit stays in the working
+  tree. A staged one stays staged, with the tick's lines added to it.
+- **Removed studio team.** If the studio group was removed, Repair rebuilds it.
+  Agents still present are kept, and missing ones are hired again with the same
+  settings under fresh request ids.
 
 ## Delivery phases
 
@@ -1233,12 +1269,13 @@ Remaining limits:
   in `venture_engine.py`.
 - Live FX covers the ECB's currencies only, at daily granularity; other pairs
   use the operator's rate.
-- The first-run path is covered by gateway tests against a stand-in store.
-  The facilitator preparation, session release and discussion retry it calls
-  are the organization store's own actions and have not been exercised
-  against a live Herdr from these tests.
-- Failure categories are matched from error text. A message the rules do not
-  know is filed as `meeting`.
+- Most gateway tests use a stand-in store. `test_venture_store_integration.py`
+  runs setup, a scout with advisors, a pitch, a replayed request and approval
+  through the real organization store with simulated agents. None of these
+  tests exercise a live Herdr or a real CLI.
+- Failure categories use the Herdr error code when the failure still carries
+  one. A failure read back from a saved job has only its text, and a message
+  the rules do not know is filed as `meeting`.
 - A permission prompt is shown on the run and linked to the group; it is
   answered in the group discussion, not from the Studio tab.
 - A scheduled run that waits on a stuck agent session does not repair it by
@@ -1260,15 +1297,18 @@ Remaining limits:
 - Assumption outcomes and dropped product changes are recorded only when the
   agents or the operator report them; the gateway does not infer them.
 
+## Decisions
+
+- Translation is done by the Analyst inside the meeting. It needs no new
+  dependency and uses part of the prompt budget.
+- FX comes from the ECB's daily reference rates when `fx_source` is `ecb`, with
+  the operator's manual rate as the fallback.
+
 ## Open questions
 
 - Should several ventures share one group? Sharing serializes their ticks behind
   one meeting at a time; separate groups cost more resident sessions.
 - Is a daily cadence right for every source, or should a venture tick only when
   enough new items have passed its filter?
-- Translation: done by the Analyst inside the meeting (no new dependency, uses
-  prompt budget) or by a separate pre-meeting step?
-- Where FX rates come from, and whether a fixed rate entered by the operator is
-  enough for the first phase.
 - Whether simulated days should always equal calendar days, or whether replaying
   a past period from stored feed items is worth supporting.

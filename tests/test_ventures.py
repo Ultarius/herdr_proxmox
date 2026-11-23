@@ -491,8 +491,9 @@ class VentureTests(unittest.TestCase):
     def test_scheduled_errors_retry_with_backoff_even_though_next_slot_is_future(self):
         record = self.create()
         hour = (ventures.now().hour + 1) % 24
-        self.configure(record, daily_ticks=True, tick_hour_utc=hour)
+        # A record saved before daily reviews required a team.
         saved = self.ventures.get(record['id'], 'org')
+        saved['configuration']['simulation'].update(daily_ticks=True, tick_hour_utc=hour)
         saved['next_at'] = (ventures.now() - timedelta(minutes=1)).isoformat()
         self.ventures.save(saved)
         with patch.object(venture_feeds, 'fetch', return_value=dict(
@@ -882,7 +883,7 @@ class VentureTests(unittest.TestCase):
         self.assertEqual([item['id'] for item in items], [fresh['id']])
 
     def test_a_qualified_venture_can_move_its_outreach_stage_but_not_its_rules(self):
-        record = self.create()
+        record = self.attach_group(self.create())
         saved = self.ventures.get(record['id'], 'org')
         saved.update(state='qualified', qualified_at=ventures.now().isoformat())
         self.ventures.save(saved)
@@ -3499,7 +3500,8 @@ class VentureTests(unittest.TestCase):
 
     def test_autonomous_mode_respects_the_active_venture_limit(self):
         self.setup_studio_manual()
-        self.add_venture_group(self.create())
+        record = self.add_venture_group(self.create())
+        self.studio(mode='resume', venture_id=record['id'])
         self.studio(mode='limits', max_active_ventures=1)
         self.studio(mode='studio_policy', studio_mode='autonomous', studio_auto_min_confidence=0)
         proposal = candidate('Carrier Desk')

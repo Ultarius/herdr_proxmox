@@ -1346,6 +1346,8 @@ class _VenturesPageState extends FeatureOperationsState<VenturesPage> {
       'candidate_id': '${candidate['id']}',
       'decision': 'approve',
       'confirmed': true,
+      // Only a likely duplicate reaches this form while excluded.
+      if (candidate['state'] == 'excluded') 'override_duplicate': true,
       ...value,
     }, organization: '${candidate['organization_id']}');
   }

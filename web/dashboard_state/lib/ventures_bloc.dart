@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'feature_bloc.dart';
 import 'request_id.dart';
 
@@ -10,6 +12,7 @@ class VenturesBloc extends FeatureBloc {
   }
 
   String _selected = '';
+  Timer? _notification;
 
   Map<String, dynamic> get data =>
       Map<String, dynamic>.from(state.values['data'] as Map? ?? {});
@@ -78,7 +81,13 @@ class VenturesBloc extends FeatureBloc {
   List<Map<String, dynamic>> _rows(String key) =>
       List<Map<String, dynamic>>.from(data[key] as List? ?? const []);
 
-  void _notified() => refresh(quiet: true);
+  /// A settled run writes several records, each with its own notification.
+  void _notified() {
+    _notification?.cancel();
+    _notification = Timer(const Duration(milliseconds: 300), () {
+      if (!isClosing) refresh(quiet: true);
+    });
+  }
 
   Future<void> select(String identity) async {
     if (identity == _selected) return;
@@ -139,6 +148,7 @@ class VenturesBloc extends FeatureBloc {
 
   @override
   Future<void> close() {
+    _notification?.cancel();
     if (!isClosing) connection.notificationRevision.removeListener(_notified);
     return super.close();
   }

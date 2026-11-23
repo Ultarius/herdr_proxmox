@@ -99,6 +99,15 @@ class CodexTrustTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'folders of them'):
                     approved_roots(wrong, self.projects)
 
+    def test_a_configuration_it_cannot_extend_is_left_alone_with_a_reason(self):
+        self.config.parent.mkdir(parents=True)
+        inline = 'projects = { "/srv/other" = { trust_level = "trusted" } }\n'
+        self.config.write_text(inline, encoding='utf-8')
+        with self.assertLogs(level='WARNING') as logs:
+            self.assertFalse(self.ensure(self.repository))
+        self.assertIn('inline table', logs.output[0])
+        self.assertEqual(self.config.read_text(encoding='utf-8'), inline)
+
     def test_custom_codex_home_with_non_ascii_project_and_crlf_configuration(self):
         directory = self.home / 'codex-custom'
         directory.mkdir(parents=True)

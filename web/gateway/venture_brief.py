@@ -99,7 +99,7 @@ def _e(value):
 
 
 def _money(amount, currency):
-    if not isinstance(amount, (int, float)):
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
         return _e(amount) if amount not in (None, '') else '-'
     # Cents matter for a per-unit price (EUR 0.89 a box); whole amounts stay whole.
     text = format(round(amount), ',') if round(amount, 2) == round(amount) else format(amount, ',.2f')
@@ -413,7 +413,7 @@ def render(candidate, organization_name='', run=None, prepared=None, dimensions=
         ('Product', _e(candidate.get('product'))),
         ('First offer', _e(candidate.get('first_offer'))),
         ('Pricing', _e(candidate.get('pricing'))),
-        ('Revised', ('Round ' + _e(candidate.get('round') or 2) + ': ' + _e(candidate['revision_note']))
+        ('Revised', ('Round ' + _e(candidate.get('round') or 1) + ': ' + _e(candidate['revision_note']))
          if candidate.get('revision_note') else ''),
     ]))
 
@@ -476,6 +476,9 @@ def render(candidate, organization_name='', run=None, prepared=None, dimensions=
                     + ': ' + _e(panel.get('back', 0)) + ' back, ' + _e(panel.get('hold', 0)) + ' hold, '
                     + _e(panel.get('pass', 0)) + ' pass. Each reviewed on its own model before hearing the '
                     'others.</p>')
+        if panel.get('outdated'):
+            body.append('<div class="note">This idea was edited after these reviews, so they are about an '
+                        'earlier version. It goes back to the next pitch.</div>')
         if panel.get('independent') is False:
             body.append('<div class="note">Every stakeholder ran on the studio\'s own model; this critique may '
                         'echo the studio.</div>')

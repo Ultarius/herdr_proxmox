@@ -60,10 +60,14 @@ def convert(amount, currency, market):
 
 
 def daily_burn(configuration):
-    """Burn lines are monthly costs; a tick is one day."""
+    """Burn lines are monthly costs; a tick is one day.
+
+    Any real cost burns at least one unit a day. Rounding a small monthly
+    burn to zero would mean capital never falls, and the reference price
+    derived from it would switch off the price ceiling."""
     monthly = sum(convert(line['amount'], line['currency'], configuration['market'])
                   for line in configuration['simulation']['burn'])
-    return int(round(monthly / 30))
+    return max(1, int(round(monthly / 30))) if monthly > 0 else 0
 
 
 def change_limit(strictness):
@@ -96,7 +100,9 @@ def bounded_price(proposed, previous, reference=0):
         return previous
     price = proposed
     if previous:
-        price = _clamp(price, int(previous * (1 - MAX_PRICE_STEP)), int(previous * (1 + MAX_PRICE_STEP)))
+        # Whole prices, rounded inward: a step never exceeds the limit either way.
+        price = _clamp(price, math.ceil(previous * (1 - MAX_PRICE_STEP)),
+                       math.floor(previous * (1 + MAX_PRICE_STEP)))
     if reference:
         price = min(price, reference * PRICE_CEILING)
     return price
@@ -250,6 +256,7 @@ STAGE = dict(
 
 
 def etiquette(language):
+    # The configuration's language pattern allows at most two languages.
     parts = [part for part in language.replace(',', '+').split('+') if part]
     lines = [ETIQUETTE.get(part, 'Formal business register appropriate to this language; one clear ask.')
              for part in parts]

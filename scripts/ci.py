@@ -76,16 +76,16 @@ def browser_shards(directory, total):
     """
     directory = Path(directory)
     suites = []
-    for path in sorted(directory.glob('*_test.dart')):
+    for path in sorted(directory.rglob('*_test.dart')):
         annotations = re.findall(r'@TestOn\(([^)]*)\)', path.read_text(encoding='utf-8'))
         if not annotations:
             continue
         # Either quote style and surrounding spaces; still only the browser.
         if (len(annotations) != 1
                 or not re.fullmatch(BROWSER_SELECTOR, annotations[0])):
-            raise ValueError(f"{path.name}: only @TestOn('browser') is planned for the browser shards; "
+            raise ValueError(f"{path.relative_to(directory).as_posix()}: only @TestOn('browser') is planned for the browser shards; "
                              'another platform selector would run in no CI job.')
-        suites.append((path.stat().st_size + SUITE_OVERHEAD, path.name))
+        suites.append((path.stat().st_size + SUITE_OVERHEAD, path.relative_to(directory).as_posix()))
     if type(total) is not int or total < 1:
         raise ValueError('The shard count must be a positive number.')
     if len(suites) < total:

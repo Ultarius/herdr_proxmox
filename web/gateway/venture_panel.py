@@ -17,7 +17,7 @@ Nothing here spends, sends or creates a venture by itself; in autonomous mode
 an idea is created only when most stakeholders back it.
 """
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -56,6 +56,7 @@ PANEL_FEEDBACK_IDEAS = 6
 PANEL_PITCH_IDEAS = 6  # Earlier open ideas join a round's new ideas up to this many.
 PANEL_PACK_LIMIT = 32000
 PANEL_PROMPT_LIMIT = 8000
+PITCH_ANNOTATIONS = ('round', 'previous_feedback', 'stakeholder_screen', 'review_notes', 'revision_note')
 
 
 class PitchPackTooLarge(ValueError):
@@ -80,11 +81,27 @@ def panel_counts(reviews):
     return counts
 
 
+def pitch_version(candidate):
+    """A fingerprint of what the panel judges about an idea.
+
+    Notes about the pitch itself (its round, earlier feedback, the gateway's
+    review notes) are left out: they can change while the idea does not."""
+    idea = {key: value for key, value in StakeholderPanel._pitch_idea(candidate).items()
+            if key not in PITCH_ANNOTATIONS}
+    return hashlib.sha256(json.dumps(idea, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:32]
+
+
+def panel_current(candidate):
+    """Whether the latest panel round reviewed the idea as it is now."""
+    panel = candidate.get('panel') if isinstance(candidate.get('panel'), dict) else {}
+    return not panel.get('version') or panel['version'] == pitch_version(candidate)
+
+
 def panel_backs(candidate):
-    """Whether most stakeholders of the latest round back the idea."""
+    """Whether most stakeholders of the latest round back the idea as it is now."""
     panel = candidate.get('panel') if isinstance(candidate.get('panel'), dict) else {}
     total = int(panel.get('stakeholders') or 0)
-    return total > 0 and 2 * int(panel.get('back') or 0) > total
+    return total > 0 and 2 * int(panel.get('back') or 0) > total and panel_current(candidate)
 
 
 def _text(value, limit, label, required=True):
@@ -207,7 +224,8 @@ class StakeholderPanel:
         studio_model = model_key(((studio.get('team') or {}).get('settings_by_role') or {}).get('scout'))
         models = {role: model_key(settings) for role, settings in (panel.get('settings') or {}).items()}
         distinct = sorted(set(models.values()))
-        independent = any(value != studio_model for value in models.values())
+        # With no stakeholders yet there is no echo to warn about.
+        independent = not models or any(value != studio_model for value in models.values())
         panel.update(studio_model=studio_model, models=models, distinct_models=len(distinct),
                      independent=independent,
                      warning='' if independent else (
@@ -410,7 +428,7 @@ class StakeholderPanel:
             message = str(error) or error.__class__.__name__
             try:
                 run.update(state='needs_attention', error=redact(message)[:500], dispatch_failed=True,
-                           failure=self._failure(message, 'dispatch'))
+                           failure=self._failure(message, 'dispatch', code=getattr(error, 'code', None)))
                 return self.save_studio_run(run)
             except Exception as recording_error:
                 logging.error('Could not record failure for pitch %s: %s', run['id'], redact(str(recording_error)))
@@ -467,7 +485,9 @@ class StakeholderPanel:
                     continue
                 candidate = json.loads(data)
                 panel = candidate.get('panel') or {}
-                if candidate.get('stakeholder_reviews') or any(panel.get(verdict) for verdict in PANEL_VERDICTS):
+                reviewed = candidate.get('stakeholder_reviews') or any(panel.get(verdict) for verdict in PANEL_VERDICTS)
+                # An idea edited since its review goes back to the panel.
+                if reviewed and panel_current(candidate):
                     continue
                 result.append(identity)
                 if len(result) == limit:
@@ -512,6 +532,7 @@ class StakeholderPanel:
                 # Keep the earliest ideas in this batch. Deferred ideas stay eligible for the next pitch.
                 ideas.pop()
         run['candidate_ids'] = [item['id'] for item in ideas]
+        run['pitched_versions'] = {item['id']: pitch_version(item) for item in ideas}
         run['pre_screened_ideas'] = [idea['name'] for idea in run['evidence']['ideas'] if idea.get('pre_screened')]
 
     @staticmethod
@@ -683,6 +704,22 @@ class StakeholderPanel:
                     problems=[redact(problem)[:300] for problem in problems[:10]],
                     panel_summary=redact(summary)[:1500])
 
+    @contextmanager
+    def _holding_candidates(self, identities):
+        """The locks edits and approvals take, without waiting: this runs on the
+        shared poll thread. ``Busy`` means an operator is on one of these ideas,
+        and nothing has been read or changed yet."""
+        held = []
+        try:
+            for identity in sorted(set(identities)):
+                lock = self.service.operation('candidate:' + identity, timeout=0)
+                lock.__enter__()
+                held.append(lock)
+            yield
+        finally:
+            for lock in reversed(held):
+                lock.__exit__(None, None, None)
+
     def _pitch_settle(self, run, parsed):
         organization = run['organization_id']
         settings = run['panel']['settings']
@@ -690,37 +727,54 @@ class StakeholderPanel:
         by_candidate = {}
         for review in parsed['reviews']:
             by_candidate.setdefault(review['candidate_id'], []).append(review)
-        for identity in run['candidate_ids']:
-            try:
-                candidate = self.get_candidate(organization, identity)
-            except ValueError:
-                continue  # Removed since the pitch; nothing to attach to.
-            pitch_round = int(candidate.get('round') or 1)
-            entries = [dict({key: value for key, value in review.items() if key != 'candidate_id'},
-                            pitch_round=pitch_round, run_id=run['id'], at=at,
-                            label=PANEL_ROLES[review['stakeholder']][0],
-                            model=model_key(settings.get(review['stakeholder'])))
-                       for review in by_candidate.get(identity, [])]
-            # Recovery can reread a pitch after some of its reviews were saved.
-            earlier = [review for review in candidate.get('stakeholder_reviews') or []
-                       if review.get('run_id') != run['id']]
-            candidate['stakeholder_reviews'] = (earlier + entries)[-PANEL_KEEP_REVIEWS:]
-            candidate['panel'] = dict(panel_counts(entries), round=pitch_round, run_id=run['id'], at=at,
-                                      reviewers=len(entries), stakeholders=len(run['panel']['roles']),
-                                      models=sorted({entry['model'] for entry in entries}),
-                                      independent=run['panel'].get('independent', False))
-            self.save_candidate(candidate)
-        run.update(review_count=len(parsed['reviews']), missing=parsed['missing'],
-                   unverified=parsed['unverified'], problems=parsed['problems'],
-                   panel_summary=parsed['panel_summary'])
+        # Read under the locks, so a price edit or a decision made while the
+        # panel met is what the reviews are merged into.
+        versions = run.get('pitched_versions') or {}
+        with self._holding_candidates(run['candidate_ids']):
+            reviewed = []
+            for identity in run['candidate_ids']:
+                try:
+                    candidate = self.get_candidate(organization, identity)
+                except ValueError:
+                    continue  # Removed since the pitch; nothing to attach to.
+                pitch_round = int(candidate.get('round') or 1)
+                entries = [dict({key: value for key, value in review.items() if key != 'candidate_id'},
+                                pitch_round=pitch_round, run_id=run['id'], at=at,
+                                label=PANEL_ROLES[review['stakeholder']][0],
+                                model=model_key(settings.get(review['stakeholder'])))
+                           for review in by_candidate.get(identity, [])]
+                # Recovery can reread a pitch after some of its reviews were saved.
+                earlier = [review for review in candidate.get('stakeholder_reviews') or []
+                           if review.get('run_id') != run['id']]
+                candidate['stakeholder_reviews'] = (earlier + entries)[-PANEL_KEEP_REVIEWS:]
+                candidate['panel'] = dict(panel_counts(entries), round=pitch_round, run_id=run['id'], at=at,
+                                          reviewers=len(entries), stakeholders=len(run['panel']['roles']),
+                                          models=sorted({entry['model'] for entry in entries}),
+                                          independent=run['panel'].get('independent', False))
+                if versions.get(identity):
+                    # Edited while the panel met: the votes stay as feedback
+                    # on the version it saw, and authorize nothing.
+                    candidate['panel'].update(version=versions[identity],
+                                              outdated=versions[identity] != pitch_version(candidate))
+                candidate['updated_at'] = at
+                reviewed.append(candidate)
+            run.update(review_count=len(parsed['reviews']), missing=parsed['missing'],
+                       unverified=parsed['unverified'], problems=parsed['problems'],
+                       panel_summary=parsed['panel_summary'])
+            if not parsed['error']:
+                run.update(state='ready', processed_at=at, error='', failure=None, waiting=None)
+            # Every idea's reviews and the settled run land together, or not at all.
+            with closing(self.service.connect()) as db, db:
+                db.execute('BEGIN IMMEDIATE')
+                for candidate in reviewed:
+                    db.execute('INSERT OR REPLACE INTO venture_candidates VALUES (?,?,?)',
+                               (candidate['id'], candidate['organization_id'], json.dumps(candidate)))
+                if not parsed['error']:
+                    db.execute('INSERT OR REPLACE INTO venture_studio_runs VALUES (?,?,?,?)',
+                               (run['id'], organization, run['kind'], json.dumps(run)))
+                    notify(db, 'job', run['id'], organization)
         if parsed['error']:
             raise ValueError(parsed['error'])
-        run.update(state='ready', processed_at=at, error='', failure=None, waiting=None)
-        with closing(self.service.connect()) as db, db:
-            db.execute('INSERT OR REPLACE INTO venture_studio_runs VALUES (?,?,?,?)',
-                       (run['id'], organization, run['kind'], json.dumps(run)))
-            notify(db, 'job', run['id'], organization)
-            db.commit()
         try:
             created = self._studio_autocreate(run)
         except Exception as error:  # Creation is extra: the settled reviews stay.
@@ -751,6 +805,7 @@ class StakeholderPanel:
             feedback.append(dict(
                 name=candidate.get('name', ''), state=candidate.get('state', ''), round=panel.get('round', 1),
                 back=panel.get('back', 0), hold=panel.get('hold', 0), **{'pass': panel.get('pass', 0)},
+                on_earlier_version=bool(panel.get('outdated')),
                 reviews=[dict(stakeholder=review['stakeholder'], verdict=review['verdict'],
                               objections=review['objections'][:3],
                               would_change_mind=review.get('would_change_mind', ''))
