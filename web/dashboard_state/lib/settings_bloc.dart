@@ -189,3 +189,62 @@ class ResourcesBloc extends SettingsFeatureBloc {
     return FeatureResult(patch: {'resources': data});
   }, replace: false);
 }
+
+/// Telegram secrets stay in request closures, never in observable feature state.
+class TelegramNotificationsBloc extends SettingsFeatureBloc {
+  TelegramNotificationsBloc(super.connection);
+  Map<String, dynamic>? get status =>
+      state.values['telegram'] as Map<String, dynamic>?;
+
+  Map<String, dynamic> _patch(dynamic value) {
+    final data = _object(value);
+    return {
+      'telegram': {
+        for (final key in const [
+          'enabled', 'token_configured', 'chat_id', 'last_error', 'last_sent_at',
+        ]) key: data[key],
+      },
+    };
+  }
+
+  @override
+  Future<void> refresh() async {
+    if (!admin) return;
+    await read<void>('status', () async {
+      final data = await connection.request('telegram');
+      return FeatureResult(patch: _patch(data));
+    });
+  }
+
+  Future<bool> configure({
+    required bool enabled,
+    required String chatId,
+    String token = '',
+  }) async => await mutate<bool>('configure', () async {
+    final data = await connection.request('telegram/configure', {
+      'enabled': enabled,
+      'chat_id': chatId.trim(),
+      if (token.trim().isNotEmpty) 'token': token.trim(),
+    });
+    return FeatureResult(
+      value: true, patch: _patch(data),
+      message: 'Telegram notification settings saved.',
+    );
+  }, admin: true) ?? false;
+
+  Future<bool> test() async => await mutate<bool>('test', () async {
+    final data = await connection.request('telegram/test', <String, dynamic>{});
+    return FeatureResult(
+      value: true, patch: _patch(data),
+      message: 'Test notification sent. Check your Telegram chat.',
+    );
+  }, admin: true) ?? false;
+
+  Future<bool> disconnect() async => await mutate<bool>('disconnect', () async {
+    final data = await connection.request('telegram/disconnect', <String, dynamic>{});
+    return FeatureResult(
+      value: true, patch: _patch(data),
+      message: 'Telegram disconnected and saved credentials removed.',
+    );
+  }, admin: true) ?? false;
+}

@@ -5,6 +5,7 @@ import '../terminal.dart';
 import 'setup_links.dart';
 import 'ssh_access_card.dart';
 import 'toolchain_card.dart';
+import 'telegram_notifications_card.dart';
 
 class CliSetupPage extends StatefulComponent {
   const CliSetupPage({super.key});
@@ -385,6 +386,7 @@ class _CliState extends State<CliSetupPage> {
       if (session != null) setupPanel(),
       const SshAccessCard(),
       const ToolchainCard(),
+      const TelegramNotificationsCard(),
     ], classes: 'cli-page');
   }
 }
