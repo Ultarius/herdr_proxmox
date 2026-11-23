@@ -24,6 +24,9 @@ class GatewayBootTests(unittest.TestCase):
                 if enabled:
                     config.write_text(json.dumps(dict(projects=str(projects), queue=str(root / 'queue'))))
                 def inspect_graph(bind, port, policy, secret, services, **kwargs):
+                    self.assertTrue(services['telegram'].thread.is_alive())
+                    self.assertFalse(services['telegram'].snapshot()['enabled'])
+                    self.assertEqual(services['telegram'].path, root / 'telegram.json')
                     self.assertIs(services['integration'].coordinator, services['coordinator'])
                     self.assertEqual(services['integration'].build_results, services['validation'].snapshot)
                     self.assertEqual(services['validation'].queue is not None, enabled)

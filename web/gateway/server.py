@@ -50,6 +50,8 @@ from github_api import GitHub, GitHubError
 from contributions import Contributions
 from herdr_errors import HerdrError, is_read_only, parse_error, server_not_running
 from notifications import OutboxPump
+from telegram_notifications import TelegramNotifications, TelegramError
+from telegram_alerts import collect_alerts
 from runtime_events import RuntimeEvents
 RUNTIME_EVENTS = None
 
@@ -557,6 +559,15 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.reply(200, self.server.storage.snapshot())
                 return
+            if self.path == '/api/telegram':
+                if self.operator['role'] != 'admin':
+                    self.reply(403, {'error': 'Only an administrator can view Telegram settings.'})
+                    return
+                try:
+                    self.reply(200, self.server.telegram.snapshot())
+                except (OSError, ValueError):
+                    self.reply(503, {'error': 'Telegram settings storage is unavailable.'})
+                return
             if self.path == '/api/organizations/export':
                 self.reply(200, export_configuration(self.server.organizations))
                 return
@@ -756,6 +767,33 @@ class Handler(BaseHTTPRequestHandler):
             return
         actor = getattr(self, 'operator', {}).get('name', 'dashboard_operator')
         role = getattr(self, 'operator', {}).get('role', 'operator')
+        if self.path in ('/api/telegram/configure', '/api/telegram/test', '/api/telegram/disconnect'):
+            if role != 'admin':
+                self.reply(403, {'error': 'Only an administrator can manage Telegram notifications.'})
+                return
+            try:
+                size = int(self.headers.get('Content-Length', '0'))
+                if not 0 < size <= 4096:
+                    raise ValueError('Invalid Telegram request size.')
+                body = json.loads(self.rfile.read(size))
+                if not isinstance(body, dict):
+                    raise ValueError('Expected a Telegram settings object.')
+                if self.path.endswith('/configure'):
+                    result = self.server.telegram.configure(body)
+                elif body:
+                    raise ValueError('This Telegram action takes no options.')
+                elif self.path.endswith('/test'):
+                    result = self.server.telegram.test()
+                else:
+                    result = self.server.telegram.disconnect()
+                self.reply(200, result)
+            except TelegramError as error:
+                self.reply(502, {'error': str(error)})
+            except (ValueError, UnicodeError) as error:
+                self.reply(400, {'error': str(error)})
+            except OSError:
+                self.reply(503, {'error': 'Telegram settings storage is unavailable.'})
+            return
         actions = {f'/api/workspaces/{name}': name for name in ('create', 'focus', 'rename')}
         actions['/api/projects/jobs/remove'] = 'remove_clone'
         actions['/api/organizations/templates'] = 'templates'
@@ -1120,10 +1158,14 @@ def main():
     from storage_service import StorageService
     storage = StorageService(organizations, validation)
     storage.start()
+    telegram = TelegramNotifications(DATABASE.parent / 'telegram.json',
+        lambda: collect_alerts(organizations, contributions, coordinator))
+    telegram.start()
     try:
-        serve_gateway(bind, 8787, policy, token, {'github': github, 'repository_connections': repository_connections, 'contributions': contributions, 'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator, 'operators': operators, 'sdk_install': sdk_install, 'build_service_install': build_service_install, 'validation': validation, 'analysis': analysis, 'environments': environments, 'repository_queries': queries, 'storage': storage}, cookie_secure=secure_setting == '1')
+        serve_gateway(bind, 8787, policy, token, {'github': github, 'repository_connections': repository_connections, 'contributions': contributions, 'projects': projects, 'organizations': organizations, 'cli_setup': cli_setup, 'run_logs': run_logs, 'ssh_access': ssh_access, 'herdr_server': HerdrServer(command), 'integration': integration, 'coordinator': coordinator, 'operators': operators, 'sdk_install': sdk_install, 'build_service_install': build_service_install, 'validation': validation, 'analysis': analysis, 'environments': environments, 'repository_queries': queries, 'storage': storage, 'telegram': telegram}, cookie_secure=secure_setting == '1')
     finally:
         try:
+            telegram.close()
             storage.close()
             environments.close()
             RUNTIME_EVENTS.close()

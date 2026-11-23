@@ -4,6 +4,7 @@
 
 - [First task walkthrough](first-task-walkthrough.md) — create a team and start work.
 - [CLI configuration](cli-configuration.md) — connect agent provider accounts.
+- [Telegram notifications](telegram-notifications.md) — receive private alerts for blockers and decisions.
 - [Model catalog](model-catalog.md) — model selection, reasoning and refresh behavior.
 - [Network troubleshooting](network-troubleshooting.md) — gateway, DNS and failed release checks.
 - [Alpha builds](alpha-builds.md) — install feature-branch builds for testing.

@@ -8,6 +8,7 @@ import 'dashboard_bloc.dart';
 import 'routes.dart';
 import 'ssh_access_card.dart';
 import 'toolchain_card.dart';
+import 'telegram_notifications_card.dart';
 
 class CliSetupPage extends StatefulWidget {
   const CliSetupPage({super.key, required this.coordinator});
@@ -492,6 +493,8 @@ class _CliSetupPageState extends State<CliSetupPage> {
                 const SshAccessCard(),
                 const SizedBox(height: 20),
                 const ToolchainCard(),
+                const SizedBox(height: 20),
+                const TelegramNotificationsCard(),
               ],
               if (busy) const LinearProgressIndicator(),
               if (error != null)

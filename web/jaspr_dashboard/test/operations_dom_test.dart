@@ -89,6 +89,15 @@ Future<void> type(String label, String value) async {
   await settle();
 }
 
+String inputValue(String label) {
+  final input =
+      elements('label')
+              .singleWhere((e) => e.querySelector('span')?.textContent == label)
+              .querySelector('input')
+          as web.HTMLInputElement;
+  return input.value;
+}
+
 Future<void> script(String url) async {
   final loaded = Completer<void>();
   final element = web.HTMLScriptElement()..src = url;
@@ -1700,14 +1709,13 @@ void main() {
           '.xterm-rows',
         ).any((e) => (e.textContent ?? '').contains('session')),
       );
+      await type('Bot token', 'telegram-token-draft');
       await type('Authorization code or API key', 'hidden-code');
       await click('Send to terminal');
       expect(posts('cli-setup/input').single['id'], 'setup-identity');
       expect(posts('cli-setup/input').single['data'], 'hidden-code\r');
-      expect(
-        (elements('input[type=password]').single as web.HTMLInputElement).value,
-        '',
-      );
+      expect(inputValue('Authorization code or API key'), '');
+      expect(inputValue('Bot token'), 'telegram-token-draft');
       expect(elements('canvas'), isEmpty);
       binding.detachRootComponent();
       await settle();
