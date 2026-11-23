@@ -341,7 +341,7 @@ class DiscoveryTests(unittest.TestCase):
         server = gateway.ThreadingHTTPServer(('127.0.0.1', 0), gateway.Handler)
         server.token = 'admin-token'
         server.operators = MagicMock()
-        server.operators.identify.side_effect = lambda token: dict(name='viewer', role='operator') if token == 'operator-token' else None
+        server.operators.identify_digest.side_effect = lambda digest: dict(name='viewer', role='operator') if digest == gateway.token_digest('operator-token') else None
         server.contributions = self.service
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()

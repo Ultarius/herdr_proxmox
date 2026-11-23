@@ -36,7 +36,17 @@ class Operators:
         """Resolve a bearer token to a named operator, or None."""
         if not isinstance(token, str) or not token:
             return None
-        digest = token_digest(token)
+        return self.identify_digest(token_digest(token))
+
+    def identify_digest(self, digest):
+        """Resolve a precomputed bearer-token digest to a named operator, or None.
+
+        Callers that only retained a digest (such as browser sessions) can still
+        resolve an identity here, re-reading the operator file on every request
+        so a revoked token stops resolving immediately.
+        """
+        if not isinstance(digest, str) or not digest:
+            return None
         with self.lock:
             entries = self._load()
         for entry in entries:
