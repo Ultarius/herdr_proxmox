@@ -2430,3 +2430,31 @@ class ContributionValidationTests(unittest.TestCase):
         runs = [dict(self.runs[0], alias='hire_ada')]
         parts = self.validate([dict(profile_id='hire_ada', round=1, content='x')], runs)
         self.assertEqual((parts[0]['profile_id'], parts[0]['name']), ('p1', 'Ada'))
+        self.assertEqual(parts[0]['recorded_profile_id'], 'hire_ada')
+
+    def test_a_retyped_profile_id_is_matched_only_when_it_names_one_member(self):
+        # A live chair kept the first 8 characters of a stakeholder's ID and
+        # got the rest wrong; the whole meeting then failed every recovery.
+        runs = [dict(profile_id='9c693a8c58714832bf382dc1661e4027', profile=dict(name='Investor')),
+                dict(profile_id='148f1d21cd8344e4a3fc03b833ba9ceb', profile=dict(name='Target customer'))]
+        typo = '9c693a8c2ec1454083b5d75b002330b9'
+        part, = self.validate([dict(profile_id=typo, round=1, content='x')], runs)
+        self.assertEqual((part['profile_id'], part['name'], part['recorded_profile_id']),
+                         (runs[0]['profile_id'], 'Investor', typo))
+        # The exact display name identifies the member too.
+        part, = self.validate([dict(profile_id='investor', name='target customer', round=1, content='x')], runs)
+        self.assertEqual(part['profile_id'], runs[1]['profile_id'])
+        refused = (
+            dict(profile_id='9c693a8', round=1, content='x'),  # Too short a prefix.
+            dict(profile_id='0000000000000000', round=1, content='x'),  # Shares nothing.
+            # The ID points at one member and the name at another: no one.
+            dict(profile_id=typo, name='Target customer', round=1, content='x'),
+        )
+        for bad in refused:
+            with self.assertRaisesRegex(ValueError, 'entry 1: profile_id'):
+                self.validate([bad], runs)
+        # Two members sharing the prefix make it ambiguous.
+        twins = [dict(profile_id='9c693a8c' + 'a' * 24, profile=dict(name='A')),
+                 dict(profile_id='9c693a8c' + 'b' * 24, profile=dict(name='B'))]
+        with self.assertRaisesRegex(ValueError, 'entry 1: profile_id'):
+            self.validate([dict(profile_id=typo, round=1, content='x')], twins)

@@ -5,6 +5,7 @@ import hashlib
 import sqlite3
 import subprocess
 import json
+import os
 from pathlib import Path
 import uuid
 from organizations import now, text
@@ -548,11 +549,44 @@ def truncate_contribution(text, limit=CONTRIBUTION_LIMIT):
     return encoded[:budget].decode('utf-8', 'ignore') + marker
 
 
+# A mistyped profile ID is matched to a member only when it shares at least
+# this many leading characters with exactly that member's ID. Profile IDs are
+# random 32-character hex, so two members never share a prefix this long by
+# chance, while a chair that retyped an ID usually keeps its start.
+SPEAKER_PREFIX = 8
+
+
+def _resolve_speaker(part, ids, aliases):
+    """The member an entry names, or None.
+
+    A chair copies 32-character IDs out of a long prompt by retyping them,
+    and one wrong character used to make the whole transcript, and every
+    recovery of it, fail. An entry is still credited only to a member it
+    identifies unambiguously: by exact ID, by alias (the prompt lists the
+    roster as {alias: profile_id}), by a long shared ID prefix, or by its
+    exact display name. Two of those that disagree identify no one."""
+    speaker = part.get('profile_id')
+    if speaker in ids:
+        return speaker
+    candidates = set()
+    if isinstance(speaker, str) and speaker:
+        if speaker in aliases:
+            candidates.add(aliases[speaker])
+        key = speaker.strip().lower()
+        prefix = [pid for pid in ids if len(key) >= SPEAKER_PREFIX and
+                  len(os.path.commonprefix([pid.lower(), key])) >= SPEAKER_PREFIX]
+        if len(prefix) == 1:
+            candidates.add(prefix[0])
+    name = part.get('name')
+    if isinstance(name, str) and name.strip():
+        named = [pid for pid, member in ids.items() if member.strip().casefold() == name.strip().casefold()]
+        if len(named) == 1:
+            candidates.add(named[0])
+    return candidates.pop() if len(candidates) == 1 else None
+
+
 def validate_contributions(contributions, runs):
     ids = {r['profile_id']: r['profile']['name'] for r in runs}
-    # The prompt lists the roster as {alias: profile_id}, so a chair sometimes
-    # records the alias. It names exactly one member, so accept it as that
-    # member; anything else outside the roster is still refused.
     aliases = {r['alias']: r['profile_id'] for r in runs if isinstance(r.get('alias'), str) and r['alias']}
     if not isinstance(contributions, list) or not 1 <= len(contributions) <= MAX_CONTRIBUTIONS:
         raise ValueError('Group agent did not provide a valid discussion transcript.')
@@ -563,11 +597,14 @@ def validate_contributions(contributions, runs):
         if not isinstance(part, dict):
             reason = 'it is not a JSON object'
         else:
-            speaker = part.get('profile_id')
-            if speaker not in ids and isinstance(speaker, str) and speaker in aliases:
-                part['profile_id'] = speaker = aliases[speaker]
-            if speaker not in ids:
-                reason = (f'profile_id {json.dumps(speaker)[:80]} is not a member of this discussion; '
+            recorded = part.get('profile_id')
+            speaker = _resolve_speaker(part, ids, aliases)
+            if speaker is not None and speaker != recorded:
+                # Keep what the chair wrote next to the member it was read as.
+                part['recorded_profile_id'] = recorded
+                part['profile_id'] = speaker
+            if speaker is None:
+                reason = (f'profile_id {json.dumps(recorded)[:80]} is not a member of this discussion; '
                           f'use one of {", ".join(sorted(ids))}')
             elif type(part.get('round')) is not int or not 1 <= part['round'] <= MAX_ROUNDS:
                 reason = f'round must be an integer from 1 to {MAX_ROUNDS}, not {json.dumps(part.get("round"))[:40]}'
@@ -1129,7 +1166,7 @@ def execute(store, job):
         "Herdr creates this collecting plan only if the organization enables automatic release planning; it does not authorize "
         "starting draft tasks, freezing, integrating or publishing. Omit release_plan when no release was requested. "
         f"Also write {transcript} as JSON with a contributions array. Each entry must have "
-        f"profile_id (from the roster below), name, round (integer 1 to {MAX_ROUNDS}), and content (Markdown). "
+        f"profile_id (the value from the roster below, copied exactly, not retyped), name (the member's name), round (integer 1 to {MAX_ROUNDS}), and content (Markdown). "
         f"Budget at most {transcript_contribution_budget(len(job['runs']))} UTF-8 bytes per contribution, "
         f"at most {MAX_CONTRIBUTIONS} entries, and {TRANSCRIPT_LIMIT} UTF-8 bytes for the ENTIRE discussion.json, "
         "including JSON formatting and optional knowledge. Summarize lengthy replies and use compact JSON "
