@@ -698,6 +698,16 @@ preserve repository-relative file names, or use direct `git show` reads instead.
 Read-only discussions allow those scratch writes without authorizing source
 changes or installation. No general `/tmp` or home-cache access is granted.
 
+A scratch directory is private to its session: OpenCode asks before any other
+session reads it. A discussion therefore also creates a `notes` folder inside
+its discussion directory under `discussion-artifacts/`, which every chair and
+member is granted at launch. The chair's prompt names that folder and asks
+members to write anything longer, or anything another participant must read,
+there as a Markdown file named after themselves, and never to leave files in a
+scratch directory for someone else. The folder falls under the existing
+`discussion-artifacts` grant, so sessions already running can use it; only a
+meeting started by an updated gateway names it.
+
 Any missing project SDK is an environment blocker, not a reason for
 the project agent to bootstrap a replacement. Use **Plan environment** and
 **Prepare SDKs** in the project's environment card, or enable the organization's

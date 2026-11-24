@@ -382,7 +382,16 @@ the prompt after a readiness check, provided the wait is still within 24 hours.
 Releasing a waiting launch cancels its saved prompt. If delivery is uncertain,
 inspect the terminal before restarting.
 
-Codex folder trust is recorded only for project roots that the deployment
+The gateway trusts the notebooks it created itself, for the Venture Studio and
+for each venture, before a Codex agent starts in one. It reads the list from
+the venture module at every launch, so a new notebook needs no setup, and a
+project someone placed beside them is not included. Set
+`HERDR_CODEX_TRUST_NOTEBOOKS=0` in the gateway service environment to turn
+this off. A trusted folder's own `.codex` settings can run code, and agents
+run as the same user, so an operator who wants every notebook reviewed by hand
+should turn it off.
+
+Any other Codex folder trust is recorded only for project roots that the deployment
 operator has approved in `HERDR_CODEX_TRUST_PROJECTS`. Set it in the gateway
 service environment as a JSON array, for example `["ventures/studio"]`.
 Entries are exact roots under `HERDR_PROJECTS` and may be relative to that
@@ -430,8 +439,9 @@ already set in Codex's `config.toml`. Codex refuses `--add-dir` and does not
 start when the effective sandbox is read-only, which is how it opens a folder
 it does not trust. The configuration setting is ignored in read-only mode, so
 an untrusted project still starts. Writing the output folders then needs an
-approval, so approve the project root in `HERDR_CODEX_TRUST_PROJECTS` (for
-example `["ventures/*"]`), and Codex opens it in `workspace-write`. A setup that
+approval. Venture notebooks are trusted by default, so they open in
+`workspace-write`; approve any other project root in
+`HERDR_CODEX_TRUST_PROJECTS` for the same. A setup that
 uses Codex's newer `[permissions]` profiles instead of `sandbox_mode` ignores
 the setting as well.
 

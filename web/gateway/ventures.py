@@ -347,9 +347,11 @@ def scout_brief(run, files):
     )
     lines = ['# Venture Studio scout: start here', '',
              'Written by the gateway for scout run ' + run['id'] + '. Read this file before any research or '
-             'delegation. The files below sit beside it. Give each member the full paths to the files for its '
-             'role. If a member cannot read one, quote the applicable rules in its prompt. Keep its existing '
-             'workspace permissions.', '']
+             'delegation. The files below sit beside it, in a folder every member of this meeting may read. '
+             'Give each member the full paths to the files for its role and let it read them there; do not '
+             'copy them into members\' folders, which only their own sessions may write. If a member still '
+             'cannot read one, quote the applicable rules in its prompt. Keep its existing workspace '
+             'permissions.', '']
     lines += ['- `' + name + '`: ' + purpose for name, purpose in roles if name == 'evidence.json' or name in files]
     return '\n'.join(lines) + '\n'
 
@@ -1445,6 +1447,24 @@ class Ventures(StudioOperations, StakeholderPanel):
             db.execute('INSERT OR REPLACE INTO venture_studio VALUES (?,?)', (organization, json.dumps(record)))
         return record
 
+    def notebook_roots(self):
+        """Every notebook this module created: the studio's and each venture's.
+
+        The gateway wrote them and they hold its own files, so Codex is told to
+        trust them unless the operator turned that off."""
+        with closing(self.service.connect()) as db:
+            relatives = [row[0] for row in db.execute(
+                "SELECT json_extract(data, '$.notebook') FROM ventures UNION "
+                "SELECT json_extract(data, '$.notebook') FROM venture_studio")]
+        projects = Path(self.service.projects).resolve()
+        roots = set()
+        for relative in relatives:
+            if isinstance(relative, str) and relative:
+                path = (projects / relative).resolve()
+                if path != projects and path.is_relative_to(projects):
+                    roots.add(path)
+        return roots
+
     def _studio_notebook(self, studio):
         relative = (studio or {}).get('notebook') or ''
         if not relative:
@@ -1872,7 +1892,8 @@ class Ventures(StudioOperations, StakeholderPanel):
             checkout, prepared = self._evidence_checkout(organization, group_id, self._studio_notebook(studio))
             target = self._write_pack(checkout, prepared, 'pitch' if pitch else 'studio', run['id'],
                                       run['evidence'], STUDIO_EVIDENCE_LIMIT, 'Venture Studio',
-                                      companions=run.get('bundle') if scout else None)
+                                      companions=run.get('bundle') if scout else None,
+                                      shared_root=self._pack_root())
             run['evidence_file'] = str(target)
             run['prompt'] = (self._pitch_prompt(run, target) if pitch
                              else self._studio_prompt(organization, run, target))
@@ -1901,7 +1922,8 @@ class Ventures(StudioOperations, StakeholderPanel):
         if not isinstance(bundle, dict):
             bundle = self._scout_bundle(run)  # Runs queued before the bundle was pinned.
         target = self._write_pack(checkout, True, 'studio', run['id'], run['evidence'],
-                                  STUDIO_EVIDENCE_LIMIT, 'Venture Studio', companions=bundle)
+                                  STUDIO_EVIDENCE_LIMIT, 'Venture Studio', companions=bundle,
+                                  shared_root=self._pack_root())
         # Keep the saved enqueue payload unchanged for request replay. Only the
         # path in the delivered prompt may move with the prepared facilitator.
         return prompt.replace(frozen_path, str(target), 1)
@@ -3992,7 +4014,8 @@ class Ventures(StudioOperations, StakeholderPanel):
     def _write_evidence(self, record, tick, content):
         checkout, prepared = self._evidence_checkout(record['organization_id'], tick['group_id'],
                                                      self._notebook(record))
-        return self._write_pack(checkout, prepared, 'venture', tick['id'], content, EVIDENCE_LIMIT, 'Venture')
+        return self._write_pack(checkout, prepared, 'venture', tick['id'], content, EVIDENCE_LIMIT, 'Venture',
+                                shared_root=self._pack_root())
 
     def _prompt(self, record, tick, target):
         configuration = tick['configuration']

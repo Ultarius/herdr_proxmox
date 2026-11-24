@@ -1067,14 +1067,20 @@ def main():
     build_service_install = BuildServiceInstall()
     cli_setup = CliSetup()
     approved_codex_projects = codex_trust.approved_roots(os.environ.get('HERDR_CODEX_TRUST_PROJECTS'), PROJECTS)
-    codex_home = os.environ.get('CODEX_HOME')
-    def record_codex_trust(project):
-        return codex_trust.ensure_trusted(project, PROJECTS, cli_setup.home,
-                                          approved=approved_codex_projects, codex_home=codex_home)
+    trust_notebooks = os.environ.get('HERDR_CODEX_TRUST_NOTEBOOKS', '1')
+    if trust_notebooks not in ('0', '1'):
+        raise SystemExit('HERDR_CODEX_TRUST_NOTEBOOKS must be 0 or 1.')
+    # The venture module exists only once Contributions is built below.
+    notebooks = {}
+    record_codex_trust = codex_trust.trust_hook(
+        PROJECTS, cli_setup.home, approved=approved_codex_projects, codex_home=os.environ.get('CODEX_HOME'),
+        owned=(lambda: notebooks['ventures'].notebook_roots() if 'ventures' in notebooks else ())
+        if trust_notebooks == '1' else None)
     organizations = OrganizationStore(DATABASE, PROJECTS, command, runtime_status=cli_setup.status, runtime_ready=cli_setup.ready,
                                       model_validator=lambda profile: model_catalog.validate_selection(cli_setup, PROJECTS, profile),
                                       template_catalog=lambda project: team_templates.catalog(cli_setup, PROJECTS, project),
-                                      codex_trust=record_codex_trust if approved_codex_projects else None)
+                                      codex_trust=record_codex_trust
+                                      if approved_codex_projects or trust_notebooks == '1' else None)
     github = GitHub(DATABASE.parent / 'github.json', require_root_policy=True)
     # Missing policy means no protected projects; a present invalid file is a
     # deployment error and must never silently remove protection at startup.
@@ -1083,6 +1089,7 @@ def main():
     except ValueError as error:
         raise SystemExit(str(error)) from None
     contributions = Contributions(DATABASE.with_name('tasks.sqlite3'), PROJECTS, organizations, github)
+    notebooks['ventures'] = contributions.ventures
     run_logs = RunLogs(DATABASE.parent / 'run-logs', BIN)
     ssh_access = SshAccess()
     repository_connections = RepositoryConnections(DATABASE.parent / 'repository-connections', PROJECTS, github)

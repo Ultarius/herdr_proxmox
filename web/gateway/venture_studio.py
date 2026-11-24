@@ -732,21 +732,43 @@ class StudioOperations:
         return project_directory(self.service.projects, run.get('worktree_path') or run.get('source_project')
                                  or (run.get('profile') or {}).get('project', '')), True
 
+    def _pack_root(self):
+        """Where meeting packs go so every participant may read them.
+
+        Each agent works in its own worktree, and OpenCode asks before reading
+        outside it. A pack in the chair's worktree was readable by the chair
+        alone, so it copied the files into members' folders and stopped on a
+        permission prompt. Every chair and meeting member is granted the
+        dashboard's ``discussion-artifacts`` folder at launch, so packs live
+        under it. None with a store that has no data folder."""
+        store_path = getattr(self.service.store, 'path', None)
+        if not isinstance(store_path, (str, Path)):
+            return None
+        return Path(store_path).parent / 'discussion-artifacts' / 'packs'
+
     @staticmethod
-    def _write_pack(checkout, prepared, folder, identity, content, limit, label, companions=None):
+    def _write_pack(checkout, prepared, folder, identity, content, limit, label, companions=None, shared_root=None):
         """Write one evidence file atomically; refuse a changed copy.
 
         ``companions`` maps a file name to gateway-written guidance (a review
         checklist) placed beside the evidence. Unlike the evidence it is
         rewritten when it differs, so an upgraded gateway can still retry a
-        frozen run."""
+        frozen run. A prepared meeting writes under ``shared_root``, where
+        its chair and members may all read."""
         data = json.dumps(content, ensure_ascii=False).encode()
         if len(data) > limit:
             raise ValueError(label + ' evidence exceeds its byte budget.')
         with repository_lock(checkout):
-            if prepared:
+            if prepared and shared_root is not None:
+                shared_root = Path(shared_root)
+                for part in (shared_root.parent, shared_root):
+                    if part.is_symlink() or (part.exists() and not part.is_dir()):
+                        raise ValueError(label + ' evidence folder must be a regular directory.')
+                shared_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                destination = shared_root / (folder + '-' + identity)
+            elif prepared:
                 # Inside the facilitator's checkout, next to its guidance
-                # bundle: already ignored by Git and already readable.
+                # bundle: already ignored by Git and readable by the chair.
                 from worker_guidance import local_bundle
                 destination = local_bundle(checkout).parent / (folder + '-' + identity)
             else:

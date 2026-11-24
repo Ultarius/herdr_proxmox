@@ -95,6 +95,24 @@ def approved_roots(value, projects):
     return frozenset(roots)
 
 
+def trust_hook(projects, home=None, *, approved=(), codex_home=None, owned=None):
+    """The launch hook: trust ``approved`` roots and, when ``owned`` is given,
+    the project roots it returns, read at each launch.
+
+    ``owned`` is how the gateway trusts the notebooks it created itself: the
+    venture module knows each one, so a folder someone cloned beside them is
+    not trusted with them."""
+    def record(project):
+        roots = set(approved)
+        if owned is not None:
+            try:
+                roots.update(owned())
+            except Exception as error:  # Trust is a convenience; a launch never fails on it.
+                logging.warning('Codex trust: gateway notebooks could not be listed: %s', error)
+        return ensure_trusted(project, projects, home, approved=frozenset(roots), codex_home=codex_home)
+    return record
+
+
 def ensure_trusted(project, projects, home=None, *, approved=(), codex_home=None):
     """Record Codex trust for the project's root; True when an entry was added."""
     if not approved:

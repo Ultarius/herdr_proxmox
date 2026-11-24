@@ -108,6 +108,23 @@ class CodexTrustTests(unittest.TestCase):
         self.assertIn('inline table', logs.output[0])
         self.assertEqual(self.config.read_text(encoding='utf-8'), inline)
 
+    def test_the_gateway_trusts_the_notebooks_it_created_and_nothing_beside_them(self):
+        from codex_trust import trust_hook
+        cloned = self.projects / 'ventures' / 'cloned'
+        (cloned / '.git').mkdir(parents=True)
+        record = trust_hook(self.projects, self.home, owned=lambda: {self.repository})
+        self.assertTrue(record(self.repository / 'docs'))
+        self.assertFalse(record(cloned))  # Beside the notebooks, but not one of them.
+        self.assertEqual(set(self.trusted()), {str(self.repository)})
+        # A notebook list that cannot be read never fails a launch.
+        def broken():
+            raise OSError('database is locked')
+        with self.assertLogs(level='WARNING'):
+            self.assertFalse(trust_hook(self.projects, self.home, owned=broken)(cloned))
+        # Operator-approved roots still count alongside the notebooks.
+        both = trust_hook(self.projects, self.home, approved={cloned}, owned=lambda: ())
+        self.assertTrue(both(cloned))
+
     def test_custom_codex_home_with_non_ascii_project_and_crlf_configuration(self):
         directory = self.home / 'codex-custom'
         directory.mkdir(parents=True)

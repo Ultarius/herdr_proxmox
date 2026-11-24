@@ -764,13 +764,20 @@ Studio tab), and `true` turns it back on. The scout prompt is close to its
 
 ### Where the evidence file goes
 
-The facilitator runs in its own worktree, so a file written into the source
-notebook is outside its checkout and every run stopped on a permission prompt.
-The gateway now prepares the facilitator session first and writes the file
-inside that worktree, next to its guidance bundle
-(`.ci-cache/herdr-guidance/studio-<run id>/evidence.json`, already ignored by
-Git). Product Discovery does the same. Venture ticks use
-`venture-<tick id>` in their own facilitator's worktree.
+Every agent works in its own worktree, and OpenCode asks before reading a file
+outside it. A pack in the source notebook, or in the chair's worktree, was
+therefore readable by the chair alone. Chairs then copied the files into each
+member's scratch folder and stopped on a permission prompt for every copy.
+
+The gateway prepares the facilitator session first, then writes the pack and
+its guidance files under the dashboard's meeting folder:
+`discussion-artifacts/packs/studio-<run id>/` for a scout or portfolio review,
+`pitch-<run id>` for a pitch and `venture-<tick id>` for a venture review.
+Every chair and meeting member is granted that folder at launch, OpenCode
+through its agent file and Codex as a writable root. All of them read the
+files in place, and `scout-brief.md` tells the chair not to copy them. A store
+without a data folder, as in the stand-in tests, keeps the files in the
+chair's worktree.
 
 ### Failures name their cause
 

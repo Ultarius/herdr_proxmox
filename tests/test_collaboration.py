@@ -1345,7 +1345,8 @@ class CollaborationTests(unittest.TestCase):
         self.store.update_job(meeting, studio_run_id=None)  # Legacy enqueue interrupted before linking the studio run.
         self.assertEqual(self.store.action('discuss', body, studio_run_id=run_id)['id'], meeting)
         self.assertEqual(self.job(meeting)['studio_run_id'], run_id)
-        target = self.projects / '.ci-cache' / 'herdr-guidance' / ('studio-' + run_id) / 'evidence.json'
+        # The pack goes to the meeting folder every participant may read.
+        target = Path(self.store.path).parent / 'discussion-artifacts' / 'packs' / ('studio-' + run_id) / 'evidence.json'
         target.parent.mkdir(parents=True)
         target.with_name(STUDIO_RULES_FILE).write_bytes(b'\xffdamaged rules')
         sent = []
@@ -1802,6 +1803,12 @@ class CollaborationTests(unittest.TestCase):
         for scratch in scratches:
             self.assertIn(json.dumps(scratch), prompt)
         self.assertIn('Scratch writes for this analysis are permitted even in a read-only discussion', prompt)
+        # Notes another participant must read go to the shared notes folder, not
+        # a scratch folder inside someone else's worktree.
+        self.assertIn("never read another session's scratch directory", prompt)
+        notes = re.search(r'Notes folder for members \(shared\): (.+)', prompt)[1].strip()
+        self.assertTrue(Path(notes).is_dir())
+        self.assertEqual(Path(notes).parent.parent.name, 'discussion-artifacts')
         self.assertIn('missing_toolchain', prompt)
         self.assertIn("not configured_project", prompt)
         worker = self.hire(self.org, name='Task worker', runtime='opencode', project=str(project))

@@ -528,6 +528,18 @@ class VentureHardeningTests(unittest.TestCase):
         self.assertEqual(live['id'], rebuilt['group_id'])
         self.assertIn(rebuilt['team']['members']['critic'], live['members'])
 
+    def test_the_module_lists_every_notebook_it_created(self):
+        self.setup_studio_manual()
+        record = self.create()
+        roots = self.ventures.notebook_roots()
+        self.assertEqual(roots, {(self.projects / 'ventures' / 'studio-org').resolve(),
+                                 (self.projects / record['notebook']).resolve()})
+        # A stored path that leaves the projects folder is never listed.
+        studio = self.ventures._studio('org')
+        studio['notebook'] = '../outside'
+        self.ventures.save_studio('org', studio)
+        self.assertNotIn((self.projects / '..' / 'outside').resolve(), self.ventures.notebook_roots())
+
     def test_failure_categories_for_real_errors(self):
         for message, expected in (
                 ('Herdr is stopped. Start Herdr, then run the review.', 'herdr'),

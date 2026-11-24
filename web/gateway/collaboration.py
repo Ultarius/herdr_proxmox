@@ -969,6 +969,12 @@ def execute(store, job):
     # Preserve its files: the fresh attempt-bound receipt prevents stale output
     # from being accepted as completion of the new submission.
     directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    # Members' notes for the chair and each other: inside the folder every
+    # participant is granted, unlike their own worktrees and scratch folders.
+    notes = directory / 'notes'
+    if notes.is_symlink() or (notes.exists() and not notes.is_dir()):
+        raise ValueError('The discussion notes folder must be a regular directory.')
+    notes.mkdir(mode=0o700, exist_ok=True)
     artifact = directory / 'action-plan.md'
     transcript = directory / 'discussion.json'
     receipt = directory / RECEIPT_NAME
@@ -1039,9 +1045,11 @@ def execute(store, job):
         "Read repository files and pinned Git objects from that member's launch_directory, not configured_project. "
         "Worktrees share committed objects: use git show <pinned SHA>:<path> in your assigned checkout. "
         "configured_project identifies the source repository and does not grant access to the main checkout. "
-        "Pass each member its own scratch_directory from this context. Temporary review files and pinned copies "
+        "Pass each member its own scratch_directory from this context. Its own temporary files and pinned copies "
         "belong there, with repository-relative paths preserved; do not hardcode /tmp/pin or /tmp/pinned. "
         "Scratch writes for this analysis are permitted even in a read-only discussion. "
+        "A scratch directory is private to its session: never read another session's scratch directory, and "
+        "never ask a member to leave anything there for you or for another member. "
         "Pass each member its own toolchains metadata and prepared commands; use session-provided wrappers on PATH when present. "
         "Do not infer another member's SDK or claim an interactive capacity wrapper exists without its binding. "
         "Use prepared SDKs only; missing SDKs are missing_toolchain evidence to report, never a request to bootstrap "
@@ -1052,8 +1060,10 @@ def execute(store, job):
         "An empty directory or absent Git repository is only a blocker when the user's task requires project files. "
         "General discussion and reporting no assigned work do not require a repository, Git identity or test commands. "
         "You are the group conversation and facilitator. Read herdr --skill. Use herdr agent prompt <alias> "
-        "with --wait --timeout 180000 to ask selected members for input. Read their results or ask them to "
-        "write Markdown files in the discussion directory. Pass the user topic, workspace context and scope restrictions "
+        "with --wait --timeout 180000 to ask selected members for input. Read their replies. For anything longer, "
+        "or anything another participant must read, give the member the full path of the notes folder inside "
+        "the discussion directory (given below) and ask it to write a Markdown file there named after itself: every "
+        "participant may read and write that folder without a permission prompt. Pass the user topic, workspace context and scope restrictions "
         "below to every member. The group purpose defines the recurring workflow and desired outcome; the user "
         "message defines this discussion's task and can refine that workflow. Follow their requested format, depth "
         "and discussion method. Where neither specifies a method, start with one round and use at most two "
@@ -1075,6 +1085,7 @@ def execute(store, job):
         "verify filesystem activity. Source code allowing a path does not establish a required repository layout. "
         f"{discussion_policy}"
         f"Discussion directory: {directory}\n"
+        f"Notes folder for members (shared): {notes}\n"
         "Use these exact output paths. Do not search home or filesystem roots for action plans or transcripts. "
         "If earlier artifacts are needed, ask for their specific path or content. A permission request is "
         "not permission to widen the task: narrow the operation to the known task/output directory, or "

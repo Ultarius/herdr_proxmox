@@ -118,15 +118,24 @@ class VentureStoreIntegrationTests(unittest.TestCase):
                 items=[item], etag='', modified='')):
             scout = self.studio(mode='studio_run', kind='scout')
         self.assertEqual(scout['state'], 'meeting', scout.get('error'))
-        # The guidance reached the facilitator's own worktree, not the source notebook.
+        # The pack sits in the meeting folder every chair and member may read,
+        # not in one agent's worktree, where the others would need a prompt.
         folder = Path(scout['evidence_file']).parent
+        shared = (self.store.path.parent / 'discussion-artifacts').resolve()
+        self.assertEqual(folder.resolve().parent, shared / 'packs')
         for name in (ventures.STUDIO_ENTRY_FILE, ventures.STUDIO_RULES_FILE, ventures.STUDIO_REVIEW_FILE,
                      ventures.STUDIO_CONSULT_FILE):
             self.assertTrue((folder / name).is_file(), name)
-        self.assertNotEqual(folder.resolve().parents[2], (self.projects / studio['notebook']).resolve())
+        self.assertIn('do not copy them', (folder / ventures.STUDIO_ENTRY_FILE).read_text(encoding='utf-8'))
 
         settled = self.settle(scout)
         self.assertEqual(settled['state'], 'ready', settled.get('error') or settled.get('failure'))
+        # Every session in that meeting was launched with the meeting folder writable and readable.
+        meeting = next(job for job in self.discussions() if job['id'] == scout['job_id'])
+        for run in [meeting['group_run'], *meeting['runs']]:
+            launched = next(job for job in self.store.job_records() if job['id'] == run['id'])
+            self.assertTrue(any(str(shared) in argument or str(shared).replace('\\', '\\\\') in argument
+                                for argument in launched['launch_arguments']), launched['alias'])
         # Stakeholders attended this one meeting as advisors; their group did not change.
         job = next(job for job in self.discussions() if job['id'] == scout['job_id'])
         self.assertEqual(job['group']['advisors'], [panel['members'][role] for role in panel['roles']])
