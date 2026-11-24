@@ -415,12 +415,25 @@ sandbox rules fail without asking for escalation. Folder trust and CLI
 sign-in follow their own startup flow. Existing sessions use their original
 launch arguments until relaunched.
 
-Codex receives exact dashboard output directories through `--add-dir`.
+Codex receives exact dashboard output directories as writable roots.
 Ordinary launches get `chat-replies`, group chairs and discussion member
 launches also get `discussion-artifacts`, and an environment helper gets its
 own `environment-assistance/<id>` directory. Managed storage grants cover the
 execution's registered data directories. OpenCode receives its output grants
 through the per-agent configuration.
+
+How the roots reach Codex depends on the sandbox. With **Workspace sandbox, no
+command prompts** the launch sets `workspace-write` itself, so the roots go in
+with `--add-dir`. Otherwise they go in as
+`--config sandbox_workspace_write.writable_roots=[...]`, keeping any roots
+already set in Codex's `config.toml`. Codex refuses `--add-dir` and does not
+start when the effective sandbox is read-only, which is how it opens a folder
+it does not trust. The configuration setting is ignored in read-only mode, so
+an untrusted project still starts. Writing the output folders then needs an
+approval, so approve the project root in `HERDR_CODEX_TRUST_PROJECTS` (for
+example `["ventures/*"]`), and Codex opens it in `workspace-write`. A setup that
+uses Codex's newer `[permissions]` profiles instead of `sandbox_mode` ignores
+the setting as well.
 
 The gateway poll loop rechecks `waiting_for_members` meetings in rotating batches
 of twenty every ten seconds, so busy early meetings do not hide later ones.

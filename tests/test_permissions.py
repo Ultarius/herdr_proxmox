@@ -117,9 +117,10 @@ class PermissionTests(unittest.TestCase):
             args = prepare_permissions(profile, outputs, home,
                                        output_directories=('chat-replies', 'discussion-artifacts', 'chat-replies'),
                                        managed_directories=(str(owned),), managed_root=home / 'storage')
-            self.assertEqual(args, ['--add-dir', str(outputs / 'chat-replies'),
-                                    '--add-dir', str(outputs / 'discussion-artifacts'),
-                                    '--add-dir', str(owned)])
+            # Configuration, not --add-dir: Codex refuses that flag and does not
+            # start when it opens an untrusted folder read-only.
+            self.assertEqual(args, ['--config', 'sandbox_workspace_write.writable_roots=' + json.dumps(
+                [str(outputs / 'chat-replies'), str(outputs / 'discussion-artifacts'), str(owned)])])
             self.assertTrue((outputs / 'discussion-artifacts').is_dir())
             # Only the output folders, never the gateway's own state beside them.
             self.assertNotIn(str(outputs), args)
@@ -132,6 +133,21 @@ class PermissionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'outside the verified'):
                 prepare_permissions(profile, outputs, home, managed_directories=(str(home / 'other'),),
                                     managed_root=home / 'storage')
+
+    def test_codex_keeps_the_writable_roots_its_operator_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / '.codex').mkdir()
+            (home / '.codex' / 'config.toml').write_text(
+                '[sandbox_workspace_write]\nwritable_roots = ["/srv/shared"]\n', encoding='utf-8')
+            args = prepare_permissions(dict(id='chair', runtime='codex'), home / 'outputs', home,
+                                       output_directories=('discussion-artifacts',))
+            roots = json.loads(args[1].split('=', 1)[1])
+            self.assertEqual(roots, ['/srv/shared', str(home / 'outputs' / 'discussion-artifacts')])
+            (home / '.codex' / 'config.toml').write_text('not toml =', encoding='utf-8')
+            args = prepare_permissions(dict(id='chair', runtime='codex'), home / 'outputs', home,
+                                       output_directories=('discussion-artifacts',))
+            self.assertEqual(json.loads(args[1].split('=', 1)[1]), [str(home / 'outputs' / 'discussion-artifacts')])
 
     def test_unattended_codex_keeps_its_sandbox_and_assisted_setup_gets_the_exact_output(self):
         with tempfile.TemporaryDirectory() as tmp:

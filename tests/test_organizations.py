@@ -1213,8 +1213,12 @@ class OrganizationTests(unittest.TestCase):
             # as a writable root instead. Claude takes its model arguments only.
             if runtime == 'opencode':
                 expected = expected + ['--agent', 'herdr-dashboard-' + profile_id]
-            if runtime == 'codex':
-                expected = expected + ['--add-dir', str(self.store.path.parent / 'chat-replies')]
+            replies = str(self.store.path.parent / 'chat-replies')
+            if runtime == 'codex' and config.get('permission_mode') == 'codex_no_approval':
+                # This mode sets the workspace-write sandbox itself, so the flag is safe.
+                expected = expected + ['--add-dir', replies]
+            elif runtime == 'codex':
+                expected = expected + ['--config', 'sandbox_workspace_write.writable_roots=' + json.dumps([replies])]
             self.assertEqual(list(call[call.index('--') + 1:]), expected)
             self.assertEqual(run['launch_arguments'], expected)
         for config in [dict(provider='openai'), dict(model='test-model'), dict(provider='-bad', model='model')]:

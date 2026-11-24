@@ -183,7 +183,8 @@ class StakeholderPanel:
         arguments = run.get('launch_arguments')
         if not isinstance(arguments, list):
             return False  # Unknown launch: never release on a guess.
-        return not any(isinstance(item, str) and item.replace('\\', '/').endswith('/discussion-artifacts')
+        # A root comes as ``--add-dir <path>`` or inside a writable_roots setting.
+        return not any(isinstance(item, str) and '/discussion-artifacts' in item.replace('\\', '/')
                        for item in arguments)
 
     def _panel_enabled(self, organization):

@@ -109,7 +109,8 @@ def check(binary, gateway):
         assert prepare_permissions(dict(id='claude', runtime='claude'), output, home=home,
                                    output_directories=('chat-replies',)) == []
         assert prepare_permissions(dict(id='codex', runtime='codex'), output, home=home,
-                                   output_directories=('chat-replies',)) == ['--add-dir', str(Path(output) / 'chat-replies')]
+                                   output_directories=('chat-replies',)) == [
+            '--config', 'sandbox_workspace_write.writable_roots=' + json.dumps([str(Path(output) / 'chat-replies')])]
         assert not (home / '.local/share/opencode/auth.json').exists(), 'Probe created credentials'
         return version
 

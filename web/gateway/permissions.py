@@ -66,14 +66,40 @@ def _output_paths(root, output_directories):
     return list(dict.fromkeys(paths))
 
 
-def _codex_writable_roots(outputs, managed):
-    """Provision the exact output directories before handing them to Codex."""
+def _configured_writable_roots(home):
+    """Writable roots the operator set in Codex's own configuration."""
+    import os
+    import tomllib
+    directory = Path(os.environ.get('CODEX_HOME') or Path(home or Path.home()) / '.codex')
+    try:
+        settings = tomllib.loads((directory / 'config.toml').read_text(encoding='utf-8'))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return []
+    roots = (settings.get('sandbox_workspace_write') or {}).get('writable_roots')
+    return [item for item in roots if isinstance(item, str)] if isinstance(roots, list) else []
+
+
+def _codex_writable_roots(outputs, managed, sandbox_set, home):
+    """Provision the exact output directories before handing them to Codex.
+
+    ``--add-dir`` is only for a launch that sets the workspace-write sandbox
+    itself: Codex refuses the flag, and does not start, when the effective
+    sandbox is read-only, which is how it opens a folder it does not trust.
+    Otherwise the roots go in as configuration, which Codex applies in
+    workspace-write and ignores in read-only. That replaces a configured list,
+    so the operator's own roots are kept in it."""
     from workspace_storage import _safe_chain
     for directory in outputs:
         _safe_chain(directory)
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         _safe_chain(directory)
-    return [argument for path in dict.fromkeys([*outputs, *managed]) for argument in ('--add-dir', str(path))]
+    roots = [str(path) for path in dict.fromkeys([*outputs, *managed])]
+    if not roots:
+        return []
+    if sandbox_set:
+        return [argument for path in roots for argument in ('--add-dir', path)]
+    values = list(dict.fromkeys([*_configured_writable_roots(home), *roots]))
+    return ['--config', 'sandbox_workspace_write.writable_roots=' + json.dumps(values)]
 
 
 def prepare_permissions(profile, output_root, home=None, output_directories=(), managed_directories=(), managed_root=None):
@@ -91,7 +117,7 @@ def prepare_permissions(profile, output_root, home=None, output_directories=(), 
     outputs = _output_paths(root, output_directories)
     if profile['runtime'] == 'codex':
         sandbox = ['--sandbox', 'workspace-write', '--ask-for-approval', 'never'] if mode == CODEX_NO_APPROVAL else []
-        return sandbox + _codex_writable_roots(outputs, managed)
+        return sandbox + _codex_writable_roots(outputs, managed, bool(sandbox), home)
     if mode == 'dashboard_outputs':
         outputs = [*(root / folder for folder in OUTPUT_FOLDERS), *outputs]
     paths = [str(path / '**') for path in outputs] + paths
