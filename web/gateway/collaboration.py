@@ -550,13 +550,33 @@ def truncate_contribution(text, limit=CONTRIBUTION_LIMIT):
 
 def validate_contributions(contributions, runs):
     ids = {r['profile_id']: r['profile']['name'] for r in runs}
+    # The prompt lists the roster as {alias: profile_id}, so a chair sometimes
+    # records the alias. It names exactly one member, so accept it as that
+    # member; anything else outside the roster is still refused.
+    aliases = {r['alias']: r['profile_id'] for r in runs if isinstance(r.get('alias'), str) and r['alias']}
     if not isinstance(contributions, list) or not 1 <= len(contributions) <= MAX_CONTRIBUTIONS:
         raise ValueError('Group agent did not provide a valid discussion transcript.')
-    for part in contributions:
-        if (not isinstance(part, dict) or part.get('profile_id') not in ids or
-            type(part.get('round')) is not int or not 1 <= part['round'] <= MAX_ROUNDS or
-            not isinstance(part.get('content'), str) or not part['content'].strip()):
-            raise ValueError('Invalid member contribution in group transcript.')
+    for number, part in enumerate(contributions, 1):
+        # Say which entry failed and why. A bare "invalid" left the operator
+        # unable to tell the chair what to fix, and recovery failed on the
+        # same file every pass.
+        if not isinstance(part, dict):
+            reason = 'it is not a JSON object'
+        else:
+            speaker = part.get('profile_id')
+            if speaker not in ids and isinstance(speaker, str) and speaker in aliases:
+                part['profile_id'] = speaker = aliases[speaker]
+            if speaker not in ids:
+                reason = (f'profile_id {json.dumps(speaker)[:80]} is not a member of this discussion; '
+                          f'use one of {", ".join(sorted(ids))}')
+            elif type(part.get('round')) is not int or not 1 <= part['round'] <= MAX_ROUNDS:
+                reason = f'round must be an integer from 1 to {MAX_ROUNDS}, not {json.dumps(part.get("round"))[:40]}'
+            elif not isinstance(part.get('content'), str) or not part['content'].strip():
+                reason = 'content must be non-empty Markdown text'
+            else:
+                reason = None
+        if reason:
+            raise ValueError(f'Invalid member contribution in group transcript: entry {number}: {reason}.')
         # Bound the content instead of rejecting it. A contribution over the
         # limit is still a real one, and rejecting it made the whole transcript
         # invalid — so a discussion whose members wrote at length could never be

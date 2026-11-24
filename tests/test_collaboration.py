@@ -2413,3 +2413,20 @@ class ContributionValidationTests(unittest.TestCase):
                     dict(profile_id='p1', round='1', content='x')):
             with self.assertRaisesRegex(ValueError, 'Invalid member contribution'):
                 self.validate([bad], self.runs)
+
+    def test_a_refusal_names_the_entry_and_what_to_fix(self):
+        good = dict(profile_id='p1', round=1, content='x')
+        cases = ((dict(profile_id='chair', round=1, content='x'), 'entry 2: profile_id "chair" .* use one of p1'),
+                 (dict(profile_id='p1', round='1', content='x'), 'entry 2: round must be an integer from 1 to 20'),
+                 (dict(profile_id='p1', round=1, content={'verdict': 'hold'}), 'entry 2: content must be'),
+                 ('note', 'entry 2: it is not a JSON object'))
+        for bad, reason in cases:
+            with self.assertRaisesRegex(ValueError, reason):
+                self.validate([dict(good), bad], self.runs)
+
+    def test_a_member_recorded_by_its_alias_is_accepted_as_that_member(self):
+        # The prompt shows the roster as {alias: profile_id}; a chair that
+        # wrote the alias still named exactly one member.
+        runs = [dict(self.runs[0], alias='hire_ada')]
+        parts = self.validate([dict(profile_id='hire_ada', round=1, content='x')], runs)
+        self.assertEqual((parts[0]['profile_id'], parts[0]['name']), ('p1', 'Ada'))
