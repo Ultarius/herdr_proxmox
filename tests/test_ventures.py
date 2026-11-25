@@ -1959,6 +1959,7 @@ class VentureTests(unittest.TestCase):
         second = self.studio(mode='studio_run', kind='scout')
         pack = json.loads(Path(second['evidence_file']).read_text(encoding='utf-8'))
         self.assertNotIn('ruled_out', pack)
+        self.assertNotIn('empty_streak', pack)  # One empty round is not a streak.
         self.assertEqual([(item['note'], item['focus']) for item in pack['scout_notes']],
                          [('Padel booking is served by Playtomic.', ['Dutch padel clubs'])])
         self.assertIn('"ruled_out"', second['prompt'])
@@ -1986,6 +1987,17 @@ class VentureTests(unittest.TestCase):
         # focus and market it was judged under, so the scout can tell.
         self.studio(mode='studio_policy', studio_focus=['German music schools'])
         third = self.studio(mode='studio_run', kind='scout')
+        # Two empty rounds in a row: the next scout is told to change method,
+        # in the pack and up front in the brief its chair starts from.
+        streak = json.loads(Path(third['evidence_file']).read_text(encoding='utf-8'))['empty_streak']
+        self.assertEqual(streak['runs'], 2)
+        self.assertTrue(streak['since'])
+        brief = Path(third['evidence_file']).with_name(ventures.STUDIO_ENTRY_FILE).read_text(encoding='utf-8')
+        self.assertIn('The last 2 scouts returned no ideas.', brief)
+        self.assertIn('AFTER EMPTY ROUNDS', brief)
+        self.assertIn('AFTER EMPTY ROUNDS: when the pack has "empty_streak"', rules)
+        self.assertIn('Start from a timing driver', rules)
+        self.assertIn('are not evidence about segments they did not research', rules)
         self.complete_studio(third, {'candidates': [], 'research': self.RESEARCH, 'ruled_out': [
             dict(segment='Padel court yield', market='Dutch padel club owners', reason='Still served.')]})
         fourth = self.studio(mode='studio_run', kind='scout')
@@ -2001,6 +2013,18 @@ class VentureTests(unittest.TestCase):
         # Notes are context, never rejections, and an explicit empty list adds none.
         self.assertEqual([item['note'] for item in pack['scout_notes']],
                          ['No useful feed items.', 'Padel booking is served by Playtomic.'])
+
+    def test_a_scout_that_returns_an_idea_ends_the_empty_streak(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        for _ in range(2):
+            run = self.studio(mode='studio_run', kind='scout')
+            self.assertEqual(self.complete_studio(run, {'candidates': [], 'research': self.RESEARCH})['state'], 'ready')
+        run = self.studio(mode='studio_run', kind='scout')
+        self.assertEqual(json.loads(Path(run['evidence_file']).read_text(encoding='utf-8'))['empty_streak']['runs'], 2)
+        done = self.complete_studio(run, {'candidates': [self.web_candidate()], 'research': self.RESEARCH})
+        self.assertEqual((done['state'], len(done['candidates'])), ('ready', 1), done.get('refused_candidates'))
+        self.assertIsNone(self.ventures._studio_empty_streak('org'))
 
     def test_a_feed_scout_rejection_keeps_the_feed_item_it_cites(self):
         self.setup_studio_manual()

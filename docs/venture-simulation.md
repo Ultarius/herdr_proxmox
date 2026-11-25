@@ -560,6 +560,24 @@ candidates are allowed only as `review.md` allows.
 
 The second batch makes an empty run longer and costs more tokens.
 
+**After empty rounds in a row**, the method changes. When the newest two or
+more settled scouts returned no idea, the next pack gets an `empty_streak`
+entry with the count and the date the streak began. Runs that failed, were
+dismissed or are still in their meeting neither count nor break the streak;
+any run that returns an idea ends it. The scout's start-here brief then opens
+with "The last N scouts returned no ideas", so a chair that has run many
+rounds cannot skim past it.
+
+The answer rules' AFTER EMPTY ROUNDS line says that repeated empty rounds mean
+the search method is wrong, not that there are no ideas. That round must not
+start from an industry and the product it might buy. It starts from a timing
+driver (a regulation with a deadline, a technology or infrastructure shift,
+or a weakening incumbent), then finds the buyer that driver forces to spend
+and what that buyer pays today. At least one batch must come from that route,
+with the driver named in each idea's `prior_state`. Earlier empty verdicts,
+in project knowledge or `scout_notes`, are not evidence about segments they
+did not research.
+
 The second batch may also return to the same buyers with a materially
 different offer that removes the first batch's reason.
 

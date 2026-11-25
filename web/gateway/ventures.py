@@ -130,6 +130,9 @@ SCOUT_RULED_OUT_MEMORY = 16
 SCOUT_RULED_OUT_RUNS = 5
 # Earlier scouts' research notes, passed as context beside ruled_out.
 SCOUT_NOTE_MEMORY = 3
+# Settled scouts in a row that returned no idea before the next one is told
+# to change its search method.
+SCOUT_EMPTY_STREAK = 2
 # A scout proposal has to state the case against itself as well as the case for
 # it. These are the checkable parts of that brief; the gateway derives the
 # economics instead of trusting a summary number.
@@ -314,6 +317,13 @@ def scout_answer_rules():
             'earn in different ways. A booking tool with a compliance or payments feature added is still a '
             'booking tool. When that second batch fails too, apply the review checklist\'s last question: hold '
             'an idea only when a credible test could change its verdict.',
+            'AFTER EMPTY ROUNDS: when the pack has "empty_streak", the last scouts returned no ideas. Treat that '
+            'as a sign the search method is wrong, not that there are no ideas, and change the method this '
+            'round. Do not start from an industry and the product it might buy. Start from a timing driver: a '
+            'regulation with a deadline, a technology or infrastructure shift, or a weakening incumbent. Then '
+            'find the buyer it forces to spend, and what that buyer pays today. At least one batch comes from '
+            'this route, and each idea names its driver in prior_state. Earlier empty verdicts, in project '
+            'knowledge or "scout_notes", are not evidence about segments they did not research.',
             'MARKET SIZE: there is no minimum number of accounts. Count what break-even needs as the review '
             'checklist\'s size question says (paying customers for a subscription, projects a month times '
             'twelve for a service) and reject a segment only when that is more than you could win in three '
@@ -411,6 +421,12 @@ def scout_brief(run, files):
              'cannot read one, quote the applicable rules in its prompt. Keep its existing workspace '
              'permissions.', '']
     lines += ['- `' + name + '`: ' + purpose for name, purpose in roles if name == 'evidence.json' or name in files]
+    streak = (run.get('evidence') or {}).get('empty_streak') if isinstance(run.get('evidence'), dict) else None
+    if isinstance(streak, dict) and streak.get('runs'):
+        # Up front, where a chair that has run many rounds cannot skim past it.
+        lines += ['', '**The last ' + str(streak['runs']) + ' scouts returned no ideas.** That means the search '
+                  'method is wrong, not that there are no ideas. Before any research, give every member the AFTER '
+                  'EMPTY ROUNDS rule in ' + STUDIO_RULES_FILE + ' and follow it this round.']
     return '\n'.join(lines) + '\n'
 
 
@@ -2144,6 +2160,9 @@ class Ventures(StudioOperations, StakeholderPanel):
                 evidence['ruled_out'] = ruled_out
             if notes:
                 evidence['scout_notes'] = notes
+            streak = self._studio_empty_streak(organization)
+            if streak:
+                evidence['empty_streak'] = streak
             feedback = self._panel_feedback(organization)
             if feedback:
                 # The panel's critique of the last round, to revise or drop.
@@ -2177,6 +2196,32 @@ class Ventures(StudioOperations, StakeholderPanel):
             else:
                 raise ValueError('Venture Studio evidence exceeds its byte budget even at minimum detail.')
         return evidence, active_ids, index
+
+    def _studio_empty_streak(self, organization):
+        """The newest settled scouts that returned no idea, when there are
+        at least SCOUT_EMPTY_STREAK of them in a row; otherwise None.
+
+        A live team returned nothing round after round, each time searching
+        the same kind of product in another industry, and cited its own
+        earlier empty verdicts as support. A run that never settled (failed,
+        dismissed, still in its meeting) neither counts nor breaks the
+        streak; one that returned any idea ends it."""
+        with closing(self.service.connect()) as db:
+            rows = db.execute(
+                "SELECT json_array_length(data, '$.candidates'), json_extract(data, '$.processed_at') "
+                "FROM venture_studio_runs WHERE organization_id=? AND kind='scout' "
+                "AND json_extract(data, '$.state')='ready' ORDER BY rowid DESC LIMIT 20", (organization,)).fetchall()
+        empty = []
+        for count, settled in rows:
+            if count:
+                break
+            empty.append(str(settled or '')[:10])
+        if len(empty) < SCOUT_EMPTY_STREAK:
+            return None
+        return dict(runs=len(empty), since=empty[-1],
+                    meaning='The last ' + str(len(empty)) + ' scouts returned no ideas. That says the search '
+                            'method is wrong, not that there are no ideas: see AFTER EMPTY ROUNDS in the '
+                            'answer rules.')
 
     def _studio_ruled_out(self, organization):
         """What recent scouts weighed and rejected, and their notes.
