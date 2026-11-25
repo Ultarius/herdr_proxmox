@@ -94,15 +94,6 @@ def prepare_locked(store, job_id):
                     raise Waiting('Waiting for an earlier discussion involving these members')
             elif other['kind'] != 'launch' and session_active(other):
                 raise Waiting('Waiting for active ' + other['kind'] + ' work')
-        if job.get('studio_run_id') and 'fresh_sessions' not in job and store.contributions is not None:
-            # A scout starts from fresh sessions, not the last round's memory.
-            # Here, holding its members, on this worker rather than the shared
-            # poller; it never raises, and closed sessions start again below.
-            released = store.contributions.ventures.studio_meeting_reset(job)
-            # Also on this copy: preparation saves it again further on.
-            job['fresh_sessions'] = list(released or [])
-            if released:
-                jobs = store.job_records()
         selected = {}
         controller = store.contributions
         for profile in profiles:
@@ -188,6 +179,24 @@ def prepare_locked(store, job_id):
             daily = policy.get('daily_session_cap') or 0
             if daily and budget['started'] + needed > daily:
                 raise Waiting('Daily session budget reached; waiting for the next window')
+        if (job.get('studio_run_id') and 'fresh_sessions' not in job
+                and getattr(controller, 'ventures', None) is not None):
+            # A scout starts from fresh sessions, not the last round's memory.
+            # Only now, once every member is eligible and the meeting is
+            # admitted (paused, meeting cap, earlier meetings, session and
+            # daily budgets all checked above): a meeting that has to wait
+            # keeps the sessions it would reuse. On this worker, holding the
+            # members, never on the shared poller; it never raises. A closed
+            # session counts the same for the budgets (one fewer active, one
+            # more to start), and the reset leaves daily starts for members
+            # that need one, so the checks above still hold.
+            released = controller.ventures.studio_meeting_reset(job)
+            job['fresh_sessions'] = list(released or [])  # Saved with the preparation below.
+            if released:
+                with store.lock, closing(store.connect()) as db:
+                    for identity, run in list(selected.items()):
+                        if store.get(db, 'jobs', run['id'])['state'] in ('released', 'finished'):
+                            del selected[identity]  # Started again below, with only its persona.
         # Nothing new is launched until all already-active members are eligible.
         # Reserve each absent session durably with a deterministic identity.
         with store.lock, closing(store.connect()) as db, db:

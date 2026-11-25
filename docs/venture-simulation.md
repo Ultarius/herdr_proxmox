@@ -598,7 +598,11 @@ round reuses it:
   its members' sessions; every other reservation still blocks it.
 - **Off the shared poller:** the reset runs inside the meeting's own
   preparation, on the store's worker, while the meeting holds its members, so
-  nothing else can take them meanwhile. A slow terminal read or pane close
+  nothing else can take them meanwhile. It runs only once every member is
+  eligible and the meeting is admitted (not paused, under the meeting cap, no
+  earlier meeting waiting, within the session and daily budgets). A scout that
+  has to wait, for example behind an unrelated meeting holding the only
+  meeting slot, keeps the sessions it would reuse until it is admitted. A slow terminal read or pane close
   delays only that meeting. It stops starting closes after
   `SCOUT_RESET_SECONDS` (30 seconds); sessions left then are reused.
 
@@ -647,9 +651,36 @@ rejected 6,225 practices as "below 10k", a cutoff that appears nowhere in
 these rules.
 
 An earlier rejection no longer applies when it rested on such a fixed cutoff,
-or when the new offer is materially different and answers the original
-objection. The scout may then reconsider that segment and must say in the
-idea which reason it answered.
+when it failed a segment only because a tool or a small vendor already sells
+the idea, or when the new offer is materially different and answers the
+original objection. The scout may then reconsider that segment and must say in
+the idea which reason it answered.
+
+**An existing tool is not a copy threat.** Question 6 of the review checklist
+asks whether the market leader can copy the idea within a quarter. Scouts read
+it as "someone already sells this" and rejected every segment with any vendor
+in it, including small ones with no published price or reach: a live round
+dropped hotel banqueting and stand building that way, and one rejection read a
+workflow into a module name on a price list. The checklist now keeps three
+cases apart:
+- a tool that already does the job is question 1: price against it and say
+  how the idea differs or which buyers it does not serve;
+- a small, young or unpriced vendor with no cited reach is not a reason to
+  reject, and not proof of paid demand either: a listing shows supply (it may
+  be a free trial or have no customers). It is a lead and a competitor to
+  beat, and counts toward paid demand only when a source shows a buyer paying
+  (a named paying customer, a customer count with prices, a paid pilot). The
+  rating rules say the same: a vendor page alone is at most medium paid
+  demand, which carries 30% of the confidence score;
+- question 6 asks two things separately, each with evidence: can the leader,
+  or an incumbent selling to these buyers, build it within a quarter, and does
+  it already reach these buyers (its own customers, a suite, a channel)? It
+  fails when both hold, so a standalone incumbent counts as well as a suite.
+  When either is uncertain, the scout names the evidence that would settle it,
+  which is a test for a held idea, not a reason to reject.
+
+Vendor pages are read for what they say, not inferred from a feature name, and
+their claims are reported as the vendor's own.
 
 Rejected ideas are listed under `ruled_out`: up to ten
 `{"segment","market","reason","evidence"}` entries per answer, where `market`

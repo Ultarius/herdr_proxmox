@@ -171,13 +171,16 @@ replaces the earlier idea.
    customer per month with the cheapest cited alternative of the same kind
    (software with software). Give every alternative price a period (month or
    year). If ours is higher, say what the buyer gets for the difference, find
-   a segment the cheap option cannot serve, or lower the price.
+   a segment the cheap option cannot serve, or lower the price. A tool that
+   already does the same job belongs here, as an alternative to price and
+   differ from, not under question 6.
 2. **What is actually sold.** If delivery (expert days times the day rate) is
    more than half of a customer's first-year revenue, it is a consulting
    business. Price the first offer to cover delivery, cut the delivery, or say
    so plainly. Compare like with like: the delivery days are for one project,
-   so a fee per site counts once for every site that project covers. Every fee the first offer names is also a revenue line: a pilot
-   or setup fee is a `one_off` line. A `service` or `productised_service`
+   so a fee per site counts once for every site that project covers. Every
+   fee the first offer names is also a revenue line: a pilot or setup fee is
+   a `one_off` line. A `service` or `productised_service`
    model is refused without one, `saas` without a recurring line, and
    `hybrid` without both.
 3. **Where the market grows.** Is the target segment gaining or losing share
@@ -191,10 +194,35 @@ replaces the earlier idea.
    consumables, marketplace or booking fees. If a share of card payments does
    not cover card costs, try another activity-linked line before giving up on
    one.
-6. **Can the leader copy it within a quarter?** If the advantage is a service,
-   a language or a lower price, assume the leader matches it. Name what it
+6. **Can the leader copy it within a quarter?** The leader is the company
+   most of the segment's buyers already use, or the large suite that could
+   bundle this (name it and cite its reach). If our advantage is a service, a
+   language or a lower price, assume the leader matches it. Name what it
    cannot copy quickly: data, distribution, an integration, or a segment it
-   does not want.
+   does not want. Answer two things separately, each with evidence:
+   - **Can it build this quickly?** Does the leader, or an incumbent selling
+     to these buyers, already have the data, workflow or integration, or could
+     it add them within a quarter?
+   - **Does it already reach these buyers?** Through its own customer base, a
+     suite it can bundle into, or a channel they buy through.
+   The idea fails question 6 when both hold: a standalone incumbent that can
+   build it and already sells to the same buyers counts, not only a suite.
+   If either is uncertain, say which and name the evidence that would settle
+   it (a customer count, a published roadmap, a buyer interview); that is a
+   test for a held idea, not a reason to reject.
+   Keep these cases apart:
+   - A tool that already does this job is question 1: price against it and
+     say how this idea differs or which buyers it does not serve. It fails
+     question 6 only if it also passes both tests above.
+   - A small, young or unpriced vendor with no cited reach is not a reason to
+     reject, and not proof of paid demand either: a listing shows supply. It
+     may be a free trial, a product with no customers, or a workflow it has
+     not shown. Treat it as a lead and a competitor to beat. It counts toward
+     paid demand only when a source shows a buyer paying: a named paying
+     customer, a published customer count with prices, or a paid pilot.
+   Read a vendor's page for what it says; do not infer a feature from a word
+   on a price list (a module name is not proof of the workflow). Vendor
+   claims are the vendor's own: say so.
 7. **How big it realistically gets.** The share of the reachable accounts you
    could win in three years, times the yearly revenue per customer. Say in the
    dissent whether this is a niche or can scale. There is no minimum number of
@@ -307,7 +335,9 @@ def scout_answer_rules():
             'and rejected, each with the reason, the market it was judged for and that run\'s focus. Skip one '
             'only when you would look at the same market and its reason still applies; another country, buyer '
             'or focus is new ground. A reason no longer applies when it rested on a fixed size cutoff (see '
-            'MARKET SIZE) or when your offer is materially different and answers the original objection; then '
+            'MARKET SIZE), when it failed a segment only because a tool or a small vendor already sells the '
+            'idea (see the review checklist\'s question 6), or when your offer is materially different and '
+            'answers the original objection; then '
             'reconsider it and say in the idea which reason you answered. "scout_notes" are earlier scouts\' '
             'own summaries: context, not rejections.',
             'SEARCH WIDER BEFORE GIVING UP: if no idea in the first batch survives the review checklist, weigh '
@@ -338,7 +368,9 @@ def scout_answer_rules():
             'twelve for a service) and reject a segment only when that is more than you could win in three '
             'years through the way you would reach its buyers; show that arithmetic instead of a fixed cutoff.',
             'RATING: ' + rating + '; weak 0, medium 50, strong 100. Strong paid demand: buyers already pay a cited '
-            'alternative or a cited paid pilot. Strong recurring potential: revenue grows with the customer '
+            'alternative or a cited paid pilot, shown by the source (a price a named customer pays, a paying '
+            'customer count, a paid pilot). A vendor page that only lists a product or a price shows supply, '
+            'not spending: on its own it is at most medium. Strong recurring potential: revenue grows with the customer '
             '(per_unit or take_rate). Strong defensibility: it becomes the customer\'s system of record, holds '
             'its data or payments, or integrations make leaving costly.',
             'Prefer the smallest sellable fixed-fee first offer over the eventual product.',

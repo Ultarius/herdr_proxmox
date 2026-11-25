@@ -2946,6 +2946,26 @@ class VentureTests(unittest.TestCase):
         self.assertIn('LEARN FROM WHAT FAILED', rules)
         self.assertIn('use it for revisions and to test new ideas', second['prompt'])
 
+    def test_an_existing_tool_is_priced_against_and_only_the_leader_fails_question_6(self):
+        # A live round rejected seven segments under question 6 because any
+        # vendor sold something similar, small and unpriced ones included.
+        checklist = ' '.join(ventures.STUDIO_REVIEW_CHECKLIST.split())
+        for rule in ('A tool that already does the same job belongs here, as an alternative to price and differ '
+                     'from, not under question 6.',
+                     # Copying and reaching the buyers are judged apart, and a
+                     # standalone incumbent counts as well as a suite.
+                     '**Can it build this quickly?**', '**Does it already reach these buyers?**',
+                     'a standalone incumbent that can build it and already sells to the same buyers counts',
+                     'that is a test for a held idea, not a reason to reject',
+                     # A listing shows supply, not spending.
+                     'not proof of paid demand either: a listing shows supply.',
+                     'It counts toward paid demand only when a source shows a buyer paying',
+                     'a module name is not proof of the workflow'):
+            self.assertIn(rule, checklist)
+        rules = ' '.join(ventures.scout_answer_rules().split())
+        self.assertIn('when it failed a segment only because a tool or a small vendor already sells the idea', rules)
+        self.assertIn('A vendor page that only lists a product or a price shows supply, not spending', rules)
+
     def test_a_rejection_reason_reaches_agents_redacted_and_ahead_of_old_archives(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())

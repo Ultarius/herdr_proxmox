@@ -99,6 +99,40 @@ class VentureStoreIntegrationTests(unittest.TestCase):
     def discussions(self):
         return [job for job in self.store.job_records() if job.get('kind') == 'discussion']
 
+    def test_a_scout_that_must_wait_for_admission_keeps_its_sessions(self):
+        # One meeting at a time, and an unrelated meeting holds that slot:
+        # the scout used to close its five sessions first and then wait.
+        settings = dict(runtime='codex')
+        studio = self.studio(mode='studio_setup', confirmed=True, settings=settings)
+        self.drain()  # The facilitator finishes starting.
+        self.studio(mode='studio_policy', studio_focus=['freight forwarding'],
+                    studio_sources=['https://news.example/feed'])
+        with self.service.operation('policy:' + self.org):
+            self.service.patch_policy(self.org, dict(max_active_meetings=1), 'admin')
+        other = dict(id=gateway.uuid.uuid4().hex, organization_id=self.org, kind='discussion', state='running',
+                     participants=[], created_at=gateway.now(), updated_at=gateway.now(),
+                     meeting_admitted_at=gateway.now())
+        with self.store.lock, closing(self.store.connect()) as db, db:
+            self.store.put(db, 'jobs', other)
+        facilitator = next(item for item in self.store.snapshot()['groups']
+                           if item['id'] == studio['group_id'])['facilitator_id']
+        chair = next(job for job in self.store.job_records() if job['kind'] == 'launch'
+                     and job.get('profile_id') == facilitator and job['state'] == 'persona_sent')
+        item = venture_fixtures.feed_item(venture_feeds.now().isoformat())
+        with patch.object(venture_feeds, 'fetch', return_value=dict(
+                status=200, source='https://news.example/feed', fetched_at=venture_feeds.now().isoformat(),
+                items=[item], etag='', modified='')):
+            scout = self.studio(mode='studio_run', kind='scout')
+        self.assertEqual(scout['state'], 'meeting', scout.get('error'))
+        self.drain()
+        meeting = next(job for job in self.discussions() if job['id'] == scout['job_id'])
+        self.assertEqual(meeting['state'], 'waiting_for_members', meeting.get('error'))
+        self.assertIn('Meeting budget reached', meeting.get('progress', ''))
+        # Nothing was closed: the reset waits for the meeting's admission.
+        self.assertNotIn('fresh_sessions', meeting)
+        self.assertEqual(next(job for job in self.store.job_records() if job['id'] == chair['id'])['state'],
+                         'persona_sent')
+
     def test_scout_pitch_and_approval_through_the_real_store(self):
         settings = dict(runtime='codex')
         studio = self.studio(mode='studio_setup', confirmed=True, settings=settings)
