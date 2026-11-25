@@ -175,7 +175,8 @@ replaces the earlier idea.
 2. **What is actually sold.** If delivery (expert days times the day rate) is
    more than half of a customer's first-year revenue, it is a consulting
    business. Price the first offer to cover delivery, cut the delivery, or say
-   so plainly. Every fee the first offer names is also a revenue line: a pilot
+   so plainly. Compare like with like: the delivery days are for one project,
+   so a fee per site counts once for every site that project covers. Every fee the first offer names is also a revenue line: a pilot
    or setup fee is a `one_off` line. A `service` or `productised_service`
    model is refused without one, `saas` without a recurring line, and
    `hybrid` without both.
@@ -327,6 +328,11 @@ def scout_answer_rules():
             'find the buyer it forces to spend, and what that buyer pays today. At least one batch comes from '
             'this route, and each idea names its driver in prior_state. Earlier empty verdicts, in project '
             'knowledge or "scout_notes", are not evidence about segments they did not research.',
+            'LEARN FROM WHAT FAILED: "stakeholder_feedback" holds the panel\'s objections to recent ideas, and '
+            '"rejected_because" (there and in "existing") the operator\'s reason for turning one down. Before '
+            'proposing an idea, check it against those objections: an idea the same objections would sink is not '
+            'new, whatever its industry. List the closest such objection in evidence_against, with why it does not '
+            'sink this idea.',
             'MARKET SIZE: there is no minimum number of accounts. Count what break-even needs as the review '
             'checklist\'s size question says (paying customers for a subscription, projects a month times '
             'twelve for a service) and reject a segment only when that is more than you could win in three '
@@ -358,6 +364,10 @@ def scout_answer_rules():
             'subsets to measure in assumptions or evidence_against, not in the segment.',
             'business_model names its revenue lines: saas needs a recurring one, service and productised_service '
             'a one_off one (the first offer\'s fee), hybrid both. Every fee the first offer names is a revenue line.',
+            'A one_off line is the price of one project, and delivery_effort is the work for that same project. '
+            'If the fee is per site, file or location, add "unit" and "units" (how many one project covers): '
+            'EUR 1,500 per site for a 3-site pilot is {"amount":1500,"unit":"site","units":3}. Without them the '
+            'amount is the whole project\'s price.',
             'per_unit: amount per unit per period, with "unit" and "units" per customer. take_rate: "percent" of '
             'a cited monthly "volume" per customer, minus "cost_percent" passed to banks or networks, with '
             '"evidence". A recurring or per_unit line states its period (month or year); a credit reduces the '
@@ -832,6 +842,11 @@ def scout_business_model(value, cite=None):
         if kind == 'per_unit':
             entry['unit'] = _value(line.get('unit'), 40, name + ' unit (room, seat, site...)', required=True)
             entry['units'] = _integer(line.get('units'), 1, 1_000_000, name + ' units per customer')
+        if kind == 'one_off' and (line.get('unit') is not None or line.get('units') is not None):
+            # A fee per site or per file: the project is that fee times the
+            # units it covers, which is what the delivery effort is set against.
+            entry['unit'] = _value(line.get('unit'), 40, name + ' unit (site, file, location...)', required=True)
+            entry['units'] = _integer(line.get('units'), 1, 10_000, name + ' units per project')
         parsed.append(entry)
     kinds = {line['kind'] for line in parsed}
     repeating = bool(kinds & set(SCOUT_REPEATING))
@@ -1087,7 +1102,9 @@ def candidate_economics(configuration, business_model, delivery_effort, reachabl
     def convert(amount, currency):
         return engine.convert(amount, currency, market)
     lines = business_model['revenue_lines']
-    one_off = sum(convert(line['amount'], line['currency']) for line in lines if line['kind'] == 'one_off')
+    # A one-off fee per unit (site, file) counts for every unit one project covers.
+    one_off = sum(convert(line['amount'], line['currency']) * line.get('units', 1)
+                  for line in lines if line['kind'] == 'one_off')
     def monthly(line):
         if line['kind'] == 'recurring':
             return convert(line['amount'], line['currency']) / SCOUT_PERIODS[line.get('period', 'month')]
@@ -1986,15 +2003,8 @@ class Ventures(StudioOperations, StakeholderPanel):
             run['evidence_file'] = str(target)
             run['prompt'] = (self._pitch_prompt(run, target) if pitch
                              else self._studio_prompt(organization, run, target))
-        if scout and not run.get('job_id') and 'fresh_sessions' not in run:
-            # Once per scout, after its pack and prompt are ready and just
-            # before its meeting is requested: a new round starts from fresh
-            # sessions, not from the last round's memory.
-            try:
-                run['fresh_sessions'] = self._fresh_scout_sessions(organization, run, studio)
-            except Exception as error:  # Never a reason to hold the scout back.
-                logging.warning('Scout %s reuses its sessions: %s', run['id'], redact(str(error)))
-                run['fresh_sessions'] = []
+        # A scout's sessions are reset when its meeting prepares
+        # (studio_meeting_reset), on the store's worker, not here on the poller.
         self.save_studio_run(run)  # Frozen: a retry or recovery reuses the exact request.
         request = dict(request_id='studio-' + run['id'], organization_id=organization,
                        group_id=group_id, prompt=run['prompt'])
@@ -2004,6 +2014,30 @@ class Ventures(StudioOperations, StakeholderPanel):
         response = self.service.store.action('discuss', request, studio_run_id=run['id'])
         run.update(job_id=response['id'], state='meeting', error='', failure=None, waiting=None)
         return self.save_studio_run(run)
+
+    def studio_meeting_reset(self, job):
+        """Close a scout's idle sessions while its meeting prepares; once per meeting.
+
+        Meeting preparation calls this on the store's worker, holding the
+        meeting's members, before it decides which sessions to reuse. So a
+        slow terminal read or pane close delays only this meeting, never the
+        shared poller, and nothing else can take those members meanwhile.
+        The result is kept on the discussion (``fresh_sessions``) and copied to
+        the run when it settles. Returns the names closed; any failure keeps
+        the sessions, because a kept session only means this round reuses it."""
+        if 'fresh_sessions' in job or not job.get('studio_run_id'):
+            return []
+        try:
+            run = self._studio_run_record(job['organization_id'], job['studio_run_id'])
+            released = []
+            if run.get('kind') == 'scout':
+                released = self._fresh_scout_sessions(job['organization_id'], run, self._studio(job['organization_id']),
+                                                      discussion_id=job['id'])
+        except Exception as error:  # Never a reason to hold the meeting back.
+            logging.warning('Scout meeting %s reuses its sessions: %s', job['id'], redact(str(error)))
+            released = []
+        self.service.store.update_job(job['id'], fresh_sessions=released)
+        return released
 
     def studio_discussion_prompt(self, job, facilitator):
         """Prepare the pinned scout files for the facilitator who will receive the prompt."""
@@ -2302,7 +2336,9 @@ class Ventures(StudioOperations, StakeholderPanel):
         """A compact reminder of names already taken, for the agents.
 
         Open entries (active ventures and open candidates) come first and are
-        kept longest; then the newest twenty closed ones. Theses are cut to a
+        kept longest; then the twenty most recently closed ventures and
+        candidates together, newest first, so a burst of archived ventures
+        cannot push out the operator's latest rejection. Theses are cut to a
         sentence: duplicate detection reads storage, not this list.
         """
         with closing(self.service.connect()) as db:
@@ -2312,17 +2348,35 @@ class Ventures(StudioOperations, StakeholderPanel):
                 'SELECT data FROM venture_candidates WHERE organization_id=? ORDER BY rowid DESC LIMIT 200',
                 (organization,))]
         def compact(item, kind):
-            return dict(kind=kind, name=str(item.get('name', ''))[:80], thesis=str(item.get('thesis', ''))[:120],
-                        state=item.get('state', ''))
+            entry = dict(kind=kind, name=str(item.get('name', ''))[:80], thesis=str(item.get('thesis', ''))[:120],
+                         state=item.get('state', ''))
+            decision = item.get('decision') if isinstance(item.get('decision'), dict) else {}
+            if kind == 'candidate' and decision.get('decision') == 'reject' and decision.get('reason'):
+                # Why the operator turned it down, with who it was for, so
+                # the next scout can tell whether the reason still applies.
+                # The stored reason stays as written; agents get it redacted.
+                entry['rejected_because'] = redact(str(decision['reason']))[:160]
+                buyer = item.get('buyer') if isinstance(item.get('buyer'), dict) else {}
+                market = ((item.get('configuration') or {}).get('market') or {}) if isinstance(
+                    item.get('configuration'), dict) else {}
+                if buyer.get('role'):
+                    entry['buyer'] = str(buyer['role'])[:80]
+                if market.get('geography'):
+                    entry['market'] = str(market['geography'])[:80]
+            return entry
+        def closed_at(item):
+            decision = item.get('decision') if isinstance(item.get('decision'), dict) else {}
+            return str(decision.get('at') or item.get('updated_at') or item.get('created_at') or '')
         open_entries = ([compact(item, 'venture') for item in all_ventures
                          if item.get('state') in ('draft', 'running', 'paused', 'qualified')]
                         + [compact(item, 'candidate') for item in candidates
                            if item.get('state') in ('proposed', 'approved', 'creating')])
-        closed_entries = ([compact(item, 'venture') for item in all_ventures
-                           if item.get('state') in ('failed', 'archived')]
-                          + [compact(item, 'candidate') for item in candidates
-                             if item.get('state') in ('rejected', 'excluded') and not item.get('venture_id')])
-        return open_entries[:60], closed_entries[:20]
+        closed = ([(closed_at(item), compact(item, 'venture')) for item in all_ventures
+                   if item.get('state') in ('failed', 'archived')]
+                  + [(closed_at(item), compact(item, 'candidate')) for item in candidates
+                     if item.get('state') in ('rejected', 'excluded') and not item.get('venture_id')])
+        closed.sort(key=lambda pair: pair[0], reverse=True)  # Stable: equal times keep their order.
+        return open_entries[:60], [entry for _, entry in closed[:20]]
 
     def _studio_known(self, organization):
         """Every venture and candidate ever recorded, for the duplicate check."""
@@ -2377,7 +2431,8 @@ class Ventures(StudioOperations, StakeholderPanel):
                     'Use "existing" and "ruled_out" to avoid repeats and explore other segments. To revise an open idea, use '
                     '"revises":"<its exact name>" and explain the change in "revision_note". '
                     + ('stakeholder_feedback in the pack is the stakeholder panel critique of earlier ideas: '
-                       'use it when weighing a revision. ' if run['evidence'].get('stakeholder_feedback') else '') +
+                       'use it for revisions and to test new ideas. ' if run['evidence'].get('stakeholder_feedback')
+                       else '') +
                     # The method and its answer fields are in the file: the prompt is near its budget.
                     ('Stakeholder advisors attend: work with them as ' + STUDIO_CONSULT_FILE
                      + ' beside the pack says. ' if run.get('consult') else '') +
@@ -2928,6 +2983,8 @@ class Ventures(StudioOperations, StakeholderPanel):
                     if not job:
                         job = next((item for item in self.service.store.snapshot(live_status=False).get('jobs', [])
                                     if item.get('id') == run.get('job_id')), None)
+                    if job and 'fresh_sessions' in job:
+                        run['fresh_sessions'] = job['fresh_sessions']  # Saved with the run's next change.
                     if not job:
                         run.update(state='needs_attention', error='Studio discussion record unavailable.',
                                    failure=self._failure('The studio discussion record is gone.', 'meeting'))

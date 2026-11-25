@@ -16,6 +16,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).parents[1] / 'web/gateway'))
 from contributions import Contributions
 import project_git
+import venture_brief
 import venture_feeds
 import venture_notebook
 import venture_studio
@@ -2042,24 +2043,31 @@ class VentureTests(unittest.TestCase):
                 raise AssertionError('The reset closes panes only through the gateway session close.')
             return {}
 
-        def manage_session(body, actor, allow_busy=False):
+        exempted = []
+
+        def manage_session(body, actor, allow_busy=False, preparing_discussion=None):
             self.assertEqual((body['mode'], body['inspected'], allow_busy), ('close', True, False))
             self.assertLessEqual(len(body['request_id']), 64)
             closed.append(body['job_id'])
+            exempted.append(preparing_discussion)
             next(job for job in self.jobs if job['id'] == body['job_id'])['state'] = 'released'
             return {'id': body['job_id']}
         self.store.command.side_effect = command
         self.store.manage_session.side_effect = manage_session
         run = self.studio(mode='studio_run', kind='scout')
         self.assertEqual(run['state'], 'meeting', run.get('error'))
-        # Only the idle, unowned session on its recorded pane is closed.
-        self.assertEqual(closed, [old['p' * 32]['id']])
-        self.assertEqual(run['fresh_sessions'], ['Portfolio Manager'])
-        self.assertEqual(self.ventures._studio_summary('org')['runs'][0]['fresh_sessions'], run['fresh_sessions'])
-        # A retry of the same scout never closes the sessions its meeting now uses.
-        record = self.ventures._studio_run_record('org', run['id'])
-        record.pop('job_id')
-        self.ventures._studio_dispatch('org', record)
+        # Requesting the meeting closes nothing: that happens while it prepares,
+        # on the store's worker, never on the shared poller.
+        self.assertEqual(closed, [])
+        meeting = dict(next(job for job in self.jobs if job['id'] == run['job_id']), state='queued',
+                       studio_run_id=run['id'])
+        self.assertEqual(self.ventures.studio_meeting_reset(meeting), ['Portfolio Manager'])
+        # Only the idle, unowned session on its recorded pane is closed, and
+        # only the preparing meeting is exempt from owning it.
+        self.assertEqual((closed, exempted), ([old['p' * 32]['id']], [meeting['id']]))
+        self.store.update_job.assert_called_with(meeting['id'], fresh_sessions=['Portfolio Manager'])
+        # Once per meeting: a retried preparation never closes what it now uses.
+        self.assertEqual(self.ventures.studio_meeting_reset(dict(meeting, fresh_sessions=['Portfolio Manager'])), [])
         self.assertEqual(closed, [old['p' * 32]['id']])
         # The same idle session again, under limits the reset must respect.
         fresh = dict(id=uuid.uuid4().hex, kind='launch', state='persona_sent', organization_id='org',
@@ -2072,6 +2080,12 @@ class VentureTests(unittest.TestCase):
         with patch.object(self.service, 'session_budget', return_value=dict(
                 policy=dict(daily_session_cap=10), active=5, meetings=0, started=10)):
             self.assertEqual(self.ventures._fresh_scout_sessions('org', attempt, studio), [])
+        # One start left, but an advisor with no session needs it: it is
+        # counted first, so the reset leaves that start to the advisor.
+        advised = dict(attempt, consult=dict(roles=['investor'], members=dict(investor='i' * 32)))
+        with patch.object(self.service, 'session_budget', return_value=dict(
+                policy=dict(daily_session_cap=10), active=5, meetings=0, started=9)):
+            self.assertEqual(self.ventures._fresh_scout_sessions('org', advised, studio), [])
         with patch.object(self.service, 'session_budget', return_value=dict(
                 policy=dict(paused=True), active=5, meetings=0, started=0)):
             self.assertEqual(self.ventures._fresh_scout_sessions('org', attempt, studio), [])
@@ -2085,7 +2099,9 @@ class VentureTests(unittest.TestCase):
         self.assertEqual(self.ventures._fresh_scout_sessions('org', attempt, studio), [])
         self.store.command.side_effect = command_effect
         self.assertEqual(closed, [old['p' * 32]['id']])
-        self.assertEqual(self.ventures._fresh_scout_sessions('org', attempt, studio), ['Portfolio Manager'])
+        with patch.object(self.service, 'session_budget', return_value=dict(
+                policy=dict(daily_session_cap=10), active=5, meetings=0, started=9)):
+            self.assertEqual(self.ventures._fresh_scout_sessions('org', attempt, studio), ['Portfolio Manager'])
         self.assertEqual(closed, [old['p' * 32]['id'], fresh['id']])
 
     def test_a_scout_that_returns_an_idea_ends_the_empty_streak(self):
@@ -2402,6 +2418,29 @@ class VentureTests(unittest.TestCase):
             ventures.scout_business_model(dict(type='productised_service', revenue_lines=[
                 dict(kind='one_off', label='pilot', amount=1900, currency='USD'),
                 dict(kind='credit', label='credited', amount=1900, currency='USD')]))
+
+    def test_a_fee_per_site_counts_for_every_site_the_project_covers(self):
+        # A real scout answer: EUR 1,500 per site for a 3-site pilot, 3 expert
+        # days for the whole pilot. Read as one site, it "lost" 450.
+        configuration = ventures.normalize_config(candidate()['configuration'])
+        effort = ventures.scout_delivery_effort(dict(expert_days=3, day_rate=dict(amount=650, currency='USD')))
+        per_site = ventures.scout_business_model(dict(type='productised_service', revenue_lines=[
+            dict(kind='one_off', label='retrofit desk', amount=1500, currency='USD', unit='site', units=3)]))
+        self.assertEqual(per_site['revenue_lines'][0]['units'], 3)
+        pilot = ventures.candidate_economics(configuration, per_site, effort, dict(count=400), 30)
+        self.assertEqual((pilot['project_price'], pilot['project_contribution']), (4500, 2550))
+        self.assertFalse([item for item in pilot['warnings'] if 'loses money' in item])
+        # Without units the amount is the whole project, as before.
+        whole = ventures.scout_business_model(dict(type='productised_service', revenue_lines=[
+            dict(kind='one_off', label='retrofit desk', amount=1500, currency='USD')]))
+        single = ventures.candidate_economics(configuration, whole, effort, dict(count=400), 30)
+        self.assertIn('The first offer loses money', single['warnings'][0])
+        with self.assertRaisesRegex(ValueError, 'units per project'):
+            ventures.scout_business_model(dict(type='service', revenue_lines=[
+                dict(kind='one_off', label='audit', amount=900, currency='USD', unit='site')]))
+        page = venture_brief._line_price(per_site['revenue_lines'][0])
+        self.assertIn('per site &times; 3 per project', page)
+        self.assertIn('"unit":"site","units":3', ventures.scout_answer_rules())
 
     def test_revenue_that_grows_with_the_customer_counts_and_upside_stays_apart(self):
         # The shape of a hotel platform: onboarding, a price per room and a
@@ -2876,6 +2915,63 @@ class VentureTests(unittest.TestCase):
     def review(idea, stakeholder, verdict, objection='The buyer already pays a cheaper tool.'):
         return dict(idea=idea, stakeholder=stakeholder, round=1, verdict=verdict, objections=[objection],
                     questions=['Who signs?'], would_change_mind='Three paid pilots.')
+
+    def test_the_next_scout_learns_why_a_reviewed_idea_was_rejected(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        done = self.scout_with(candidate('Carrier Desk', 'N1'))
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        settled = self.complete_pitch(self.pitch_runs()[0], [
+            self.review('Carrier Desk', 'investor', 'hold', 'One-off fees and no moat.'),
+            self.review('Carrier Desk', 'customer', 'pass', 'The deadline is too close to trust a new supplier.')],
+            spoke=['investor', 'customer'])
+        self.assertEqual(settled['state'], 'ready', settled.get('error'))
+        stored = self.stored_candidates()[0]
+        self.studio(mode='candidate_decide', candidate_id=stored['id'], decision='reject',
+                    reason='Off focus: hardware retrofit coordination, not scheduling.')
+        self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'])
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            second = self.studio(mode='studio_run', kind='scout')
+        pack = json.loads(Path(second['evidence_file']).read_text(encoding='utf-8'))
+        feedback, = pack['stakeholder_feedback']
+        self.assertEqual((feedback['name'], feedback['state'], feedback['rejected_because']),
+                         ('Carrier Desk', 'rejected', 'Off focus: hardware retrofit coordination, not scheduling.'))
+        self.assertEqual(sorted(review['objections'][0] for review in feedback['reviews']),
+                         ['One-off fees and no moat.', 'The deadline is too close to trust a new supplier.'])
+        closed = next(entry for entry in pack['existing'] if entry['name'] == 'Carrier Desk')
+        self.assertEqual(closed['rejected_because'], 'Off focus: hardware retrofit coordination, not scheduling.')
+        self.assertTrue(closed['buyer'] and closed['market'], closed)
+        rules = ' '.join(ventures.scout_answer_rules().split())
+        self.assertIn('LEARN FROM WHAT FAILED', rules)
+        self.assertIn('use it for revisions and to test new ideas', second['prompt'])
+
+    def test_a_rejection_reason_reaches_agents_redacted_and_ahead_of_old_archives(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        done = self.scout_with(candidate('Carrier Desk', 'N1'))
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        stored = self.stored_candidates()[0]
+        secret = 'Authorization: Bearer abc123SECRETtoken'
+        self.studio(mode='candidate_decide', candidate_id=stored['id'], decision='reject',
+                    reason='Off focus. ' + secret)
+        # The operator's own record keeps what they wrote.
+        self.assertIn(secret, self.ventures.get_candidate('org', stored['id'])['decision']['reason'])
+        # Twenty ventures archived after older history, then nothing newer:
+        # the rejection must still be in the agents' history.
+        with closing(self.service.connect()) as db, db:
+            for number in range(20):
+                record = dict(id=uuid.uuid4().hex, organization_id='org', name='Old ' + str(number),
+                              thesis='Archived long ago.', state='archived',
+                              updated_at='2020-01-01T00:00:00+00:00', created_at='2020-01-01T00:00:00+00:00')
+                db.execute('INSERT INTO ventures (id, organization_id, data) VALUES (?, ?, ?)',
+                           (record['id'], 'org', json.dumps(record)))
+        open_entries, closed = self.ventures._studio_existing('org')
+        self.assertEqual(len(closed), 20)
+        entry = next(item for item in closed if item['name'] == 'Carrier Desk')
+        self.assertEqual(closed[0], entry)
+        self.assertNotIn('abc123SECRETtoken', json.dumps(entry))
+        self.assertIn('Off focus.', entry['rejected_because'])
 
     def test_a_stakeholder_panel_on_other_models_reviews_each_round_and_feeds_the_next(self):
         self.setup_studio_manual()

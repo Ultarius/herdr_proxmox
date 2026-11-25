@@ -307,6 +307,9 @@ def _line_price(line):
     if kind == 'per_unit':
         return (_money(line.get('amount'), line.get('currency')) + ' per ' + _e(line.get('unit') or 'unit')
                 + _e(period) + ' &times; ' + _e(line.get('units')))
+    if kind == 'one_off' and line.get('units'):
+        return (_money(line.get('amount'), line.get('currency')) + ' per ' + _e(line.get('unit') or 'unit')
+                + ' &times; ' + _e(line.get('units')) + ' per project')
     return ('&minus; ' if kind == 'credit' else '') + _money(line.get('amount'), line.get('currency')) + _e(period)
 
 

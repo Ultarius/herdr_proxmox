@@ -94,6 +94,15 @@ def prepare_locked(store, job_id):
                     raise Waiting('Waiting for an earlier discussion involving these members')
             elif other['kind'] != 'launch' and session_active(other):
                 raise Waiting('Waiting for active ' + other['kind'] + ' work')
+        if job.get('studio_run_id') and 'fresh_sessions' not in job and store.contributions is not None:
+            # A scout starts from fresh sessions, not the last round's memory.
+            # Here, holding its members, on this worker rather than the shared
+            # poller; it never raises, and closed sessions start again below.
+            released = store.contributions.ventures.studio_meeting_reset(job)
+            # Also on this copy: preparation saves it again further on.
+            job['fresh_sessions'] = list(released or [])
+            if released:
+                jobs = store.job_records()
         selected = {}
         controller = store.contributions
         for profile in profiles:

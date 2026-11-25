@@ -1066,7 +1066,11 @@ class OrganizationStore:
             self.jobs_changed.set()
         return job
 
-    def manage_session(self, body, actor, allow_busy=False):
+    def manage_session(self, body, actor, allow_busy=False, preparing_discussion=None):
+        # preparing_discussion: the id of a queued meeting closing its own
+        # members' idle sessions while it prepares (never taken from a request
+        # body). That one meeting does not count as owning them; every other
+        # reservation still does.
         if body.get('mode') in ('archives', 'view_archive'):
             from session_archives import listing, read
             org_id = text(body, 'organization_id', 40)
@@ -1116,7 +1120,10 @@ class OrganizationStore:
                     raise ValueError('Restart only the currently bound session.')
                 # Applies to every mode: a discussion that still owns this
                 # binding must not have it closed, finished or restarted.
-                if any(reserves(j, run['profile_id']) for j in self.job_records()):
+                if any(reserves(j, run['profile_id']) for j in self.job_records()
+                       if not (preparing_discussion and j.get('id') == preparing_discussion
+                               and j.get('kind') == 'discussion' and j.get('state') == 'queued'
+                               and mode == 'close')):
                     raise ValueError('A discussion or meeting still owns this session; resolve it before changing it.')
                 if run.get('session_closed_at') and mode in ('close', 'finish'):
                     return {'id': run['id'], 'status': 'already_closed', 'archive_id': run.get('session_archive_id')}

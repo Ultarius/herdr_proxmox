@@ -369,7 +369,7 @@ class StudioOperations:
                                failed=(run.get('state') or 'not_started') not in LIVE_BINDINGS))
         return result
 
-    def _fresh_scout_sessions(self, organization, run, studio):
+    def _fresh_scout_sessions(self, organization, run, studio, discussion_id=None):
         """Release the idle sessions a scout meeting would reuse; return their names.
 
         A meeting reuses any live session of a member, so every scout used to
@@ -386,14 +386,17 @@ class StudioOperations:
         - only a session whose agent is idle, on the pane its run records, and
           that no job still owns (a delivered delegation included) is a
           candidate;
-        - when the organization is paused or its daily start budget cannot
-          take a new session for every candidate, none is closed, so the
-          meeting is never left unable to start its members;
+        - when the organization is paused, none is closed; under a daily start
+          cap, members that need a new session anyway are counted first and
+          only as many are closed as the remaining starts can replace (the
+          chair first), so the meeting is never left unable to start;
         - each one is closed through the gateway's own session close, which
           takes the agent's lock, re-checks ownership and the agent's identity
           before closing its pane, and archives its transcript first;
-        - the whole reset stops at SCOUT_RESET_SECONDS, because a scheduled
-          scout runs on the shared poller."""
+        - it runs while the meeting prepares (discussion_id), on the store's
+          worker, and stops at SCOUT_RESET_SECONDS, which bounds how long that
+          one meeting waits. The preparing meeting is the only job not
+          counted as owning its members' sessions."""
         store = self.service.store
         deadline = time.monotonic() + SCOUT_RESET_SECONDS
         bindings = self._studio_bindings(organization, studio)
@@ -410,7 +413,8 @@ class StudioOperations:
             response.get('agents') if isinstance(response, dict) else None)
         if not isinstance(live, list):
             return []
-        jobs = store.snapshot(live_status=False).get('jobs', [])
+        jobs = [job for job in store.snapshot(live_status=False).get('jobs', [])
+                if not discussion_id or job.get('id') != discussion_id]
         idle = []
         for binding in wanted:
             agents = [item for item in live if isinstance(item, dict) and item.get('name') == binding['alias']]
@@ -426,22 +430,40 @@ class StudioOperations:
             idle.append(binding)
         if not idle:
             return []
+        # The chair first: its memory steers the whole meeting.
+        idle.sort(key=lambda binding: not binding.get('facilitator'))
         if hasattr(self.service, 'session_budget'):
             budget = self.service.session_budget(organization, jobs)
             policy = budget.get('policy') or {}
-            daily = policy.get('daily_session_cap') or 0
-            if policy.get('paused') or (daily and budget.get('started', 0) + len(idle) > daily):
-                logging.info('Scout %s reuses its sessions: no room to start %d new ones today.',
-                             run['id'], len(idle))
+            if policy.get('paused'):
                 return []
+            daily = policy.get('daily_session_cap') or 0
+            if daily:
+                # Members without a session start one whatever happens here,
+                # so they are counted before any start is spent on a reset.
+                present = {binding['profile_id'] for binding in bindings}
+                needed = (len([binding for binding in bindings if binding.get('state') == 'not_started'
+                               or binding.get('failed')]) + len(advisors - present))
+                room = daily - budget.get('started', 0) - needed
+                if room < len(idle):
+                    logging.info('Scout %s resets %d of %d sessions: %d starts are left today and %d members '
+                                 'need one anyway.', run['id'], max(room, 0), len(idle),
+                                 daily - budget.get('started', 0), needed)
+                    idle = idle[:max(room, 0)]
+                    if not idle:
+                        return []
         released = []
         for binding in idle:
             if time.monotonic() > deadline:
                 break  # The rest are reused this round.
             try:
-                store.manage_session(dict(organization_id=organization, job_id=binding['job_id'], mode='close',
-                                          inspected=True, request_id='scout-fresh-' + run['id'][:20] + '-'
-                                          + binding['job_id'][:20]), AUTO_ACTOR)
+                request = dict(organization_id=organization, job_id=binding['job_id'], mode='close',
+                               inspected=True, request_id='scout-fresh-' + run['id'][:20] + '-'
+                               + binding['job_id'][:20])
+                if discussion_id:
+                    store.manage_session(request, AUTO_ACTOR, preparing_discussion=discussion_id)
+                else:
+                    store.manage_session(request, AUTO_ACTOR)
             except (ValueError, OSError) as error:
                 logging.warning('Scout %s kept the session of %s: %s', run['id'], binding.get('name'),
                                 redact(str(error)))

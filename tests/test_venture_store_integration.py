@@ -118,9 +118,12 @@ class VentureStoreIntegrationTests(unittest.TestCase):
                 items=[item], etag='', modified='')):
             scout = self.studio(mode='studio_run', kind='scout')
         self.assertEqual(scout['state'], 'meeting', scout.get('error'))
-        # The live chair from the panel setup was released, so this round's
-        # meeting starts a new one instead of reusing the last round's memory.
-        self.assertEqual(scout['fresh_sessions'], ['Venture Studio'])
+        # The reset waits for the meeting's preparation, off the shared poller.
+        self.assertNotIn('fresh_sessions', scout)
+        facilitator = next(item for item in self.store.snapshot()['groups']
+                           if item['id'] == studio['group_id'])['facilitator_id']
+        chair = next(job for job in self.store.job_records() if job['kind'] == 'launch'
+                     and job.get('profile_id') == facilitator and job['state'] == 'persona_sent')
         # The pack sits in the meeting folder every chair and member may read,
         # not in one agent's worktree, where the others would need a prompt.
         folder = Path(scout['evidence_file']).parent
@@ -133,6 +136,15 @@ class VentureStoreIntegrationTests(unittest.TestCase):
 
         settled = self.settle(scout)
         self.assertEqual(settled['state'], 'ready', settled.get('error') or settled.get('failure'))
+        # While the meeting prepared, the live chair from the panel setup was
+        # closed through the verified close, although that queued meeting
+        # already reserved it; the meeting then started a new chair.
+        self.assertEqual(settled['fresh_sessions'], ['Venture Studio'])
+        meeting = next(job for job in self.discussions() if job['id'] == scout['job_id'])
+        self.assertEqual(meeting['fresh_sessions'], ['Venture Studio'])
+        self.assertEqual(next(job for job in self.store.job_records() if job['id'] == chair['id'])['state'],
+                         'released')
+        self.assertNotEqual(meeting['group_run']['id'], chair['id'])
         # Every session in that meeting was launched with the meeting folder writable and readable.
         meeting = next(job for job in self.discussions() if job['id'] == scout['job_id'])
         for run in [meeting['group_run'], *meeting['runs']]:

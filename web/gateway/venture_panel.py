@@ -803,8 +803,13 @@ class StakeholderPanel:
                       if review.get('run_id') == panel.get('run_id')]
             if not latest:
                 continue
+            decision = candidate.get('decision') if isinstance(candidate.get('decision'), dict) else {}
             feedback.append(dict(
                 name=candidate.get('name', ''), state=candidate.get('state', ''), round=panel.get('round', 1),
+                # The operator's own reason outweighs any one reviewer's. The
+                # stored reason stays as written; agents get it redacted.
+                **(dict(rejected_because=redact(str(decision.get('reason') or ''))[:300])
+                   if decision.get('decision') == 'reject' and decision.get('reason') else {}),
                 back=panel.get('back', 0), hold=panel.get('hold', 0), **{'pass': panel.get('pass', 0)},
                 on_earlier_version=bool(panel.get('outdated')),
                 reviews=[dict(stakeholder=review['stakeholder'], verdict=review['verdict'],

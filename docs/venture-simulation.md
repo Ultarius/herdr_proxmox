@@ -496,8 +496,11 @@ it. The gateway refuses a candidate that omits any of these fields:
   `units` per customer. A `take_rate` line is `percent` of a cited monthly
   `volume` per customer (payments, for instance), minus `cost_percent` passed
   on to banks or networks. Per-unit and take-rate revenue counts as recurring;
-  a credit reduces the first year of that revenue, so it needs one of them;
-- `delivery_effort`: expert days and a day rate;
+  a credit reduces the first year of that revenue, so it needs one of them.
+  A `one_off` line is the price of one project; a fee per site or file adds
+  `unit` and `units` (how many one project covers), so EUR 1,500 per site
+  for a 3-site pilot counts as EUR 4,500 against that pilot's delivery days;
+- `delivery_effort`: expert days and a day rate, for one project;
 - `evidence_against`: at least one cited page or reason that weakens the idea;
 - `dissent`: the Skeptic's structured `advance`, `hold` or `reject` verdict;
 - `confidence_dimensions`: timing driver (15%), paid demand (30%), technical
@@ -567,9 +570,8 @@ The second batch makes an empty run longer and costs more tokens.
 of its members, so every scout used to meet the same chair, studio agents and
 stakeholder advisors, each still holding every earlier round in its
 conversation. Live, two scouts in a row returned the previous answer word for
-word, with the same three pages and no new research. When a scout's pack and
-prompt are ready, and just before its meeting is first requested, the
-gateway therefore closes the sessions of:
+word, with the same three pages and no new research. When a scout's meeting
+prepares, the gateway therefore closes the sessions of:
 - the studio chair;
 - the four studio agents;
 - the stakeholders advising that scout.
@@ -584,20 +586,27 @@ round reuses it:
   the pane its run records, and no job still owns it. A delivered but
   unfinished delegation counts as owning it. A session still starting, working
   or blocked is left alone.
-- **Room to restart:** when the organization is paused, or its daily start
-  budget cannot take a new session for every candidate, none is closed, so
-  the meeting is never left unable to start its members.
+- **Room to restart:** when the organization is paused, none is closed. Under
+  a daily start cap, members and advisors that need a new session anyway (none
+  yet, or a failed one) are counted first. Only as many sessions are closed as
+  the remaining starts can replace, the chair first, so the meeting is never
+  left unable to start its members.
 - **The gateway's own close:** each session goes through the same close an
   operator uses. That takes the agent's lock, re-checks ownership and the
   agent's identity before closing its pane, and archives the transcript first.
-- **Time limit:** the reset stops after `SCOUT_RESET_SECONDS` (30 seconds),
-  because a scheduled scout runs on the shared poller. Sessions left when time
-  runs out are reused for that round.
+  The preparing meeting is the only job that close does not count as owning
+  its members' sessions; every other reservation still blocks it.
+- **Off the shared poller:** the reset runs inside the meeting's own
+  preparation, on the store's worker, while the meeting holds its members, so
+  nothing else can take them meanwhile. A slow terminal read or pane close
+  delays only that meeting. It stops starting closes after
+  `SCOUT_RESET_SECONDS` (30 seconds); sessions left then are reused.
 
 Other details:
-- **Shown on the run:** the names closed are listed under `fresh_sessions`.
-- **Retries:** a retry or recovery of the same scout never closes sessions
-  again.
+- **Shown on the run:** the names closed are kept on the meeting and copied to
+  the run's `fresh_sessions` when it settles.
+- **Retries:** a retried preparation or recovery of the same meeting never
+  closes sessions again.
 - **Cost:** new sessions mean startup time and tokens for every scout.
 - **Pitches** keep their stakeholder sessions, since a second-round review
   compares with the first.
@@ -846,6 +855,20 @@ improves comes back with `revises` (the earlier idea's name) and a
 revises; it carries the next round number and the previous objections
 (`previous_feedback`), the earlier idea becomes `superseded`, and the panel
 sees in the next pitch whether each objection was answered.
+
+The feedback is also for new ideas, not only revisions. An idea you rejected
+carries your reason as `rejected_because`, in `stakeholder_feedback` and in
+its `existing` entry (also for a rejected idea the panel never saw), with its
+buyer and market so the scout can tell whether the reason still applies. The
+reason is redacted (credentials, keys and links removed) before agents see
+it; your stored decision keeps what you wrote. The closed part of `existing`
+is the twenty most recently closed ventures and ideas together, newest first,
+so a batch of archived ventures cannot push out your latest rejection. The
+answer rules' LEARN FROM WHAT FAILED tells the scout to test each new idea
+against those objections: an idea the same objections would sink is not new,
+whatever its industry, and the closest objection goes in `evidence_against`
+with why it does not apply.
+
 `revises` may name an idea that is not open, because the chair reuses one session
 and remembers earlier rounds. The idea may have been refused or never recorded.
 The candidate then comes in as a new round-1 idea with `revises_unmatched`, and

@@ -337,6 +337,9 @@ String revenueLineText(Map line) {
           'per ${line['unit'] ?? 'unit'}$period × ${line['units'] ?? 0}';
     case 'credit':
       return '${line['label'] ?? 'credit'}: − ${_moneyText(line['amount'], currency)}';
+    case 'one_off' when line['units'] != null:
+      return '${line['label'] ?? 'one-off'}: ${_moneyText(line['amount'], currency)} '
+          'per ${line['unit'] ?? 'unit'} × ${line['units']} per project';
     default:
       return '${line['label'] ?? kind}: ${_moneyText(line['amount'], currency)}$period';
   }
