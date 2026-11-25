@@ -527,6 +527,38 @@ regulation), asks it to weigh three times as many ideas as it may return and
 keep the strongest, and warns it that ratings are checked against citations.
 The Ideas tab lists open ideas by confidence, highest first.
 
+A scout does not give up after one batch. When no idea in its first batch
+survives the review checklist, the answer rules tell it to weigh one more
+batch of the same size from segments it has not covered, and to return an
+empty list only when that batch fails too. The second batch makes an empty
+run longer and costs more tokens.
+
+Rejected ideas are listed under `ruled_out`: up to ten
+`{"segment","market","reason","evidence"}` entries per answer, where `market`
+names the buyer and geography the idea was judged for. They are advisory:
+- an unusable entry is dropped;
+- a segment repeated for the same market is kept once;
+- the reason is bounded to 300 characters;
+- cited ids become their URLs, a web page (`W`) from the research list and a
+  feed item (`N`) from the run's frozen pack;
+- the gateway adds the run's focus areas.
+
+The next scout's evidence pack carries the newest 16 entries from the last
+five settled scouts, newest first and dated. A segment rejected again for the
+same market keeps only its newest reason, so repeats do not use up the
+memory. The rules tell the scout to skip one only when it would look at the
+same market and the reason still applies: another country, buyer or focus is
+new ground.
+
+The last three scouts' `research_note`s go into the pack separately as
+`scout_notes`, with their focus. They are context, not rejections. A scout
+settled before `ruled_out` existed has only its note.
+
+When the pack is over its byte budget, the oldest notes are dropped first,
+then the oldest ruled-out entries, right after closed history. Without this
+memory each run started from scratch and could spend its whole budget
+re-checking crowded segments an earlier run had already rejected.
+
 Every scout run also gets a review checklist, `review.md`, written by the
 gateway beside its evidence file, and the prompt tells the Skeptic and the
 Research Analyst to work through it for every idea. It asks how the price

@@ -1886,7 +1886,7 @@ class VentureTests(unittest.TestCase):
         self.assertIn('Can the leader copy it within a quarter?', ventures.STUDIO_REVIEW_CHECKLIST)
         self.assertIn('Return held ideas too', ventures.STUDIO_REVIEW_CHECKLIST)
         self.assertIn('auditing them again', ventures.STUDIO_REVIEW_CHECKLIST)
-        self.assertIn('Return advanced and held ideas; omit rejected ideas.', run['prompt'])
+        self.assertIn('Return advanced and held ideas; list rejected ones under "ruled_out".', run['prompt'])
         self.assertIn('"revises":"<its exact name>"', run['prompt'])
         unlisted = self.web_candidate('Dock Ledger', evidence=['W2'])
         unlisted['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
@@ -1909,6 +1909,84 @@ class VentureTests(unittest.TestCase):
                          ('W1', 'Searched trade press for freight invoice disputes.'))
         # Nothing was added by itself.
         self.assertEqual(self.ventures._studio_policy('org')['studio_sources'], [])
+
+    def test_the_next_scout_skips_what_earlier_scouts_ruled_out_and_searches_wider_first(self):
+        # A live scout rejected five crowded segments and came back empty; the
+        # next run started from scratch and could spend its budget on the
+        # same ones. Each answer now records them, and the next pack has them.
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        rules = ventures.scout_answer_rules()
+        self.assertIn('SEARCH WIDER BEFORE GIVING UP', rules)
+        self.assertIn('SKIP WHAT EARLIER SCOUTS RULED OUT', rules)
+        self.assertIn('second batch in the answer', ventures.STUDIO_REVIEW_CHECKLIST)
+        self.assertIn('"market"', rules)
+        self.studio(mode='studio_policy', studio_focus=['Dutch padel clubs'])
+        first = self.studio(mode='studio_run', kind='scout')
+        pack = json.loads(Path(first['evidence_file']).read_text(encoding='utf-8'))
+        self.assertNotIn('ruled_out', pack)
+        self.assertNotIn('scout_notes', pack)
+        # An answer from before ruled_out existed: its note travels as context.
+        done = self.complete_studio(first, {'candidates': [], 'research': self.RESEARCH,
+                                            'research_note': 'Padel booking is served by Playtomic.'})
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        second = self.studio(mode='studio_run', kind='scout')
+        pack = json.loads(Path(second['evidence_file']).read_text(encoding='utf-8'))
+        self.assertNotIn('ruled_out', pack)
+        self.assertEqual([(item['note'], item['focus']) for item in pack['scout_notes']],
+                         [('Padel booking is served by Playtomic.', ['Dutch padel clubs'])])
+        self.assertIn('"ruled_out"', second['prompt'])
+        done = self.complete_studio(second, {'candidates': [], 'research': self.RESEARCH,
+                                             'research_note': 'No useful feed items.', 'ruled_out': [
+            dict(segment='Padel court yield', market='Dutch padel club owners', evidence=['W1', 'W9'],
+                 reason='BookThisCourt already sells peak pricing.'),
+            dict(segment='padel court yield', market='dutch padel club owners', reason='The same segment twice.'),
+            dict(segment='Padel court yield', market='German padel chains', reason='Playtomic dominates.'),
+            dict(segment='Music schools', reason='x' * 900),
+            dict(segment='', reason='No segment.'),
+            'not an object']})
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        # Kept: one entry per segment and market, reasons bounded, page ids as
+        # their URLs (an unknown id is dropped, never a reason to refuse the
+        # run), and the focus the run was judged under.
+        self.assertEqual([(item['segment'], item['market'], item['sources']) for item in done['ruled_out']],
+                         [('Padel court yield', 'Dutch padel club owners', ['https://trade.example/report']),
+                          ('Padel court yield', 'German padel chains', []), ('Music schools', '', [])])
+        self.assertEqual(len(done['ruled_out'][2]['reason']), ventures.SCOUT_POINT_LENGTH)
+        self.assertEqual({tuple(item['focus']) for item in done['ruled_out']}, {('Dutch padel clubs',)})
+        self.assertEqual(self.ventures._studio_summary('org')['runs'][0]['ruled_out'], done['ruled_out'])
+        # Another focus: the rejections still come along, each naming the
+        # focus and market it was judged under, so the scout can tell.
+        self.studio(mode='studio_policy', studio_focus=['German music schools'])
+        third = self.studio(mode='studio_run', kind='scout')
+        self.complete_studio(third, {'candidates': [], 'research': self.RESEARCH, 'ruled_out': [
+            dict(segment='Padel court yield', market='Dutch padel club owners', reason='Still served.')]})
+        fourth = self.studio(mode='studio_run', kind='scout')
+        pack = json.loads(Path(fourth['evidence_file']).read_text(encoding='utf-8'))
+        # Newest first; a segment rejected again for the same market keeps
+        # only its newest reason, so repeats do not use up the memory.
+        self.assertEqual([(item['segment'], item['market'], item['reason'][:20], item['focus'])
+                          for item in pack['ruled_out']],
+                         [('Padel court yield', 'Dutch padel club owners', 'Still served.', ['German music schools']),
+                          ('Padel court yield', 'German padel chains', 'Playtomic dominates.', ['Dutch padel clubs']),
+                          ('Music schools', '', 'x' * 20, ['Dutch padel clubs'])])
+        self.assertTrue(all(item['date'] for item in pack['ruled_out']))
+        # Notes are context, never rejections, and an explicit empty list adds none.
+        self.assertEqual([item['note'] for item in pack['scout_notes']],
+                         ['No useful feed items.', 'Padel booking is served by Playtomic.'])
+
+    def test_a_feed_scout_rejection_keeps_the_feed_item_it_cites(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'], studio_web_research=False)
+        with self.news(feed_item(venture_feeds.now().isoformat())):
+            run = self.studio(mode='studio_run', kind='scout')
+        self.assertFalse(run.get('web_research'))
+        done = self.complete_studio(run, {'candidates': [], 'ruled_out': [
+            dict(segment='Instant settlement for banks', market='Japanese banks', reason='Not B2B software.',
+                 evidence=['N1', 'N7'])]})
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        self.assertEqual(done['ruled_out'][0]['sources'], ['https://news.example/item-1'])
 
     def test_a_web_scout_candidate_keeps_the_schema_and_a_refusal_names_every_problem(self):
         # The shape a real web-researching scout returned: planning notes in
