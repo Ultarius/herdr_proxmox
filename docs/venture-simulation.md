@@ -539,6 +539,25 @@ how it earns:
 - a buyer larger than a one-person business;
 - a share of the money it moves or saves.
 
+Each batch must weigh at least two materially different offers: they solve
+different buyer problems and earn in different ways. A booking tool with a
+compliance or payments feature added is still a booking tool. A live team had
+filled three rounds with booking software for one industry after another.
+
+Before a scout returns nothing, the review checklist's last question has the
+team look at the round's rejected ideas again. An idea with a credible test
+that could change its verdict is a hold, not a reject. A credible test is
+named, can run within the runway, costs little next to the capital, and has
+an outcome that would flip the verdict, such as a paid pilot, a signed partner
+or a measured baseline. The strongest such idea is returned as held, with that
+test.
+
+The team must not hold an idea only to have something to show. Held ideas
+count toward the candidate backlog, and a full backlog stops the scout. When
+no idea has a credible test, the empty list stands, and `ruled_out` and
+`research_note` record what the round learned. The prompt says empty
+candidates are allowed only as `review.md` allows.
+
 The second batch makes an empty run longer and costs more tokens.
 
 The second batch may also return to the same buyers with a materially

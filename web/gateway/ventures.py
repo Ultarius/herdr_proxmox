@@ -212,8 +212,18 @@ replaces the earlier idea.
     the operator can judge them; a held idea is never created unattended.
     Return the strongest eligible ideas up to the round's cap. Leave rejected
     ideas out of the candidates and list them under "ruled_out" with the
-    reason. Return an empty list only when the second batch in the answer
-    rules has failed too.
+    reason.
+11. **Look again before returning nothing.** When the second batch in the
+    answer rules has failed too, check the round's rejected ideas once more
+    against question 9. An idea with a credible test that could change its
+    verdict is a hold, not a reject. A credible test is named, can run within
+    the runway, costs little next to the venture's capital, and has an
+    outcome that would flip the verdict: a paid pilot, a signed partner, or a
+    measured baseline. Return the strongest such idea as held, with that test
+    and what is missing. Do not hold an idea only to have something to show:
+    a held idea takes a backlog slot, and a full backlog stops the scout. If
+    no idea has a credible test, return an empty list; "ruled_out" and
+    "research_note" record what the round learned.
 '''
 # How the scout uses the stakeholder panel while it researches. Written beside
 # the evidence file, like the checklist, so the prompt stays within budget.
@@ -299,8 +309,11 @@ def scout_answer_rules():
             'fails the same way. It may be a segment not covered in this run or under "ruled_out", or the same '
             'buyers with a materially different offer that removes the reason. If a cheap tool already served '
             'them, change the product, the buyer or how it earns: compliance or reporting a regulation '
-            'requires, a larger buyer than a one-person business, or a share of money it moves or saves. Return '
-            'an empty list only when that second batch fails too.',
+            'requires, a larger buyer than a one-person business, or a share of money it moves or saves. Each '
+            'batch weighs at least two materially different offers: they solve different buyer problems and '
+            'earn in different ways. A booking tool with a compliance or payments feature added is still a '
+            'booking tool. When that second batch fails too, apply the review checklist\'s last question: hold '
+            'an idea only when a credible test could change its verdict.',
             'MARKET SIZE: there is no minimum number of accounts. Count what break-even needs as the review '
             'checklist\'s size question says (paying customers for a subscription, projects a month times '
             'twelve for a service) and reject a segment only when that is more than you could win in three '
@@ -2340,7 +2353,8 @@ class Ventures(StudioOperations, StakeholderPanel):
                     'checked rules, which refuse an idea, from optional fields and advice, which only add notes. '
                     'Return advanced and held ideas; list rejected ones under "ruled_out". '
                     'A candidate is a proposal, not a venture. Maximum candidates: '
-                    + str(run['policy']['studio_max_candidates']) + '. Empty candidates is valid.\n'
+                    + str(run['policy']['studio_max_candidates']) + '. Empty candidates only as '
+                    + STUDIO_REVIEW_FILE + ' allows.\n'
                     'Evidence index: ')
         if len(head) + PROMPT_INDEX_RESERVE > PROMPT_LIMIT:
             # Long focus areas or many exclusions: name them by reference, so

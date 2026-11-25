@@ -1919,7 +1919,7 @@ class VentureTests(unittest.TestCase):
         rules = ventures.scout_answer_rules()
         self.assertIn('SEARCH WIDER BEFORE GIVING UP', rules)
         self.assertIn('SKIP WHAT EARLIER SCOUTS RULED OUT', rules)
-        self.assertIn('second batch in the answer', ventures.STUDIO_REVIEW_CHECKLIST)
+        self.assertIn('second batch in the answer rules', ' '.join(ventures.STUDIO_REVIEW_CHECKLIST.split()))
         # A live team rejected 6,225 practices as "below 10k" and spent its
         # second batch on the same booking product in other industries.
         checklist = ' '.join(ventures.STUDIO_REVIEW_CHECKLIST.split())
@@ -1935,6 +1935,17 @@ class VentureTests(unittest.TestCase):
         # A saved "below 10k" rejection, or one a new offer answers, may be revisited.
         self.assertIn('rested on a fixed size cutoff', rules)
         self.assertIn('the same buyers with a materially different offer', rules)
+        # A live team filled every batch with booking software for another
+        # industry and ended three rounds with nothing to judge.
+        self.assertIn('at least two materially different offers', rules)
+        self.assertIn('A booking tool with a compliance or payments feature added is still a booking tool', rules)
+        # Look again before returning nothing, but hold only with a credible
+        # test: a held idea takes a backlog slot, and a full backlog stops the scout.
+        self.assertIn('Look again before returning nothing', checklist)
+        self.assertIn('An idea with a credible test that could change its verdict is a hold', checklist)
+        self.assertIn('Do not hold an idea only to have something to show', checklist)
+        self.assertIn('If no idea has a credible test, return an empty list', checklist)
+        self.assertIn('hold an idea only when a credible test could change its verdict', rules)
         self.assertIn('"market"', rules)
         self.studio(mode='studio_policy', studio_focus=['Dutch padel clubs'])
         first = self.studio(mode='studio_run', kind='scout')
@@ -1951,6 +1962,7 @@ class VentureTests(unittest.TestCase):
         self.assertEqual([(item['note'], item['focus']) for item in pack['scout_notes']],
                          [('Padel booking is served by Playtomic.', ['Dutch padel clubs'])])
         self.assertIn('"ruled_out"', second['prompt'])
+        self.assertIn('Empty candidates only as review.md allows.', second['prompt'])
         done = self.complete_studio(second, {'candidates': [], 'research': self.RESEARCH,
                                              'research_note': 'No useful feed items.', 'ruled_out': [
             dict(segment='Padel court yield', market='Dutch padel club owners', evidence=['W1', 'W9'],
