@@ -485,7 +485,10 @@ it. The gateway refuses a candidate that omits any of these fields:
   software or service alternative needs a cited page; doing nothing or
   in-house work does not;
 - `buyer`: the role that signs and the budget it comes from;
-- `reachable_accounts`: a cited count and the segment it covers;
+- `reachable_accounts`: a cited count and the segment it covers (the segment
+  at most 300 characters, as for `market_ceiling`; names and the buyer role
+  at most 120, the buyer budget 200). The answer rules state these limits,
+  and a refusal names the field, its length and the limit;
 - `business_model`: `saas`, `service`, `productised_service` or `hybrid`, with
   one-off, recurring, per-unit, take-rate and credit revenue lines. A
   recurring line states its `period` (`month` or `year`). A `per_unit` line is

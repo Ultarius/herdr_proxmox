@@ -2100,6 +2100,22 @@ class VentureTests(unittest.TestCase):
         self.assertEqual((done['state'], len(done['candidates'])), ('ready', 1), done.get('refused_candidates'))
         self.assertIsNone(self.ventures._studio_empty_streak('org'))
 
+    def test_a_segment_with_its_qualifiers_fits_and_an_overlong_one_says_the_limit(self):
+        # A real scout answer: a 248-character segment that names the upper
+        # bound and the first wave. It was refused at 200 with no reason.
+        segment = ('All German public charging operators (upper bound; the AFIR-covered pre-2024 '
+                   'TEN-T/secure-parking subset is smaller and must be measured from operator master data); '
+                   'first wave: small municipal utilities/CPOs with 10-50 sites')
+        cite = lambda value, limit: list(value or [])[:limit]
+        parsed = ventures.scout_reachable_accounts(dict(count=11909, segment=segment, evidence=['W5']), cite)
+        self.assertEqual(parsed['segment'], segment)
+        with self.assertRaisesRegex(ValueError, r'reachable accounts segment is 301 characters; the limit is 300'):
+            ventures.scout_reachable_accounts(dict(count=5, segment='x' * 301, evidence=['W5']), cite)
+        with self.assertRaisesRegex(ValueError, r'buyer role is required'):
+            ventures.scout_buyer(dict(role=' ', budget='Ops budget', evidence=['W1']), cite)
+        rules = ' '.join(ventures.scout_answer_rules().split())
+        self.assertIn('reachable_accounts.segment and market_ceiling.segment: 300', rules)
+
     def test_a_feed_scout_rejection_keeps_the_feed_item_it_cites(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())

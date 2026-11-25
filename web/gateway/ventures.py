@@ -120,6 +120,9 @@ SCOUT_MAX_EVIDENCE = 12
 ACTIVE_VENTURE_STATES = ('running', 'paused', 'qualified')
 SCOUT_MAX_POINTS = 8
 SCOUT_POINT_LENGTH = 300
+# A segment definition carries its qualifiers (region, size band, which
+# subset is counted), so it gets more room than a name or a role.
+SCOUT_SEGMENT_LENGTH = 300
 # Segments a scout weighed and rejected. Each answer may list up to
 # SCOUT_RULED_OUT; the next scout's pack carries the newest
 # SCOUT_RULED_OUT_MEMORY from the last SCOUT_RULED_OUT_RUNS settled scouts, so
@@ -348,6 +351,11 @@ def scout_answer_rules():
             'each with a price when public, searched for independently with the same scrutiny for every idea. '
             'Alternatives that are software or a service need a cited page.',
             'buyer names the signing role and its budget. reachable_accounts cites a count and segment.',
+            'Text fields have length limits; an idea with one over its limit is refused whole. Names (candidate, '
+            'alternative, incumbent) and buyer.role: at most 120 characters. buyer.budget: 200. '
+            'reachable_accounts.segment and market_ceiling.segment: ' + str(SCOUT_SEGMENT_LENGTH) + '. Count '
+            'the accounts you can reach and define that segment in a phrase; put caveats, upper bounds and '
+            'subsets to measure in assumptions or evidence_against, not in the segment.',
             'business_model names its revenue lines: saas needs a recurring one, service and productised_service '
             'a one_off one (the first offer\'s fee), hybrid both. Every fee the first offer names is a revenue line.',
             'per_unit: amount per unit per period, with "unit" and "units" per customer. take_rate: "percent" of '
@@ -482,11 +490,18 @@ def defaults():
 def _value(value, limit, label, required=False):
     if value is None and not required:
         return ''
+    # The reason travels back to the scout's prompt and the operator, so it
+    # says what to change rather than only which field was refused.
     if not isinstance(value, str):
-        raise ValueError('Invalid venture field: ' + label)
+        raise ValueError('Invalid venture field: ' + label + ' must be text')
     value = value.strip()
-    if (required and not value) or len(value) > limit or '\0' in value:
-        raise ValueError('Invalid venture field: ' + label)
+    if required and not value:
+        raise ValueError('Invalid venture field: ' + label + ' is required')
+    if len(value) > limit:
+        raise ValueError('Invalid venture field: ' + label + ' is ' + str(len(value))
+                         + ' characters; the limit is ' + str(limit))
+    if '\0' in value:
+        raise ValueError('Invalid venture field: ' + label + ' contains a null character')
     return value
 
 
@@ -767,7 +782,7 @@ def scout_reachable_accounts(value, cite):
     if not isinstance(value, dict):
         raise ValueError('reachable_accounts must give a count, segment and evidence')
     return dict(count=_integer(value.get('count'), 1, 1_000_000, 'reachable accounts count'),
-                segment=_value(value.get('segment'), 200, 'reachable accounts segment', required=True),
+                segment=_value(value.get('segment'), SCOUT_SEGMENT_LENGTH, 'reachable accounts segment', required=True),
                 evidence=cite(value.get('evidence'), 3))
 
 
@@ -868,7 +883,7 @@ def scout_market_ceiling(value, cite, reachable=None):
     if not isinstance(value, dict):
         raise ValueError('market_ceiling must give a count, segment and evidence')
     ceiling = dict(count=_integer(value.get('count'), 1, 100_000_000, 'market ceiling count'),
-                   segment=_value(value.get('segment'), 200, 'market ceiling segment', required=True),
+                   segment=_value(value.get('segment'), SCOUT_SEGMENT_LENGTH, 'market ceiling segment', required=True),
                    evidence=cite(value.get('evidence'), 3))
     if reachable and ceiling['count'] < reachable['count']:
         raise ValueError('market_ceiling.count cannot be below reachable_accounts.count')
