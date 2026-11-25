@@ -1920,6 +1920,21 @@ class VentureTests(unittest.TestCase):
         self.assertIn('SEARCH WIDER BEFORE GIVING UP', rules)
         self.assertIn('SKIP WHAT EARLIER SCOUTS RULED OUT', rules)
         self.assertIn('second batch in the answer', ventures.STUDIO_REVIEW_CHECKLIST)
+        # A live team rejected 6,225 practices as "below 10k" and spent its
+        # second batch on the same booking product in other industries.
+        checklist = ' '.join(ventures.STUDIO_REVIEW_CHECKLIST.split())
+        self.assertIn('There is no minimum number of accounts', checklist)
+        self.assertIn('never reject on a fixed number of accounts', checklist)
+        # Break-even counted the way the gateway does: a service's projects a
+        # month times twelve, a subscription's paying customers.
+        self.assertIn('for a service, the projects a month that cover them times twelve', checklist)
+        self.assertIn('a warning sign to check, not a cutoff', checklist)
+        self.assertIn('MARKET SIZE: there is no minimum number of accounts', rules)
+        self.assertIn('projects a month times twelve for a service', rules)
+        self.assertIn('must avoid that reason, not only the vertical', rules)
+        # A saved "below 10k" rejection, or one a new offer answers, may be revisited.
+        self.assertIn('rested on a fixed size cutoff', rules)
+        self.assertIn('the same buyers with a materially different offer', rules)
         self.assertIn('"market"', rules)
         self.studio(mode='studio_policy', studio_focus=['Dutch padel clubs'])
         first = self.studio(mode='studio_run', kind='scout')
@@ -1979,14 +1994,24 @@ class VentureTests(unittest.TestCase):
         self.setup_studio_manual()
         self.add_venture_group(self.create())
         self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'], studio_web_research=False)
-        with self.news(feed_item(venture_feeds.now().isoformat())):
+        published = venture_feeds.now().isoformat()
+        # An https feed may link to a plain http article; the feed parser keeps it, so must this.
+        plain = dict(feed_item(published), id=hashlib.sha256(b'http://news.example/item-2').hexdigest(),
+                     link='http://news.example/item-2', title='Banks settle over plain http')
+        with self.news(feed_item(published), plain):
             run = self.studio(mode='studio_run', kind='scout')
         self.assertFalse(run.get('web_research'))
+        links = {item['id']: item['link'] for item in json.loads(
+            Path(run['evidence_file']).read_text(encoding='utf-8'))['items']}
+        self.assertEqual(sorted(links.values()), ['http://news.example/item-2', 'https://news.example/item-1'])
         done = self.complete_studio(run, {'candidates': [], 'ruled_out': [
             dict(segment='Instant settlement for banks', market='Japanese banks', reason='Not B2B software.',
-                 evidence=['N1', 'N7'])]})
+                 evidence=sorted(links) + ['N7'])]})
         self.assertEqual(done['state'], 'ready', done.get('error'))
-        self.assertEqual(done['ruled_out'][0]['sources'], ['https://news.example/item-1'])
+        self.assertEqual(done['ruled_out'][0]['sources'], [links[key] for key in sorted(links)])
+        next_run = self.studio(mode='studio_run', kind='scout')
+        remembered = json.loads(Path(next_run['evidence_file']).read_text(encoding='utf-8'))['ruled_out']
+        self.assertEqual(remembered[0]['sources'], done['ruled_out'][0]['sources'])
 
     def test_a_web_scout_candidate_keeps_the_schema_and_a_refusal_names_every_problem(self):
         # The shape a real web-researching scout returned: planning notes in

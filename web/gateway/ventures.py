@@ -190,7 +190,16 @@ replaces the earlier idea.
    does not want.
 7. **How big it realistically gets.** The share of the reachable accounts you
    could win in three years, times the yearly revenue per customer. Say in the
-   dissent whether this is a niche or can scale.
+   dissent whether this is a niche or can scale. There is no minimum number of
+   accounts: a few thousand businesses can carry a venture. Count the accounts
+   break-even needs the way the gateway does: for a subscription, the paying
+   customers that cover the monthly costs; for a service, the projects a month
+   that cover them times twelve, since an account buys about one project a
+   year. A segment is too small only when that count is more than you could
+   win in three years through the way you would reach these buyers, with
+   evidence for it. More than a quarter of the reachable accounts is a warning
+   sign to check, not a cutoff. Show that arithmetic; never reject on a fixed
+   number of accounts.
 8. **One reframe.** For every surviving idea, try at least one reframe: a
    different customer (new entrants instead of switchers), a different revenue
    line (activity-linked) or a different first offer. Keep the stronger
@@ -280,12 +289,22 @@ def scout_answer_rules():
             'SKIP WHAT EARLIER SCOUTS RULED OUT: the pack\'s "ruled_out" lists segments recent scouts weighed '
             'and rejected, each with the reason, the market it was judged for and that run\'s focus. Skip one '
             'only when you would look at the same market and its reason still applies; another country, buyer '
-            'or focus is new ground. If you return to one with new evidence that answers the reason, say so in '
-            'the idea. "scout_notes" are earlier scouts\' own summaries: context, not rejections.',
+            'or focus is new ground. A reason no longer applies when it rested on a fixed size cutoff (see '
+            'MARKET SIZE) or when your offer is materially different and answers the original objection; then '
+            'reconsider it and say in the idea which reason you answered. "scout_notes" are earlier scouts\' '
+            'own summaries: context, not rejections.',
             'SEARCH WIDER BEFORE GIVING UP: if no idea in the first batch survives the review checklist, weigh '
-            'one more batch of the same size from segments not covered in this run or under "ruled_out", for '
-            'example another customer type, a regulation-driven change or a less crowded vertical. Return an '
-            'empty list only when that second batch fails too.',
+            'one more batch of the same size. First name the reason the first batch failed; the second batch '
+            'must avoid that reason, not only the vertical. Another industry with the same product usually '
+            'fails the same way. It may be a segment not covered in this run or under "ruled_out", or the same '
+            'buyers with a materially different offer that removes the reason. If a cheap tool already served '
+            'them, change the product, the buyer or how it earns: compliance or reporting a regulation '
+            'requires, a larger buyer than a one-person business, or a share of money it moves or saves. Return '
+            'an empty list only when that second batch fails too.',
+            'MARKET SIZE: there is no minimum number of accounts. Count what break-even needs as the review '
+            'checklist\'s size question says (paying customers for a subscription, projects a month times '
+            'twelve for a service) and reject a segment only when that is more than you could win in three '
+            'years through the way you would reach its buyers; show that arithmetic instead of a fixed cutoff.',
             'RATING: ' + rating + '; weak 0, medium 50, strong 100. Strong paid demand: buyers already pay a cited '
             'alternative or a cited paid pilot. Strong recurring potential: revenue grows with the customer '
             '(per_unit or take_rate). Strong defensibility: it becomes the customer\'s system of record, holds '
@@ -2189,7 +2208,9 @@ class Ventures(StudioOperations, StakeholderPanel):
                 seen.add(key)
                 ruled_out.append(dict(segment=item['segment'][:120], market=market,
                                       reason=str(item.get('reason') or '')[:SCOUT_POINT_LENGTH],
-                                      sources=strings(item.get('sources'), 2, 300),
+                                      # A URL is kept whole or not at all.
+                                      sources=[url for url in strings(item.get('sources'), 2, 2001)
+                                               if len(url) <= 2000 and url.startswith(('https://', 'http://'))],
                                       focus=strings(item.get('focus'), 5, 80) or focus, date=date))
             if isinstance(note, str) and note.strip() and len(notes) < SCOUT_NOTE_MEMORY:
                 notes.append(dict(note=note.strip()[:600], focus=focus, date=date))
@@ -2490,10 +2511,18 @@ class Ventures(StudioOperations, StakeholderPanel):
         entry keeps the market it was judged for and the run's focus, so a
         later scout looking at another country, buyer or focus can tell that
         the rejection does not cover it."""
+        # Research pages were validated as https when parsed. A feed item's
+        # article may be plain http even when its feed is https, so it gets
+        # the feed parser's own check rather than an https-only one.
         links = dict((key, entry.get('url')) for key, entry in research.items())
         for item in (run.get('evidence') or {}).get('items') or []:
-            if isinstance(item, dict) and isinstance(item.get('id'), str):
-                links.setdefault(item['id'], item.get('link'))
+            if isinstance(item, dict) and isinstance(item.get('id'), str) and isinstance(item.get('link'), str):
+                try:
+                    link = venture_feeds.canonical_link(item['link'])
+                except ValueError:
+                    link = ''
+                if link:
+                    links.setdefault(item['id'], link)
         focus = [str(area)[:80] for area in (run.get('policy') or {}).get('studio_focus') or []][:5]
         result, seen = [], set()
         for item in value if isinstance(value, list) else []:
@@ -2510,7 +2539,7 @@ class Ventures(StudioOperations, StakeholderPanel):
             sources = []
             for identity in item.get('evidence') if isinstance(item.get('evidence'), list) else []:
                 url = links.get(identity) if isinstance(identity, str) else None
-                if isinstance(url, str) and url.startswith('https://') and url not in sources:
+                if isinstance(url, str) and url and url not in sources:
                     sources.append(url)
             result.append(dict(segment=redact(segment.strip())[:120], market=market,
                                reason=redact(reason.strip())[:SCOUT_POINT_LENGTH], sources=sources[:2],

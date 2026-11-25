@@ -530,8 +530,38 @@ The Ideas tab lists open ideas by confidence, highest first.
 A scout does not give up after one batch. When no idea in its first batch
 survives the review checklist, the answer rules tell it to weigh one more
 batch of the same size from segments it has not covered, and to return an
-empty list only when that batch fails too. The second batch makes an empty
-run longer and costs more tokens.
+empty list only when that batch fails too. The second batch must avoid the
+reason the first one failed, not only its industries: another vertical with
+the same product usually fails the same way. When a cheap tool already
+served the first ideas, the rules suggest changing the product, the buyer or
+how it earns:
+- compliance or reporting that a regulation requires;
+- a buyer larger than a one-person business;
+- a share of the money it moves or saves.
+
+The second batch makes an empty run longer and costs more tokens.
+
+The second batch may also return to the same buyers with a materially
+different offer that removes the first batch's reason.
+
+There is no minimum market size. The checklist's size question and the
+answer rules count the accounts break-even needs the way the gateway's
+economics do:
+- for a subscription, the paying customers that cover the monthly costs;
+- for a service, the projects a month that cover them times twelve, since an
+  account buys about one project a year.
+
+A segment is too small only when that count is more than the studio could
+win in three years through the way it would reach those buyers, with evidence
+for it. Needing more than a quarter of the reachable accounts is a warning to
+check, not a cutoff. The dissent shows that arithmetic. A live team had
+rejected 6,225 practices as "below 10k", a cutoff that appears nowhere in
+these rules.
+
+An earlier rejection no longer applies when it rested on such a fixed cutoff,
+or when the new offer is materially different and answers the original
+objection. The scout may then reconsider that segment and must say in the
+idea which reason it answered.
 
 Rejected ideas are listed under `ruled_out`: up to ten
 `{"segment","market","reason","evidence"}` entries per answer, where `market`
@@ -539,8 +569,9 @@ names the buyer and geography the idea was judged for. They are advisory:
 - an unusable entry is dropped;
 - a segment repeated for the same market is kept once;
 - the reason is bounded to 300 characters;
-- cited ids become their URLs, a web page (`W`) from the research list and a
-  feed item (`N`) from the run's frozen pack;
+- cited ids become their URLs: a web page (`W`) from the research list, and a
+  feed item (`N`) from the run's frozen pack, checked like the feed parser
+  checks it, so an http article linked from an https feed is kept;
 - the gateway adds the run's focus areas.
 
 The next scout's evidence pack carries the newest 16 entries from the last
