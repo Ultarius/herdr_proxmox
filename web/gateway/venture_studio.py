@@ -25,6 +25,10 @@ from venture_panel import panel_backs, panel_current
 
 # Four role agents and the group facilitator.
 STUDIO_PARTICIPANTS = 5
+# How long a scout may spend closing its old sessions before its meeting. A
+# scheduled scout runs on the shared poller; sessions left when time runs out
+# are reused for that round.
+SCOUT_RESET_SECONDS = 30
 RUNTIME_ORDER = ('claude', 'codex', 'opencode', 'agy')
 RUNTIME_LABELS = dict(claude='Claude Code', codex='Codex', opencode='OpenCode', agy='Antigravity')
 STUDIO_MODES = dict(proposal='Proposal: the studio suggests, you approve',
@@ -360,9 +364,90 @@ class StudioOperations:
             result.append(dict(profile_id=identity, name=person.get('name', ''),
                                facilitator=identity == group.get('facilitator_id'),
                                state=run.get('state') or 'not_started', job_id=run.get('id', ''),
+                               alias=run.get('alias') or '', pane_id=run.get('pane_id') or '',
                                error=redact(str(run.get('error') or ''))[:300],
                                failed=(run.get('state') or 'not_started') not in LIVE_BINDINGS))
         return result
+
+    def _fresh_scout_sessions(self, organization, run, studio):
+        """Release the idle sessions a scout meeting would reuse; return their names.
+
+        A meeting reuses any live session of a member, so every scout used to
+        meet the same chair, studio agents and stakeholder advisors, each
+        still holding every earlier round. They answered from that memory:
+        two runs in a row returned the previous answer, with the same three
+        pages and no new research. Released, each one starts again with only
+        its persona when the meeting prepares it.
+
+        Every step leans towards keeping a session; a session kept only means
+        this round reuses it:
+        - one Herdr agent listing, bounded in time, shows what is live; without
+          it nothing is closed;
+        - only a session whose agent is idle, on the pane its run records, and
+          that no job still owns (a delivered delegation included) is a
+          candidate;
+        - when the organization is paused or its daily start budget cannot
+          take a new session for every candidate, none is closed, so the
+          meeting is never left unable to start its members;
+        - each one is closed through the gateway's own session close, which
+          takes the agent's lock, re-checks ownership and the agent's identity
+          before closing its pane, and archives its transcript first;
+        - the whole reset stops at SCOUT_RESET_SECONDS, because a scheduled
+          scout runs on the shared poller."""
+        store = self.service.store
+        deadline = time.monotonic() + SCOUT_RESET_SECONDS
+        bindings = self._studio_bindings(organization, studio)
+        advisors = set(((run.get('consult') or {}).get('members') or {}).values())
+        if advisors:
+            bindings += [binding for binding in self._panel_bindings(organization, studio)
+                         if binding['profile_id'] in advisors]
+        wanted = [binding for binding in bindings if binding.get('state') == 'persona_sent'
+                  and binding.get('job_id') and binding.get('alias')]
+        if not wanted or not hasattr(store, 'manage_session'):
+            return []
+        response = store.command('agent', 'list', timeout=5)
+        live = response if isinstance(response, list) else (
+            response.get('agents') if isinstance(response, dict) else None)
+        if not isinstance(live, list):
+            return []
+        jobs = store.snapshot(live_status=False).get('jobs', [])
+        idle = []
+        for binding in wanted:
+            agents = [item for item in live if isinstance(item, dict) and item.get('name') == binding['alias']]
+            if len(agents) != 1:
+                continue
+            status = agents[0].get('agent_status', agents[0].get('state'))
+            if status not in ('idle', 'done'):
+                continue  # Working, blocked or unknown: it may still be doing something.
+            if binding.get('pane_id') and agents[0].get('pane_id') not in (None, binding['pane_id']):
+                continue  # The alias answers from another pane than its run records.
+            if self.service.session_owner(binding['job_id'], jobs):
+                continue
+            idle.append(binding)
+        if not idle:
+            return []
+        if hasattr(self.service, 'session_budget'):
+            budget = self.service.session_budget(organization, jobs)
+            policy = budget.get('policy') or {}
+            daily = policy.get('daily_session_cap') or 0
+            if policy.get('paused') or (daily and budget.get('started', 0) + len(idle) > daily):
+                logging.info('Scout %s reuses its sessions: no room to start %d new ones today.',
+                             run['id'], len(idle))
+                return []
+        released = []
+        for binding in idle:
+            if time.monotonic() > deadline:
+                break  # The rest are reused this round.
+            try:
+                store.manage_session(dict(organization_id=organization, job_id=binding['job_id'], mode='close',
+                                          inspected=True, request_id='scout-fresh-' + run['id'][:20] + '-'
+                                          + binding['job_id'][:20]), AUTO_ACTOR)
+            except (ValueError, OSError) as error:
+                logging.warning('Scout %s kept the session of %s: %s', run['id'], binding.get('name'),
+                                redact(str(error)))
+                continue
+            released.append(binding.get('name') or binding['profile_id'])
+        return released
 
     def _limit_problems(self, organization, people):
         limits = self._policy(organization)

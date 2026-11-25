@@ -560,6 +560,45 @@ candidates are allowed only as `review.md` allows.
 
 The second batch makes an empty run longer and costs more tokens.
 
+**Each scout starts from fresh sessions.** A meeting reuses any live session
+of its members, so every scout used to meet the same chair, studio agents and
+stakeholder advisors, each still holding every earlier round in its
+conversation. Live, two scouts in a row returned the previous answer word for
+word, with the same three pages and no new research. When a scout's pack and
+prompt are ready, and just before its meeting is first requested, the
+gateway therefore closes the sessions of:
+- the studio chair;
+- the four studio agents;
+- the stakeholders advising that scout.
+
+The meeting then starts each one again with only its persona.
+
+Every step leans towards keeping a session; a kept session only means that
+round reuses it:
+- **Verified live state:** one bounded Herdr agent listing shows what is live.
+  Without it, nothing is closed.
+- **Only safe candidates:** a session is closed only when its agent is idle, on
+  the pane its run records, and no job still owns it. A delivered but
+  unfinished delegation counts as owning it. A session still starting, working
+  or blocked is left alone.
+- **Room to restart:** when the organization is paused, or its daily start
+  budget cannot take a new session for every candidate, none is closed, so
+  the meeting is never left unable to start its members.
+- **The gateway's own close:** each session goes through the same close an
+  operator uses. That takes the agent's lock, re-checks ownership and the
+  agent's identity before closing its pane, and archives the transcript first.
+- **Time limit:** the reset stops after `SCOUT_RESET_SECONDS` (30 seconds),
+  because a scheduled scout runs on the shared poller. Sessions left when time
+  runs out are reused for that round.
+
+Other details:
+- **Shown on the run:** the names closed are listed under `fresh_sessions`.
+- **Retries:** a retry or recovery of the same scout never closes sessions
+  again.
+- **Cost:** new sessions mean startup time and tokens for every scout.
+- **Pitches** keep their stakeholder sessions, since a second-round review
+  compares with the first.
+
 **After empty rounds in a row**, the method changes. When the newest two or
 more settled scouts returned no idea, the next pack gets an `empty_streak`
 entry with the count and the date the streak began. Runs that failed, were

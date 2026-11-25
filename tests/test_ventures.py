@@ -2014,6 +2014,80 @@ class VentureTests(unittest.TestCase):
         self.assertEqual([item['note'] for item in pack['scout_notes']],
                          ['No useful feed items.', 'Padel booking is served by Playtomic.'])
 
+    def test_each_scout_starts_from_fresh_sessions_instead_of_the_last_rounds_memory(self):
+        # Live, two scouts in a row returned the previous answer word for
+        # word: every meeting reused the same chair and agents, which still
+        # held the earlier rounds.
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        old, live = {}, []
+        for number, profile in enumerate(self.profiles):
+            job = dict(id=uuid.uuid4().hex, kind='launch', state='persona_sent', organization_id='org',
+                       profile_id=profile['id'], alias='alias-' + profile['id'][:4], pane_id='w1:p' + str(number))
+            self.jobs.append(job)
+            old[profile['id']] = job
+            live.append(dict(name=job['alias'], agent_status='idle', pane_id=job['pane_id']))
+        live[2]['agent_status'] = 'working'  # The Skeptic is busy although its persona was sent.
+        old['s' * 32]['state'] = 'running'  # The Research Analyst is still starting.
+        live[4]['pane_id'] = 'w9:p9'  # The chair's alias answers from another pane than its run records.
+        # A delivered delegation still owns the Scout's session although it looks idle.
+        self.jobs.append(dict(id=uuid.uuid4().hex, kind='delegate', state='delivered', organization_id='org',
+                              recipient_run=dict(id=old['q' * 32]['id'])))
+        closed = []
+
+        def command(*args, **kwargs):
+            if args[:2] == ('agent', 'list'):
+                return dict(agents=live)
+            if args[:2] == ('pane', 'close'):
+                raise AssertionError('The reset closes panes only through the gateway session close.')
+            return {}
+
+        def manage_session(body, actor, allow_busy=False):
+            self.assertEqual((body['mode'], body['inspected'], allow_busy), ('close', True, False))
+            self.assertLessEqual(len(body['request_id']), 64)
+            closed.append(body['job_id'])
+            next(job for job in self.jobs if job['id'] == body['job_id'])['state'] = 'released'
+            return {'id': body['job_id']}
+        self.store.command.side_effect = command
+        self.store.manage_session.side_effect = manage_session
+        run = self.studio(mode='studio_run', kind='scout')
+        self.assertEqual(run['state'], 'meeting', run.get('error'))
+        # Only the idle, unowned session on its recorded pane is closed.
+        self.assertEqual(closed, [old['p' * 32]['id']])
+        self.assertEqual(run['fresh_sessions'], ['Portfolio Manager'])
+        self.assertEqual(self.ventures._studio_summary('org')['runs'][0]['fresh_sessions'], run['fresh_sessions'])
+        # A retry of the same scout never closes the sessions its meeting now uses.
+        record = self.ventures._studio_run_record('org', run['id'])
+        record.pop('job_id')
+        self.ventures._studio_dispatch('org', record)
+        self.assertEqual(closed, [old['p' * 32]['id']])
+        # The same idle session again, under limits the reset must respect.
+        fresh = dict(id=uuid.uuid4().hex, kind='launch', state='persona_sent', organization_id='org',
+                     profile_id='p' * 32, alias='alias-pppp-2', pane_id='w2:p0')
+        self.jobs.append(fresh)
+        live.append(dict(name=fresh['alias'], agent_status='idle', pane_id=fresh['pane_id']))
+        studio = self.ventures._studio('org')
+        attempt = dict(id=uuid.uuid4().hex)
+        # At the daily start cap, nothing is closed: the meeting could not start replacements.
+        with patch.object(self.service, 'session_budget', return_value=dict(
+                policy=dict(daily_session_cap=10), active=5, meetings=0, started=10)):
+            self.assertEqual(self.ventures._fresh_scout_sessions('org', attempt, studio), [])
+        with patch.object(self.service, 'session_budget', return_value=dict(
+                policy=dict(paused=True), active=5, meetings=0, started=0)):
+            self.assertEqual(self.ventures._fresh_scout_sessions('org', attempt, studio), [])
+        # Out of time (a slow Herdr on the shared poller): the rest are reused.
+        with patch.object(venture_studio, 'SCOUT_RESET_SECONDS', -1):
+            self.assertEqual(self.ventures._fresh_scout_sessions('org', attempt, studio), [])
+        # Without a verifiable agent listing nothing is closed.
+        command_effect = self.store.command.side_effect
+        self.store.command.side_effect = lambda *args, **kwargs: (
+            dict(error='timeout') if args[:2] == ('agent', 'list') else {})
+        self.assertEqual(self.ventures._fresh_scout_sessions('org', attempt, studio), [])
+        self.store.command.side_effect = command_effect
+        self.assertEqual(closed, [old['p' * 32]['id']])
+        self.assertEqual(self.ventures._fresh_scout_sessions('org', attempt, studio), ['Portfolio Manager'])
+        self.assertEqual(closed, [old['p' * 32]['id'], fresh['id']])
+
     def test_a_scout_that_returns_an_idea_ends_the_empty_streak(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())

@@ -1971,6 +1971,15 @@ class Ventures(StudioOperations, StakeholderPanel):
             run['evidence_file'] = str(target)
             run['prompt'] = (self._pitch_prompt(run, target) if pitch
                              else self._studio_prompt(organization, run, target))
+        if scout and not run.get('job_id') and 'fresh_sessions' not in run:
+            # Once per scout, after its pack and prompt are ready and just
+            # before its meeting is requested: a new round starts from fresh
+            # sessions, not from the last round's memory.
+            try:
+                run['fresh_sessions'] = self._fresh_scout_sessions(organization, run, studio)
+            except Exception as error:  # Never a reason to hold the scout back.
+                logging.warning('Scout %s reuses its sessions: %s', run['id'], redact(str(error)))
+                run['fresh_sessions'] = []
         self.save_studio_run(run)  # Frozen: a retry or recovery reuses the exact request.
         request = dict(request_id='studio-' + run['id'], organization_id=organization,
                        group_id=group_id, prompt=run['prompt'])
@@ -3151,6 +3160,7 @@ class Ventures(StudioOperations, StakeholderPanel):
                      'created_at', 'processed_at', 'job_id', 'dispatch_failed', 'dismissed',
                      'refused_candidates', 'failure', 'waiting', 'auto', 'auto_error', 'manual',
                      'web_research', 'research', 'research_note', 'ruled_out', 'suggested_sources', 'reread',
+                     'fresh_sessions',
                      'scout_run_id', 'candidate_ids', 'review_count', 'missing', 'unverified', 'problems',
                      'panel_summary', 'consulted', 'stakeholder_exploration', 'pre_screened_ideas',
                      'skeptic_silent', 'skeptic_usage')}

@@ -118,6 +118,9 @@ class VentureStoreIntegrationTests(unittest.TestCase):
                 items=[item], etag='', modified='')):
             scout = self.studio(mode='studio_run', kind='scout')
         self.assertEqual(scout['state'], 'meeting', scout.get('error'))
+        # The live chair from the panel setup was released, so this round's
+        # meeting starts a new one instead of reusing the last round's memory.
+        self.assertEqual(scout['fresh_sessions'], ['Venture Studio'])
         # The pack sits in the meeting folder every chair and member may read,
         # not in one agent's worktree, where the others would need a prompt.
         folder = Path(scout['evidence_file']).parent
