@@ -3,6 +3,7 @@ from contextlib import closing
 from datetime import timedelta
 import ipaddress
 import json
+import math
 from pathlib import Path
 import shutil
 import socket
@@ -679,7 +680,8 @@ class FeedLimitTests(unittest.TestCase):
             connection.connect()
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertLess(len(attempts), 8)  # The later addresses were not tried.
-        self.assertTrue(all(timeout <= 0.1 for timeout in attempts))
+        # Subtracting two absolute clock readings can round the remaining budget up by one ulp.
+        self.assertTrue(all(timeout <= 0.1 + math.ulp(budget.at) for timeout in attempts))
 
     def test_keywords_match_whole_words_and_plurals(self):
         for text, word, expected in (('she said no', 'ai', False), ('new ai tools', 'ai', True),

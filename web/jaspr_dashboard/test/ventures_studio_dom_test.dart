@@ -138,6 +138,14 @@ void main() {
             'state': 'ready',
             'consult_roles': ['investor', 'customer'],
             'consulted': ['investor'],
+            'research_lead': {
+              'question': 'Who carries the cost?',
+              'test': 'Compare two invoices.',
+              'sources': ['https://example.org/rates'],
+            },
+            'stakeholder_screen': [
+              {'idea': 'Carrier Desk', 'stakeholder': 'investor', 'follow_up': 'Check the volume discount.'},
+            ],
             'stakeholder_exploration': [
               {'stakeholder': 'investor', 'overlooked': 'Freight brokers'},
             ],
@@ -159,6 +167,11 @@ void main() {
     expect(page(), contains('Pre-screened ideas: Carrier Desk'));
     expect(page(), contains('1 of 2 invited advisors spoke.'));
     expect(page(), contains('Overlooked segment: Freight brokers'));
+    expect(page(), contains('Findings from the last completed scout'));
+    expect(page(), contains('Who carries the cost?'));
+    expect(nodes('p').map((node) => node.textContent), contains('Cheapest test: Compare two invoices.'));
+    expect(page(), contains('Cited source: https://example.org/rates'));
+    expect(page(), contains('After the redesign: Check the volume discount.'));
   });
 
   test('a fresh installation is offered the studio, not an organization', () async {

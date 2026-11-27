@@ -145,6 +145,7 @@ List<Component> _scoutStatus(Map<String, dynamic>? scout) {
   final state = '${scout['state'] ?? ''}';
   final started = displayTime(scout['created_at']);
   final note = '${scout['research_note'] ?? ''}';
+  final lead = '${(scout['research_lead'] as Map?)?['question'] ?? ''}';
   if (state == 'meeting' || state == 'pending') {
     final waiting = scout['waiting'] is Map
         ? ' ${(scout['waiting'] as Map)['title'] ?? ''}: ${(scout['waiting'] as Map)['message'] ?? ''}'
@@ -173,7 +174,8 @@ List<Component> _scoutStatus(Map<String, dynamic>? scout) {
     return [
       notice(
         'The latest scout (started $started) proposed no ideas.'
-        '${note.isEmpty ? '' : ' Its note: $note'}',
+        '${note.isEmpty ? '' : ' Its note: $note'}'
+        '${lead.isEmpty ? '' : ' It left the next scout a research lead: $lead See the Studio tab.'}',
       ),
     ];
   }
@@ -627,6 +629,8 @@ Component candidateDiligence(Map<String, dynamic> item) {
               paragraph('Would change its view: ${entry['would_change_view']}'),
             if ('${entry['response'] ?? ''}'.isNotEmpty)
               paragraph('What the studio did: ${entry['response']}'),
+            if ('${entry['follow_up'] ?? ''}'.isNotEmpty)
+              paragraph('After the redesign: ${entry['follow_up']}'),
           ], classes: 'stack'),
       ]),
     if (review.isNotEmpty)

@@ -2801,8 +2801,10 @@ class VentureTests(unittest.TestCase):
         idea['business_model'] = dict(type='productised_service', revenue_lines=[dict(
             kind='per_unit', label='Verified filled appointment', amount=6, currency=currency, period='month',
             unit='filled appointment', units=30)])
-        done = self.complete_studio(run, {'candidates': [idea], 'research': self.RESEARCH})
+        lead = dict(question='Would an upfront fee cover delivery?', test='Compare the pilot fee with staff hours.')
+        done = self.complete_studio(run, {'candidates': [idea], 'research': self.RESEARCH, 'research_lead': lead})
         self.assertIn('needs a one-off revenue line', done['refused_candidates'][0]['error'])
+        self.assertEqual(done['research_lead']['question'], lead['question'])
         # Reading the same answer again under the same rules adds nothing, and says so.
         again = self.studio(mode='studio_recover', run_id=run['id'], inspected=True)
         self.assertEqual((again['reread']['added'], again['reread']['still_refused']), ([], ['FysioFront']))
@@ -2812,6 +2814,8 @@ class VentureTests(unittest.TestCase):
         job['result'] = '```json\n' + json.dumps({'candidates': [idea], 'research': self.RESEARCH}) + '\n```'
         fixed = self.studio(mode='studio_recover', run_id=run['id'], inspected=True)
         self.assertEqual(fixed['reread']['added'], ['FysioFront'])
+        self.assertNotIn('research_lead', fixed)
+        self.assertIsNone(self.ventures._studio_research_lead('org', []))
 
     def test_approval_can_attach_the_studio_sources_to_an_idea_without_feeds(self):
         self.setup_studio_manual()
@@ -3025,13 +3029,19 @@ class VentureTests(unittest.TestCase):
                       'change in a normal week, and what record would show it?"', method)
         self.assertNotIn('Also ask the industry operator', method)
         self.assertIn('it stays a research lead, not evidence', method)
+        # So does the walk through one real instance of the buyer's workflow.
+        self.assertIn('a. The target customer: "Walk me through one instance', method)
         method = ' '.join(ventures.scout_consult_method(['investor', 'operator']).split())
         self.assertIn('Also ask the industry operator, for each idea: "If this worked tomorrow, which record '
                       'would you inspect to see what changed in a normal week?"', method)
         self.assertNotIn('target customer, for each idea', method)
+        self.assertIn('a. The industry operator: "Walk me through one instance', method)
         method = ' '.join(ventures.scout_consult_method(['investor', 'competitor']).split())
         self.assertNotIn('If this worked tomorrow', method)
+        self.assertIn('a. No buyer-side stakeholder advises, so the Research Analyst answers from the evidence '
+                      'and marks what is inferred: "Walk me through one instance', method)
         self.assertNotIn('{record_question}', method)
+        self.assertNotIn('{workflow_witness}', method)
         # A saving or a lowered risk can pass with the same capacity.
         for rule in ('capacity this idea adds or frees',
                      'show how the offer lowers that likelihood or cost',
@@ -3764,6 +3774,8 @@ class VentureTests(unittest.TestCase):
         pack = json.loads(Path(pitch['evidence_file']).read_text(encoding='utf-8'))
         self.assertEqual(pack['ideas'][0]['stakeholder_screen'], stored['stakeholder_screen'])
         self.assertTrue(pack['ideas'][0]['pre_screened'])
+        follow_up_only = dict(stored, stakeholder_screen=[dict(stakeholder='investor', follow_up='Test the price.')])
+        self.assertTrue(self.ventures._pitch_pack(done, [follow_up_only], panel=panel)['ideas'][0]['pre_screened'])
         other_panel = dict(members=dict(investor='replacement', customer=panel['members']['customer']))
         self.assertNotIn('pre_screened', self.ventures._pitch_pack(done, [stored], panel=other_panel)['ideas'][0])
         summaries = {item['id']: item for item in self.ventures._studio_summary('org')['runs']}
@@ -3771,6 +3783,165 @@ class VentureTests(unittest.TestCase):
         self.assertEqual(summaries[run['id']]['stakeholder_exploration'], done['stakeholder_exploration'])
         self.assertEqual(summaries[run['id']]['consulted'], ['investor'])
         self.assertEqual(summaries[pitch['id']]['pre_screened_ideas'], ['Carrier Desk'])
+
+    def test_a_screened_out_idea_gets_one_redesign_and_an_empty_round_leaves_a_research_lead(self):
+        # Live, two rounds settled empty: the reframe only reached ideas that
+        # survived the screen, the top-level screens were lost, and the next
+        # scout learned more about what failed than about what to test.
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        panel = self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        focus = ['Dutch nursery wholesale', 'logistics', 'returns', 'packaging', 'purchasing',
+                 'Distribution of wholesale goods with shared inventory and seasonal demand across independent traders']
+        self.studio(mode='studio_policy', studio_sources=['https://news.example/feed'], studio_max_candidates=3,
+                    studio_focus=focus)
+        investor = panel['members']['investor']
+
+        def scout():
+            with self.news(feed_item(venture_feeds.now().isoformat())):
+                return self.studio(mode='studio_run', kind='scout')
+
+        def answer(run, value):
+            job = next(job for job in self.jobs if job['id'] == run['job_id'])
+            job.update(state='artifact_ready', result='```json\n' + json.dumps(value) + '\n```',
+                       contributions=[dict(profile_id=investor, name='investor', round=1, content='Noted.')])
+            self.ventures.advance()
+            done = next(item for item in self.studio_runs() if item['id'] == run['id'])
+            self.assertEqual(done['state'], 'ready', done.get('error'))
+            return done
+
+        first = scout()
+        folder = Path(first['evidence_file']).parent
+        method = ' '.join((folder / ventures.STUDIO_CONSULT_FILE).read_text(encoding='utf-8').split())
+        for rule in ('Give one problem a second attempt', 'Set the proposed solution aside',
+                     'Where, if anywhere, does someone still lose time, money or an opportunity? Who bears that loss?',
+                     'Do not ask whether the buyer would buy the idea',
+                     'is a hypothesis until the Research Analyst can support it',
+                     'Which assumption makes you say no? If we removed that assumption, would the buyer still '
+                     'have a problem worth solving?',
+                     'Which part is observed, which is inferred, and what record would settle the difference?',
+                     'The Portfolio Manager, to the Venture Scout: "Give me two materially different ways',
+                     'to the stakeholder that raised the objection only',
+                     'What is the cheapest comparison that could change our decision, and what result would make '
+                     'us drop it?', 'Stop when the analyst finds evidence', 'One problem per round',
+                     '"follow_up"', 'top-level "stakeholder_screen"'):
+            self.assertIn(rule, method)
+        # Generic wording: the agents are not handed the nursery round's answer.
+        for example in ('crew', 'credits', 'nursery'):
+            self.assertNotIn(example, method.casefold())
+        checklist = ' '.join((folder / ventures.STUDIO_REVIEW_FILE).read_text(encoding='utf-8').split())
+        for rule in ('the one idea the stakeholder screen eliminated that gets a second attempt',
+                     'a redesigned offer advances only on question 10', 'Leave one research lead from an empty round',
+                     'A lead is not an idea', 'Work on an earlier lead first'):
+            self.assertIn(rule, checklist)
+        rules = (folder / ventures.STUDIO_RULES_FILE).read_text(encoding='utf-8')
+        self.assertIn('research_lead: only when candidates is empty', rules)
+        self.assertIn('research_lead_outcome', rules)
+        lead = dict(question='Do wholesale traders leave enough documented supplier credits unrecovered?',
+                    problem='Unrecovered supplier credits after peak season.', failed_offer='An on-site crew.',
+                    change='Reconcile existing photos, delivery notes and credit notes; no crew.',
+                    unknown='How much goes unrecovered.', test='A retrospective on one trader\'s closed shipments.',
+                    evidence=['N1', 'N9'])
+        done = answer(first, dict(candidates=[], research_note='n' * 1500, research_lead=lead, stakeholder_screen=[
+            dict(idea='YardCheck', stakeholder='investor', objection='A crew costs more than the work is worth.',
+                 follow_up='f' * 700),
+            dict(idea='yardcheck', stakeholder='customer', objection='Never spoke.'),
+            dict(name='TradeTrust', stakeholder='investor', objection='Traders will not share prices.'),
+            dict(stakeholder='investor', objection='No idea named.'), 'not an entry']))
+        self.assertEqual(len(done['research_note']), ventures.SCOUT_NOTE_LENGTH)
+        self.assertEqual([(item['idea'], item['stakeholder']) for item in done['stakeholder_screen']],
+                         [('YardCheck', 'investor'), ('TradeTrust', 'investor')])
+        self.assertEqual(len(done['stakeholder_screen'][0]['follow_up']), ventures.SCOUT_FOLLOW_UP_LENGTH)
+        self.assertEqual(done['research_lead']['test'], lead['test'])
+        self.assertEqual(done['research_lead']['sources'], ['https://news.example/item-1'])  # N9 was not supplied.
+        self.assertEqual(done['research_lead']['focus'], focus)
+        summary = next(item for item in self.ventures._studio_summary('org')['runs'] if item['id'] == first['id'])
+        self.assertEqual((summary['research_lead'], summary['stakeholder_screen']),
+                         (done['research_lead'], done['stakeholder_screen']))
+        # A lead is for its focus; a scout with another focus does not get it.
+        self.assertIsNone(self.ventures._studio_research_lead('org', ['German music schools']))
+        self.assertEqual(self.ventures._studio_research_lead('org', [focus[-1]])['run_id'], first['id'])
+        self.assertIsNone(self.ventures._studio_research_lead('org', [focus[-1][:80]]))
+
+        second = scout()
+        pack = json.loads(Path(second['evidence_file']).read_text(encoding='utf-8'))
+        self.assertEqual((pack['research_lead']['run_id'], pack['research_lead']['question']),
+                         (first['id'], lead['question']))
+        self.assertEqual(len(pack['scout_notes'][0]['note']), ventures.SCOUT_NOTE_LENGTH)
+        self.assertEqual(pack['research_lead']['earlier_screens'], done['stakeholder_screen'])
+        brief = Path(second['evidence_file']).with_name(ventures.STUDIO_ENTRY_FILE).read_text(encoding='utf-8')
+        self.assertIn('Read research_lead in evidence.json', brief)
+        self.assertNotIn(lead['question'], brief)
+        self.assertNotIn(lead['test'], brief)
+        done = answer(second, dict(candidates=[], research_lead=lead,
+                                   research_lead_outcome=dict(status='open', note='Not reached.')))
+        self.assertEqual(done['research_lead_outcome'], dict(run_id=first['id'], question=lead['question'],
+                                                             status='open', note='Not reached.'))
+        self.assertNotIn('research_lead', done)
+
+        third = scout()  # Still open: the lead comes along again.
+        carried = json.loads(Path(third['evidence_file']).read_text(encoding='utf-8'))['research_lead']
+        self.assertEqual((carried['run_id'], carried['last_progress']), (first['id'], 'Not reached.'))
+        answer(third, dict(candidates=[], research_lead=dict(lead, question=lead['question'].upper()),
+                           research_lead_outcome=dict(status='retired', note='Credits are claimed.')))
+        self.ventures.save_studio_run(self.ventures._studio_run_record('org', first['id']))
+
+        fourth = scout()  # Retired: no lead.
+        self.assertNotIn('research_lead', json.loads(Path(fourth['evidence_file']).read_text(encoding='utf-8')))
+        self.assertNotIn('An earlier round left a research lead',
+                         Path(fourth['evidence_file']).with_name(ventures.STUDIO_ENTRY_FILE).read_text(encoding='utf-8'))
+        # A round with an idea leaves no lead, and a top-level screen naming
+        # that idea joins its own screen.
+        idea = dict(candidate('Carrier Desk', 'N1'), stakeholder_screen=[
+            dict(stakeholder='investor', objection='Buyers already pay a cheaper tool.')])
+        done = answer(fourth, dict(candidates=[idea], research_lead=lead, stakeholder_screen=[
+            dict(idea=' Carrier   DESK ', stakeholder='investor', objection='Same objection reworded.'),
+            dict(idea='carrier desk', stakeholder='investor', follow_up='Check the minimum order size.')]))
+        self.assertNotIn('research_lead', done)
+        self.assertNotIn('stakeholder_screen', done)
+        stored, = [item for item in self.stored_candidates() if item['name'] == 'Carrier Desk']
+        self.assertEqual(stored['stakeholder_screen'], [dict(stakeholder='investor',
+                                                             objection='Buyers already pay a cheaper tool.',
+                                                             follow_up='Check the minimum order size.')])
+
+    def test_only_an_accepted_replacement_can_supersede_a_scout_lead(self):
+        run = dict(evidence=dict(research_lead=dict(run_id='origin', question='Is the problem recurring?')))
+        valid = dict(name='Carrier Desk', state='proposed')
+        excluded = dict(name='Rejected redesign', state='excluded')
+
+        def outcome(submitted, parsed, **fields):
+            return self.ventures._scout_lead_outcome(dict(status='superseded', **fields), run, parsed, submitted)
+
+        self.assertIsNone(outcome(0, []))
+        self.assertIsNone(outcome(1, [excluded]))
+        self.assertIsNone(outcome(2, [valid]))  # The unnamed second proposal was refused.
+        self.assertIsNone(outcome(2, [valid, excluded], candidate=excluded['name']))
+        self.assertIsNone(outcome(2, [valid], candidate='Unknown'))
+        self.assertEqual(outcome(2, [valid, excluded], candidate=' carrier   DESK ')['candidate'], valid['name'])
+        self.assertEqual(outcome(1, [valid])['candidate'], valid['name'])  # Saved answers without the new field.
+
+    def test_a_lead_keeps_its_test_under_pack_pressure_and_expires_by_settled_round(self):
+        self.setup_studio_manual()
+        focus = 'Purchasing teams handling seasonal goods and fragmented distribution across independent suppliers'
+        origin = dict(id='origin', organization_id='org', kind='scout', state='ready', processed_at='2026-01-01',
+                      policy=dict(studio_focus=[focus]), research_lead=dict(
+                          question='Who bears the cost?', test='Compare two invoices.', focus=[focus[:80]]),
+                      stakeholder_screen=[dict(idea='Desk', stakeholder='investor', follow_up='Check invoice fees.')])
+        self.ventures.save_studio_run(origin)
+        policy = dict(self.ventures._studio_policy('org'), studio_focus=[focus])
+        pack, _, _ = self.ventures._studio_evidence('org', 'scout', policy)
+        self.assertEqual(pack['research_lead']['focus'], [focus])  # Older lead, complete frozen policy.
+        self.assertTrue(pack['research_lead']['earlier_screens'])
+        with patch.object(ventures, 'STUDIO_EVIDENCE_LIMIT', len(json.dumps(pack, ensure_ascii=False).encode()) - 1):
+            smaller, _, _ = self.ventures._studio_evidence('org', 'scout', policy)
+        self.assertFalse(smaller['research_lead'].get('earlier_screens'))
+        self.assertEqual(smaller['research_lead']['test'], 'Compare two invoices.')
+        for day in range(2, 2 + ventures.SCOUT_LEAD_RUNS):
+            self.assertEqual(self.ventures._studio_research_lead('org', [focus])['run_id'], 'origin')
+            self.ventures.save_studio_run(dict(id=str(day), kind='scout', organization_id='org', state='ready',
+                                               processed_at=f'2026-01-{day:02}'))
+        self.ventures.save_studio_run(origin)  # A later write cannot extend the original deadline.
+        self.assertIsNone(self.ventures._studio_research_lead('org', [focus]))
 
     def test_the_stakeholders_can_be_kept_to_the_pitch(self):
         self.setup_studio_manual()

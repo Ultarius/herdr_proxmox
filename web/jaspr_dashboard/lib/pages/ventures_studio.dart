@@ -156,6 +156,10 @@ Component venturesStudio({
   final scout = runs.where((item) => item['kind'] == 'scout').toList();
   final latestPortfolio = portfolio.isEmpty ? null : portfolio.first;
   final latestScout = scout.isEmpty ? null : scout.first;
+  final completedScout = scout.where((run) => run['state'] == 'ready').firstOrNull;
+  final previousFindings = completedScout != null && latestScout != completedScout
+      ? _scoutLead(completedScout)
+      : const <Component>[];
   final schedule = Map<String, dynamic>.from(
     studio?['schedule'] as Map? ?? const {},
   );
@@ -410,11 +414,13 @@ Component venturesStudio({
       else
         disclosure('Scout review · ${latestScout['state']}', [
           if (latestScout['skeptic_silent'] == true)
-            notice([
-              'The Skeptic did not contribute. Ideas from this scout need manual approval.',
-              if (latestScout['skeptic_usage'] case final Map hold)
-                'A provider usage limit was observed. ${_usageTiming(hold)}',
-            ].join(' ')),
+            notice(
+              [
+                'The Skeptic did not contribute. Ideas from this scout need manual approval.',
+                if (latestScout['skeptic_usage'] case final Map hold)
+                  'A provider usage limit was observed. ${_usageTiming(hold)}',
+              ].join(' '),
+            ),
           if ('${latestScout['error'] ?? ''}'.isNotEmpty)
             notice('${latestScout['error']}', error: true)
           else
@@ -428,11 +434,14 @@ Component venturesStudio({
             paragraph(
               'Refused by the gateway: ${refused['name'] ?? 'unnamed'}: ${refused['error'] ?? ''}',
             ),
+          ..._scoutLead(latestScout),
           if (latestScout['web_research'] == true)
             paragraph(
               'This scout researched the web because no source gave items. '
               '${latestScout['research_note'] ?? ''}',
-            ),
+            )
+          else if ('${latestScout['research_note'] ?? ''}'.isNotEmpty)
+            paragraph('${latestScout['research_note']}'),
           for (final page in List<Map<String, dynamic>>.from(
             latestScout['research'] as List? ?? const [],
           ))
@@ -471,6 +480,8 @@ Component venturesStudio({
           if (latestScout['state'] == 'needs_attention')
             recoverActions(latestScout),
         ]),
+      if (previousFindings.isNotEmpty)
+        disclosure('Findings from the last completed scout', previousFindings),
       if (lessons.isNotEmpty)
         disclosure('Lessons the studio sees (${lessons.length})', [
           paragraph(
@@ -507,6 +518,55 @@ Component venturesStudio({
         ? 'The studio creates ventures within its caps. It never spends, publishes or sends mail.'
         : 'Recommended actions are inert until you click them. The studio never spends, publishes or sends mail.',
   );
+}
+
+/// The research lead an empty scout round left, what the scout said about
+/// the lead it was given, and the screens of ideas that never became
+/// candidates.
+List<Component> _scoutLead(Map<String, dynamic> scout) {
+  final lead = scout['research_lead'] as Map? ?? const {};
+  final outcome = scout['research_lead_outcome'] as Map? ?? const {};
+  final screened = (scout['stakeholder_screen'] as List? ?? const [])
+      .whereType<Map>()
+      .toList();
+  return [
+    if (outcome.isNotEmpty)
+      paragraph(
+        'Earlier research lead (${outcome['question'] ?? ''}): ${outcome['status'] ?? ''}'
+        '${outcome['candidate'] == null ? '' : ' by ${outcome['candidate']}'}'
+        '${'${outcome['note'] ?? ''}'.isEmpty ? '' : ' · ${outcome['note']}'}',
+      ),
+    if ('${lead['question'] ?? ''}'.isNotEmpty)
+      el('article', [
+        paragraph('Research lead for the next scout: ${lead['question']}'),
+        for (final (key, label) in const [
+          ('problem', 'Buyer problem'),
+          ('failed_offer', 'Offer that failed'),
+          ('change', 'Material change'),
+          ('unknown', 'Decisive unknown'),
+          ('test', 'Cheapest test'),
+        ])
+          if ('${lead[key] ?? ''}'.isNotEmpty) paragraph('$label: ${lead[key]}'),
+        for (final source in lead['sources'] as List? ?? const [])
+          paragraph('Cited source: $source'),
+      ], classes: 'stack'),
+    if (screened.isNotEmpty)
+      disclosure('Stakeholder feedback on omitted ideas (${screened.length})', [
+        for (final entry in screened)
+          el('article', [
+            paragraph(
+              '${entry['idea'] ?? ''} · ${_stakeholderLabels['${entry['stakeholder']}'] ?? entry['stakeholder']}: '
+              '${entry['objection'] ?? 'no objection given'}',
+            ),
+            if ('${entry['would_change_view'] ?? ''}'.isNotEmpty)
+              paragraph('Would change its view: ${entry['would_change_view']}'),
+            if ('${entry['response'] ?? ''}'.isNotEmpty)
+              paragraph('What the studio did: ${entry['response']}'),
+            if ('${entry['follow_up'] ?? ''}'.isNotEmpty)
+              paragraph('After the redesign: ${entry['follow_up']}'),
+          ], classes: 'stack'),
+      ]),
+  ];
 }
 
 const _stakeholderLabels = {

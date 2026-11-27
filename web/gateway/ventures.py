@@ -135,8 +135,23 @@ SCOUT_DISSENT_LENGTH = 1200
 SCOUT_RULED_OUT = 10
 SCOUT_RULED_OUT_MEMORY = 16
 SCOUT_RULED_OUT_RUNS = 5
-# Earlier scouts' research notes, passed as context beside ruled_out.
+# Earlier scouts' research notes, passed as context beside ruled_out. A
+# note says what the round learned and what to investigate, which did not
+# fit in 600 characters.
 SCOUT_NOTE_MEMORY = 3
+SCOUT_NOTE_LENGTH = 1200
+# The stakeholder's answer to a redesigned offer: the revised offer, which
+# part of its objection still applies, and how to check it.
+SCOUT_FOLLOW_UP_LENGTH = 600
+# Screens of ideas that never reached the candidates, kept on the run.
+SCOUT_SCREENED_OUT = 40
+# A research lead from an empty round: the one question whose answer could
+# justify a better idea. The next relevant scout gets the newest open one;
+# it lapses when a scout reports it retired or superseded, or after
+# SCOUT_LEAD_RUNS settled scouts.
+SCOUT_LEAD_FIELDS = ('question', 'problem', 'failed_offer', 'change', 'unknown', 'test')
+SCOUT_LEAD_STATUS = ('open', 'retired', 'superseded')
+SCOUT_LEAD_RUNS = 5
 # Settled scouts in a row that returned no idea before the next one is told
 # to change its search method.
 SCOUT_EMPTY_STREAK = 2
@@ -239,10 +254,13 @@ replaces the earlier idea.
    evidence for it. More than a quarter of the reachable accounts is a warning
    sign to check, not a cutoff. Show that arithmetic; never reject on a fixed
    number of accounts.
-8. **One reframe.** For every surviving idea, try at least one reframe: a
+8. **One reframe.** For every surviving idea, and for the one idea the
+   stakeholder screen eliminated that gets a second attempt (step 3 of
+   stakeholders.md, when stakeholders advise), try at least one reframe: a
    different customer (new entrants instead of switchers), a different revenue
    line (activity-linked) or a different first offer. Keep the stronger
-   version and name the reframe you weighed in the dissent summary.
+   version and name the reframe you weighed in the dissent summary. The bar
+   does not change: a redesigned offer advances only on question 10.
 9. **The benefit the buyer pays for.** Name the one benefit the buyer would
    pay for, then test that claim with evidence of its own kind:
    - **More output** (more jobs, visits or deliveries): show the extra work
@@ -291,6 +309,29 @@ replaces the earlier idea.
     a held idea takes a backlog slot, and a full backlog stops the scout. If
     no idea has a credible test, return an empty list; "ruled_out" and
     "research_note" record what the round learned.
+13. **Leave one research lead from an empty round.** "Worth investigating
+    next" is not "ready to advance". When the answer has no candidates, name
+    at most one buyer problem for the next scout in "research_lead": the
+    decisive question, the buyer problem, the offer that failed, the material
+    change that could make a different offer work, the decisive unknown and
+    the cheapest test whose result could change the decision. Prefer a
+    problem where the buyer has an identifiable cost, a materially different
+    offer could address it, and a cheap test could flip the verdict. A lead
+    is not an idea: it takes no backlog slot and is never created. A
+    simulated customer saying it would pilot names a test, not evidence; the
+    absence of a signed pilot in a read-only session does not settle whether
+    that test is worth running. Raise a confidence rating only when evidence
+    improves.
+14. **Work on an earlier lead first.** When the pack has a "research_lead"
+    for this focus, read its last_progress and the originating round's
+    earlier_screens when supplied. What has already been learned? Check the
+    decisive unknown using evidence available this round. If the test needs
+    private records or a real buyer, name the operator check and explore new
+    ground. Report "research_lead_outcome": "superseded" with the candidate's
+    name when a proposal takes up the lead, "retired" when evidence answers
+    the question against it, otherwise "open" with what remains to learn.
+    Record progress on the same question in the outcome note. Reserve a
+    new research_lead for a different question.
 '''
 # How the scout uses the stakeholder panel while it researches. Written beside
 # the evidence file, like the checklist, so the prompt stays within budget.
@@ -318,21 +359,71 @@ a question open.
    for its biggest objection to each idea, and one piece of evidence that
    would change its view.{record_question} Use the answers to decide where to
    spend the remaining research time: look for exactly that evidence.
-3. **Pivot when a segment looks stronger.** If an answer points to a stronger
+3. **Give one problem a second attempt.** After the screen, pick at most one
+   idea the objections would eliminate whose buyer problem may still be worth
+   solving. Set the proposed solution aside and work from the outcome the
+   buyer is failing to achieve. Ask these in order, each of the member named,
+   one at a time. The chair relays the questions and brings each answer
+   back to the studio team:
+   a. {workflow_witness}"Walk me through one instance, from the trigger to
+      the final outcome. Where does the current approach work well? Where, if
+      anywhere, does someone still lose time, money or an opportunity? Who
+      bears that loss?" Do not ask whether the buyer would buy the idea: that
+      gets a verdict on the studio's idea, not a workflow to design from. A
+      stakeholder's account of the workflow is a hypothesis until the
+      Research Analyst can support it.
+   b. The stakeholder that raised the objection: "Which assumption makes you
+      say no? If we removed that assumption, would the buyer still have a
+      problem worth solving? What makes you think so?" An objection to how
+      the idea is delivered (its price, the work it takes, who does that
+      work) can be met by a different offer. An objection that the buyer
+      already achieves the outcome adequately needs evidence from the analyst.
+      An unknown nobody has measured is a test to name, not a reason to redesign.
+   c. The Research Analyst: "What evidence distinguishes that remaining
+      problem from something the buyer already handles adequately? Which
+      part is observed, which is inferred, and what record would settle the
+      difference?"
+   d. The Portfolio Manager, to the Venture Scout: "Give me two materially
+      different ways to deliver the remaining outcome. For each, who pays,
+      what do they receive, what must they change, and what does it cost us
+      to deliver? Which deserves the one follow-up?"
+   e. The Venture Scout takes the chosen offer back once, to the stakeholder
+      that raised the objection only, stating what changed in the buyer, the
+      deliverable, the price and the delivery effort: "Here is the revised
+      offer. Which part of your original objection still applies? What would
+      the buyer still choose instead, and why? What is the cheapest
+      comparison that could change our decision, and what result would make
+      us drop it?"
+   Stop when the analyst finds evidence that the buyer already achieves the
+   outcome. The stakeholders' answers are research leads, not
+   evidence, and they do not approve the idea. The Skeptic then judges the
+   revised offer through the review checklist like any other idea: a
+   candidate when the evidence holds, held when a credible test could flip
+   the verdict, otherwise the round's research lead. One problem per round
+   and one follow-up on the revised offer. If the test needs private records
+   or a real customer, state what the operator could verify. Continue with
+   other research available to this read-only meeting.
+4. **Pivot when a segment looks stronger.** If an answer points to a stronger
    segment or idea, investigate it in this same session and drop the weaker
    idea. Respect the configured exclusions. Raise a confidence rating only
    when cited evidence supports it, never because a stakeholder liked the
    idea. A promising idea with a clear evidence gap can still come back held,
    with the gap named.
-4. **Report what they said.** In the answer, under "stakeholder_exploration",
+5. **Report what they said.** In the answer, under "stakeholder_exploration",
    give one entry per stakeholder:
    {"stakeholder":"<role>","spend":"...","segments":"...","workarounds":"...",
    "overlooked":"..."}. Under each candidate, "stakeholder_screen" lists one
    entry per stakeholder that screened it:
    {"stakeholder":"<role>","objection":"...","would_change_view":"...",
-   "response":"what the studio found or changed"}. Each text is at most 300
-   characters. Leave out a stakeholder that did not answer: never write an
-   answer for it.
+   "response":"what the studio found or changed"}. The stakeholder that saw a
+   redesigned offer also gets "follow_up": the outcome the buyer still fails
+   to achieve, the revised offer, which part of its objection still applies,
+   what the buyer would choose instead and the cheapest comparison (at most
+   600 characters). Every other text is at most 300 characters. Screens of ideas
+   that did not reach the candidates go in a top-level "stakeholder_screen"
+   list, each entry with "idea" naming the idea, so the operator can see
+   what failed and why. Leave out a stakeholder that did
+   not answer: never write an answer for it.
 
 The stakeholders review the final ideas again in the pitch that follows this
 round. That review is theirs, so do not ask them to approve an idea now.
@@ -347,6 +438,17 @@ _RECORD_QUESTIONS = (
 )
 
 
+# Who can walk the studio through one real instance of the buyer's
+# workflow, for the second attempt: the buyer, else the operator, else the
+# analyst from the evidence.
+_WORKFLOW_WITNESSES = (
+    ('customer', 'The target customer: '),
+    ('operator', 'The industry operator: '),
+)
+_WORKFLOW_FALLBACK = ('No buyer-side stakeholder advises, so the Research Analyst answers from the evidence and '
+                      'marks what is inferred: ')
+
+
 def scout_consult_method(roles):
     """The stakeholder guide for this roster: the record question goes to the
     customer when present, else the operator, else it is left out."""
@@ -355,7 +457,8 @@ def scout_consult_method(roles):
         question += (' An answer such as overtime invoices, agency bills or completed work orders names the '
                      'benefit and the record to research for the review checklist\'s question 9; it stays a '
                      'research lead, not evidence.')
-    return STUDIO_CONSULT_METHOD.replace('{record_question}', question)
+    witness = next((text for role, text in _WORKFLOW_WITNESSES if role in (roles or ())), _WORKFLOW_FALLBACK)
+    return STUDIO_CONSULT_METHOD.replace('{record_question}', question).replace('{workflow_witness}', witness)
 # The scout's answer rules, written beside the evidence file. They are long
 # and fixed, and the prompt they used to fill sat at its 8,000-character
 # limit: any longer focus or one more stakeholder sentence refused the run.
@@ -479,8 +582,18 @@ def scout_answer_rules():
             'the stakeholder panel.',
             'analogue, incumbent, market_ceiling (every account it could serve) and expansion (later modules, '
             'share of customers buying) are cited upside, never counted in break-even.',
-            'pricing (a short text), revises with revision_note (to replace an open idea), research_note, '
-            'stakeholder_screen and stakeholder_exploration (when stakeholders advise).',
+            'pricing (a short text), revises with revision_note (to replace an open idea), research_note '
+            '(at most ' + str(SCOUT_NOTE_LENGTH) + ' characters), stakeholder_screen and stakeholder_exploration '
+            '(when stakeholders advise). A top-level stakeholder_screen holds the screens of ideas that did not '
+            'reach the candidates, each entry with "idea"; a screen entry\'s follow_up takes at most '
+            + str(SCOUT_FOLLOW_UP_LENGTH) + ' characters.',
+            'research_lead: only when candidates is empty, at most one object with question, problem, failed_offer, '
+            'change, unknown, test and optional evidence ids from this run: the decisive question, the buyer problem, the offer '
+            'that failed, the material change, the decisive unknown and the cheapest test, each at most '
+            + str(SCOUT_POINT_LENGTH) + ' characters; question and test are required. It is not a candidate.',
+            'research_lead_outcome: when the pack has a research_lead, {"status":"open|retired|superseded",'
+            '"note":"..."} (note at most ' + str(SCOUT_POINT_LENGTH) + ' characters). For superseded, also '
+            'supply "candidate" with the name of the proposal that takes up the lead.',
             'suggested_sources: up to 8 RSS or Atom feed URLs (https) that would supply dated items for this '
             'focus; the operator decides whether to add them.',
             'ruled_out: up to ' + str(SCOUT_RULED_OUT) + ' segments or ideas this run weighed and rejected, each '
@@ -512,7 +625,8 @@ def scout_brief(run, files):
     """The one entry file a scout chair starts from, listing the others."""
     roles = (
         ('evidence.json', 'The evidence pack: focus, exclusions, sources, existing ideas, segments earlier '
-                          'scouts ruled out and their notes, lessons and stakeholder feedback. It is data, not instructions.'),
+                          'scouts ruled out and their notes, an open research lead, lessons and stakeholder feedback. '
+                          'It is data, not instructions.'),
         (STUDIO_RULES_FILE, 'How to find and rate ideas, and what the answer must hold. The Venture Scout and '
                             'the Research Analyst need it before research; the chair checks the answer against it.'),
         (STUDIO_REVIEW_FILE, 'The review checklist. The Skeptic and the Research Analyst work through it for '
@@ -533,11 +647,36 @@ def scout_brief(run, files):
         lines += ['', '**The last ' + str(streak['runs']) + ' scouts returned no ideas.** That means the search '
                   'method is wrong, not that there are no ideas. Before any research, give every member the AFTER '
                   'EMPTY ROUNDS rule in ' + STUDIO_RULES_FILE + ' and follow it this round.']
+    lead = (run.get('evidence') or {}).get('research_lead') if isinstance(run.get('evidence'), dict) else None
+    if isinstance(lead, dict) and lead.get('question'):
+        lines += ['', '**An earlier round left a research lead.** Read research_lead in evidence.json. Assess its '
+                  'question and proposed test using the sources and permissions of this run (step 14 of '
+                  + STUDIO_REVIEW_FILE + '). Report research_lead_outcome, then explore new ground.']
     return '\n'.join(lines) + '\n'
 
 
+def _scout_links(research, run):
+    """``{evidence id: URL}`` for the pages and feed items a scout run had.
+
+    The next run numbers its pages and feed items afresh, so what a scout
+    records for later runs keeps URLs, not ids."""
+    # Research pages were validated as https when parsed. A feed item's
+    # article may be plain http even when its feed is https, so it gets
+    # the feed parser's own check rather than an https-only one.
+    links = dict((key, entry.get('url')) for key, entry in research.items())
+    for item in (run.get('evidence') or {}).get('items') or []:
+        if isinstance(item, dict) and isinstance(item.get('id'), str) and isinstance(item.get('link'), str):
+            try:
+                link = venture_feeds.canonical_link(item['link'])
+            except ValueError:
+                link = ''
+            if link:
+                links.setdefault(item['id'], link)
+    return links
+
+
 SCOUT_EXPLORE_FIELDS = ('spend', 'segments', 'workarounds', 'overlooked')
-SCOUT_SCREEN_FIELDS = ('objection', 'would_change_view', 'response')
+SCOUT_SCREEN_FIELDS = ('objection', 'would_change_view', 'response', 'follow_up')
 SCOUT_MAX_COMPLAINTS = 5
 # Alternatives that need no page to exist: the buyer's own fallback.
 SCOUT_UNCITED_ALTERNATIVES = ('in_house', 'do_nothing')
@@ -2022,6 +2161,14 @@ class Ventures(StudioOperations, StakeholderPanel):
             run.update(candidates=kept + fresh, refused_candidates=refused, reread=dict(
                 at=now().isoformat(), added=[item['name'] for item in fresh],
                 still_refused=[item.get('name', '') for item in refused]))
+            if fresh:
+                run.pop('research_lead', None)
+                if parsed.get('stakeholder_screen'):
+                    run['stakeholder_screen'] = parsed['stakeholder_screen']
+                else:
+                    run.pop('stakeholder_screen', None)
+                if parsed.get('research_lead_outcome'):
+                    run['research_lead_outcome'] = parsed['research_lead_outcome']
             self._save_round(run, fresh)
         if fresh:
             self._pitch_start(dict(run, candidates=fresh))
@@ -2306,6 +2453,9 @@ class Ventures(StudioOperations, StakeholderPanel):
                 evidence['ruled_out'] = ruled_out
             if notes:
                 evidence['scout_notes'] = notes
+            lead = self._studio_research_lead(organization, policy['studio_focus'])
+            if lead:
+                evidence['research_lead'] = lead
             streak = self._studio_empty_streak(organization)
             if streak:
                 evidence['empty_streak'] = streak
@@ -2323,12 +2473,16 @@ class Ventures(StudioOperations, StakeholderPanel):
                 evidence['existing'].pop()
             elif evidence.get('scout_notes'):
                 evidence['scout_notes'].pop()  # Oldest first.
+            elif (evidence.get('research_lead') or {}).get('earlier_screens'):
+                evidence['research_lead']['earlier_screens'].pop()
             elif evidence.get('ruled_out'):
                 evidence['ruled_out'].pop()
             elif evidence['lessons']:
                 evidence['lessons'].pop()
             elif evidence.get('stakeholder_feedback'):
                 evidence['stakeholder_feedback'].pop()
+            elif evidence.get('research_lead'):
+                evidence.pop('research_lead')
             elif len(evidence['items']) > 5:
                 evidence['items'].pop()
             elif level < 2:
@@ -2417,7 +2571,7 @@ class Ventures(StudioOperations, StakeholderPanel):
                                                if len(url) <= 2000 and url.startswith(('https://', 'http://'))],
                                       focus=strings(item.get('focus'), 5, 80) or focus, date=date))
             if isinstance(note, str) and note.strip() and len(notes) < SCOUT_NOTE_MEMORY:
-                notes.append(dict(note=note.strip()[:600], focus=focus, date=date))
+                notes.append(dict(note=note.strip()[:SCOUT_NOTE_LENGTH], focus=focus, date=date))
         return ruled_out[:SCOUT_RULED_OUT_MEMORY], notes
 
     def _studio_existing(self, organization):
@@ -2704,10 +2858,22 @@ class Ventures(StudioOperations, StakeholderPanel):
             consulted = dict(stakeholder_exploration=self._stakeholder_notes(
                 data.get('stakeholder_exploration'), spoke, SCOUT_EXPLORE_FIELDS),
                 consulted=sorted(spoke))
+            # Without these an empty round kept a clearer record of what
+            # failed than of what the stakeholders said would change it.
+            screened = self._scout_screened_out(data.get('stakeholder_screen'), spoke, parsed)
+            if screened:
+                consulted['stakeholder_screen'] = screened
+        # A lead belongs to an empty round only: a round with ideas has them.
+        lead = None if parsed else self._scout_lead(data.get('research_lead'), research, run)
+        if lead:
+            consulted['research_lead'] = lead
+        outcome = self._scout_lead_outcome(data.get('research_lead_outcome'), run, parsed, len(candidates))
+        if outcome:
+            consulted['research_lead_outcome'] = outcome
         return dict(summary='', recommendations=[], candidates=parsed, refused_candidates=refused,
                     skeptic_silent=silent, **consulted,
                     research=list(research.values()),
-                    research_note=redact(str(data.get('research_note') or ''))[:600]
+                    research_note=redact(str(data.get('research_note') or ''))[:SCOUT_NOTE_LENGTH]
                     if isinstance(data.get('research_note'), str) else '',
                     ruled_out=self._scout_ruled_out(data.get('ruled_out'), research, run),
                     suggested_sources=self._scout_sources(data.get('suggested_sources'),
@@ -2753,18 +2919,7 @@ class Ventures(StudioOperations, StakeholderPanel):
         entry keeps the market it was judged for and the run's focus, so a
         later scout looking at another country, buyer or focus can tell that
         the rejection does not cover it."""
-        # Research pages were validated as https when parsed. A feed item's
-        # article may be plain http even when its feed is https, so it gets
-        # the feed parser's own check rather than an https-only one.
-        links = dict((key, entry.get('url')) for key, entry in research.items())
-        for item in (run.get('evidence') or {}).get('items') or []:
-            if isinstance(item, dict) and isinstance(item.get('id'), str) and isinstance(item.get('link'), str):
-                try:
-                    link = venture_feeds.canonical_link(item['link'])
-                except ValueError:
-                    link = ''
-                if link:
-                    links.setdefault(item['id'], link)
+        links = _scout_links(research, run)
         focus = [str(area)[:80] for area in (run.get('policy') or {}).get('studio_focus') or []][:5]
         result, seen = [], set()
         for item in value if isinstance(value, list) else []:
@@ -2787,6 +2942,137 @@ class Ventures(StudioOperations, StakeholderPanel):
                                reason=redact(reason.strip())[:SCOUT_POINT_LENGTH], sources=sources[:2],
                                focus=focus))
         return result
+
+    @classmethod
+    def _scout_screened_out(cls, value, spoke, candidates):
+        """Screens of ideas that did not reach the candidates, each entry
+        naming its idea: ``[{idea, stakeholder, objection, ...}]``.
+
+        Advisory, like the candidates' own screens. A screen that names a
+        returned candidate joins that candidate's screen instead, for each
+        missing field. The candidate's own screen takes precedence."""
+        groups = {}
+        for item in value if isinstance(value, list) else []:
+            if not isinstance(item, dict):
+                continue
+            idea = next((item[key] for key in ('idea', 'name', 'candidate')
+                         if isinstance(item.get(key), str) and item[key].strip()), '')
+            if idea:
+                idea = redact(' '.join(idea.split()))[:120]
+                groups.setdefault(idea.casefold(), (idea, []))[1].append(item)
+        named = {' '.join(candidate['name'].split()).casefold(): candidate for candidate in candidates}
+        result = []
+        for key, (idea, items) in groups.items():
+            notes = cls._stakeholder_notes(items, spoke, SCOUT_SCREEN_FIELDS)
+            candidate = named.get(key)
+            if candidate is None:
+                result += [dict(idea=idea, **note) for note in notes]
+                continue
+            if notes:
+                combined = {note['stakeholder']: note for note in candidate.get('stakeholder_screen') or []}
+                for note in notes:
+                    role = note['stakeholder']
+                    combined[role] = {**note, **combined.get(role, {})}
+                candidate['stakeholder_screen'] = list(combined.values())
+        return result[:SCOUT_SCREENED_OUT]
+
+    @staticmethod
+    def _scout_lead(value, research, run):
+        """The one research lead an empty round leaves the next scout, or None.
+
+        Advisory: an unusable lead is dropped, never a reason to refuse the
+        run. Cited ids become URLs, like ruled_out."""
+        if isinstance(value, list):
+            value = next((item for item in value if isinstance(item, dict)), None)
+        if not isinstance(value, dict):
+            return None
+        lead = {}
+        for field in SCOUT_LEAD_FIELDS:
+            text = value.get(field)
+            if isinstance(text, str) and text.strip():
+                lead[field] = redact(' '.join(text.split()))[:SCOUT_POINT_LENGTH]
+        if not (lead.get('question') and lead.get('test')):
+            return None
+        carried = (run.get('evidence') or {}).get('research_lead') or {}
+        if lead['question'].casefold() == str(carried.get('question') or '').casefold():
+            return None  # Repeating the same question must not restart its five-round lifetime.
+        links, sources = _scout_links(research, run), []
+        for identity in value.get('evidence') if isinstance(value.get('evidence'), list) else []:
+            url = links.get(identity) if isinstance(identity, str) else None
+            if isinstance(url, str) and url and url not in sources:
+                sources.append(url)
+        lead.update(sources=sources[:2], focus=(run.get('policy') or {}).get('studio_focus') or [])
+        return lead
+
+    @staticmethod
+    def _scout_lead_outcome(value, run, candidates, submitted):
+        """What this scout reports about the earlier lead its pack carried."""
+        lead = (run.get('evidence') or {}).get('research_lead')
+        if not (isinstance(lead, dict) and isinstance(value, dict) and value.get('status') in SCOUT_LEAD_STATUS):
+            return None
+        note = value.get('note')
+        outcome = dict(run_id=lead.get('run_id'), question=str(lead.get('question') or '')[:SCOUT_POINT_LENGTH],
+                       status=value['status'],
+                       note=redact(' '.join(note.split()))[:SCOUT_POINT_LENGTH] if isinstance(note, str) else '')
+        if value['status'] == 'superseded':
+            # An older answer without a name is unambiguous only for one submitted idea.
+            name = value.get('candidate')
+            if name is None and submitted == 1 and candidates:
+                name = candidates[0]['name']
+            key = ' '.join(name.split()).casefold() if isinstance(name, str) else ''
+            match = next((item for item in candidates if item['state'] == 'proposed'
+                          and ' '.join(item['name'].split()).casefold() == key), None)
+            if not match:
+                return None
+            outcome['candidate'] = match['name']
+        return outcome
+
+    def _studio_research_lead(self, organization, focus):
+        """The newest open research lead for this focus, or None.
+
+        A lead lapses when a later scout reports it retired or superseded,
+        or once SCOUT_LEAD_RUNS settled scouts have passed since its round."""
+        with closing(self.service.connect()) as db:
+            rows = db.execute(
+                "SELECT id, json_extract(data, '$.research_lead'), json_extract(data, '$.research_lead_outcome'), "
+                "json_extract(data, '$.processed_at') AS settled, json_extract(data, '$.policy.studio_focus'), "
+                "json_extract(data, '$.stakeholder_screen') FROM venture_studio_runs "
+                "WHERE organization_id=? AND kind='scout' AND json_extract(data, '$.state')='ready' "
+                'ORDER BY settled DESC, id DESC LIMIT ?', (organization, SCOUT_LEAD_RUNS)).fetchall()
+
+        def parsed(value):
+            try:
+                return json.loads(value) if isinstance(value, str) else None
+            except ValueError:
+                return None
+
+        wanted = {str(area).casefold() for area in focus or []}
+        closed = set()
+        progress = {}
+        for identity, lead, outcome, settled, run_focus, screens in rows:
+            outcome = parsed(outcome)
+            if isinstance(outcome, dict) and outcome.get('status') in ('retired', 'superseded'):
+                closed.add(outcome.get('run_id'))
+            elif isinstance(outcome, dict) and outcome.get('note'):
+                progress.setdefault(outcome.get('run_id'), outcome['note'])
+            lead = parsed(lead)
+            if not isinstance(lead, dict) or identity in closed or not lead.get('question'):
+                continue
+            # The frozen policy also retains complete focus areas for older, shortened leads.
+            saved_focus = parsed(run_focus)
+            if isinstance(saved_focus, list):
+                lead['focus'] = saved_focus
+            areas = {str(area).casefold() for area in lead.get('focus') or []}
+            if areas and wanted and not areas & wanted:
+                continue  # Another focus: not this scout's question.
+            result = dict(run_id=identity, date=str(settled or '')[:10],
+                          **{key: lead[key] for key in SCOUT_LEAD_FIELDS + ('sources', 'focus') if key in lead})
+            if identity in progress:
+                result['last_progress'] = progress[identity]
+            if earlier_screens := parsed(screens):
+                result['earlier_screens'] = earlier_screens
+            return result
+        return None
 
     @staticmethod
     def _scout_sources(value, existing):
@@ -2850,20 +3136,19 @@ class Ventures(StudioOperations, StakeholderPanel):
         Advisory: an unusable entry is dropped, never a reason to refuse the
         idea or the run. A stakeholder that did not speak in the meeting
         cannot have said anything, so its entry is dropped too."""
-        result, seen = [], set()
+        notes = {}
         for item in value if isinstance(value, list) else []:
             role = item.get('stakeholder') if isinstance(item, dict) else None
-            if not isinstance(role, str) or role not in spoke or role in seen:
+            if not isinstance(role, str) or role not in spoke:
                 continue
-            entry = dict(stakeholder=role)
             for field in fields:
                 text = item.get(field)
                 if isinstance(text, str) and text.strip():
-                    entry[field] = redact(' '.join(text.split()))[:SCOUT_POINT_LENGTH]
-            if len(entry) > 1:
-                seen.add(role)
-                result.append(entry)
-        return result
+                    limit = SCOUT_FOLLOW_UP_LENGTH if field == 'follow_up' else SCOUT_POINT_LENGTH
+                    entry = notes.setdefault(role, dict(stakeholder=role))
+                    if field not in entry:
+                        entry[field] = redact(' '.join(text.split()))[:limit]
+        return list(notes.values())
 
     def _revisable(self, organization):
         """Open ideas a scout may revise, by lower-case name."""
@@ -3340,6 +3625,7 @@ class Ventures(StudioOperations, StakeholderPanel):
                      'fresh_sessions',
                      'scout_run_id', 'candidate_ids', 'review_count', 'missing', 'unverified', 'problems',
                      'panel_summary', 'consulted', 'stakeholder_exploration', 'pre_screened_ideas',
+                     'stakeholder_screen', 'research_lead', 'research_lead_outcome',
                      'skeptic_silent', 'skeptic_usage')}
             if run.get('consult'):
                 item['consult_roles'] = run['consult']['roles']

@@ -86,7 +86,8 @@ class VentureStoreIntegrationTests(unittest.TestCase):
             transcript_sha256=hashlib.sha256(transcript.read_bytes()).hexdigest())), encoding='utf-8')
 
     def settle(self, run):
-        self.drain()
+        # Preparing the scout and its advisors creates real Git worktrees.
+        self.store.wait_idle(timeout=30)
         self.ventures.advance()
         with closing(self.service.connect()) as db:
             return json.loads(db.execute('SELECT data FROM venture_studio_runs WHERE id=?', (run['id'],)).fetchone()[0])

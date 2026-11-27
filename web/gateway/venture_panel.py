@@ -630,7 +630,7 @@ class StakeholderPanel:
                 if any(advisors.get(note.get('stakeholder')) in reviewers
                        for note in idea.get('stakeholder_screen') or []
                        if isinstance(note, dict) and isinstance(note.get('stakeholder'), str)
-                       and (note.get('objection') or note.get('would_change_view'))):
+                       and (note.get('objection') or note.get('would_change_view') or note.get('follow_up'))):
                     idea['pre_screened'] = True
             cited = {identity for _, idea in entries for identity in cited_evidence_ids(idea)}
             pages = {page['id']: page for page in origin.get('research') or []
@@ -718,7 +718,8 @@ class StakeholderPanel:
             'earlier objections. summary states where the stakeholders disagree.')
         if any(item.get('stakeholder_screen') for item in run['evidence']['ideas']):
             prompt += (' Some ideas list stakeholder_screen: the objections the stakeholders raised on a rough '
-                       'shortlist during the scout, with what the studio did about them. In round 2, '
+                       'shortlist during the scout, with what the studio did about them; a follow_up is the '
+                       'objecting stakeholder\'s answer to a redesigned offer. In round 2, '
                        'say whether each screened objection is answered.')
         if len(prompt) > PANEL_PROMPT_LIMIT:
             raise ValueError('The pitch prompt exceeds the discussion budget.')

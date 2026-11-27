@@ -773,12 +773,39 @@ new ground.
 
 The last three scouts' `research_note`s go into the pack separately as
 `scout_notes`, with their focus. They are context, not rejections. A scout
-settled before `ruled_out` existed has only its note.
+settled before `ruled_out` existed has only its note. A note keeps up to
+1,200 characters; at 600, live notes were cut before saying what to
+investigate.
 
-When the pack is over its byte budget, the oldest notes are dropped first,
-then the oldest ruled-out entries, right after closed history. Without this
-memory each run started from scratch and could spend its whole budget
-re-checking crowded segments an earlier run had already rejected.
+**Research leads.** "Worth investigating next" is not "ready to advance". An
+empty round may leave one `research_lead` (checklist step 13): the decisive
+question, the buyer problem, the offer that failed, the material change that
+could make a different offer work, the decisive unknown and the cheapest
+test, each up to 300 characters; the question and the test are required. Its
+cited ids become URLs, like `ruled_out`, and it keeps the run's focus. A
+round that returns an idea leaves no lead. A lead is not a candidate: it
+takes no backlog slot, goes to no pitch and is never created.
+
+The next scout whose focus shares an area with the lead's (or either has
+none) gets the newest open lead as `research_lead` in its pack. The brief
+points to the pack, which includes the latest progress note and the
+originating round's feedback on omitted ideas when available. The scout
+investigates the decisive unknown first and identifies any check that needs
+private records or a real buyer. For a `superseded` outcome it names the
+proposal that takes up the lead. The gateway checks that the proposal was
+accepted as a candidate. A saved answer can omit the name if it submitted a
+single proposal and that proposal was accepted. The scout reports `retired`
+when evidence answers the question against it and `open` when it needs more
+research. A lead closes on retirement or replacement and expires after five
+subsequent settled scouts. Repeating the carried question preserves its
+original expiry. The Studio tab shows the lead, its outcome and feedback on
+omitted ideas. The Ideas tab names the lead when the latest scout proposed
+nothing.
+
+When the pack is over its byte budget, closed history and older scout notes
+are trimmed first. The originating round's feedback, ruled-out entries,
+lessons and pitch feedback can then be trimmed to preserve the open lead.
+The lead itself can be omitted if the remaining pack still exceeds the budget.
 
 Every scout run also gets a review checklist, `review.md`, written by the
 gateway beside its evidence file, and the prompt tells the Skeptic and the
@@ -1004,13 +1031,64 @@ method:
 2. **Screen a rough shortlist.** For each idea, every stakeholder gives its
    biggest objection and one piece of evidence that would change its view.
    The studio spends its remaining research on that evidence.
-3. **Pivot.** A stronger segment is investigated in the same session. A
+3. **One second attempt.** The scout picks at most one idea the objections
+   would eliminate whose buyer problem may still be worth solving, sets the
+   proposed solution aside and works from the outcome the buyer is failing
+   to achieve. Five questions go in order, each to one member:
+   - **The buyer's workflow** (the target customer, else the industry
+     operator, else the Research Analyst from the evidence): one instance
+     from trigger to outcome, where the current approach works, and where
+     someone still loses time, money or an opportunity. Asking whether the
+     buyer would buy the idea only gets a verdict on the studio's idea; a
+     traced workflow gives it something to design from. A stakeholder's
+     account stays a hypothesis until the analyst supports it.
+   - **The objecting stakeholder:** which assumption makes it say no, and
+     whether the buyer would still have a problem without that assumption.
+     A new offer can address an objection to delivery, price or effort.
+     The analyst checks whether the buyer already achieves the outcome.
+     An unmeasured assumption becomes a test.
+   - **The Research Analyst:** what separates the remaining problem from
+     something the buyer already handles, what is observed versus inferred,
+     and which record would settle it.
+   - **The Portfolio Manager, to the Venture Scout:** two materially
+     different ways to deliver the remaining outcome (who pays, what they
+     get, what they must change, our delivery cost), and which deserves the
+     follow-up.
+   - **The objecting stakeholder again, once:** the revised offer with what
+     changed in buyer, deliverable, price and effort; which part of the
+     objection still applies, what the buyer would choose instead, and the
+     cheapest comparison that could change the decision.
+
+   The scout stops the redesign when the analyst finds evidence that the
+   buyer already achieves the outcome.
+   The Skeptic judges the revised offer through the same checklist (step 8
+   covers it): a candidate when the evidence holds, held when a credible
+   test could flip the verdict, otherwise the round's research lead. The bar
+   for advancing does not change. Before this step the reframe only reached
+   ideas that survived the screen. The method's wording is generic on
+   purpose: industry examples in it would hand the agents an answer instead
+   of testing whether they can find one.
+4. **Pivot.** A stronger segment is investigated in the same session. A
    rating rises only with a cited page, never because a stakeholder liked
    the idea. A promising idea with a named evidence gap can come back held.
 
 The answer returns `stakeholder_exploration` (one entry per stakeholder) and
-each candidate's `stakeholder_screen` (objection, `would_change_view`, and the
-studio's `response`). Both are advisory: an unusable entry is dropped, never
+each candidate's `stakeholder_screen` (objection, `would_change_view`, the
+studio's `response`, and `follow_up`: the objecting stakeholder's answer to a
+redesigned offer, up to 600 characters). Screens of ideas that did not reach
+the candidates go in a top-level `stakeholder_screen`, each entry naming its
+`idea`; the run keeps up to 40 and the Studio tab shows them. A top-level
+entry naming a returned candidate joins that candidate's screen. These were
+dropped before, so an empty round lost every screen.
+
+The unit tests show the gateway carries a redesign through; they supply it.
+Whether the agents can discover one is judged by a blind replay: give a live
+scout a rejected idea from an unrelated business, with no examples or
+suggested solution, and read the transcript. One member should uncover an
+unresolved buyer outcome, another should challenge the evidence for it, and
+the revised offer should change the economics or the work the buyer must do.
+That says more about the studio than a higher average score or more
+published ideas. All of these are advisory: an unusable entry is dropped, never
 a reason to refuse an idea. As with pitch reviews, an entry from a stakeholder
 that did not speak in the transcript is dropped. The run keeps the
 exploration and the roles that spoke (`consulted`). The Studio tab shows the
