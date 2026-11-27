@@ -550,8 +550,10 @@ different buyer problems and earn in different ways. A booking tool with a
 compliance or payments feature added is still a booking tool. A live team had
 filled three rounds with booking software for one industry after another.
 
-Before a scout returns nothing, the review checklist's last question has the
-team look at the round's rejected ideas again. An idea with a credible test
+Before a scout returns nothing, the review checklist's "Look again before
+returning nothing" (question 12) has the team look at the round's rejected
+ideas again. The answer rules name it by its heading, not as "the last
+question", because the checklist grew. An idea with a credible test
 that could change its verdict is a hold, not a reject. A credible test is
 named, can run within the runway, costs little next to the capital, and has
 an outcome that would flip the verdict, such as a paid pilot, a signed partner
@@ -682,6 +684,57 @@ cases apart:
 Vendor pages are read for what they say, not inferred from a feature name, and
 their claims are reported as the vendor's own.
 
+**The benefit the buyer pays for.** Scouts kept proposing a coordination
+layer over fragmented, manual work (Excel, WhatsApp, subcontractors),
+assuming manual work is a paid automation opportunity. Often the limit is not
+the planning but the capacity itself: patients who can attend, qualified
+inspectors, installers and hardware, refrigeration technicians, drivers and
+vans. Better coordination raises the use of existing capacity; it cannot
+create capacity that is not there.
+
+Question 9 of the review checklist, just before the Skeptic's verdict, asks
+the scout to name the one benefit the buyer would pay for and test it with
+evidence of its own kind:
+- **more output:** the extra work the buyer can actually complete and sell
+  (waiting demand plus capacity freed). A no-show rate or idle hours alone do
+  not show the slots can be refilled;
+- **lower cost:** a baseline, the part the idea can recover, and that saving
+  compared with the fee. A buyer at full capacity can still buy a saving, such
+  as the same deliveries with less paid overtime;
+- **less risk:** the event, how likely it is, what it costs, and how the offer
+  lowers that likelihood or cost. Doing the same work in a better order can
+  count, such as inspections ranked by certification deadline cutting lapses
+  with the same staff and spend.
+
+More output may come from capacity the offer adds as well as capacity it
+frees.
+
+It then names what limits the buyer's output (demand, capacity, money or
+coordination). An idea that only organizes the consequences of a shortage,
+with no cost it recovers and no risk it measurably lowers, fails. An unmeasured but plausible benefit is a
+test for a held idea, not a pass. The Skeptic advances an idea only when
+questions 1, 2, 6 and 9 hold, and puts the ids behind its verdict in the
+dissent's `evidence` field: ids named only in the summary never reach the
+stakeholder panel's pitch. The answer example cites the run's own kind of
+source: `W1` for a web scout, `N1` for a feed scout (a feed scout that copied
+`W1` had the whole idea refused). During the shortlist screen the scout also
+asks what would change in a normal week and which record would show it
+(overtime invoices, completed work orders): the target customer when it
+advises, otherwise the industry operator, and nobody when neither is on the
+roster. That answer is a research lead, not evidence.
+
+A pitch pack over its 32 KB limit first drops optional idea details, then
+shortens each source's summary to 160 characters, then drops summaries and
+titles. It never drops a source: each cited id keeps its id, link and scope.
+If the pack is still too large, the last idea is deferred to the next pitch,
+as before. Dropping sources from the end had left ideas citing `W12` with no
+`W12` in the pack.
+
+When this question was added the checklist was renumbered: the verdict, held
+ideas and "Look again before returning nothing" moved to 10, 11 and 12.
+Questions 1 to 8, including question 6, kept their numbers. Older scout notes
+that cite Q9 to Q11 refer to the earlier numbering.
+
 Rejected ideas are listed under `ruled_out`: up to ten
 `{"segment","market","reason","evidence"}` entries per answer, where `market`
 names the buyer and geography the idea was judged for. They are advisory:
@@ -716,8 +769,9 @@ compares with the cheapest cited alternative, whether the business is mostly
 consulting, where the market grows, whether customers with no system yet are a
 better start, what revenue grows with the customer's activity, whether the
 leader could copy the idea within a quarter, how big it realistically gets,
-and which reframe was weighed; the Skeptic advances only when price, delivery
-and the copy question hold. Held ideas are returned too, with their dissent,
+which reframe was weighed, and which benefit the buyer pays for against its
+binding constraint; the Skeptic advances only when price, delivery, the copy
+question and the benefit question hold. Held ideas are returned too, with their dissent,
 so the stakeholder panel and the operator see them (autonomous mode never
 creates one). The scout omits rejected ideas and returns up to the round cap.
 

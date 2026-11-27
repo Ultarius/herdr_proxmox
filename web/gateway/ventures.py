@@ -239,18 +239,46 @@ replaces the earlier idea.
    different customer (new entrants instead of switchers), a different revenue
    line (activity-linked) or a different first offer. Keep the stronger
    version and name the reframe you weighed in the dissent summary.
-9. **The verdict follows.** The Skeptic advances an idea only when questions
-   1, 2 and 6 hold. It holds an idea that fails one of them but has a reframe
-   or evidence worth testing, and rejects the rest.
-10. **Return held ideas too.** Put advanced and held ideas in the answer, each
+9. **The benefit the buyer pays for.** Name the one benefit the buyer would
+   pay for, then test that claim with evidence of its own kind:
+   - **More output** (more jobs, visits or deliveries): show the extra work
+     the buyer can actually complete and sell, meaning demand that is waiting
+     and capacity this idea adds or frees. A measured no-show rate or idle
+     hours are not enough: show that those slots can be refilled.
+   - **Lower cost** (overtime, agency fees, fuel, penalties, write-offs): give
+     the baseline, the part this idea can recover, and compare that saving
+     with the proposed fee. A buyer at full capacity can still buy this: the
+     same 40 deliveries with two fewer hours of paid overtime is a saving.
+   - **Less risk** (a fine, a lost contract, a failed audit, a lapsed
+     certificate): name the event, how likely it is and what it costs, and
+     show how the offer lowers that likelihood or cost. Doing the same work
+     in a better order can count: inspections ranked by certification
+     deadline can cut lapses with the same staff, spend and number of
+     inspections.
+   Then name what limits the buyer's output today: demand, capacity (people,
+   equipment, vehicles, slots), money or coordination. Better planning raises
+   the use of existing capacity; it does not create capacity that is not
+   there. An idea that only organizes the consequences of a shortage, with no
+   cost it recovers and no risk it measurably lowers, fails this question: reshuffling a fully booked
+   technician, queueing patients or inspections faster, or coordinating
+   installers who have no free weeks. When the benefit is plausible but
+   unmeasured, that is a test for a held idea (measure it at a pilot
+   customer), not a pass. Say in the dissent summary which benefit and which
+   constraint you named, and put the evidence ids for them in the dissent's
+   "evidence" field, so the stakeholder panel sees those sources too.
+10. **The verdict follows.** The Skeptic advances an idea only when questions
+    1, 2, 6 and 9 hold. It holds an idea that fails one of them but has a
+    reframe or evidence worth testing, and rejects the rest. The dissent's
+    "evidence" lists the ids that support the verdict.
+11. **Return held ideas too.** Put advanced and held ideas in the answer, each
     with its dissent verdict and what is missing, so the stakeholder panel and
     the operator can judge them; a held idea is never created unattended.
     Return the strongest eligible ideas up to the round's cap. Leave rejected
     ideas out of the candidates and list them under "ruled_out" with the
     reason.
-11. **Look again before returning nothing.** When the second batch in the
+12. **Look again before returning nothing.** When the second batch in the
     answer rules has failed too, check the round's rejected ideas once more
-    against question 9. An idea with a credible test that could change its
+    against question 10. An idea with a credible test that could change its
     verdict is a hold, not a reject. A credible test is named, can run within
     the runway, costs little next to the venture's capital, and has an
     outcome that would flip the verdict: a paid pilot, a signed partner, or a
@@ -284,8 +312,8 @@ a question open.
 2. **Screen a rough shortlist.** When the studio has a shortlist (a name, one
    line and the key numbers per idea), send it to every stakeholder and ask
    for its biggest objection to each idea, and one piece of evidence that
-   would change its view. Use the answers to decide where to spend the
-   remaining research time: look for exactly that evidence.
+   would change its view.{record_question} Use the answers to decide where to
+   spend the remaining research time: look for exactly that evidence.
 3. **Pivot when a segment looks stronger.** If an answer points to a stronger
    segment or idea, investigate it in this same session and drop the weaker
    idea. Respect the configured exclusions. Raise a confidence rating only
@@ -305,6 +333,25 @@ a question open.
 The stakeholders review the final ideas again in the pitch that follows this
 round. That review is theirs, so do not ask them to approve an idea now.
 '''
+# Who can say what a working idea would change on the ground: the buyer when
+# it advises, otherwise the operator. An investor or a market leader cannot.
+_RECORD_QUESTIONS = (
+    ('customer', ' Also ask the target customer, for each idea: "If this worked tomorrow, what would change '
+                 'in a normal week, and what record would show it?"'),
+    ('operator', ' Also ask the industry operator, for each idea: "If this worked tomorrow, which record '
+                 'would you inspect to see what changed in a normal week?"'),
+)
+
+
+def scout_consult_method(roles):
+    """The stakeholder guide for this roster: the record question goes to the
+    customer when present, else the operator, else it is left out."""
+    question = next((text for role, text in _RECORD_QUESTIONS if role in (roles or ())), '')
+    if question:
+        question += (' An answer such as overtime invoices, agency bills or completed work orders names the '
+                     'benefit and the record to research for the review checklist\'s question 9; it stays a '
+                     'research lead, not evidence.')
+    return STUDIO_CONSULT_METHOD.replace('{record_question}', question)
 # The scout's answer rules, written beside the evidence file. They are long
 # and fixed, and the prompt they used to fill sat at its 8,000-character
 # limit: any longer focus or one more stakeholder sentence refused the run.
@@ -349,8 +396,8 @@ def scout_answer_rules():
             'requires, a larger buyer than a one-person business, or a share of money it moves or saves. Each '
             'batch weighs at least two materially different offers: they solve different buyer problems and '
             'earn in different ways. A booking tool with a compliance or payments feature added is still a '
-            'booking tool. When that second batch fails too, apply the review checklist\'s last question: hold '
-            'an idea only when a credible test could change its verdict.',
+            'booking tool. When that second batch fails too, apply the review checklist\'s "Look again before '
+            'returning nothing": hold an idea only when a credible test could change its verdict.',
             'AFTER EMPTY ROUNDS: when the pack has "empty_streak", the last scouts returned no ideas. Treat that '
             'as a sign the search method is wrong, not that there are no ideas, and change the method this '
             'round. Do not start from an industry and the product it might buy. Start from a timing driver: a '
@@ -421,6 +468,9 @@ def scout_answer_rules():
             'Use only allowed studio source URLs in configuration.sources.feeds.',
         ]),
         ('Optional: leave out what you cannot cite', [
+            'dissent.evidence: up to 3 ids behind the Skeptic\'s verdict, including the benefit and constraint '
+            'evidence from the review checklist\'s question 9. Ids named only in the summary are not passed to '
+            'the stakeholder panel.',
             'analogue, incumbent, market_ceiling (every account it could serve) and expansion (later modules, '
             'share of customers buying) are cited upside, never counted in break-even.',
             'pricing (a short text), revises with revision_note (to replace an open idea), research_note, '
@@ -2488,7 +2538,7 @@ class Ventures(StudioOperations, StakeholderPanel):
                     '"amount":0,"currency":"EUR","period":"month|year"}]},'
                     '"delivery_effort":{"expert_days":2,"day_rate":{"amount":0,"currency":"EUR"}},'
                     '"evidence_against":[{"claim":"...","evidence":["W1"]}],'
-                    '"dissent":{"verdict":"advance|hold|reject","summary":"..."},'
+                    '"dissent":{"verdict":"advance|hold|reject","summary":"...","evidence":["W1"]},'
                     '"first_offer":"...","time_to_first_payment_days":30,'
                     '"confidence_dimensions":{'
                     + ','.join('"' + key + '":{"rating":"weak|medium|strong","evidence":["W1"]}'
@@ -2512,6 +2562,10 @@ class Ventures(StudioOperations, StakeholderPanel):
                     + str(run['policy']['studio_max_candidates']) + '. Empty candidates only as '
                     + STUDIO_REVIEW_FILE + ' allows.\n'
                     'Evidence index: ')
+            if not web:
+                # A feed scout has no W pages: an example citing W1 was copied
+                # as is and refused the whole idea. Show a feed item id instead.
+                head = head.replace('["W1"]', '["N1"]')
         if len(head) + PROMPT_INDEX_RESERVE > PROMPT_LIMIT:
             # Long focus areas or many exclusions: name them by reference, so
             # the evidence index still has room. The pack's policy holds both
@@ -2757,7 +2811,8 @@ class Ventures(StudioOperations, StakeholderPanel):
         files = {STUDIO_REVIEW_FILE: STUDIO_REVIEW_CHECKLIST, STUDIO_RULES_FILE: scout_answer_rules()}
         if run.get('consult'):
             files[STUDIO_CONSULT_FILE] = (
-                STUDIO_CONSULT_METHOD + '\nUse these exact stakeholder role keys in the answer. '
+                scout_consult_method(run['consult']['roles'])
+                + '\nUse these exact stakeholder role keys in the answer. '
                 'Match each profile ID to its alias in the meeting roster.\n\n'
                 + '\n'.join(role + ': ' + run['consult']['members'][role] for role in run['consult']['roles'])
                 + '\n')

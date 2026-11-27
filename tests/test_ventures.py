@@ -1878,6 +1878,7 @@ class VentureTests(unittest.TestCase):
         run = self.studio(mode='studio_run', kind='scout')
         self.assertTrue(run['web_research'])
         self.assertIn('RESEARCH THE WEB YOURSELF', run['prompt'])
+        self.assertIn('"dissent":{"verdict":"advance|hold|reject","summary":"...","evidence":["W1"]}', run['prompt'])
         self.assertIn('suggested_sources', run['prompt'])
         self.assertTrue(json.loads(Path(run['evidence_file']).read_text(encoding='utf-8'))['web_research'])
         # The review checklist sits beside the evidence, and the prompt sends the team to it.
@@ -2945,6 +2946,10 @@ class VentureTests(unittest.TestCase):
         rules = ' '.join(ventures.scout_answer_rules().split())
         self.assertIn('LEARN FROM WHAT FAILED', rules)
         self.assertIn('use it for revisions and to test new ideas', second['prompt'])
+        # A feed scout's example cites feed items: W1 there was copied and refused the idea.
+        self.assertIn('"dissent":{"verdict":"advance|hold|reject","summary":"...","evidence":["N1"]}',
+                      second['prompt'])
+        self.assertNotIn('["W1"]', second['prompt'])
 
     def test_an_existing_tool_is_priced_against_and_only_the_leader_fails_question_6(self):
         # A live round rejected seven segments under question 6 because any
@@ -2965,6 +2970,49 @@ class VentureTests(unittest.TestCase):
         rules = ' '.join(ventures.scout_answer_rules().split())
         self.assertIn('when it failed a segment only because a tool or a small vendor already sells the idea', rules)
         self.assertIn('A vendor page that only lists a product or a price shows supply, not spending', rules)
+
+    def test_an_idea_must_name_the_benefit_the_buyer_pays_for_before_the_verdict(self):
+        # Five ideas in a row coordinated a resource that was simply scarce:
+        # patients, inspectors, installers, technicians, drivers.
+        checklist = ' '.join(ventures.STUDIO_REVIEW_CHECKLIST.split())
+        for rule in ('9. **The benefit the buyer pays for.**',
+                     'it does not create capacity that is not there',
+                     # A saving at full capacity is a reason to buy; a no-show
+                     # rate alone is not proof the slots can be refilled.
+                     'the same 40 deliveries with two fewer hours of paid overtime is a saving',
+                     'show that those slots can be refilled',
+                     'compare that saving with the proposed fee',
+                     'that is a test for a held idea (measure it at a pilot customer), not a pass',
+                     'put the evidence ids for them in the dissent\'s "evidence" field',
+                     '10. **The verdict follows.** The Skeptic advances an idea only when questions 1, 2, 6 and 9 hold.',
+                     '12. **Look again before returning nothing.**', 'against question 10.'):
+            self.assertIn(rule, checklist)
+        # The benefit question comes before the verdict that depends on it.
+        self.assertLess(checklist.index('9. **The benefit'), checklist.index('10. **The verdict'))
+        rules = ' '.join(ventures.scout_answer_rules().split())
+        # The fallback is named by its heading, not as "the last question".
+        self.assertIn('apply the review checklist\'s "Look again before returning nothing"', rules)
+        self.assertNotIn('last question', rules)
+        self.assertIn('Ids named only in the summary are not passed to the stakeholder panel', rules)
+        # The record question goes to whoever can answer it on this roster.
+        method = ' '.join(ventures.scout_consult_method(['investor', 'customer', 'operator']).split())
+        self.assertIn('Also ask the target customer, for each idea: "If this worked tomorrow, what would '
+                      'change in a normal week, and what record would show it?"', method)
+        self.assertNotIn('Also ask the industry operator', method)
+        self.assertIn('it stays a research lead, not evidence', method)
+        method = ' '.join(ventures.scout_consult_method(['investor', 'operator']).split())
+        self.assertIn('Also ask the industry operator, for each idea: "If this worked tomorrow, which record '
+                      'would you inspect to see what changed in a normal week?"', method)
+        self.assertNotIn('target customer, for each idea', method)
+        method = ' '.join(ventures.scout_consult_method(['investor', 'competitor']).split())
+        self.assertNotIn('If this worked tomorrow', method)
+        self.assertNotIn('{record_question}', method)
+        # A saving or a lowered risk can pass with the same capacity.
+        for rule in ('capacity this idea adds or frees',
+                     'show how the offer lowers that likelihood or cost',
+                     'inspections ranked by certification deadline can cut lapses with the same staff',
+                     'with no cost it recovers and no risk it measurably lowers, fails this question'):
+            self.assertIn(rule, checklist)
 
     def test_a_rejection_reason_reaches_agents_redacted_and_ahead_of_old_archives(self):
         self.setup_studio_manual()
@@ -3215,6 +3263,27 @@ class VentureTests(unittest.TestCase):
             (backlog_idea['source_scope'], 'W1'): self.RESEARCH[0]['url'],
             (backlog_idea['source_scope'], 'W2'): old_page['url'],
         })
+
+    def test_a_large_pitch_shortens_its_sources_but_keeps_every_cited_one(self):
+        # Three ideas citing W12 in their dissent once reached the panel with
+        # only W1-W4: the reducer dropped sources from the end.
+        from venture_panel import PitchPackTooLarge
+        scout = dict(id='s' * 32, organization_id='org', research=[
+            dict(id='W' + str(number), url='https://source.example/' + str(number), title='Title ' * 15,
+                 claim='What the page shows. ' * 30) for number in range(1, 13)])
+        ideas = [dict(name='Idea ' + str(number), run_id=scout['id'],
+                      evidence=['W' + str(page) for page in range(1, 12)],
+                      dissent=dict(verdict='hold', summary='Held.', evidence=['W12'])) for number in range(3)]
+        full = len(json.dumps(self.ventures._pitch_pack(scout, ideas), ensure_ascii=False).encode())
+        with patch('venture_panel.PANEL_PACK_LIMIT', full - 3000):
+            pack = self.ventures._pitch_pack(scout, ideas)
+        self.assertEqual([source['id'] for source in pack['sources']], ['W' + str(n) for n in range(1, 13)])
+        self.assertTrue(all(source['url'] and len(source['claim']) <= 160 for source in pack['sources']))
+        # Shortening is not enough: the batch is refused, and the caller
+        # defers its last idea rather than sending a citation with no source.
+        with patch('venture_panel.PANEL_PACK_LIMIT', 600):
+            with self.assertRaises(PitchPackTooLarge):
+                self.ventures._pitch_pack(scout, ideas)
 
     def test_an_oversize_batch_defers_the_backlog_idea_to_the_next_pitch(self):
         self.setup_studio_manual()

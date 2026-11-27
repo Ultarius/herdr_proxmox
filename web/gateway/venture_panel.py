@@ -55,6 +55,8 @@ PANEL_KEEP_REVIEWS = 24
 PANEL_FEEDBACK_IDEAS = 6
 PANEL_PITCH_IDEAS = 6  # Earlier open ideas join a round's new ideas up to this many.
 PANEL_PACK_LIMIT = 32000
+# A source's claim is first cut to this when a pitch pack is over its limit.
+PANEL_SOURCE_CLAIM = 160
 PANEL_PROMPT_LIMIT = 8000
 PITCH_ANNOTATIONS = ('round', 'previous_feedback', 'stakeholder_screen', 'review_notes', 'revision_note')
 
@@ -608,9 +610,20 @@ class StakeholderPanel:
                 break
             for idea in pack['ideas']:
                 idea.pop(key, None)
-        while size() > PANEL_PACK_LIMIT and pack['sources']:
-            pack['sources'].pop()
+        # Then shorten what each source says, never which sources there are:
+        # dropping sources from the end left ideas citing an id the pack no
+        # longer explained. The id, the link and the scope always stay.
+        for step in ('claim_short', 'claim', 'title'):
+            if size() <= PANEL_PACK_LIMIT:
+                break
+            for source in pack['sources']:
+                if step == 'claim_short':
+                    if isinstance(source.get('claim'), str) and len(source['claim']) > PANEL_SOURCE_CLAIM:
+                        source['claim'] = source['claim'][:PANEL_SOURCE_CLAIM - 3].rstrip() + '...'
+                else:
+                    source.pop(step, None)
         if size() > PANEL_PACK_LIMIT:
+            # The caller defers the last idea to the next pitch.
             raise PitchPackTooLarge('The pitch exceeds its byte budget even without supporting detail.')
         return pack
 
