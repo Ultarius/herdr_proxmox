@@ -488,7 +488,14 @@ it. The gateway refuses a candidate that omits any of these fields:
 - `reachable_accounts`: a cited count and the segment it covers (the segment
   at most 300 characters, as for `market_ceiling`; names and the buyer role
   at most 120, the buyer budget 200). The answer rules state these limits,
-  and a refusal names the field, its length and the limit;
+  and a refusal names the field, its length and the limit. `basis` says how
+  the count was obtained: `counted` when a cited source states it,
+  `estimated` (the default) when the scout derived it. A count claimed as
+  counted that its sources do not state is stored as an estimate, with a
+  review note. The brief's header reads "Reachable accounts (estimated)" and
+  break-even reads "10% of the 400 estimated reachable accounts", so a
+  planning figure no longer reads as a published one (the CrossDockDesk
+  brief called its derived 400 traders "cited");
 - `business_model`: `saas`, `service`, `productised_service` or `hybrid`, with
   one-off, recurring, per-unit, take-rate and credit revenue lines. A
   recurring line states its `period` (`month` or `year`). A `per_unit` line is
@@ -499,8 +506,22 @@ it. The gateway refuses a candidate that omits any of these fields:
   a credit reduces the first year of that revenue, so it needs one of them.
   A `one_off` line is the price of one project; a fee per site or file adds
   `unit` and `units` (how many one project covers), so EUR 1,500 per site
-  for a 3-site pilot counts as EUR 4,500 against that pilot's delivery days;
-- `delivery_effort`: expert days and a day rate, for one project;
+  for a 3-site pilot counts as EUR 4,500 against that pilot's delivery days.
+  A one-off fee that pays for months of service adds `covers_months` (1-12):
+  year one counts the recurring price only after them. ClaimDesk's EUR 1,450
+  3-month pilot then EUR 99 a month is EUR 2,341 in year one, not EUR 2,638,
+  and CrossDockDesk's EUR 990 season prepay with `covers_months: 12` is
+  EUR 990, not EUR 1,578. A hybrid without it gets a review note asking
+  whether the fee covers months the year also charges. A `per_unit` line may
+  add `units_range` (`low`, `high`) around its `units` for the price
+  comparison;
+- `delivery_effort`: expert days and a day rate, for one project, and
+  `monthly_hours`, required: the service hours each customer needs every
+  month after onboarding (support, a concierge import, transcribing phone or
+  chat replies), 0 when none. They cost the day rate over 8 hours and come off
+  the monthly contribution break-even uses. At EUR 400 a day, one hour a month
+  is EUR 50, which turns a EUR 49 subscription's contribution negative and
+  raises a warning;
 - `evidence_against`: at least one cited page or reason that weakens the idea;
 - `dissent`: the Skeptic's structured `advance`, `hold` or `reject` verdict,
   with a summary of at most 1,200 characters. The summary answers the review
@@ -714,7 +735,13 @@ studio could arrive "before an incumbent bundles it". The checklist now says:
   record that stops the buyer typing the same data twice. The bundle fails
   question 6 when one incumbent (an ERP or suite) already sells the whole set
   to these buyers. Its first offer is still one module that sells alone; the
-  rest is expansion and defensibility, never break-even.
+  later modules belong under expansion. A paid first offer must work on its own.
+  For each priced add-on, record the workflow or record it reuses (`shared_input`)
+  and the observable decision that would justify selling it (`purchase_test`).
+  For example, a buyer can purchase an audit of one settlement file. Monitoring
+  becomes a separate opportunity if the buyer supplies a second file and pays
+  to repeat the check. Until monitoring is contracted, its price and assumed
+  adoption stay in expansion and contribute zero to base break-even.
 
 During the shortlist screen the market leader is asked what matching a lower
 price would cost it across its customers, and the target customer (else the
@@ -738,8 +765,9 @@ the gateway does the arithmetic:
 | `bundle` | `stack`: 2-6 different sellers the buyer pays today, each with price, period and evidence | the stack's monthly total and the saving | the bundle costs more than the stack, or less than 5% below it without a `shared_record` |
 | `segment` | `leader` (name and evidence; price optional) and `unserved` | our price per month | never on the figures |
 
-Our side is what the buyer pays a month in year one: one-off fees plus twelve
-months of recurring revenue, less credits, over twelve. A price within 15% of
+Our side is what the buyer pays a month in year one: one-off fees plus the
+recurring revenue for the months after the period they cover, less credits,
+over twelve. A price within 15% of
 the leader's gets the note "assume it matches". Every price and customer count
 cites the evidence it was read from. When none of the cited sources states the
 number (thousands separators and decimal commas are read as written), the
@@ -758,6 +786,23 @@ gateway multiplies the fee by the stated monthly volume, and the pitch and
 Ideas tab show the assumption. For example, USD 89 per job at eight jobs a
 month is USD 712 a month. Compare offers at the same workload. A volume
 absent from its cited sources gets a note for review.
+
+A single workload hides where an advantage ends, so a per-unit price may add
+`units_range` with a `low` and `high` volume around `units_per_month` (2
+users at a small contractor, 20 at a large one), and our own per-unit lines
+may too; a share-of-volume (`take_rate`) line gives `volume_range` around its
+monthly volume. Every usage-based price on both sides needs its range, or
+the comparison stays at the typical volume with a note saying so. What the
+buyer pays at each volume includes the share passed on to the network. The gateway then compares both sides at the low and high volume as
+well. The typical volume still decides a refusal; each other point where the
+price or bundle advantage disappears becomes a note, such as "At the low
+volume (Bouwportaal at 10 user a month), Bouwportaal costs 50 USD a month
+against our 100: the price advantage disappears." When a flat price meets a
+per-unit leader, the gateway also names the volume where they are equal
+(`crossover_units`): "Our year-one price matches Bouwportaal's at 20 user a
+month; below that Bouwportaal is cheaper." A range its cited sources do not
+state gets a note. Alternatives accept the same per-unit prices, so the
+price review note can compare a per-user tool at its cited volume.
 
 **Checking a draft during the meeting.** A meeting used to learn that an idea
 was refused (a past kill date, a missing citation, broken revenue lines) only
@@ -1070,9 +1115,14 @@ changes it. Alternative prices may state a `period`.
 
 The questions the gateway can check become `review_notes` on the candidate,
 shown on the card and in the brief. Like kill-criteria notes they never refuse
-or hold an idea: a price more than 10% above the cheapest cited software
-alternative with a period, delivery costing more than half of a customer's
-first-year revenue, and no per-unit or take-rate revenue. For service models,
+or hold an idea: a year-one price per month more than 10% above the cheapest
+cited software alternative with a period (a per-unit one at its cited
+volume), a one-off fee beside a subscription without `covers_months`,
+break-even against an estimated reach, delivery costing more than half of a
+customer's first-year revenue, and no per-unit or take-rate revenue. The
+price note used to compare the subscription after the pilot, so
+CrossDockDesk's EUR 49 passed against GroenVision's EUR 52 while the buyer
+paid EUR 82.50 to EUR 131.50 a month in year one. For service models,
 the delivery note compares the cost per project with the project price.
 Services with recurring revenue also get the price and usage-based revenue checks.
 The gateway recomputes these notes when the operator edits the idea.
@@ -1091,11 +1141,14 @@ month in the market currency:
   recurring price (an annual fee counts as a twelfth), the share of the cited
   reachable accounts that is, and roughly how many new customers a month are
   needed to get there between the first payment and the end of the runway;
-- first-year revenue and contribution per customer: one-off fees plus twelve
-  months of recurring revenue, minus credits, minus the delivery effort.
+- first-year revenue and contribution per customer: one-off fees plus the
+  recurring revenue for the months after the period they cover, minus
+  credits, minus the delivery effort and twelve months of service hours;
+- the monthly contribution: the recurring price less the monthly service
+  hours at the day rate.
 
-Variable costs beyond the stated delivery effort are not modelled, so the
-break-even is a floor. These figures are stored on the candidate, shown on the
+Variable costs beyond the stated delivery effort and service hours are not
+modelled, so the break-even is a floor. These figures are stored on the candidate, shown on the
 Ideas card and in the approval dialog, and recomputed if the operator edits the
 configuration. Warnings (a losing first offer, a service with no one-off
 revenue to fund delivery, a break-even above the reachable accounts, a first
@@ -1113,6 +1166,95 @@ pilot decides the item; a bare amount, such as a competitor's price, does not)
 are stored as `kill_criteria_notes` and
 shown on the card as criteria to tighten, so they do not cost an otherwise
 sound idea. Operator edits are checked the same way.
+
+A criterion that sets a saving or recovery bar (saved, recovered, credits,
+refund, benefit) in the market currency below what the buyer pays in year
+one, or for the project, gets a note too: the pilot would pass a buyer who
+loses money on it. A monthly bar counts twelve times. ClaimDesk killed the
+idea only when recovered credits fell below EUR 1,450 a year while the buyer
+paid EUR 2,341, and the customer stakeholder answered "the design accepts
+recovery below what I pay." The answer rules also ask the first offer to tie
+its refund or credit to that bar.
+
+**Three more benefit checks.** The panel's operator and customer rejected
+ClaimDesk on points the checklist did not ask, and question 9 now asks them
+of every idea:
+
+- **Does the cited change help the buyer act, or stop them?** ClaimDesk cited
+  tree scarcity as its timing driver, but in a sellers' market contractors
+  do not press claims against the few traders they depend on.
+- **Who produces the first input, and when?** Crews unloading a late truck
+  do not count trees or get a signature, so the missing record, not the
+  claim letter, was the problem. CrossDockDesk's supplier replies arrive by
+  voice and WhatsApp and need someone to transcribe them. The product must
+  capture the input where it happens, or the pilot must test that step
+  first. The stakeholder guide asks the customer (else the operator) who
+  writes down that first figure today.
+- **Does the pass bar cover what the buyer pays?** As above.
+
+**Price from the buyer's benefit, and count what winning a customer costs.**
+CrossDockDesk and ClaimDesk priced against the cheapest tool (EUR 49 and
+EUR 99 a month) and could not fund their own delivery. A redesign the operator
+wrote by hand, TradeProof, started instead from the buyer's loss (about
+EUR 15,000 a year) and priced at half of it. The studio now does the same
+arithmetic:
+
+- `benefit` (optional): what the buyer gains in cash, `{"kind":
+  "cost|output|risk", "amount", "currency", "period", "basis":
+  "measured|estimated", "evidence" or "reason"}`. A measured benefit cites
+  its baseline. Time counts only where it cuts paid hours. The gateway
+  divides it by what the buyer pays in year one (`roi_multiple`). Below 2×
+  is a note ("few buyers change how they work for it"); 5× or more, or 3×
+  with a price that does not fund delivery, service and acquisition, is a
+  note to price from the loss. An idea without a benefit gets a note.
+  For a recovery offer, `comparison.with_offer` and `comparison.without_offer`
+  describe value actually received or expected on comparable workloads in the
+  same period and currency. The gateway subtracts the baseline, including
+  existing credits or replacements. It then subtracts all contracted year-one
+  fees and any stated `benefit.buyer_cost_year_one` for the buyer's own work.
+  In the illustrative ClaimDesk case, EUR 4,500 received less EUR 1,500
+  already recovered leaves EUR 3,000 attributable to the offer. The EUR 1,450
+  pilot and nine EUR 99 payments leave EUR 659 before buyer-side costs.
+  Hypothetical inputs stay estimated, and a negative difference is retained.
+  A processing fee includes the portion passed to the payment network in what
+  the buyer pays. Only the retained portion funds the venture.
+- `acquisition_cost` (required): the fully loaded cost of winning one
+  customer, with evidence or a reason; 0 needs a reason. The gateway
+  reports the months of contribution that repay it (`payback_months`) and
+  the first year, or first project, after it. A first year that does not
+  repay it is a warning; payback beyond 12 months is a note. Both investor
+  reviews had asked for it.
+- **Studio cost floor** (Studio settings, optional, such as 6500 EUR): the
+  least an idea costs a month, for founder pay and sales. A scout whose
+  monthly costs are lower gets an "Operator cost floor" burn line for the
+  difference, recorded in `scout_adjusted.burn` and shown on the Ideas
+  card. Capital stays as proposed, so the runway shortens. The earlier
+  briefs ran on EUR 2,010 a month with nobody paid to sell.
+
+**Read the panel's objections as a design brief.** The pack already carried
+`stakeholder_feedback`, but the rules only asked the scout to check new ideas
+against it. They now also ask it to group the objections by what they blame,
+and, when two held ideas sit on either side of one transaction, to weigh one
+idea for the party in the middle that holds both records and pays alone.
+That is the move behind TradeProof: the tree wholesaler between growers and
+contractors. Question 8 lists it as a reframe.
+
+**Standard tests.** Question 6's test for whether the leader can build the
+idea is a scripted demo of the exact transaction by the leader and the
+buyer's installed vendor; the market-leader stakeholder is asked whether its
+product could run it today. Question 9's test for a benefit is a pilot with a
+control: the buyer's current tool or a free, improved spreadsheet template.
+
+**What would raise each rating.** Each confidence dimension below strong may
+carry `raise`: the evidence that would move it up one step. The brief shows
+it in a "What would raise it" column and the Ideas card under the
+dimensions. The score stays tied to evidence: a redesign shows its path to a
+higher score instead of claiming one. An incumbent's paying customers establish
+category spending. The scout reserves strong paid demand for evidence that
+a target buyer paid or signed at a stated price for this offer. A second paid
+purchase can support recurring potential. Documented dependence on a shared
+record can support defensibility. An assumed module adoption rate supplies
+neither observation. Ratings remain the agents' judgments.
 
 Because those pages are unverified, **autonomous mode never creates a venture
 from web research alone**; such a candidate waits for the operator.

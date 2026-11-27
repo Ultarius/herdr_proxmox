@@ -110,6 +110,14 @@ def _price(price):
     return _money(price.get('amount'), price.get('currency')) if isinstance(price, dict) else 'Price not public'
 
 
+_REACH_LABELS = dict(counted='counted', estimated='estimated')
+
+
+def _reach_label(basis):
+    """How a reach figure was obtained; ideas recorded before the basis say cited."""
+    return _REACH_LABELS.get(basis, 'cited')
+
+
 def _cite(ids):
     ids = [str(item) for item in ids or [] if item]
     return ' <span class="cite">[' + _e(', '.join(ids)) + ']</span>' if ids else ''
@@ -134,13 +142,16 @@ def cited_evidence_ids(candidate):
             if isinstance(item, str) and item not in seen:
                 seen.append(item)
     add(candidate.get('evidence'))
-    for key in ('prior_state', 'buyer', 'reachable_accounts', 'dissent', 'analogue', 'market_ceiling'):
+    for key in ('prior_state', 'buyer', 'reachable_accounts', 'dissent', 'analogue', 'market_ceiling',
+                'benefit', 'acquisition_cost'):
         if isinstance(candidate.get(key), dict):
             add(candidate[key].get('evidence'))
-    for key in ('alternatives', 'evidence_against'):
+    for key in ('alternatives', 'evidence_against', 'expansion'):
         for item in candidate.get(key) or []:
             if isinstance(item, dict):
                 add(item.get('evidence'))
+                if key == 'alternatives' and isinstance(item.get('price'), dict):
+                    add(item['price'].get('usage_evidence'))
     business = candidate.get('business_model')
     for line in (business.get('revenue_lines') or []) if isinstance(business, dict) else []:
         if isinstance(line, dict):
@@ -185,6 +196,9 @@ def _sources(candidate, run):
                 known.setdefault(item['id'], dict(id=item['id'],
                                                   title=item.get('title') or 'Lesson from an earlier venture',
                                                   claim='Lesson from this studio\'s own ventures'))
+        for item in evidence.get('ventures') or []:
+            if isinstance(item, dict) and item.get('id'):
+                known.setdefault(item['id'], dict(id=item['id'], title=item.get('name'), claim=item.get('thesis')))
     lines = []
     for identity in cited_evidence_ids(candidate):
         link = known.get(identity)
@@ -244,16 +258,59 @@ def _economics(candidate):
     if project:
         rows.append(('Contribution', _money(economics.get('contribution'), currency) + ' per project after delivery'))
     else:
-        rows.append(('Contribution', _money(economics.get('contribution'), currency)
-                     + ' per customer a month'))
+        service = economics.get('service_cost_monthly')
+        hours = economics.get('service_hours_monthly')
+        rows.append(('Contribution', _money(economics.get('contribution'), currency) + ' per customer a month'
+                     + (' after ' + _e(format(hours, 'g')) + ' service hours (' + _money(service, currency) + ')'
+                        if service else ' (no monthly service hours stated)' if hours == 0 else '')))
         if economics.get('first_year_revenue') is not None:
+            months = economics.get('first_year_paid_months')
             rows.append(('First year per customer', _money(economics.get('first_year_revenue'), currency)
                          + ' revenue, ' + _money(economics.get('first_year_contribution'), currency)
-                         + ' after delivery and credits'))
+                         + ' after delivery, service and credits'
+                         + (' · the first offer covers ' + _e(12 - months) + ' months, so '
+                            + _e(months) + ' months of subscription follow'
+                            if isinstance(months, int) and months < 12 else '')))
+            spread = economics.get('first_year_range')
+            if isinstance(spread, dict) and spread.get('low') is not None:
+                rows.append(('First year by volume', ' · '.join(
+                    point + ' ' + _money(spread.get(point), currency) for point in ('low', 'typical', 'high'))))
     if economics.get('project_contribution') is not None:
         days = economics.get('pilot_break_even_days')
         rows.append(('First offer margin', _money(economics.get('project_contribution'), currency) + ' per pilot'
                      + (' · loses money above ' + _e(days) + ' expert days' if days is not None else '')))
+    if economics.get('acquisition_cost') is not None:
+        acquisition = candidate.get('acquisition_cost') or {}
+        payback, left = economics.get('payback_months'), economics.get('contribution_after_acquisition')
+        rows.append(('Winning a customer', _money(economics['acquisition_cost'], currency)
+                     + (' · repaid in ' + _e(payback) + ' months of contribution' if payback is not None else '')
+                     + (' · ' + _money(left, currency) + ' left from the '
+                        + ('first project' if project else 'first year') if left is not None else '')
+                     + _cite(acquisition.get('evidence'))
+                     + ('<br>' + _e(acquisition['reason']) if acquisition.get('reason') else '')))
+    benefit = candidate.get('benefit') if isinstance(candidate.get('benefit'), dict) else {}
+    if economics.get('benefit_yearly') is not None:
+        roi = economics.get('roi_multiple')
+        rows.append(('Buyer benefit', _money(economics['benefit_yearly'], currency) + ' a year, '
+                     + _e(benefit.get('basis') or 'estimated') + ' (' + _e(benefit.get('kind') or 'benefit') + ')'
+                     + _cite(benefit.get('evidence'))
+                     + (' · ' + _e(format(roi, 'g') if isinstance(roi, (int, float)) else roi)
+                        + '&times; what the buyer pays in '
+                        + ('the project' if project and 'buyer_cost_year_one' not in economics else 'year one')
+                        if roi is not None else '')
+                     + ('<br><span class="muted">' + _e(benefit['reason']) + '</span>' if benefit.get('reason')
+                        else '')))
+        comparison = benefit.get('comparison')
+        if comparison:
+            rows.append(('Value received per ' + benefit['period'],
+                         _money(comparison['with_offer'], benefit['currency']) + ' with the offer, '
+                         + _money(comparison['without_offer'], benefit['currency']) + ' under the current process'))
+        if economics.get('buyer_net_year_one') is not None:
+            rows.append(('Buyer net benefit in year one', _money(economics['buyer_net_year_one'], currency)
+                         + ' after ' + _money(economics['buyer_fees_year_one'], currency) + ' in fees'
+                         + (' and ' + _money(benefit['buyer_cost_year_one'], benefit['currency'])
+                            + ' in buyer-side costs' if 'buyer_cost_year_one' in benefit
+                            else ', before any unreported buyer-side costs')))
     mix = economics.get('revenue_mix') if isinstance(economics.get('revenue_mix'), dict) else {}
     if mix.get('per_unit') or mix.get('take_rate'):
         # Revenue that grows with the customer is what makes the idea scale.
@@ -283,8 +340,8 @@ def _economics(candidate):
         if project and economics.get('accounts_needed') is not None:
             text += ' (about ' + _e(economics['accounts_needed']) + ' a year)'
         if share is not None:
-            text += ' · ' + _e(round(share * 100)) + '% of the ' + _e(economics.get('reachable_accounts')) \
-                + ' cited reachable accounts'
+            text += (' · ' + _e(round(share * 100)) + '% of the ' + _e(economics.get('reachable_accounts')) + ' '
+                     + _reach_label(economics.get('reach_basis')) + ' reachable accounts')
         if economics.get('customers_per_month') is not None:
             text += ' · about ' + _e(economics['customers_per_month']) + ' new a month before the money runs out'
         rows.append(('Break-even', text))
@@ -309,16 +366,36 @@ def _line_price(line):
         percent, cost = line.get('percent'), line.get('cost_percent')
         text = (_e(format(percent, 'g') if isinstance(percent, (int, float)) else percent) + '% of '
                 + _money(line.get('volume'), line.get('currency')) + ' a month')
+        spread = line.get('volume_range') if isinstance(line.get('volume_range'), dict) else {}
+        if spread:
+            text += (' (' + _money(spread.get('low'), line.get('currency')) + '&ndash;'
+                     + _money(spread.get('high'), line.get('currency')) + ')')
         if isinstance(cost, (int, float)) and cost > 0:
             text += ' (' + _e(format(cost, 'g')) + '% passed on)'
         return text + _cite(line.get('evidence'))
     if kind == 'per_unit':
+        spread = line.get('units_range') if isinstance(line.get('units_range'), dict) else {}
         return (_money(line.get('amount'), line.get('currency')) + ' per ' + _e(line.get('unit') or 'unit')
-                + _e(period) + ' &times; ' + _e(line.get('units')))
+                + _e(period) + ' &times; ' + _e(line.get('units'))
+                + (' (' + _e(spread.get('low')) + '&ndash;' + _e(spread.get('high')) + ')' if spread else ''))
+    covers = line.get('covers_months') if kind == 'one_off' else None
+    term = ' · covers ' + _e(covers) + ' months' if covers else ''
     if kind == 'one_off' and line.get('units'):
         return (_money(line.get('amount'), line.get('currency')) + ' per ' + _e(line.get('unit') or 'unit')
-                + ' &times; ' + _e(line.get('units')) + ' per project')
-    return ('&minus; ' if kind == 'credit' else '') + _money(line.get('amount'), line.get('currency')) + _e(period)
+                + ' &times; ' + _e(line.get('units')) + ' per project' + term)
+    return ('&minus; ' if kind == 'credit' else '') + _money(line.get('amount'), line.get('currency')) + _e(period) + term
+
+
+def _comparison_price(price):
+    """An alternative's price with its period, or its volume for a per-unit price."""
+    if not isinstance(price, dict):
+        return _price(price)
+    if price.get('period') == 'per_unit':
+        spread = price.get('units_range') if isinstance(price.get('units_range'), dict) else {}
+        return (_price(price) + ' per ' + _e(price.get('unit') or 'unit') + ' &times; '
+                + _e(price.get('units_per_month')) + ' a month'
+                + (' (' + _e(spread.get('low')) + '&ndash;' + _e(spread.get('high')) + ')' if spread else ''))
+    return _price(price) + {'month': ' a month', 'year': ' a year'}.get(price.get('period'), '')
 
 
 def _origin(candidate):
@@ -357,7 +434,10 @@ def _upside(candidate):
     for item in expansion:
         period = {'month': ' a month', 'year': ' a year'}.get(item.get('period'), '')
         rows.append(('Later module', _e(item.get('name')) + ' · ' + _money(item.get('amount'), item.get('currency'))
-                     + _e(period) + ' · ' + _e(item.get('attach_percent')) + '% of customers expected'))
+                     + _e(period) + ' · ' + _e(item.get('attach_percent')) + '% assumed adoption'
+                     + _cite(item.get('evidence'))
+                     + ('<br>Reuses ' + _e(item['shared_input']) if item.get('shared_input') else '')
+                     + '<br>Purchase test: ' + _e(item.get('purchase_test') or 'Unspecified')))
     if economics.get('expansion_monthly'):
         rows.append(('Expansion per customer', _money(economics['expansion_monthly'], currency)
                      + ' a month on average'))
@@ -382,7 +462,8 @@ def _stats(candidate):
     reachable = candidate.get('reachable_accounts')
     if isinstance(reachable, dict) and reachable.get('count') is not None:
         stats.append((_e(format(reachable['count'], ',') if isinstance(reachable['count'], int)
-                         else reachable['count']), 'Reachable accounts (cited)'))
+                         else reachable['count']), 'Reachable accounts (' + _reach_label(reachable.get('basis'))
+                      + ')'))
     if economics.get('project_contribution') is not None:
         stats.append((_money(economics['project_contribution'], currency), 'Margin on the first offer'))
     elif economics.get('first_year_contribution') is not None:
@@ -444,6 +525,7 @@ def render(candidate, organization_name='', run=None, prepared=None, dimensions=
          if buyer else ''),
         ('Reachable market', (_e(format(reachable['count'], ',') if isinstance(reachable.get('count'), int)
                                  else reachable.get('count')) + ' accounts · ' + _e(reachable.get('segment'))
+                              + (' · estimated' if reachable.get('basis') == 'estimated' else '')
                               + _cite(reachable.get('evidence'))) if reachable else ''),
         ('Market', ' · '.join(_e(value) for value in (geography, market.get('currency')) if value)),
         ('First outreach', ' · '.join(_e(value) for value in (outreach.get('persona'), outreach.get('stage'))
@@ -463,7 +545,8 @@ def render(candidate, organization_name='', run=None, prepared=None, dimensions=
                     '<th class="num">Price</th></tr></thead><tbody>'
                     + ''.join('<tr><td>' + _e(item.get('name')) + _cite(item.get('evidence')) + '</td><td>'
                               + _e(_ALTERNATIVES.get(item.get('kind'), item.get('kind'))) + '</td><td class="num">'
-                              + (_price(item.get('price')) if item.get('price') else '<span class="muted">-</span>')
+                              + (_comparison_price(item.get('price')) if item.get('price')
+                                 else '<span class="muted">-</span>')
                               + '</td></tr>' for item in alternatives)
                     + '</tbody></table>')
 
@@ -508,15 +591,20 @@ def render(candidate, organization_name='', run=None, prepared=None, dimensions=
         # Older records may carry a dimension under a former name; list it too.
         labels = [(key, label, weight) for key, label, weight in dimensions if key in ratings] + [
             (key, str(key).replace('_', ' '), None) for key in ratings if key not in known]
-        body.append('<h2>Confidence</h2><table><thead><tr><th>Dimension</th><th>Weight</th><th>Rating</th></tr>'
-                    '</thead><tbody>'
+        # What would raise each rating: the path to a higher score, in evidence.
+        lifts = any(isinstance(ratings[key], dict) and ratings[key].get('raise') for key, _, _ in labels)
+        body.append('<h2>Confidence</h2><table><thead><tr><th>Dimension</th><th>Weight</th><th>Rating</th>'
+                    + ('<th>What would raise it</th>' if lifts else '') + '</tr></thead><tbody>'
                     + ''.join('<tr><td>' + _e(label[:1].upper() + label[1:]) + '</td><td>'
                               + (_e(round(weight * 100)) + '%' if weight is not None else '-') + '</td><td>'
                               + _e((ratings[key] or {}).get('rating') if isinstance(ratings[key], dict) else '')
                               + (' <span class="muted">(not rated)</span>'
                                  if isinstance(ratings[key], dict) and ratings[key].get('unrated') else '')
                               + _cite((ratings[key] or {}).get('evidence') if isinstance(ratings[key], dict) else [])
-                              + '</td></tr>' for key, label, weight in labels)
+                              + '</td>'
+                              + ('<td>' + _e((ratings[key] or {}).get('raise', '') if isinstance(ratings[key], dict)
+                                             else '') + '</td>' if lifts else '')
+                              + '</tr>' for key, label, weight in labels)
                     + '</tbody></table>')
 
     assumptions = _list(candidate.get('assumptions'))

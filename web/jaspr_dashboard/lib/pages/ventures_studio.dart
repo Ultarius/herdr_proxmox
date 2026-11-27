@@ -652,7 +652,8 @@ String _triedCase(Map competition) {
   for (final usage
       in (competition['usage'] as List? ?? const []).whereType<Map>()) {
     parts.add(
-      '${usage['seller']} at ${usage['units_per_month']} ${usage['unit']} per month',
+      '${usage['seller']} at ${usage['units_per_month']} ${usage['unit']} per month'
+      '${usage['units_range'] is Map ? ' (${(usage['units_range'] as Map)['low']} to ${(usage['units_range'] as Map)['high']})' : ''}',
     );
   }
   if ('${competition['refused'] ?? ''}'.isNotEmpty) {

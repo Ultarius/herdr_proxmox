@@ -90,7 +90,8 @@ def candidate(name='Carrier Desk', evidence='V1'):
         'business_model': {'type': 'saas',
                            'revenue_lines': [{'kind': 'recurring', 'label': 'site subscription',
                                               'amount': 600, 'currency': 'USD', 'period': 'month'}]},
-        'delivery_effort': {'expert_days': 2, 'day_rate': {'amount': 900, 'currency': 'USD'}},
+        'delivery_effort': {'expert_days': 2, 'day_rate': {'amount': 900, 'currency': 'USD'}, 'monthly_hours': 0},
+        'acquisition_cost': {'amount': 1500, 'currency': 'USD', 'reason': 'Founder-led sales calls.'},
         'evidence_against': [{'claim': 'Small forwarders may keep a manual review for low volumes.',
                               'evidence': [evidence]}],
         'dissent': {'verdict': 'advance', 'summary': 'Worth a paid pilot; the workflow may still be too small.',
@@ -2383,7 +2384,7 @@ class VentureTests(unittest.TestCase):
                 dict(kind='credit', label='pilot credited to annual contract', amount=1900, currency='USD'),
             ],
         }
-        proposal['delivery_effort'] = dict(expert_days=3, day_rate=dict(amount=500, currency='USD'))
+        proposal['delivery_effort'] = dict(expert_days=3, day_rate=dict(amount=500, currency='USD'), monthly_hours=0)
         proposal['reachable_accounts']['count'] = 25
         proposal['time_to_first_payment_days'] = 45
         done = self.scout_with(proposal)
@@ -2412,13 +2413,13 @@ class VentureTests(unittest.TestCase):
         hybrid = ventures.scout_business_model(dict(type='hybrid', revenue_lines=[
             dict(kind='one_off', label='pilot', amount=1900, currency='USD'),
             dict(kind='recurring', label='annual', amount=5400, currency='USD', period='year')]))
-        slow = ventures.scout_delivery_effort(dict(expert_days=6, day_rate=dict(amount=500, currency='USD')))
+        slow = ventures.scout_delivery_effort(dict(expert_days=6, day_rate=dict(amount=500, currency='USD'), monthly_hours=0))
         losing = ventures.candidate_economics(configuration, hybrid, slow, dict(count=400), 30)
         self.assertIn('The first offer loses money', losing['warnings'][0])
         self.assertIn('break-even at 3.8 days', losing['warnings'][0])
         service = ventures.scout_business_model(dict(type='productised_service', revenue_lines=[
             dict(kind='one_off', label='file build', amount=1000, currency='USD')]))
-        fast = ventures.scout_delivery_effort(dict(expert_days=1, day_rate=dict(amount=500, currency='USD')))
+        fast = ventures.scout_delivery_effort(dict(expert_days=1, day_rate=dict(amount=500, currency='USD'), monthly_hours=0))
         outgrown = ventures.candidate_economics(configuration, service, fast, dict(count=30), 30)
         # 3,000 of costs at 500 contribution: 6 projects a month, about 72 a year.
         self.assertEqual((outgrown['break_even_customers'], outgrown['break_even_unit'], outgrown['accounts_needed']),
@@ -2443,7 +2444,7 @@ class VentureTests(unittest.TestCase):
         # A real scout answer: EUR 1,500 per site for a 3-site pilot, 3 expert
         # days for the whole pilot. Read as one site, it "lost" 450.
         configuration = ventures.normalize_config(candidate()['configuration'])
-        effort = ventures.scout_delivery_effort(dict(expert_days=3, day_rate=dict(amount=650, currency='USD')))
+        effort = ventures.scout_delivery_effort(dict(expert_days=3, day_rate=dict(amount=650, currency='USD'), monthly_hours=0))
         per_site = ventures.scout_business_model(dict(type='productised_service', revenue_lines=[
             dict(kind='one_off', label='retrofit desk', amount=1500, currency='USD', unit='site', units=3)]))
         self.assertEqual(per_site['revenue_lines'][0]['units'], 3)
@@ -2471,7 +2472,7 @@ class VentureTests(unittest.TestCase):
             dict(kind='per_unit', label='rooms', amount=12, currency='USD', period='month', unit='room', units=60),
             dict(kind='take_rate', label='card payments', percent=1.0, cost_percent=0.7, volume=100000,
                  currency='USD')]))
-        delivery = ventures.scout_delivery_effort(dict(expert_days=2, day_rate=dict(amount=500, currency='USD')))
+        delivery = ventures.scout_delivery_effort(dict(expert_days=2, day_rate=dict(amount=500, currency='USD'), monthly_hours=0))
         ceiling = dict(count=4000, segment='independent hotels in the US', evidence=['V1'])
         expansion = ventures.scout_expansion([dict(name='Revenue management', amount=400, currency='USD',
                                                    period='month', attach_percent=25)])
@@ -2565,7 +2566,7 @@ class VentureTests(unittest.TestCase):
         subscription = ventures.scout_business_model(dict(type='hybrid', revenue_lines=[
             dict(kind='one_off', label='migration', amount=1250, currency='USD'),
             dict(kind='recurring', label='base', amount=299, currency='USD', period='month')]))
-        heavy = ventures.scout_delivery_effort(dict(expert_days=15, day_rate=dict(amount=500, currency='USD')))
+        heavy = ventures.scout_delivery_effort(dict(expert_days=15, day_rate=dict(amount=500, currency='USD'), monthly_hours=0))
         economics = ventures.candidate_economics(configuration, subscription, heavy, dict(count=747), 30)
         alternatives = ventures.scout_alternatives([
             dict(name='Cheap Local', kind='software', price=dict(amount=600, currency='USD', period='year'),
@@ -2579,15 +2580,21 @@ class VentureTests(unittest.TestCase):
         # Only software with a period is compared: 600 a year is 50 a month.
         self.assertIn('above the cheapest cited software alternative (Cheap Local at 50 USD a month)', notes[0])
         # 15 days at 500 is 7,500 against 1,250 + 12 x 299 = 4,838 in the first year.
-        self.assertIn('Delivery costs 7500 USD per new customer', notes[1])
-        self.assertIn('No revenue grows with the customer', notes[2])
+        # A one-off fee beside a subscription may pay for months the year also charges.
+        self.assertIn('give its covers_months', notes[1])
+        self.assertIn('Delivery costs 7500 USD per new customer', notes[2])
+        self.assertIn('No revenue grows with the customer', notes[3])
+        self.assertIn('No benefit is stated', notes[4])
         page = ventures.venture_brief.render(dict(name='Storage Desk', economics=economics, review_notes=notes))
-        self.assertEqual(page.count('<b>Review:</b>'), 3)
+        self.assertEqual(page.count('<b>Review:</b>'), 5)
         # A per-unit price that undercuts the alternative, light delivery: nothing to note.
         units = ventures.scout_business_model(dict(type='saas', revenue_lines=[
             dict(kind='per_unit', label='units', amount=1, currency='USD', period='month', unit='unit', units=40)]))
-        light = ventures.scout_delivery_effort(dict(expert_days=1, day_rate=dict(amount=100, currency='USD')))
-        fine = ventures.candidate_economics(configuration, units, light, dict(count=747), 30)
+        light = ventures.scout_delivery_effort(dict(expert_days=1, day_rate=dict(amount=100, currency='USD'), monthly_hours=0))
+        # A stated benefit 2.5 times the year-one price: neither too thin nor far above the price.
+        fine = ventures.candidate_economics(configuration, units, light, dict(count=747), 30,
+                                            benefit=dict(kind='cost', amount=1200, currency='USD', period='year',
+                                                         basis='estimated'))
         self.assertEqual(ventures.candidate_review_notes(configuration, alternatives, fine), [])
         with self.assertRaisesRegex(ValueError, 'price period'):
             ventures.scout_alternatives([
@@ -2603,19 +2610,20 @@ class VentureTests(unittest.TestCase):
         support = dict(kind='recurring', label='support', amount=2400, currency='USD', period='year')
         per_unit = dict(kind='per_unit', label='sites', amount=40, currency='USD', period='month',
                         unit='site', units=1)
-        price_note = 'Priced at 200 USD a month per customer, above the cheapest cited software alternative'
+        price_note = 'Costs the buyer 283 USD a month in year one'
         delivery_note = 'Delivery costs 1000 USD per project, more than half of the project price (1000 USD)'
         growth_note = 'No revenue grows with the customer'
+        benefit_note = 'No benefit is stated'
         for model in ('service', 'productised_service'):
             for lines, days, expected in (
-                    ([project], 2, [delivery_note]),
-                    ([project, support], 1, [price_note, growth_note]),
-                    ([project, support], 2, [price_note, delivery_note, growth_note]),
-                    ([project, per_unit], 2, [delivery_note])):
+                    ([project], 2, [delivery_note, benefit_note]),
+                    ([project, support], 1, [price_note, growth_note, benefit_note]),
+                    ([project, support], 2, [price_note, delivery_note, growth_note, benefit_note]),
+                    ([project, per_unit], 2, ['Costs the buyer 123 USD a month in year one', delivery_note, benefit_note])):
                 with self.subTest(model=model, lines=lines, days=days):
                     business = ventures.scout_business_model(dict(type=model, revenue_lines=lines))
                     effort = ventures.scout_delivery_effort(dict(
-                        expert_days=days, day_rate=dict(amount=500, currency='USD')))
+                        expert_days=days, day_rate=dict(amount=500, currency='USD'), monthly_hours=0))
                     economics = ventures.candidate_economics(configuration, business, effort, dict(count=747), 30)
                     notes = ventures.candidate_review_notes(configuration, alternatives, economics)
                     self.assertEqual(len(notes), len(expected))
@@ -3027,7 +3035,7 @@ class VentureTests(unittest.TestCase):
                      # A bundle of what the buyer pays several sellers for.
                      '12. **Combine before ruling out.**', 'add up what the buyer pays for the stack',
                      'an ERP or suite that covers it is that incumbent',
-                     'counts toward defensibility, never toward break-even',
+                     'A planned module or assumed adoption rate earns no confidence increase.',
                      # The later steps moved up by one.
                      '13. **Look again before returning nothing.**',
                      '14. **Leave one research lead from an empty round.**',
@@ -3277,7 +3285,7 @@ class VentureTests(unittest.TestCase):
                      '**A segment the leader does not serve** passes when cited evidence shows these buyers do not '
                      'buy from it',
                      'records which of the three ways it tried and why that failed',
-                     'or the buyers a leader does not serve (question 6)'):
+                     'the buyers a leader does not serve (question 6)'):
             self.assertIn(rule, checklist)
         method = ' '.join(ventures.scout_consult_method(['competitor']).split())
         self.assertIn('"Which of these buyers do you not serve today, and why have you not built this for them?"',
@@ -3437,7 +3445,11 @@ class VentureTests(unittest.TestCase):
         done = self.complete_studio(run, dict(candidates=[idea], ruled_out=[rejected], research=research))
         stored, = self.stored_candidates()
         self.assertEqual(stored['competition']['figures']['leader_monthly'], 712)
-        self.assertEqual(stored['competition']['notes'], [])
+        # A flat price against a per-unit leader: the volume where they meet.
+        crossover = stored['competition']['figures']['crossover_units']
+        self.assertEqual(stored['competition']['notes'], [
+            'Our year-one price matches BoomDesk' + chr(39) + 's at ' + format(crossover, 'g')
+            + ' takeoffs a month; below that BoomDesk is cheaper.'])
         self.assertEqual([page['id'] for page in stored['evidence_links']], ['W1', 'W2'])
         self.assertEqual({page['id'] for page in self.ventures._pitch_pack(done, [stored])['sources']}, {'W1', 'W2'})
         carried = done['ruled_out'][0]['competition']
@@ -3446,6 +3458,335 @@ class VentureTests(unittest.TestCase):
         price.pop('units_per_month')
         with self.assertRaisesRegex(ValueError, 'units_per_month'):
             ventures.scout_competition(claim, lambda ids, limit: ids)
+
+    def test_year_one_counts_the_months_a_pilot_covers_and_monthly_service_comes_off_contribution(self):
+        configuration = ventures.normalize_config(candidate()['configuration'])
+        reach = dict(count=1200, basis='estimated')
+
+        def economics(covers=None, hours=0, recurring=99, one_off=1450):
+            line = dict(kind='one_off', label='pilot', amount=one_off, currency='USD')
+            if covers is not None:
+                line['covers_months'] = covers
+            model = ventures.scout_business_model(dict(type='hybrid', revenue_lines=[
+                line, dict(kind='recurring', label='desk', amount=recurring, currency='USD', period='month')]))
+            effort = ventures.scout_delivery_effort(dict(expert_days=1, day_rate=dict(amount=400, currency='USD'),
+                                                         monthly_hours=hours))
+            return ventures.candidate_economics(configuration, model, effort, reach, 45)
+
+        # A 3-month pilot then 99 a month: 1,450 + 9 x 99, not 1,450 + 12 x 99.
+        pilot = economics(covers=3)
+        self.assertEqual((pilot['first_year_revenue'], pilot['first_year_paid_months']), (2341, 9))
+        self.assertEqual(economics()['first_year_revenue'], 2638)
+        # A season prepay covering the year leaves no subscription month in it.
+        season = economics(covers=12, recurring=49, one_off=990)
+        self.assertEqual(season['first_year_revenue'], 990)
+        # One service hour a month at a 400 day rate is 50: more than a 49 subscription.
+        served = economics(covers=12, recurring=49, one_off=990, hours=1)
+        self.assertEqual((served['service_cost_monthly'], served['recurring_contribution']), (50, -1))
+        self.assertIsNone(served['break_even_customers'])
+        self.assertEqual(served['first_year_contribution'], 990 - 400 - 12 * 50)
+        self.assertIn('Service of 1 hours a month costs 50 USD, at or above the 49 USD a customer pays a month.',
+                      served['warnings'])
+        self.assertNotIn('There is no recurring revenue to cover the monthly costs.', served['warnings'])
+        with self.assertRaisesRegex(ValueError, 'monthly_hours'):
+            ventures.scout_delivery_effort(dict(expert_days=1, day_rate=dict(amount=400, currency='USD')))
+        with self.assertRaisesRegex(ValueError, 'covers_months'):
+            ventures.scout_business_model(dict(type='hybrid', revenue_lines=[
+                dict(kind='one_off', label='pilot', amount=1, currency='USD', covers_months=13),
+                dict(kind='recurring', label='desk', amount=1, currency='USD', period='month')]))
+
+        # The price note compares year one, and a per-user alternative at its cited volume.
+        alternatives = ventures.scout_alternatives([
+            dict(name='Bouwportaal', kind='software', evidence=['V1'],
+                 price=dict(amount=5, currency='USD', period='per_unit', unit='user', units_per_month=10,
+                            usage_evidence=['V1'], units_range=dict(low=2, high=20))),
+            dict(name='Consultant', kind='service', evidence=['V1']),
+            dict(name='Paper', kind='do_nothing')], lambda value, limit: value)
+        notes = ventures.candidate_review_notes(configuration, alternatives, pilot)
+        self.assertIn('Costs the buyer 195 USD a month in year one (one-off fees and the months after them, over '
+                      'twelve; 99 USD a month after), above the cheapest cited software alternative (Bouwportaal '
+                      'at 10 user a month at 50 USD a month)', notes[0])
+        self.assertTrue(any(note.startswith('Reach is an estimate: break-even needs') for note in notes))
+        self.assertFalse(any('covers_months' in note for note in notes))
+        self.assertTrue(any('give its covers_months' in note
+                            for note in ventures.candidate_review_notes(configuration, alternatives, economics())))
+
+        # A saving or recovery bar below the buyer's year-one cost is a note.
+        kill = ['Recovered credit notes are below USD 1,450/year per contractor at 3 contractors.',
+                'Measured admin time saved is below $150 a month at 3 traders.',
+                'Fewer than 3 signed USD 1,450 pilots from named contractors.',
+                'Recovered credits are below USD 3,000 a year at 3 contractors.']
+        bars = ventures.kill_criteria_notes(kill, pilot)
+        self.assertEqual([note for note in bars if 'below the 2341' in note], [
+            'Item 1 passes a buyer whose saving or recovery is 1450 USD a year, below the 2341 they pay in year '
+            'one: set the bar at or above that, or credit the fee against what the pilot recovers.',
+            'Item 2 passes a buyer whose saving or recovery is 1800 USD a year, below the 2341 they pay in year '
+            'one: set the bar at or above that, or credit the fee against what the pilot recovers.'])
+        self.assertEqual([note for note in ventures.kill_criteria_notes(kill) if 'below the' in note], [])
+
+        page = ventures.venture_brief.render(dict(
+            name='Claim Desk', economics=served, reachable_accounts=dict(count=1200, segment='Contractors',
+                                                                         basis='estimated', evidence=['V1']),
+            business_model=dict(type='hybrid', revenue_lines=[
+                dict(kind='one_off', label='Season', amount=990, currency='USD', covers_months=12)]),
+            delivery_effort=dict(expert_days=1, day_rate=dict(amount=400, currency='USD'), monthly_hours=1),
+            alternatives=alternatives))
+        self.assertIn('Reachable accounts (estimated)', page)
+        self.assertIn('after 1 service hours', page)
+        self.assertIn('covers 12 months', page)
+        self.assertIn('the first offer covers 12 months, so 0 months of subscription follow', page)
+        self.assertIn('per user &times; 10 a month (2&ndash;20)', page)
+
+    def test_reach_says_whether_it_was_counted_or_estimated(self):
+        cite = lambda value, limit: value
+        texts = dict(V1='There are 1,200 contractors with 5-50 staff.', V2='About 15,530 landscape firms.')
+        self.assertEqual(ventures.scout_reachable_accounts(
+            dict(count=400, segment='Traders', evidence=['V2']), cite)['basis'], 'estimated')
+        counted = ventures.scout_reachable_accounts(
+            dict(count=1200, segment='Contractors', evidence=['V1'], basis='counted'), cite, texts)
+        self.assertEqual(counted['basis'], 'counted')
+        self.assertNotIn('basis_note', counted)
+        claimed = ventures.scout_reachable_accounts(
+            dict(count=400, segment='Traders', evidence=['V2'], basis='counted'), cite, texts)
+        self.assertEqual(claimed['basis'], 'estimated')
+        self.assertEqual(claimed['basis_note'], 'The count 400 is not stated in its cited evidence (V2), so it '
+                                                'is shown as an estimate.')
+        with self.assertRaisesRegex(ValueError, 'basis'):
+            ventures.scout_reachable_accounts(dict(count=1, segment='X', evidence=['V1'], basis='guessed'), cite)
+
+    def test_a_per_unit_price_is_compared_at_a_low_typical_and_high_volume(self):
+        market = dict(market=dict(currency='USD', fx_pair='USD/USD', fx_rate=1))
+        cite = lambda value, limit: value
+        leader = dict(name='Bouwportaal', customers=100, evidence=['V1'],
+                      price=dict(amount=5, currency='USD', period='per_unit', unit='user', units_per_month=30,
+                                 usage_evidence=['V2'], units_range=dict(low=10, high=60)))
+        case = ventures.scout_competition(dict(strategy='price', leader=leader, cost_reason='Self-serve.'), cite)
+        figures, notes = ventures.competition_check(case, dict(first_year_revenue=1200, currency='USD'), market)
+        self.assertEqual((figures['leader_monthly'], figures['leader_monthly_low'], figures['leader_monthly_high']),
+                         (150, 50, 300))
+        self.assertEqual((figures['ours_monthly_low'], figures['crossover_units']), (100, 20))
+        self.assertEqual(notes, [
+            'At the low volume (Bouwportaal at 10 user a month), Bouwportaal costs 50 USD a month against our '
+            '100: the price advantage disappears.',
+            "Our year-one price matches Bouwportaal's at 20 user a month; below that Bouwportaal is cheaper."])
+        # Ours grows with seats: compared at our own low and high volume.
+        configuration = ventures.normalize_config(candidate()['configuration'])
+        seats = ventures.scout_business_model(dict(type='saas', revenue_lines=[
+            dict(kind='per_unit', label='seats', amount=10, currency='USD', period='month', unit='seat', units=5,
+                 units_range=dict(low=2, high=12))]))
+        effort = ventures.scout_delivery_effort(dict(expert_days=1, day_rate=dict(amount=100, currency='USD'),
+                                                     monthly_hours=0))
+        ours = ventures.candidate_economics(configuration, seats, effort, dict(count=500), 30)
+        self.assertEqual(ours['first_year_range'], dict(low=240, typical=600, high=1440))
+        stack = [dict(name=name, evidence=['V1'], price=dict(amount=40, currency='USD', period='month'))
+                 for name in ('Quotes', 'Invoices')]
+        bundle = ventures.scout_competition(dict(strategy='bundle', stack=stack), cite)
+        figures, notes = ventures.competition_check(bundle, ours, configuration)
+        self.assertEqual((figures['saving_percent'], figures['stack_monthly_high'], figures['ours_monthly_high']),
+                         (37.5, 80, 120))
+        self.assertEqual(notes, ['At the high volume (our high volume), the stack costs 80 USD a month against '
+                                 'our 120: the bundle is dearer.'])
+        self.assertEqual(ventures.competition_provenance(case, dict(V1='5 per user, 100 customers',
+                                                                    V2='A firm has 30 users')),
+                         ["Bouwportaal's volume range (low 10, high 60 user a month) is not stated in its cited "
+                          "evidence (V2)."])
+        with self.assertRaisesRegex(ValueError, 'units_range'):
+            ventures.scout_competition(dict(strategy='price', cost_reason='x', leader=dict(
+                leader, price=dict(leader['price'], units_range=dict(low=40, high=60)))), cite)
+
+    def test_the_checklist_asks_who_records_the_first_input_and_whether_the_change_cuts_the_other_way(self):
+        checklist = ' '.join(ventures.STUDIO_REVIEW_CHECKLIST.split())
+        for text in ('Compare what the buyer pays a month in year one', 'give it as monthly hours',
+                     'Does the change help the buyer act, or stop them?', 'Who produces the first input, and when?',
+                     'Does the pass bar cover what the buyer pays?', 'say where ours stops being cheaper'):
+            self.assertIn(text, checklist)
+        rules = ' '.join(ventures.scout_answer_rules().split())
+        for text in ('"covers_months" (1-12)', '"monthly_hours": the service hours', '"units_range" {"low","high"}',
+                     '"basis": counted when a cited source states the count',
+                     'sets a saving or recovery bar below what the buyer pays in year one',
+                     'A first offer whose refund or credit is not tied to the kill criterion'):
+            self.assertIn(text, rules)
+        for role in ('customer', 'operator'):
+            self.assertIn('Who writes down the first figure it needs', ventures.scout_consult_method([role]))
+
+    def test_the_price_is_set_against_the_buyer_benefit_and_the_cost_of_winning_a_customer(self):
+        configuration = ventures.normalize_config(candidate()['configuration'])
+        cite = lambda value, limit: value
+        model = ventures.scout_business_model(dict(type='hybrid', revenue_lines=[
+            dict(kind='one_off', label='pilot', amount=3000, currency='USD', covers_months=2),
+            dict(kind='recurring', label='ledger', amount=450, currency='USD', period='month')]))
+        effort = ventures.scout_delivery_effort(dict(expert_days=4, day_rate=dict(amount=500, currency='USD'),
+                                                     monthly_hours=1.44))
+
+        def economics(benefit=None, acquisition=1500):
+            return ventures.candidate_economics(
+                configuration, model, effort, dict(count=60, basis='estimated'), 30,
+                benefit=ventures.scout_benefit(benefit, cite) if benefit else None,
+                acquisition_cost=ventures.scout_acquisition_cost(
+                    dict(amount=acquisition, currency='USD', reason='Accountant introductions.'), cite))
+
+        # TradeProof: 3,000 + 10 x 450 = 7,500 in year one; 450 less 90 of service is 360 a month.
+        proof = economics(dict(kind='cost', amount=15000, currency='USD', period='year', basis='estimated',
+                               reason='Credits and overpayments a wholesaler absorbs today.'))
+        self.assertEqual((proof['first_year_revenue'], proof['recurring_contribution']), (7500, 360))
+        self.assertEqual((proof['acquisition_cost'], proof['payback_months']), (1500, 4.2))
+        self.assertEqual(proof['contribution_after_acquisition'], 7500 - 2000 - 12 * 90 - 1500)
+        self.assertEqual((proof['benefit_yearly'], proof['roi_multiple']), (15000, 2))
+        notes = ventures.candidate_review_notes(configuration, [], proof)
+        self.assertFalse(any('benefit' in note for note in notes))
+        # Below twice the price: few buyers change how they work for it.
+        thin = ventures.candidate_review_notes(configuration, [], economics(dict(
+            kind='cost', amount=900, currency='USD', period='month', basis='estimated', reason='Overpayments.')))
+        self.assertIn("The buyer's estimated benefit of 10800 USD a year is 1.44× what it pays in year one "
+                      "(7500 USD): below 2×, few buyers change how they work for it.", ' '.join(thin))
+        # Far above the price: the price may sit too far below the value.
+        rich = ventures.candidate_review_notes(configuration, [], economics(dict(
+            kind='cost', amount=60000, currency='USD', period='year', basis='measured', evidence=['V1'])))
+        self.assertIn("The buyer's measured benefit of 60000 USD a year is 8× what it pays in year one (7500 USD): "
+                      "the price may sit too far below the value. Price from the buyer's loss", ' '.join(rich))
+        # An expensive customer to win: payback beyond a year, and a first year that does not repay it.
+        costly = economics(acquisition=6000)
+        self.assertEqual(costly['payback_months'], 16.7)
+        self.assertIn('A customer does not repay its 6000 USD acquisition cost in its first year.',
+                      costly['warnings'])
+        self.assertIn('Repaying the 6000 USD it costs to win a customer takes 16.7 months of contribution, '
+                      'more than 12.', ventures.candidate_review_notes(configuration, [], costly))
+        self.assertIn('No benefit is stated', ventures.candidate_review_notes(configuration, [], costly)[-1])
+        with self.assertRaisesRegex(ValueError, 'measured benefit cites the baseline'):
+            ventures.scout_benefit(dict(kind='cost', amount=1, currency='USD', period='year', basis='measured',
+                                        reason='x'), cite)
+        with self.assertRaisesRegex(ValueError, 'cite the evidence or give the reason'):
+            ventures.scout_benefit(dict(kind='cost', amount=1, currency='USD', period='year'), cite)
+        with self.assertRaisesRegex(ValueError, 'zero cost needs a reason'):
+            ventures.scout_acquisition_cost(dict(amount=0, currency='USD'), cite)
+        page = ventures.venture_brief.render(dict(
+            name='TradeProof', economics=proof, benefit=dict(kind='cost', basis='estimated', reason='Credits.'),
+            confidence_dimensions=dict(paid_demand={'rating': 'medium', 'evidence': ['V1'],
+                                                    'raise': 'One signed 3,000 pilot at the stated price.'})))
+        self.assertIn('repaid in 4.2 months of contribution', page)
+        self.assertIn('2&times; what the buyer pays in year one', page)
+        self.assertIn('<th>What would raise it</th>', page)
+        self.assertIn('One signed 3,000 pilot at the stated price.', page)
+        # The raise line is kept below strong only.
+        dimensions, _ = ventures.scout_confidence({
+            key: {'rating': 'strong' if key == 'differentiation' else 'medium', 'evidence': ['V1'], 'raise': 'More.'}
+            for key, _, _ in ventures.SCOUT_CONFIDENCE}, cite)
+        self.assertEqual(dimensions['paid_demand']['raise'], 'More.')
+        self.assertNotIn('raise', dimensions['differentiation'])
+
+    def test_layered_service_keeps_the_purchase_test_and_realized_value_in_the_pitch_and_brief(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='scout')
+        idea = self.web_candidate('Settlement Review')
+        idea['business_model'] = dict(type='productised_service', revenue_lines=[
+            dict(kind='one_off', label='pilot', amount=1450, currency='USD', covers_months=3),
+            dict(kind='recurring', label='contracted follow-up', amount=99, currency='USD', period='month')])
+        idea['benefit'] = dict(kind='cost', currency='USD', period='year', basis='estimated',
+                               comparison=dict(with_offer=4500, without_offer=1500), evidence=['W2'])
+        idea['acquisition_cost']['evidence'] = ['W3']
+        idea['expansion'] = [dict(name='Monitoring', amount=180, currency='USD', period='month',
+                                  attach_percent=25, shared_input='Reconciled settlement ledger',
+                                  purchase_test='The same buyer signs for a second site at 180 a month.',
+                                  evidence=['W4'])]
+        idea['alternatives'][1]['price'] = dict(amount=5, currency='USD', period='per_unit', unit='seat',
+                                                units_per_month=4, usage_evidence=['W5'])
+        pages = [dict(id=f'W{i}', url=f'https://trade.example/report-{i}', title=title, claim=title)
+                 for i, title in enumerate(('First offer', 'Settlements', 'Sales time', 'Second sites', 'Seat counts'), 1)]
+        done = self.complete_studio(run, dict(candidates=[idea], research=pages))
+        stored, = self.stored_candidates()
+        econ = stored['economics']
+        self.assertEqual((econ['benefit_yearly'], econ['buyer_fees_year_one'], econ['buyer_net_year_one']),
+                         (3000, 2341, 659))
+        self.assertEqual(econ['expansion_monthly'], 45)
+        without = ventures.candidate_economics(stored['configuration'], stored['business_model'], stored['delivery_effort'],
+                                              stored['reachable_accounts'], stored['time_to_first_payment_days'])
+        self.assertEqual(econ['break_even_customers'], without['break_even_customers'])
+        self.assertEqual(stored['confidence'], ventures.scout_confidence(idea['confidence_dimensions'], lambda ids, n: ids)[1])
+        pack = self.ventures._pitch_pack(done, [stored])
+        self.assertEqual({p['id'] for p in pack['sources']}, {p['id'] for p in pages})
+        self.assertEqual({p['id'] for p in stored['evidence_links']}, {p['id'] for p in pages})
+        self.assertEqual(pack['ideas'][0]['expansion'], idea['expansion'])
+        prompt = self.ventures._pitch_prompt(dict(evidence=pack, panel=dict(roles=['customer'])), 'pack.json')
+        self.assertIn('what would trigger a second paid purchase?', prompt)
+        self.assertIn('Strong needs evidence a target buyer paid or signed', ventures.scout_answer_rules())
+        page = self.studio(mode='candidate_brief', candidate_id=stored['id'])['html']
+        for fragment in ('USD 659 after USD 2,341 in fees', 'USD 4,500 with the offer', 'USD 1,500 under the current process',
+                         'Reuses Reconciled settlement ledger', idea['expansion'][0]['purchase_test'], '25% assumed adoption',
+                         'https://trade.example/report-5'):
+            self.assertIn(fragment, page)
+
+    def test_an_unfavorable_control_and_processing_costs_remain_visible_in_buyer_economics(self):
+        cite = lambda ids, limit: ids
+        comparison = dict(kind='cost', currency='USD', period='month', reason='Comparable accounts',
+                          comparison=dict(with_offer=90, without_offer=100), buyer_cost_year_one=200)
+        with self.assertRaisesRegex(ValueError, 'with_offer minus without_offer'):
+            ventures.scout_benefit(dict(comparison, amount=90), cite)
+        model = ventures.scout_business_model(dict(type='saas', revenue_lines=[
+            dict(kind='take_rate', label='handling', currency='USD', volume=10000, percent=2, cost_percent=1,
+                 evidence=['V1'])]), cite)
+        econ = ventures.candidate_economics(ventures.normalize_config(candidate()['configuration']), model,
+                                           candidate()['delivery_effort'], dict(count=500), 30,
+                                           benefit=ventures.scout_benefit(comparison, cite))
+        self.assertEqual((econ['first_year_revenue'], econ['buyer_fees_year_one'], econ['buyer_cost_year_one']),
+                         (1200, 2400, 2600))
+        self.assertEqual((econ['benefit_yearly'], econ['buyer_net_year_one']), (-120, -2720))
+        leader = dict(name='Compare', customers=20, price=dict(amount=150, currency='USD', period='month'))
+        with self.assertRaisesRegex(ValueError, 'ours is 200 USD a month against 150'):
+            ventures.competition_check(dict(strategy='price', leader=leader), econ, candidate()['configuration'])
+        leader['price'] = dict(amount=25, currency='USD', period='per_unit', unit='order', units_per_month=10,
+                               units_range=dict(low=5, high=20))
+        figures, notes = ventures.competition_check(dict(strategy='price', leader=leader), econ, candidate()['configuration'])
+        self.assertNotIn('crossover_units', figures)
+        self.assertNotIn('leader_monthly_low', figures)
+        self.assertIn('Only the typical workload can be compared', ' '.join(notes))
+        # With a volume range on the share of volume, both sides are compared at
+        # each volume, and the buyer's price includes the share passed on.
+        ranged = ventures.scout_business_model(dict(type='saas', revenue_lines=[
+            dict(kind='take_rate', label='handling', currency='USD', volume=10000, percent=2, cost_percent=1,
+                 volume_range=dict(low=5000, high=20000), evidence=['V1'])]), cite)
+        econ = ventures.candidate_economics(ventures.normalize_config(candidate()['configuration']), ranged,
+                                           candidate()['delivery_effort'], dict(count=500), 30)
+        self.assertEqual(econ['buyer_fees_range'], dict(low=1200, typical=2400, high=4800))
+        leader['price']['units_range'] = dict(low=5, high=15)
+        figures, notes = ventures.competition_check(dict(strategy='price', leader=leader), econ,
+                                                    candidate()['configuration'])
+        self.assertEqual((figures['ours_monthly_low'], figures['leader_monthly_low']), (100, 125))
+        self.assertEqual((figures['ours_monthly_high'], figures['leader_monthly_high']), (400, 375))
+        self.assertEqual(notes, ['At the high volume (Compare at 15 order a month), Compare costs 375 USD a month '
+                                 'against our 400: the price advantage disappears.'])
+        with self.assertRaisesRegex(ValueError, 'volume_range'):
+            ventures.scout_business_model(dict(type='saas', revenue_lines=[
+                dict(kind='take_rate', label='handling', currency='USD', volume=10000, percent=2,
+                     volume_range=dict(low=20000, high=30000), evidence=['V1'])]), cite)
+
+    def test_the_studio_cost_floor_raises_a_scout_burn_and_reaches_the_pack(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        with self.assertRaisesRegex(ValueError, 'studio cost floor currency'):
+            self.studio(mode='studio_policy', studio_cost_floor=dict(amount=6500, currency='EURO'))
+        policy = self.studio(mode='studio_policy', studio_cost_floor=dict(amount=6500, currency='usd'))
+        self.assertEqual(policy['studio_cost_floor'], dict(amount=6500, currency='USD', label='founder pay and sales'))
+        run = self.studio(mode='studio_run', kind='scout')
+        pack = json.loads(Path(run['evidence_file']).read_text(encoding='utf-8'))
+        self.assertEqual(pack['policy']['cost_floor']['amount'], 6500)
+        self.complete_studio(run, dict(candidates=[self.web_candidate('Floor Desk')], research=self.RESEARCH))
+        stored, = self.stored_candidates()
+        self.assertEqual(stored['scout_adjusted']['burn'], dict(proposed=3000, used=6500))
+        self.assertEqual(stored['configuration']['simulation']['burn'][-1],
+                         dict(label='Operator cost floor: founder pay and sales', amount=3500, currency='USD'))
+        self.assertEqual(stored['economics']['monthly_burn'], 6510)  # Whole units a day: 217 x 30.
+        self.assertIsNone(self.studio(mode='studio_policy', studio_cost_floor=None)['studio_cost_floor'])
+        rules = ' '.join(ventures.scout_answer_rules().split())
+        checklist = ' '.join(ventures.STUDIO_REVIEW_CHECKLIST.split())
+        for text in ('READ OBJECTIONS AS A DESIGN BRIEF', 'PRICE FROM THE LOSS', 'acquisition_cost {"amount","currency"}',
+                     'add "raise": the evidence that would move it up one step'):
+            self.assertIn(text, rules)
+        for text in ('When the evidence pack\'s policy has a "cost_floor"', '**the party in the middle**',
+                     'is a **scripted demo**', 'a pilot with a **control**'):
+            self.assertIn(text, checklist)
+        self.assertIn('Could your product run this exact transaction today',
+                      ventures.scout_consult_method(['competitor']))
 
     def test_the_pitch_keeps_competition_citations_and_an_fx_edit_refreshes_the_comparison(self):
         self.setup_studio_manual()
@@ -3531,14 +3872,16 @@ class VentureTests(unittest.TestCase):
         # The record question goes to whoever can answer it on this roster.
         method = ' '.join(ventures.scout_consult_method(['investor', 'customer', 'operator']).split())
         self.assertIn('Also ask the target customer, for each idea: "If this worked tomorrow, what would '
-                      'change in a normal week, and what record would show it?"', method)
+                      'change in a normal week, and what record would show it? Who writes down the first figure '
+                      'it needs', method)
         self.assertNotIn('Also ask the industry operator', method)
         self.assertIn('it stays a research lead, not evidence', method)
         # So does the walk through one real instance of the buyer's workflow.
         self.assertIn('a. The target customer: "Walk me through one instance', method)
         method = ' '.join(ventures.scout_consult_method(['investor', 'operator']).split())
         self.assertIn('Also ask the industry operator, for each idea: "If this worked tomorrow, which record '
-                      'would you inspect to see what changed in a normal week?"', method)
+                      'would you inspect to see what changed in a normal week? Who writes down the first figure '
+                      'it needs', method)
         self.assertNotIn('target customer, for each idea', method)
         self.assertIn('a. The industry operator: "Walk me through one instance', method)
         method = ' '.join(ventures.scout_consult_method(['investor', 'competitor']).split())

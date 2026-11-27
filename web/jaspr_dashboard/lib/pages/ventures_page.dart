@@ -1703,6 +1703,15 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
   late String _exclude =
       (component.policy['studio_exclude'] as List? ?? const []).join(', ');
   late String _strategy = '${component.policy['studio_strategy'] ?? ''}';
+  late String _floor = switch (component.policy['studio_cost_floor']) {
+    final Map floor => '${floor['amount'] ?? ''} ${floor['currency'] ?? ''}'
+        .trim(),
+    _ => '',
+  };
+  late String _floorLabel = switch (component.policy['studio_cost_floor']) {
+    final Map floor => '${floor['label'] ?? ''}',
+    _ => '',
+  };
   late String _sources =
       (component.policy['studio_sources'] as List? ?? const []).join('\n');
   late bool _paused = component.policy['studio_paused'] == true;
@@ -1738,6 +1747,17 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
       setState(() => _error = 'Minimum confidence must be 0-100.');
       return;
     }
+    // "6500 EUR": a whole amount and a three-letter currency, or empty for none.
+    final floor = RegExp(
+      r'^\s*(\d{1,8})\s*([A-Za-z]{3})\s*$',
+    ).firstMatch(_floor);
+    if (_floor.trim().isNotEmpty && floor == null) {
+      setState(
+        () => _error =
+            'Cost floor must be a whole amount and a currency, such as 6500 EUR, or empty.',
+      );
+      return;
+    }
     component.onSave({
       'studio_portfolio_cadence': _portfolio,
       'studio_scout_cadence': _scout,
@@ -1746,6 +1766,13 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
       'studio_focus': _commas(_focus),
       'studio_exclude': _commas(_exclude),
       'studio_strategy': _strategy.trim(),
+      'studio_cost_floor': floor == null
+          ? null
+          : {
+              'amount': int.parse(floor.group(1)!),
+              'currency': floor.group(2)!.toUpperCase(),
+              if (_floorLabel.trim().isNotEmpty) 'label': _floorLabel.trim(),
+            },
       'studio_sources': _lines(_sources),
       'studio_paused': _paused,
       'studio_mode': _mode,
@@ -1799,6 +1826,17 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
       _strategy,
       (value) => setState(() => _strategy = value),
       rows: 3,
+    ),
+    field(
+      'Monthly cost floor (optional, such as 6500 EUR): the least an idea may '
+      'cost a month. A scout proposing less is raised to it.',
+      _floor,
+      (value) => setState(() => _floor = value),
+    ),
+    field(
+      'What the cost floor covers (optional)',
+      _floorLabel,
+      (value) => setState(() => _floorLabel = value),
     ),
     textarea(
       'Allowed scouting sources (one https URL per line)',

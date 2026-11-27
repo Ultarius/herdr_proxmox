@@ -592,10 +592,14 @@ class StakeholderPanel:
         economics = candidate.get('economics') if isinstance(candidate.get('economics'), dict) else {}
         keep = ('currency', 'recurring_monthly', 'revenue_mix', 'monthly_burn', 'runway_months',
                 'break_even_customers', 'break_even_unit', 'break_even_share', 'first_year_revenue',
-                'first_year_contribution', 'project_contribution', 'ceiling_annual_revenue', 'warnings')
+                'first_year_contribution', 'project_contribution', 'ceiling_annual_revenue', 'warnings',
+                'first_year_paid_months', 'service_cost_monthly', 'recurring_contribution', 'acquisition_cost',
+                'contribution_after_acquisition', 'payback_months', 'benefit_yearly', 'roi_multiple',
+                'buyer_fees_year_one', 'buyer_cost_year_one', 'buyer_net_year_one')
         idea = {key: candidate.get(key) for key in (
             'name', 'thesis', 'product', 'pricing', 'first_offer', 'time_to_first_payment_days', 'confidence',
             'confidence_dimensions', 'buyer', 'reachable_accounts', 'business_model', 'delivery_effort',
+            'benefit', 'acquisition_cost',
             'alternatives', 'competition', 'evidence', 'evidence_against',
             'dissent', 'analogue', 'incumbent', 'market_ceiling', 'expansion', 'prior_state', 'assumptions',
             'kill_criteria', 'review_notes', 'revision_note', 'stakeholder_screen')
@@ -726,6 +730,15 @@ class StakeholderPanel:
                        'actually uses. For a price challenger, ask whether the seller can match only for these '
                        'buyers. For a bundle, ask which paid tools it replaces and whether the first module '
                        'sells on its own. Check that usage-based offers are priced at the same buyer workload.')
+        if any(item.get('expansion') for item in run['evidence']['ideas']):
+            prompt += (' For a layered offer, would one payer buy the first deliverable alone? Which record can '
+                       'that payer reuse, and what would trigger a second paid purchase? Test the proposed '
+                       'purchase against the current workflow. Base your verdict on the first offer and cite '
+                       'any separate evidence for renewal or expansion.')
+        if any(item.get('benefit') for item in run['evidence']['ideas']):
+            prompt += (' Which buyer outcome was actually realized, how much already happens under the current '
+                       'process, and what remains after year-one fees and buyer effort? Identify which inputs '
+                       'are estimates and which record could verify them.')
         if len(prompt) > PANEL_PROMPT_LIMIT:
             raise ValueError('The pitch prompt exceeds the discussion budget.')
         return prompt

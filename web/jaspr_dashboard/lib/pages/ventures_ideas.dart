@@ -72,7 +72,13 @@ List<(String, Component)> candidateBar(Map<String, dynamic> item) {
           '${(adjusted['reference_price'] as Map)['proposed']})',
         ),
       ),
-    ('Monthly costs', text(burn.isEmpty ? 'None' : burn)),
+    (
+      'Monthly costs',
+      text(
+        '${burn.isEmpty ? 'None' : burn}'
+        '${adjusted['burn'] is Map ? ' (raised to the studio cost floor; the scout proposed ${(adjusted['burn'] as Map)['proposed']} a month)' : ''}',
+      ),
+    ),
   ];
 }
 
@@ -327,8 +333,10 @@ String _competitionText(Map competition) {
   ]) {
     if (seller['price'] case final Map price
         when price['period'] == 'per_unit') {
+      final range = price['units_range'] as Map?;
       usage.add(
-        '${seller['name']} at ${price['units_per_month']} ${price['unit']} per month',
+        '${seller['name']} at ${price['units_per_month']} ${price['unit']} per month'
+        '${range == null ? '' : ' (${range['low']} to ${range['high']})'}',
       );
     }
   }
@@ -352,7 +360,11 @@ String _moneyText(Object? value, Object? currency) {
 
 String _priceText(Map? price) {
   if (price == null) return 'price not public';
-  return _moneyText(price['amount'], price['currency']);
+  final amount = _moneyText(price['amount'], price['currency']);
+  if (price['period'] == 'per_unit') {
+    return '$amount per ${price['unit']} × ${price['units_per_month']} a month';
+  }
+  return '$amount${_periodText[price['period']] ?? ''}';
 }
 
 String _numberText(Object? value) =>
@@ -381,17 +393,21 @@ String revenueLineText(Map line) {
       final cost = line['cost_percent'];
       return '${line['label'] ?? 'share'}: ${_numberText(line['percent'])}% of '
           '${_moneyText(line['volume'], currency)} a month'
+          '${line['volume_range'] is Map ? ' (${_moneyText((line['volume_range'] as Map)['low'], currency)} to ${_moneyText((line['volume_range'] as Map)['high'], currency)})' : ''}'
           '${cost is num && cost > 0 ? ' (${_numberText(cost)}% passed on)' : ''}';
     case 'per_unit':
       return '${line['label'] ?? 'per unit'}: ${_moneyText(line['amount'], currency)} '
-          'per ${line['unit'] ?? 'unit'}$period × ${line['units'] ?? 0}';
+          'per ${line['unit'] ?? 'unit'}$period × ${line['units'] ?? 0}'
+          '${line['units_range'] is Map ? ' (${(line['units_range'] as Map)['low']} to ${(line['units_range'] as Map)['high']})' : ''}';
     case 'credit':
       return '${line['label'] ?? 'credit'}: − ${_moneyText(line['amount'], currency)}';
     case 'one_off' when line['units'] != null:
       return '${line['label'] ?? 'one-off'}: ${_moneyText(line['amount'], currency)} '
-          'per ${line['unit'] ?? 'unit'} × ${line['units']} per project';
+          'per ${line['unit'] ?? 'unit'} × ${line['units']} per project'
+          '${line['covers_months'] == null ? '' : ', covers ${line['covers_months']} months'}';
     default:
-      return '${line['label'] ?? kind}: ${_moneyText(line['amount'], currency)}$period';
+      return '${line['label'] ?? kind}: ${_moneyText(line['amount'], currency)}$period'
+          '${kind == 'one_off' && line['covers_months'] != null ? ', covers ${line['covers_months']} months' : ''}';
   }
 }
 
@@ -441,6 +457,8 @@ Component candidateDiligence(Map<String, dynamic> item) {
   );
   final dissent = item['dissent'] as Map?;
   final dimensions = item['confidence_dimensions'] as Map?;
+  final benefit = item['benefit'] as Map?;
+  final comparison = benefit?['comparison'] as Map?;
   final economics = item['economics'] as Map?;
   final firstOffer = '${item['first_offer'] ?? ''}';
   final firstPayment = item['time_to_first_payment_days'];
@@ -506,7 +524,10 @@ Component candidateDiligence(Map<String, dynamic> item) {
     if (reachable != null)
       (
         'Reachable market',
-        text('${reachable['count'] ?? 0} · ${reachable['segment'] ?? ''}'),
+        text(
+          '${reachable['count'] ?? 0} · ${reachable['segment'] ?? ''}'
+          '${reachable['basis'] == 'estimated' ? ' · estimated' : reachable['basis'] == 'counted' ? ' · counted' : ''}',
+        ),
       ),
     if (business != null)
       (
@@ -532,7 +553,8 @@ Component candidateDiligence(Map<String, dynamic> item) {
         'Delivery',
         text(
           '${delivery['expert_days'] ?? 0} expert days at '
-          '${_priceText(delivery['day_rate'] as Map?)}',
+          '${_priceText(delivery['day_rate'] as Map?)}'
+          '${delivery['monthly_hours'] == null ? '' : ' · ${delivery['monthly_hours']} service hours a customer each month'}',
         ),
       ),
     if (economics != null)
@@ -551,7 +573,8 @@ Component candidateDiligence(Map<String, dynamic> item) {
         text(
           economics['basis'] == 'project'
               ? '${_moneyText(economics['contribution'], economics['currency'])} per project after delivery'
-              : '${_moneyText(economics['contribution'], economics['currency'])} per customer a month',
+              : '${_moneyText(economics['contribution'], economics['currency'])} per customer a month'
+                    '${(economics['service_cost_monthly'] as num? ?? 0) > 0 ? ' after ${_moneyText(economics['service_cost_monthly'], economics['currency'])} of service' : ''}',
         ),
       ),
     if (economics != null &&
@@ -561,7 +584,8 @@ Component candidateDiligence(Map<String, dynamic> item) {
         'First year per customer',
         text(
           '${_moneyText(economics['first_year_revenue'], economics['currency'])} revenue, '
-          '${_moneyText(economics['first_year_contribution'], economics['currency'])} after delivery and credits',
+          '${_moneyText(economics['first_year_contribution'], economics['currency'])} after delivery, service and credits'
+          '${economics['first_year_paid_months'] is int && (economics['first_year_paid_months'] as int) < 12 ? ' · ${economics['first_year_paid_months']} months of subscription after the first offer' : ''}',
         ),
       ),
     if (economics != null && economics['project_contribution'] != null)
@@ -571,6 +595,37 @@ Component candidateDiligence(Map<String, dynamic> item) {
           '${_moneyText(economics['project_contribution'], economics['currency'])} per pilot'
           '${economics['pilot_break_even_days'] == null ? '' : ' · loses money above ${economics['pilot_break_even_days']} expert days'}',
         ),
+      ),
+    if (economics != null && economics['acquisition_cost'] != null)
+      (
+        'Winning a customer',
+        text(
+          '${_moneyText(economics['acquisition_cost'], economics['currency'])}'
+          '${economics['payback_months'] == null ? '' : ' · repaid in ${economics['payback_months']} months of contribution'}'
+          '${economics['contribution_after_acquisition'] == null ? '' : ' · ${_moneyText(economics['contribution_after_acquisition'], economics['currency'])} left from the ${economics['basis'] == 'project' ? 'first project' : 'first year'}'}',
+        ),
+      ),
+    if (economics != null && economics['benefit_yearly'] != null)
+      (
+        'Buyer benefit',
+        text(
+          '${_moneyText(economics['benefit_yearly'], economics['currency'])} a year, '
+          '${economics['benefit_basis'] ?? 'estimated'}'
+          '${economics['roi_multiple'] == null ? '' : ' · ${economics['roi_multiple']}× what the buyer pays in ${economics['basis'] == 'project' && economics['buyer_cost_year_one'] == null ? 'the project' : 'year one'}'}',
+        ),
+      ),
+    if (comparison != null)
+      (
+        'Value received per ${benefit?['period']}',
+        text('${_moneyText(comparison['with_offer'], benefit?['currency'])} with the offer, '
+            '${_moneyText(comparison['without_offer'], benefit?['currency'])} under the current process'),
+      ),
+    if (economics?['buyer_net_year_one'] != null)
+      (
+        'Buyer net benefit in year one',
+        text('${_moneyText(economics?['buyer_net_year_one'], currency)} after '
+            '${_moneyText(economics?['buyer_fees_year_one'], currency)} in fees'
+            '${benefit?['buyer_cost_year_one'] == null ? ', before any unreported buyer-side costs' : ' and ${_moneyText(benefit?['buyer_cost_year_one'], benefit?['currency'])} in buyer-side costs'}'),
       ),
     if (firstPayment != null) ('First payment', text('$firstPayment days')),
     if (item['competition'] is Map)
@@ -602,7 +657,9 @@ Component candidateDiligence(Map<String, dynamic> item) {
         text(
           '${module['name'] ?? ''} · ${_moneyText(module['amount'], module['currency'])}'
           '${_periodText['${module['period'] ?? ''}'] ?? ''} · '
-          '${module['attach_percent'] ?? 0}% of customers expected',
+          '${module['attach_percent'] ?? 0}% assumed adoption'
+          '${module['shared_input'] == null ? '' : ' · Reuses ${module['shared_input']}'}'
+          ' · Purchase test: ${module['purchase_test'] ?? 'Unspecified'}',
         ),
       ),
     if (((economics?['expansion_monthly'] as num?) ?? 0) > 0)
@@ -747,7 +804,8 @@ Component candidateDiligence(Map<String, dynamic> item) {
           paragraph(
             '${entry.key.toString().replaceAll('_', ' ')}: '
             '${entry.value is Map ? (entry.value as Map)['rating'] ?? '' : ''}'
-            '${entry.value is Map && (entry.value as Map)['unrated'] == true ? ' (not rated)' : ''}',
+            '${entry.value is Map && (entry.value as Map)['unrated'] == true ? ' (not rated)' : ''}'
+            '${entry.value is Map && '${(entry.value as Map)['raise'] ?? ''}'.isNotEmpty ? '. To raise it: ${(entry.value as Map)['raise']}' : ''}',
           ),
       ]),
   ], classes: 'stack');
@@ -858,7 +916,7 @@ Component _candidate(
     if ((item['scout_adjusted'] as Map? ?? const {}).isNotEmpty)
       paragraph(
         'The gateway reset the values the scout proposed for the bar, the schedule and capital above a '
-        'year of costs. You can change them with Edit.',
+        'year of costs, and raised monthly costs below the studio cost floor. You can change them with Edit.',
       ),
     if (assumptions.isNotEmpty) ...[
       paragraph('Assumptions'),

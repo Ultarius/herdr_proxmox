@@ -224,6 +224,12 @@ void main() {
           ],
         },
         'market_ceiling': {'count': 4000, 'segment': 'US forwarders'},
+        'expansion': [
+          {'name': 'Repeat review', 'amount': 180, 'currency': 'USD', 'period': 'month',
+           'attach_percent': 25, 'shared_input': 'Settlement ledger', 'purchase_test': 'Second paid review'},
+        ],
+        'benefit': {'period': 'year', 'currency': 'USD', 'basis': 'estimated',
+                    'comparison': {'with_offer': 4500, 'without_offer': 1500}},
         'panel': {
           'run_id': 'pitch-1',
           'round': 1,
@@ -281,6 +287,8 @@ void main() {
           'break_even_customers': 31,
           'basis': 'recurring',
           'break_even_share': 1.24,
+          'buyer_net_year_one': 659,
+          'buyer_fees_year_one': 2341,
           'contribution': 600,
           'recurring_monthly': 600,
           'revenue_mix': {'recurring': 0, 'per_unit': 600, 'take_rate': 0},
@@ -595,6 +603,9 @@ void main() {
     expect(page, contains('sites: 200 USD per site a month × 3'));
     expect(page, contains('600 USD per unit'));
     expect(page, contains('Upside, not counted in break-even'));
+    expect(page, contains('25% assumed adoption · Reuses Settlement ledger · Purchase test: Second paid review'));
+    expect(page, contains('4500 USD with the offer, 1500 USD under the current process'));
+    expect(page, contains('659 USD after 2341 USD in fees, before any unreported buyer-side costs'));
     expect(page, contains('Review notes (1)'));
     // The gateway's own competition figures, and numbers changed after a failed check.
     expect(
