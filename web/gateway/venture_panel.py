@@ -596,7 +596,7 @@ class StakeholderPanel:
         idea = {key: candidate.get(key) for key in (
             'name', 'thesis', 'product', 'pricing', 'first_offer', 'time_to_first_payment_days', 'confidence',
             'confidence_dimensions', 'buyer', 'reachable_accounts', 'business_model', 'delivery_effort',
-            'alternatives', 'evidence', 'evidence_against',
+            'alternatives', 'competition', 'evidence', 'evidence_against',
             'dissent', 'analogue', 'incumbent', 'market_ceiling', 'expansion', 'prior_state', 'assumptions',
             'kill_criteria', 'review_notes', 'revision_note', 'stakeholder_screen')
             if candidate.get(key) not in (None, '', [])}
@@ -721,6 +721,11 @@ class StakeholderPanel:
                        'shortlist during the scout, with what the studio did about them; a follow_up is the '
                        'objecting stakeholder\'s answer to a redesigned offer. In round 2, '
                        'say whether each screened objection is answered.')
+        if any(item.get('competition') for item in run['evidence']['ideas']):
+            prompt += (' In round 1, test each competition claim against the cited prices and what the buyer '
+                       'actually uses. For a price challenger, ask whether the seller can match only for these '
+                       'buyers. For a bundle, ask which paid tools it replaces and whether the first module '
+                       'sells on its own.')
         if len(prompt) > PANEL_PROMPT_LIMIT:
             raise ValueError('The pitch prompt exceeds the discussion budget.')
         return prompt

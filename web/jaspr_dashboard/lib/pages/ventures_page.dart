@@ -1702,6 +1702,7 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
       .join(', ');
   late String _exclude =
       (component.policy['studio_exclude'] as List? ?? const []).join(', ');
+  late String _strategy = '${component.policy['studio_strategy'] ?? ''}';
   late String _sources =
       (component.policy['studio_sources'] as List? ?? const []).join('\n');
   late bool _paused = component.policy['studio_paused'] == true;
@@ -1744,6 +1745,7 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
       'studio_candidate_backlog': backlog,
       'studio_focus': _commas(_focus),
       'studio_exclude': _commas(_exclude),
+      'studio_strategy': _strategy.trim(),
       'studio_sources': _lines(_sources),
       'studio_paused': _paused,
       'studio_mode': _mode,
@@ -1789,6 +1791,14 @@ class _StudioPolicyFormState extends State<_StudioPolicyForm> {
       _exclude,
       (value) => setState(() => _exclude = value),
       rows: 2,
+    ),
+    textarea(
+      'Studio strategy (optional, up to 600 characters): the advantages the '
+      'studio claims, such as a lower price or one platform per vertical. '
+      'The Skeptic tests them for each idea.',
+      _strategy,
+      (value) => setState(() => _strategy = value),
+      rows: 3,
     ),
     textarea(
       'Allowed scouting sources (one https URL per line)',

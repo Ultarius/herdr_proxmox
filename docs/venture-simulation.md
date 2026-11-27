@@ -541,9 +541,10 @@ survives the review checklist, the answer rules tell it to weigh one more
 batch of the same size from segments it has not covered, and to return an
 empty list only when that batch fails too. The second batch must avoid the
 reason the first one failed, not only its industries: another vertical with
-the same product usually fails the same way. When a cheap tool already
-served the first ideas, the rules suggest changing the product, the buyer or
-how it earns:
+the same product usually fails the same way. When a tool already served the
+first ideas, the rules suggest pricing below it with a cost reason the seller
+will not match (question 6), bundling it with what the same buyer buys beside
+it (question 12), or changing the product, the buyer or how it earns:
 - compliance or reporting that a regulation requires;
 - a buyer larger than a one-person business;
 - a share of the money it moves or saves.
@@ -554,7 +555,7 @@ compliance or payments feature added is still a booking tool. A live team had
 filled three rounds with booking software for one industry after another.
 
 Before a scout returns nothing, the review checklist's "Look again before
-returning nothing" (question 12) has the team look at the round's rejected
+returning nothing" (question 13) has the team look at the round's rejected
 ideas again. The answer rules name it by its heading, not as "the last
 question", because the checklist grew. An idea with a credible test
 that could change its verdict is a hold, not a reject. A credible test is
@@ -684,6 +685,100 @@ cases apart:
   When either is uncertain, the scout names the evidence that would settle it,
   which is a test for a held idea, not a reason to reject.
 
+**A competitor is not a verdict.** Two live rounds in one vertical rejected
+every idea because a different seller sold each piece: an AI mailbox desk at
+EUR 149-699/month, plant takeoff at USD 89 a takeoff, a complaints module at
+EUR 2,500/year. Question 6 told the Skeptic to assume the leader matches a
+lower price, one round read the sellers' paying customers as evidence against
+a new entrant, and a lead was retired because its question asked whether the
+studio could arrive "before an incumbent bundles it". The checklist now says:
+- a competitor with paying customers shows the buyer pays for the job. That
+  is paid demand, as the rating rules already said, and it moves the question
+  to why this buyer would choose us. No idea is rejected only because a
+  competitor sells it;
+- a lower price is an advantage when the seller has a reason to maintain its
+  price. The **matching test** uses the leader's price, billing period and
+  number of customers on that plan to estimate the revenue impact of
+  repricing those accounts. The scout also checks whether the seller could
+  offer targeted discounts or a cheaper tier. It shows our structural cost
+  advantage in delivery (question 2) and in the size calculation at our price
+  (question 7);
+- a price challenger and a bundle are reframes question 8 weighs, beside a
+  different customer, revenue line or first offer;
+- **Combine before ruling out** (question 12): before an idea goes under
+  `ruled_out` because a competitor sells it, the team looks at the round's
+  other rejected ideas, and the pack's `ruled_out` entries blocked by an
+  incumbent, that serve the same buyer. When that buyer pays two or more
+  sellers for them today, it weighs one bundle: each price with its period,
+  the stack's total, and a bundle price below it, or at it with one shared
+  record that stops the buyer typing the same data twice. The bundle fails
+  question 6 when one incumbent (an ERP or suite) already sells the whole set
+  to these buyers. Its first offer is still one module that sells alone; the
+  rest is expansion and defensibility, never break-even.
+
+During the shortlist screen the market leader is asked what matching a lower
+price would cost it across its customers, and the target customer (else the
+industry operator) what the tools around the job cost together and whether one
+product at a lower total would replace them. Both answers are research leads.
+
+The operator can state the studio's own advantages in **Studio strategy**
+(`studio_strategy`, up to 600 characters, empty by default), such as "we
+undercut on price as an AI-native vendor and build one platform per vertical".
+It travels in the pack as `policy.strategy` and up front in the brief. It is a
+claim, not evidence: the Skeptic tests it for each idea, and it counts under
+questions 1, 6 and 12 only where the evidence supports it for that buyer.
+
+**The competition field.** An idea that wins on price, as a bundle or in a
+segment a seller ignores states it in an optional `competition` object, and
+the gateway does the arithmetic:
+
+| Strategy | Required | The gateway computes | Refused when |
+| --- | --- | --- | --- |
+| `price` | `leader` with name, price and period, a cited count of paying `customers` on that plan, and `cost_reason` | the discount and the monthly revenue difference if the cited accounts are repriced | our year-one price per month is not below the leader's |
+| `bundle` | `stack`: 2-6 different sellers the buyer pays today, each with price, period and evidence | the stack's monthly total and the saving | the bundle costs more than the stack, or less than 5% below it without a `shared_record` |
+| `segment` | `leader` (name and evidence; price optional) and `unserved` | our price per month | never on the figures |
+
+Our side is what the buyer pays a month in year one: one-off fees plus twelve
+months of recurring revenue, less credits, over twelve. A price within 15% of
+the leader's gets the note "assume it matches". Every price and customer count
+cites the evidence it was read from. When none of the cited sources states the
+number (thousands separators and decimal commas are read as written), the
+idea gets a note naming it, so a guessed customer count or price shows. The
+figures and notes are stored as `competition` and shown under **How it
+competes**. Edits to the candidate's currency or exchange rate refresh the
+comparison. If the old claim fails at the new rate, the Ideas tab shows what
+needs review. The pitch includes the comparison and its cited sources so
+stakeholders can challenge the prices, the tools in the bundle and whether
+the first module can sell on its own.
+
+**Checking a draft during the meeting.** A meeting used to learn that an idea
+was refused (a past kill date, a missing citation, broken revenue lines) only
+after it ended, and the idea was lost for that round. The gateway now checks
+drafts while the meeting runs:
+
+- The pack folder has a `drafts/` folder and a small `check.py`. The chair runs
+  `python3 check.py draft.json`, which copies the draft into `drafts/` and
+  waits for a result for those exact bytes. Without Python the chair writes
+  `drafts/<name>.json` using a fresh name for each submission.
+- On its next pass (about ten seconds) the gateway checks every new draft with
+  the same `_scout_candidate` rules it applies when the meeting ends, and writes
+  `drafts/<name>.result.json`: whether each idea passes, its problems, the
+  economics (break-even, year-one revenue, runway), the competition figures,
+  warnings and notes. A draft is untrusted: only a regular file of at most
+  256 KB named like `draft-1.json` is read. A result the gateway cannot write
+  uses no check, and the gateway continues processing the other drafts.
+- A run gets three checks. Later drafts get "no checks left" and are logged up
+  to eight entries.
+- The gateway keeps the log (`draft_checks` on the run), with up to 80 numeric
+  fields per checked idea. The submitted answer is validated again when the
+  meeting ends.
+- When an idea fails a check, the next result lists up to 12 changes to
+  those fields since the first failed check. The settled idea keeps them as `draft_changes`
+  (shown on the Ideas tab as **Changed after failed check N**). A fix and a
+  number nudged until it passes both show, so the Skeptic and the operator can
+  tell which it was. The brief says to fix a failure by changing the offer,
+  citing what a page states or dropping the idea.
+
 Vendor pages are read for what they say, not inferred from a feature name, and
 their claims are reported as the vendor's own.
 
@@ -751,11 +846,21 @@ scout's frozen pack and kept under the same `source_scope` as the idea.
 When this question was added the checklist was renumbered: the verdict, held
 ideas and "Look again before returning nothing" moved to 10, 11 and 12.
 Questions 1 to 8, including question 6, kept their numbers. Older scout notes
-that cite Q9 to Q11 refer to the earlier numbering.
+that cite Q9 to Q11 refer to the earlier numbering. "Combine before ruling
+out" later became step 12, moving "Look again before returning nothing", the
+research lead and the earlier lead to 13, 14 and 15.
 
 Rejected ideas are listed under `ruled_out`: up to ten
-`{"segment","market","reason","evidence"}` entries per answer, where `market`
-names the buyer and geography the idea was judged for. They are advisory:
+`{"segment","market","reason","blocked_by","incumbent","evidence"}` entries per
+answer, where `market` names the buyer and geography the idea was judged for.
+`blocked_by` says what sank it: `incumbent` (a seller already sells it),
+`no_problem` (the buyer already achieves the outcome), `no_payer`, `delivery`,
+`size` or `other`; another value is dropped. With `incumbent`, `incumbent`
+names the seller and its price (`{"name","price"}`, at most 120 and 80
+characters; a bare name is accepted). The next scout's pack keeps both, so it
+can weigh those segments for a lower price or as bundle modules instead of
+skipping them, and the Studio tab lists them first under **Ruled out this
+round**. They are advisory:
 - an unusable entry is dropped;
 - a segment repeated for the same market is kept once;
 - the reason is bounded to 300 characters;
@@ -778,13 +883,14 @@ settled before `ruled_out` existed has only its note. A note keeps up to
 investigate.
 
 **Research leads.** "Worth investigating next" is not "ready to advance". An
-empty round may leave one `research_lead` (checklist step 13): the decisive
+empty round may leave one `research_lead` (checklist step 14): the decisive
 question, the buyer problem, the offer that failed, the material change that
 could make a different offer work, the decisive unknown and the cheapest
 test, each up to 300 characters; the question and the test are required. Its
 cited ids become URLs, like `ruled_out`, and it keeps the run's focus. A
-round that returns an idea leaves no lead. A lead is not a candidate: it
-takes no backlog slot, goes to no pitch and is never created.
+round that adds an idea to the proposal queue leaves no lead. Excluded
+duplicates stay in the run history and count as an empty round for scout
+guidance. A research lead takes no backlog slot and goes to no pitch.
 
 The next scout whose focus shares an area with the lead's (or either has
 none) gets the newest open lead as `research_lead` in its pack. The brief
@@ -796,7 +902,12 @@ proposal that takes up the lead. The gateway checks that the proposal was
 accepted as a candidate. A saved answer can omit the name if it submitted a
 single proposal and that proposal was accepted. The scout reports `retired`
 when evidence answers the question against it and `open` when it needs more
-research. A lead closes on retirement or replacement and expires after five
+research. A competitor selling the same thing does not retire a lead on its
+own: the lead is retired when buyers already get the outcome at a price the
+studio cannot beat with a cost reason, or when nobody pays for it. A lead's
+question asks what the buyer pays for and why it would choose us, not whether
+the studio can arrive before an incumbent. A lead closes on retirement or
+replacement and expires after five
 subsequent settled scouts. Repeating the carried question preserves its
 original expiry. The Studio tab shows the lead, its outcome and feedback on
 omitted ideas. The Ideas tab names the lead when the latest scout proposed

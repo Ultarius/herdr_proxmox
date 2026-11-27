@@ -1365,7 +1365,7 @@ class VentureTests(unittest.TestCase):
         failed = self.studio_runs()[-1]
         folder = Path(failed['evidence_file']).parent
         names = {ventures.STUDIO_ENTRY_FILE, ventures.STUDIO_RULES_FILE, ventures.STUDIO_REVIEW_FILE,
-                 ventures.STUDIO_CONSULT_FILE}
+                 ventures.STUDIO_CONSULT_FILE, ventures.STUDIO_CHECK_FILE}
         self.assertEqual(set(failed['bundle']), names)
         pinned = {name: (folder / name).read_text(encoding='utf-8') for name in names}
         self.assertEqual(pinned, failed['bundle'])
@@ -2108,13 +2108,23 @@ class VentureTests(unittest.TestCase):
     def test_a_scout_that_returns_an_idea_ends_the_empty_streak(self):
         self.setup_studio_manual()
         self.add_venture_group(self.create())
-        for _ in range(2):
-            run = self.studio(mode='studio_run', kind='scout')
-            self.assertEqual(self.complete_studio(run, {'candidates': [], 'research': self.RESEARCH})['state'], 'ready')
+        self.studio(mode='studio_policy', studio_exclude=['Legacy Cargo'])
         run = self.studio(mode='studio_run', kind='scout')
-        self.assertEqual(json.loads(Path(run['evidence_file']).read_text(encoding='utf-8'))['empty_streak']['runs'], 2)
+        self.assertEqual(self.complete_studio(run, {'candidates': [], 'research': self.RESEARCH})['state'], 'ready')
+        run = self.studio(mode='studio_run', kind='scout')
+        lead = dict(question='Who pays for the handoff?', test='Review an invoice for the handoff.')
+        blocked = self.web_candidate('Legacy Cargo')
+        blocked['thesis'] = 'Cold storage depots pay to reconcile temperature excursion logs.'
+        excluded = self.complete_studio(run, dict(candidates=[blocked], research=self.RESEARCH, research_lead=lead))
+        self.assertEqual(excluded['candidates'][0]['state'], 'excluded')
+        self.assertEqual(excluded['research_lead']['question'], lead['question'])
+        run = self.studio(mode='studio_run', kind='scout')
+        pack = json.loads(Path(run['evidence_file']).read_text(encoding='utf-8'))
+        self.assertEqual(pack['empty_streak']['runs'], 2)
+        self.assertEqual(pack['research_lead']['question'], lead['question'])
         done = self.complete_studio(run, {'candidates': [self.web_candidate()], 'research': self.RESEARCH})
         self.assertEqual((done['state'], len(done['candidates'])), ('ready', 1), done.get('refused_candidates'))
+        self.assertEqual(done['candidates'][0]['state'], 'proposed')
         self.assertIsNone(self.ventures._studio_empty_streak('org'))
 
     def test_a_segment_with_its_qualifiers_fits_and_an_overlong_one_says_the_limit(self):
@@ -3000,6 +3010,314 @@ class VentureTests(unittest.TestCase):
         self.assertIn('when it failed a segment only because a tool or a small vendor already sells the idea', rules)
         self.assertIn('A vendor page that only lists a product or a price shows supply, not spending', rules)
 
+    def test_a_competitor_selling_the_job_leaves_room_for_a_lower_price_or_a_bundle(self):
+        # Two live rounds rejected every idea in a vertical because a different
+        # seller sold each piece, assumed every leader matches a lower price,
+        # and retired a lead once a competitor turned up.
+        checklist = ' '.join(ventures.STUDIO_REVIEW_CHECKLIST.split())
+        self.assertNotIn('assume the leader matches it', checklist)
+        for rule in ('If ours is lower than a tool buyers already pay for, that is a strategy, not a weakness',
+                     '**The matching test.** A lower price is an advantage only when matching it costs the leader '
+                     'more than it gains.',
+                     'A lower price without a lower cost is a thinner margin, which the leader can match.',
+                     'Assume it matches when it already sells near our price or has few customers to reprice.',
+                     'that is paid demand, not a verdict against us',
+                     'Never reject an idea only because a competitor sells it.',
+                     'a price challenger (below a seller buyers already pay',
+                     # A bundle of what the buyer pays several sellers for.
+                     '12. **Combine before ruling out.**', 'add up what the buyer pays for the stack',
+                     'an ERP or suite that covers it is that incumbent',
+                     'counts toward defensibility, never toward break-even',
+                     # The later steps moved up by one.
+                     '13. **Look again before returning nothing.**',
+                     '14. **Leave one research lead from an empty round.**',
+                     'not whether the studio can arrive before an incumbent',
+                     '15. **Work on an earlier lead first.**',
+                     'A competitor selling the same thing does not retire a lead on its own',
+                     # The operator's strategy is a claim to test.
+                     'one the evidence does not support for this buyer counts for nothing'):
+            self.assertIn(rule, checklist)
+        self.assertLess(checklist.index('12. **Combine'), checklist.index('13. **Look again'))
+        rules = ' '.join(ventures.scout_answer_rules().split())
+        for rule in ('"blocked_by": "incumbent": weigh it as a lower price or a bundle module',
+                     'price below it with a cost reason it will not match',
+                     'blocked_by is what sank it: incumbent|no_problem|no_payer|delivery|size|other',
+                     'an incumbent entry stays open to a lower price or a bundle',
+                     'A competitor selling the same thing is not on its own a reason to retire a lead.'):
+            self.assertIn(rule, rules)
+        self.assertNotIn('If a cheap tool already served them', rules)
+        # The market leader says what matching would cost it; the buyer, else
+        # the operator, what the tools around the job cost together.
+        method = ' '.join(ventures.scout_consult_method(['customer', 'operator', 'competitor']).split())
+        self.assertIn('Ask the market leader, for each idea a seller already sells: "If a newcomer sold this below '
+                      'your price, what would matching it cost you across your customers', method)
+        self.assertIn('Ask the target customer: "What do you pay per year for the tools around this job together',
+                      method)
+        self.assertNotIn('Ask the industry operator: "What does a typical buyer pay', method)
+        self.assertIn("feed the review checklist's questions 6 and 12", method)
+        method = ' '.join(ventures.scout_consult_method(['operator']).split())
+        self.assertIn('Ask the industry operator: "What does a typical buyer pay per year', method)
+        self.assertNotIn('Ask the market leader', method)
+        method = ' '.join(ventures.scout_consult_method(['investor']).split())
+        self.assertNotIn('questions 6 and 12', method)
+        self.assertNotIn('{competition_question}', method)
+
+        # The operator states the studio's strategy; the pack and the brief carry it.
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='scout')
+        pack = json.loads(Path(run['evidence_file']).read_text(encoding='utf-8'))
+        self.assertNotIn('strategy', pack['policy'])
+        self.complete_studio(run, {'candidates': [], 'research': self.RESEARCH})
+        strategy = 'We undercut on price as an AI-native vendor and build one platform per vertical.'
+        with self.assertRaisesRegex(ValueError, 'studio strategy is 601 characters; the limit is 600'):
+            self.studio(mode='studio_policy', studio_strategy='x' * 601)
+        with self.assertRaisesRegex(ValueError, 'studio strategy must be text'):
+            self.studio(mode='studio_policy', studio_strategy=['a list'])
+        self.assertEqual(self.studio(mode='studio_policy', studio_strategy='  ' + strategy + ' ')['studio_strategy'],
+                         strategy)
+        run = self.studio(mode='studio_run', kind='scout')
+        pack = json.loads(Path(run['evidence_file']).read_text(encoding='utf-8'))
+        self.assertEqual(pack['policy']['strategy'], strategy)
+        brief = Path(run['evidence_file']).with_name(ventures.STUDIO_ENTRY_FILE).read_text(encoding='utf-8')
+        self.assertIn("**The operator's studio strategy:** " + strategy + ' These are advantages the studio '
+                      'claims, not evidence', brief)
+
+        # ruled_out records what sank each segment, and the seller when it was one.
+        done = self.complete_studio(run, {'candidates': [], 'research': self.RESEARCH, 'ruled_out': [
+            dict(segment='Mailbox quote desk', market='Dutch tree traders', reason='BoomkwekerAI sells it.',
+                 blocked_by='incumbent', incumbent=dict(name='BoomkwekerAI', price='EUR 149-699/month'),
+                 evidence=['W1']),
+            dict(segment='Claims recovery', market='Dutch tree traders', reason='PlantScout sells it.',
+                 blocked_by='incumbent', incumbent='PlantScout'),
+            dict(segment='Plant takeoff', market='Dutch contractors', reason='Extraction is not the bottleneck.',
+                 blocked_by='no_problem', incumbent=dict(name='Matrak', price='USD 89/takeoff')),
+            dict(segment='Spray register', market='Dutch nurseries', reason='Excel is accepted.',
+                 blocked_by='cheap', incumbent=dict(name='GroenVision'))]})
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        self.assertEqual([(item['segment'], item.get('blocked_by'), item.get('incumbent'))
+                          for item in done['ruled_out']],
+                         [('Mailbox quote desk', 'incumbent', dict(name='BoomkwekerAI', price='EUR 149-699/month')),
+                          ('Claims recovery', 'incumbent', dict(name='PlantScout', price='')),
+                          ('Plant takeoff', 'no_problem', None), ('Spray register', None, None)])
+        # The next scout gets them, so it can weigh a lower price or a bundle.
+        later = self.studio(mode='studio_run', kind='scout')
+        remembered = json.loads(Path(later['evidence_file']).read_text(encoding='utf-8'))['ruled_out']
+        self.assertEqual([(item['segment'], item.get('blocked_by'), item.get('incumbent')) for item in remembered],
+                         [(item['segment'], item.get('blocked_by'), item.get('incumbent'))
+                          for item in done['ruled_out']])
+
+    PRICED = [dict(id='W1', url='https://desk.example/pricing', title='BoomDesk pricing',
+                   claim='BoomDesk costs USD 900/month and lists 40 paying customers.'),
+              dict(id='W2', url='https://stack.example/a', title='StackA', claim='StackA is USD 400 a month.'),
+              dict(id='W3', url='https://stack.example/b', title='StackB', claim='StackB is USD 3,600 per year.')]
+
+    def priced_candidate(self, name, thesis, competition):
+        proposal = self.web_candidate(name, ('W1', 'W2', 'W3'))
+        proposal.update(thesis=thesis, competition=competition)
+        return proposal
+
+    def test_a_price_or_bundle_claim_is_complete_cited_and_computed_by_the_gateway(self):
+        # A scout may now win on price or as a bundle; the claim must carry
+        # the cited prices, and the gateway, not the agents, does the sums.
+        cite = lambda value, limit=3: list(value or ['W1'])[:limit]
+        market = dict(currency='USD', fx_pair='USD/USD', fx_rate=1)
+        configuration = dict(market=market)
+        economics = dict(first_year_revenue=7200, currency='USD')  # 600 a month in year one.
+        price = lambda amount, period='month': dict(amount=amount, currency='USD', period=period)
+        bundle = ventures.scout_competition(dict(strategy='bundle', stack=[
+            dict(name='StackA', price=price(400), evidence=['W2']),
+            dict(name='StackB', price=price(3600, 'year'), evidence=['W3'])]), cite)
+        figures, notes = ventures.competition_check(bundle, economics, configuration)
+        self.assertEqual((figures['stack_monthly'], figures['saving_percent'], notes), (700, 14.3, []))
+        dear = dict(bundle, stack=[dict(bundle['stack'][0], price=price(250)), bundle['stack'][1]])
+        with self.assertRaisesRegex(ValueError, 'more than the 550 the buyer pays for the stack it replaces'):
+            ventures.competition_check(dear, economics, configuration)
+        level = dict(bundle, stack=[dict(bundle['stack'][0], price=price(320)), bundle['stack'][1]])
+        with self.assertRaisesRegex(ValueError, 'needs a shared_record'):
+            ventures.competition_check(level, economics, configuration)
+        self.assertEqual(ventures.competition_check(dict(level, shared_record='One order record for all three.'),
+                                                    economics, configuration)[0]['saving_percent'], 3.2)
+        for value, message in (
+                (dict(strategy='discount'), 'competition strategy'),
+                (dict(strategy='price', leader=dict(name='BoomDesk', price=price(900), evidence=['W1']),
+                      cost_reason='Self-serve setup.'), 'competition leader customers'),
+                (dict(strategy='price', leader=dict(name='BoomDesk', price=price(900), customers=40,
+                                                    evidence=['W1'])), 'competition cost_reason'),
+                (dict(strategy='price', leader=dict(name='BoomDesk', price=dict(amount=900, currency='USD'),
+                                                    customers=40, evidence=['W1']), cost_reason='x'),
+                 'price period'),
+                (dict(strategy='bundle', stack=[dict(name='StackA', price=price(400), evidence=['W2'])]),
+                 'competition stack must list 2-6'),
+                (dict(strategy='bundle', stack=[dict(name='StackA', price=price(400), evidence=['W2']),
+                                                dict(name='stacka', price=price(300), evidence=['W3'])]),
+                 'different sellers'),
+                (dict(strategy='segment', leader=dict(name='BoomDesk', evidence=['W1'])), 'competition unserved')):
+            with self.assertRaisesRegex(ValueError, message):
+                ventures.scout_competition(value, cite)
+        segment = ventures.scout_competition(dict(strategy='segment', leader=dict(name='BoomDesk', evidence=['W1']),
+                                                  unserved='Brokers with no ERP.'), cite)
+        self.assertIsNone(segment['leader']['price'])
+        self.assertEqual(ventures.competition_check(segment, economics, configuration)[0]['ours_monthly'], 600)
+        # Thousands separators and decimal commas are read as the page wrote them.
+        self.assertEqual(ventures._stated_numbers('EUR 149/249 a month, EUR 1,500/year, 1.500 euro, 29,90'),
+                         {149, 249, 1500, 29.9})
+
+        # In a run: the figures and the notes travel with the idea.
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        self.studio(mode='studio_policy', studio_max_candidates=3)
+        run = self.studio(mode='studio_run', kind='scout')
+        leader = lambda amount, customers: dict(name='BoomDesk', price=price(amount), customers=customers,
+                                                evidence=['W1'])
+        done = self.complete_studio(run, {'research': self.PRICED, 'candidates': [
+            self.priced_candidate('Price Desk', 'Brokers pay less for the same quote desk without an ERP.',
+                                  dict(strategy='price', leader=leader(900, 40), cost_reason='Self-serve setup.')),
+            self.priced_candidate('Guess Board', 'Traders pay per order for intake that the leader sells monthly.',
+                                  dict(strategy='price', leader=leader(650, 400), cost_reason='No onboarding.')),
+            self.priced_candidate('Dear Ledger', 'Nurseries pay a premium for credit notes reconciled weekly.',
+                                  dict(strategy='price', leader=leader(500, 40), cost_reason='Automation.'))]})
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        ideas = {item['name']: item for item in self.stored_candidates()}
+        self.assertEqual(ideas['Price Desk']['competition']['figures'],
+                         dict(ours_monthly=600, currency='USD', leader_monthly=900, discount_percent=33.3,
+                              matching_cost_monthly=12000))
+        self.assertEqual(ideas['Price Desk']['competition']['notes'], [])
+        # A price the leader can match cheaply, and numbers the page never stated.
+        self.assertEqual(ideas['Guess Board']['competition']['notes'], [
+            'Within 15% of BoomDesk\'s price: assume it matches.',
+            "BoomDesk's price 650 USD is not stated in its cited evidence (W1).",
+            "BoomDesk's 400 paying customers are not stated in its cited evidence (W1)."])
+        self.assertNotIn('Dear Ledger', ideas)
+        refused = {item['name']: item['error'] for item in done['refused_candidates']}
+        self.assertIn('a price strategy needs a year-one price below BoomDesk\'s; ours is 600 USD a month '
+                      'against 500', refused['Dear Ledger'])
+        rules = ' '.join(ventures.scout_answer_rules().split())
+        self.assertIn('"leader" {"name","price":{"amount","currency","period"},"customers","evidence"}', rules)
+        self.assertIn('A price or count the cited sources do not state becomes a note to check', rules)
+        checklist = ' '.join(ventures.STUDIO_REVIEW_CHECKLIST.split())
+        self.assertIn('Record it in the idea\'s "competition" with strategy "price"', checklist)
+        self.assertIn('record it in "competition" with strategy "bundle"', checklist)
+
+    def test_a_scout_checks_drafts_with_the_gateway_during_the_meeting_and_the_log_shows_what_changed(self):
+        # A live meeting lost ideas to a past kill date or a missing citation,
+        # found out only after it ended. It now checks drafts while it runs;
+        # the gateway logs each check, so numbers tweaked after a failed check show.
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='scout')
+        pack = Path(run['evidence_file']).parent
+        drafts = pack / ventures.STUDIO_DRAFTS
+        self.assertTrue(drafts.is_dir())
+        self.assertEqual((pack / ventures.STUDIO_CHECK_FILE).read_text(encoding='utf-8'), ventures.SCOUT_CHECK_SCRIPT)
+        brief = (pack / ventures.STUDIO_ENTRY_FILE).read_text(encoding='utf-8')
+        self.assertIn('**Check the answer before you submit it.** In this folder, run `python3 check.py', brief)
+        self.assertIn('The chair may write drafts beside this pack', run['prompt'])
+        self.assertIn('This run has 3 checks', brief)
+        self.assertIn('never by adjusting a number until it passes', brief)
+        self.assertIn('Check a draft answer with check.py first', ventures.scout_answer_rules())
+
+        def draft(name, idea, research=self.RESEARCH):
+            (drafts / name).write_text(json.dumps({'candidates': [idea], 'research': research}), encoding='utf-8')
+            self.ventures.advance()
+            report = json.loads((drafts / (name[:-5] + '.result.json')).read_text(encoding='utf-8'))
+            return report, self.ventures._studio_run_record('org', run['id'])
+
+        failing = self.web_candidate()
+        failing['kill_criteria'] = ['No paid pilot signed by 2020-01-01.']
+        report, saved = draft('draft-1.json', failing)
+        self.assertEqual((report['checked'], report['passes'], report['attempt'], report['limit']), (True, False, 1, 3))
+        self.assertIn('kill criteria: item 1 names a date in the past', report['candidates'][0]['problems'])
+        self.assertIn('Check 1 of 3: the draft has problems.', report['summary'])
+        self.assertEqual(saved['state'], 'meeting')
+        self.assertEqual(saved['draft_checks'][0]['candidates'][0]['numbers']['reachable_accounts.count'], 300)
+        # The same draft again is not a new check.
+        self.ventures.advance()
+        self.assertEqual(len(self.ventures._studio_run_record('org', run['id'])['draft_checks']), 1)
+
+        fixed = self.web_candidate()
+        fixed['reachable_accounts']['count'] = 900
+        report, saved = draft('draft-2.json', fixed)
+        self.assertTrue(report['passes'], report['summary'])
+        entry = report['candidates'][0]
+        self.assertEqual(entry['economics']['break_even_customers'], 5)
+        self.assertEqual(entry['changed_since_failed_check'], ['reachable_accounts.count: 300 -> 900'])
+        self.assertIn('Changed since its failed check (the operator sees this): reachable_accounts.count: 300 -> 900',
+                      report['summary'])
+        # An oversized draft uses a check; past the limit, the meeting is told to submit.
+        (drafts / 'draft-3.json').write_bytes(b' ' * (ventures.SCOUT_DRAFT_BYTES + 1))
+        self.ventures.advance()
+        report = json.loads((drafts / 'draft-3.result.json').read_text(encoding='utf-8'))
+        self.assertIn('regular file of at most 256 KB', report['summary'])
+        report, saved = draft('draft-4.json', fixed)
+        self.assertFalse(report['checked'])
+        self.assertIn('No checks left (3 per run)', report['summary'])
+        self.assertEqual([entry['checked'] for entry in saved['draft_checks']], [True, True, False, False])
+
+        done = self.complete_studio(run, {'candidates': [fixed], 'research': self.RESEARCH})
+        self.assertEqual(done['state'], 'ready', done.get('error'))
+        idea = self.stored_candidates()[0]
+        self.assertEqual(idea['draft_changes'], dict(after_check=1, changes=['reachable_accounts.count: 300 -> 900']))
+        self.assertEqual(len(done['draft_checks']), 4)
+
+    def test_the_pitch_keeps_competition_citations_and_an_fx_edit_refreshes_the_comparison(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='scout')
+        idea = self.web_candidate('Price Desk', ('W1',))
+        idea['configuration']['market'].update(fx_pair='USD/EUR', fx_rate=1)
+        idea['competition'] = dict(strategy='price', leader=dict(
+            name='BoomDesk', price=dict(amount=900, currency='EUR', period='month'), customers=40,
+            evidence=['W2']), cost_reason='Self-serve setup.')
+        research = [self.PRICED[0], dict(self.PRICED[1], claim='BoomDesk costs EUR 900 a month for 40 paying accounts.')]
+        done = self.complete_studio(run, dict(candidates=[idea], research=research))
+        stored, = self.stored_candidates()
+        self.assertNotIn('W2', stored['evidence'])
+        self.assertIn('W2', {page['id'] for page in stored['evidence_links']})
+        pack = self.ventures._pitch_pack(done, [stored])
+        self.assertEqual(pack['ideas'][0]['competition'], stored['competition'])
+        self.assertIn('W2', {page['id'] for page in pack['sources']})
+
+        def edit_fx(rate):
+            return self.studio(mode='candidate_update', candidate_id=stored['id'],
+                               configuration=dict(market=dict(fx_rate=rate)))['competition']
+
+        changed = edit_fx(2)
+        self.assertEqual(changed['figures'], {})
+        self.assertIn('against 450', changed['comparison_error'])
+        changed = edit_fx(0.75)
+        self.assertNotIn('comparison_error', changed)
+        self.assertEqual(changed['figures']['leader_monthly'], 1200)
+
+    def test_a_failed_draft_result_write_does_not_spend_a_check_or_discard_other_results(self):
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        run = self.studio(mode='studio_run', kind='scout')
+        drafts = Path(run['evidence_file']).parent / ventures.STUDIO_DRAFTS
+        draft = self.web_candidate()
+        draft['ignored_number'] = 10 ** 500  # Audit fields must not break valid answers.
+        data = json.dumps(dict(candidates=[draft], research=self.RESEARCH)).encode()
+        for name in ('blocked.json', 'good.json'):
+            (drafts / name).write_bytes(data)
+        write = self.ventures._write_draft_result
+
+        def write_result(path, report):
+            if path.name == 'blocked.result.json':
+                raise PermissionError('Temporarily unable to publish the result.')
+            return write(path, report)
+
+        with patch.object(self.ventures, '_write_draft_result', side_effect=write_result):
+            self.ventures.advance()
+        report = json.loads((drafts / 'good.result.json').read_text(encoding='utf-8'))
+        self.assertTrue(report['passes'], report['summary'])
+        self.assertEqual(report['digest'], hashlib.sha256(data).hexdigest())
+        self.assertEqual(report['attempt'], 1)
+        saved = self.ventures._studio_run_record('org', run['id'])
+        self.assertEqual([entry['draft'] for entry in saved['draft_checks']], ['good.json'])
+        done = self.complete_studio(run, dict(candidates=[draft], research=self.RESEARCH))
+        self.assertEqual(done['state'], 'ready')
+        self.assertEqual(len(self.stored_candidates()), 1)
+
     def test_an_idea_must_name_the_benefit_the_buyer_pays_for_before_the_verdict(self):
         # Five ideas in a row coordinated a resource that was simply scarce:
         # patients, inspectors, installers, technicians, drivers.
@@ -3014,7 +3332,7 @@ class VentureTests(unittest.TestCase):
                      'that is a test for a held idea (measure it at a pilot customer), not a pass',
                      'put the evidence ids for them in the dissent\'s "evidence" field',
                      '10. **The verdict follows.** The Skeptic advances an idea only when questions 1, 2, 6 and 9 hold.',
-                     '12. **Look again before returning nothing.**', 'against question 10.'):
+                     '13. **Look again before returning nothing.**', 'against question 10.'):
             self.assertIn(rule, checklist)
         # The benefit question comes before the verdict that depends on it.
         self.assertLess(checklist.index('9. **The benefit'), checklist.index('10. **The verdict'))

@@ -529,6 +529,13 @@ List<Component> _scoutLead(Map<String, dynamic> scout) {
   final screened = (scout['stakeholder_screen'] as List? ?? const [])
       .whereType<Map>()
       .toList();
+  // A seller already selling it leaves room for a lower price or a bundle,
+  // so those come first.
+  final ruledOut = (scout['ruled_out'] as List? ?? const [])
+      .whereType<Map>()
+      .toList();
+  final sold = ruledOut.where((e) => e['blocked_by'] == 'incumbent').toList();
+  final rest = ruledOut.where((e) => e['blocked_by'] != 'incumbent').toList();
   return [
     if (outcome.isNotEmpty)
       paragraph(
@@ -566,7 +573,41 @@ List<Component> _scoutLead(Map<String, dynamic> scout) {
               paragraph('After the redesign: ${entry['follow_up']}'),
           ], classes: 'stack'),
       ]),
+    if (ruledOut.isNotEmpty)
+      disclosure(
+        'Ruled out this round (${ruledOut.length}'
+        '${sold.isEmpty ? '' : ', ${sold.length} because a competitor sells it'})',
+        [
+          for (final entry in [...sold, ...rest])
+            paragraph(
+              '${entry['segment'] ?? ''}'
+              '${'${entry['market'] ?? ''}'.isEmpty ? '' : ' (${entry['market']})'}'
+              ' · ${_blockedLabels['${entry['blocked_by']}'] ?? 'reason not classified'}'
+              '${_seller(entry['incumbent'])}: ${entry['reason'] ?? ''}',
+            ),
+          if (sold.isNotEmpty)
+            paragraph(
+              'A competitor with paying customers shows that buyers pay for the job. Later scouts weigh '
+              'these segments for a lower price or as modules of one bundle.',
+            ),
+        ],
+      ),
   ];
+}
+
+const _blockedLabels = {
+  'incumbent': 'a competitor sells it',
+  'no_problem': 'the buyer already manages',
+  'no_payer': 'nobody pays for it',
+  'delivery': 'too costly to deliver',
+  'size': 'too few accounts',
+  'other': 'other reason',
+};
+
+String _seller(Object? incumbent) {
+  if (incumbent is! Map || '${incumbent['name'] ?? ''}'.isEmpty) return '';
+  final price = '${incumbent['price'] ?? ''}';
+  return ' (${incumbent['name']}${price.isEmpty ? '' : ', $price'})';
 }
 
 const _stakeholderLabels = {

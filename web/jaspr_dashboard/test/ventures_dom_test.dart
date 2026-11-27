@@ -247,6 +247,23 @@ void main() {
         'review_notes': [
           'Delivery costs 1800 USD per new customer, more than half of its first-year revenue.',
         ],
+        'competition': {
+          'strategy': 'price',
+          'leader': {'name': 'BoomDesk', 'customers': 40},
+          'cost_reason': 'Self-serve setup.',
+          'figures': {
+            'currency': 'USD',
+            'ours_monthly': 600,
+            'leader_monthly': 900,
+            'discount_percent': 33.3,
+            'matching_cost_monthly': 12000,
+          },
+          'notes': ["BoomDesk's 40 paying customers are not stated in its cited evidence (W1)."],
+        },
+        'draft_changes': {
+          'after_check': 1,
+          'changes': ['reachable_accounts.count: 300 -> 900'],
+        },
         'dissent': {
           'verdict': 'hold',
           'summary': 'The workflow may not be painful enough to pay for.',
@@ -579,6 +596,17 @@ void main() {
     expect(page, contains('600 USD per unit'));
     expect(page, contains('Upside, not counted in break-even'));
     expect(page, contains('Review notes (1)'));
+    // The gateway's own competition figures, and numbers changed after a failed check.
+    expect(
+      page,
+      contains(
+        'Price: 33.3% below BoomDesk (900 USD a month, 40 paying customers). Repricing all cited accounts '
+        'would cut monthly revenue by 12000 USD. Our lower cost: Self-serve setup. To check: '
+        'BoomDesk\'s 40 paying customers',
+      ),
+    );
+    expect(page, contains('Changed after failed check 1'));
+    expect(page, contains('reachable_accounts.count: 300 -> 900'));
     expect(page, contains('Stakeholders, round 1: 1 back · 0 hold · 1 pass'));
     expect(page, contains('Pitched, no reviews.'));
     // Another organization's candidate is not listed; a decided one is filed apart.

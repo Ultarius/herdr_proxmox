@@ -146,6 +146,17 @@ void main() {
             'stakeholder_screen': [
               {'idea': 'Carrier Desk', 'stakeholder': 'investor', 'follow_up': 'Check the volume discount.'},
             ],
+            'ruled_out': [
+              {'segment': 'Plant takeoff', 'reason': 'Extraction is not the bottleneck.', 'blocked_by': 'no_problem'},
+              {
+                'segment': 'Mailbox quote desk',
+                'market': 'Dutch tree traders',
+                'reason': 'BoomkwekerAI sells it.',
+                'blocked_by': 'incumbent',
+                'incumbent': {'name': 'BoomkwekerAI', 'price': 'EUR 149-699/month'},
+              },
+              {'segment': 'Spray register', 'reason': 'Excel is accepted.'},
+            ],
             'stakeholder_exploration': [
               {'stakeholder': 'investor', 'overlooked': 'Freight brokers'},
             ],
@@ -172,6 +183,20 @@ void main() {
     expect(nodes('p').map((node) => node.textContent), contains('Cheapest test: Compare two invoices.'));
     expect(page(), contains('Cited source: https://example.org/rates'));
     expect(page(), contains('After the redesign: Check the volume discount.'));
+    // What a competitor already sells comes first, with the seller and its price.
+    expect(page(), contains('Ruled out this round (3, 1 because a competitor sells it)'));
+    final ruledOut = nodes('p').map((node) => node.textContent ?? '').toList();
+    final sold = ruledOut.indexOf(
+      'Mailbox quote desk (Dutch tree traders) · a competitor sells it (BoomkwekerAI, EUR 149-699/month): '
+      'BoomkwekerAI sells it.',
+    );
+    expect(sold, greaterThanOrEqualTo(0));
+    expect(
+      ruledOut.indexOf('Plant takeoff · the buyer already manages: Extraction is not the bottleneck.'),
+      greaterThan(sold),
+    );
+    expect(ruledOut, contains('Spray register · reason not classified: Excel is accepted.'));
+    expect(page(), contains('Later scouts weigh these segments for a lower price or as modules of one bundle.'));
   });
 
   test('a fresh installation is offered the studio, not an organization', () async {

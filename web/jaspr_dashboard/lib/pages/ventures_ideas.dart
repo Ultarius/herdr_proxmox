@@ -168,12 +168,16 @@ List<Component> _scoutStatus(Map<String, dynamic>? scout) {
       ),
     ];
   }
+  final submitted = (scout['candidates'] as List? ?? const []).whereType<Map>();
+  final refused = scout['refused_candidates'] as List? ?? const [];
   if (state == 'ready' &&
-      (scout['candidates'] as List? ?? const []).isEmpty &&
-      (scout['refused_candidates'] as List? ?? const []).isEmpty) {
+      submitted.every((idea) => idea['state'] == 'excluded') &&
+      (refused.isEmpty || lead.isNotEmpty)) {
+    final proposedNone = submitted.isEmpty && refused.isEmpty;
     return [
       notice(
-        'The latest scout (started $started) proposed no ideas.'
+        'The latest scout (started $started) '
+        '${proposedNone ? 'proposed no ideas' : 'added no ideas to the queue'}.'
         '${note.isEmpty ? '' : ' Its note: $note'}'
         '${lead.isEmpty ? '' : ' It left the next scout a research lead: $lead See the Studio tab.'}',
       ),
@@ -289,6 +293,34 @@ Component venturesIdeas({
     subtitle:
         '$organizationName · ${open.length} waiting. Evidence, assumptions and kill criteria are agent opinion until reviewed.',
   );
+}
+
+/// How an idea means to win where a seller already has paying customers,
+/// with the gateway's own figures and anything to check.
+String _competitionText(Map competition) {
+  final figures = competition['figures'] as Map? ?? const {};
+  final leader = competition['leader'] as Map? ?? const {};
+  final currency = figures['currency'];
+  final notes = (competition['notes'] as List? ?? const []).join(' ');
+  final claim = switch ('${competition['strategy'] ?? ''}') {
+    'price' =>
+      'Price: ${figures['discount_percent']}% below ${leader['name']} '
+          '(${_moneyText(figures['leader_monthly'], currency)} a month, '
+          '${leader['customers']} paying customers). Repricing all cited accounts would cut monthly revenue by '
+          '${_moneyText(figures['matching_cost_monthly'], currency)}. '
+          'Our lower cost: ${competition['cost_reason'] ?? ''}',
+    'bundle' =>
+      'Bundle replacing ${(competition['stack'] as List? ?? const []).map((seller) => seller is Map ? seller['name'] : seller).join(', ')}: '
+          'the buyer pays ${_moneyText(figures['stack_monthly'], currency)} a month for them today, '
+          'the bundle saves ${figures['saving_percent']}%'
+          '${'${competition['shared_record'] ?? ''}'.isEmpty ? '' : '. One record: ${competition['shared_record']}'}',
+    'segment' =>
+      'Buyers ${leader['name']} does not serve: ${competition['unserved'] ?? ''}',
+    _ => '${competition['strategy'] ?? ''}',
+  };
+  final error = '${competition['comparison_error'] ?? ''}';
+  final comparison = error.isEmpty ? claim : 'Recheck this comparison. $error';
+  return notes.isEmpty ? comparison : '$comparison To check: $notes';
 }
 
 String _moneyText(Object? value, Object? currency) {
@@ -525,6 +557,18 @@ Component candidateDiligence(Map<String, dynamic> item) {
         ),
       ),
     if (firstPayment != null) ('First payment', text('$firstPayment days')),
+    if (item['competition'] is Map)
+      ('How it competes', text(_competitionText(item['competition'] as Map))),
+    // Numbers the meeting changed after a draft check failed: a fix, or a
+    // number nudged until the check passed.
+    if (item['draft_changes'] is Map)
+      (
+        'Changed after failed check ${(item['draft_changes'] as Map)['after_check'] ?? ''}',
+        text(
+          ((item['draft_changes'] as Map)['changes'] as List? ?? const [])
+              .join('; '),
+        ),
+      ),
   ];
   // Upside: shown, never counted toward break-even or the warnings.
   final upside = <(String, Component)>[
