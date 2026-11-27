@@ -671,6 +671,12 @@ Component candidateDiligence(Map<String, dynamic> item) {
         'The studio never creates this idea by itself.',
         error: true,
       ),
+    if (item['pitch_blocked'] is Map)
+      notice(
+        'Not pitched to the stakeholders: '
+        '${(item['pitch_blocked'] as Map)['reason'] ?? 'its pitch is too large.'}',
+        error: true,
+      ),
     if (dimensions != null)
       disclosure('Confidence dimensions', [
         for (final entry in dimensions.entries)

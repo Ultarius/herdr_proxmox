@@ -502,7 +502,10 @@ it. The gateway refuses a candidate that omits any of these fields:
   for a 3-site pilot counts as EUR 4,500 against that pilot's delivery days;
 - `delivery_effort`: expert days and a day rate, for one project;
 - `evidence_against`: at least one cited page or reason that weakens the idea;
-- `dissent`: the Skeptic's structured `advance`, `hold` or `reject` verdict;
+- `dissent`: the Skeptic's structured `advance`, `hold` or `reject` verdict,
+  with a summary of at most 1,200 characters. The summary answers the review
+  checklist's questions 1, 2, 6 and 9 and names the reframe weighed, which did
+  not fit the earlier 800-character limit;
 - `confidence_dimensions`: timing driver (15%), paid demand (30%), technical
   feasibility (10%), differentiation (15%), recurring potential (15%) and
   defensibility (15%), each rated weak, medium or strong and cited. An older
@@ -715,9 +718,13 @@ with no cost it recovers and no risk it measurably lowers, fails. An unmeasured 
 test for a held idea, not a pass. The Skeptic advances an idea only when
 questions 1, 2, 6 and 9 hold, and puts the ids behind its verdict in the
 dissent's `evidence` field: ids named only in the summary never reach the
-stakeholder panel's pitch. The answer example cites the run's own kind of
-source: `W1` for a web scout, `N1` for a feed scout (a feed scout that copied
-`W1` had the whole idea refused). During the shortlist screen the scout also
+stakeholder panel's pitch. The answer example cites only ids the run
+supplied: `W1` for a web scout; for any other scout, its first feed item
+(`N1`), else its first lesson (`L1`), else its first venture record (`V1`).
+The top-level example lists the first lesson and feed item the run has. A
+scout that copied an id its run lacked (`W1` in a feed run) had the whole idea
+refused. A run with no citable evidence is told to return no candidates and
+say so in `research_note`. During the shortlist screen the scout also
 asks what would change in a normal week and which record would show it
 (overtime invoices, completed work orders): the target customer when it
 advises, otherwise the industry operator, and nobody when neither is on the
@@ -726,9 +733,20 @@ roster. That answer is a research lead, not evidence.
 A pitch pack over its 32 KB limit first drops optional idea details, then
 shortens each source's summary to 160 characters, then drops summaries and
 titles. It never drops a source: each cited id keeps its id, link and scope.
-If the pack is still too large, the last idea is deferred to the next pitch,
-as before. Dropping sources from the end had left ideas citing `W12` with no
-`W12` in the pack.
+If the pack is still too large, each idea is first tried on its own. An idea
+too large even alone is flagged (`pitch_blocked`, shown on the Ideas tab)
+and left out of every pitch until an edit changes it. Nothing is cut from the
+idea itself, the Skeptic's full summary included. The ideas that fit are
+batched from the oldest, and the last one is deferred to the next pitch until
+the batch fits. When every idea in a pitch is too large alone, the pitch needs
+attention and keeps them, so recovering it after an edit (or a gateway
+update) tries them again; an idea that fits clears its flag. Dropping sources from the end had left
+ideas citing `W12` with no `W12` in the pack.
+
+Lessons (`L`) and the studio's own ventures (`V`) are sources too. A cited
+lesson travels as its title and the first 300 characters of its text, and a
+cited venture as its name, state and thesis, both taken from the originating
+scout's frozen pack and kept under the same `source_scope` as the idea.
 
 When this question was added the checklist was renumbered: the verdict, held
 ideas and "Look again before returning nothing" moved to 10, 11 and 12.

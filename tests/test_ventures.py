@@ -2132,6 +2132,15 @@ class VentureTests(unittest.TestCase):
             ventures.scout_buyer(dict(role=' ', budget='Ops budget', evidence=['W1']), cite)
         rules = ' '.join(ventures.scout_answer_rules().split())
         self.assertIn('reachable_accounts.segment and market_ceiling.segment: 300', rules)
+        # A real Skeptic summary (BandWise, 896 characters) answering questions
+        # 1, 2, 6 and 9 and the Portfolio Manager's objection was refused at 800.
+        summary = 'Q6 is the kill risk: the leader reaches these buyers. ' * 16
+        self.assertGreater(len(summary.strip()), 800)
+        self.assertEqual(ventures.scout_dissent(dict(verdict='hold', summary=summary), cite)['summary'],
+                         summary.strip())
+        with self.assertRaisesRegex(ValueError, r'dissent summary is 1201 characters; the limit is 1200'):
+            ventures.scout_dissent(dict(verdict='hold', summary='x' * 1201), cite)
+        self.assertIn('dissent.summary: 1200', rules)
 
     def test_a_feed_scout_rejection_keeps_the_feed_item_it_cites(self):
         self.setup_studio_manual()
@@ -2950,6 +2959,22 @@ class VentureTests(unittest.TestCase):
         self.assertIn('"dissent":{"verdict":"advance|hold|reject","summary":"...","evidence":["N1"]}',
                       second['prompt'])
         self.assertNotIn('["W1"]', second['prompt'])
+        # The example cites what this run supplied: with only a venture
+        # record, V1 (N1 or L1 would be refused); with nothing, no candidates.
+        only_ventures = dict(second, delivered_evidence_ids=['V1'], evidence=dict(
+            second['evidence'], items=[], lessons=[], ventures=[dict(id='V1', name='Carrier Desk', state='running')]))
+        prompt = self.ventures._studio_prompt('org', only_ventures, second['evidence_file'])
+        self.assertIn('"dissent":{"verdict":"advance|hold|reject","summary":"...","evidence":["V1"]}', prompt)
+        self.assertIn('"evidence":["V1"]}]', prompt)
+        self.assertNotIn('"N1"', prompt)
+        self.assertNotIn('"L1"', prompt)
+        self.assertNotIn('no citable evidence', prompt)
+        lessons_too = dict(only_ventures, delivered_evidence_ids=['N1', 'V1', 'L1'])
+        self.assertIn('"evidence":["L1", "N1"]}]',
+                      self.ventures._studio_prompt('org', lessons_too, second['evidence_file']))
+        nothing = dict(only_ventures, delivered_evidence_ids=[], evidence=dict(only_ventures['evidence'], ventures=[]))
+        self.assertIn('This run supplied no citable evidence: return empty candidates',
+                      self.ventures._studio_prompt('org', nothing, second['evidence_file']))
 
     def test_an_existing_tool_is_priced_against_and_only_the_leader_fails_question_6(self):
         # A live round rejected seven segments under question 6 because any
@@ -3146,7 +3171,7 @@ class VentureTests(unittest.TestCase):
         self.assertEqual(done['state'], 'ready', done.get('error'))
         pitch, = self.pitch_runs()
         self.assertEqual((pitch['state'], pitch['dispatch_failed']), ('needs_attention', True))
-        self.assertIn('byte budget', pitch['error'])
+        self.assertIn('Too large to pitch even on its own', pitch['error'])
         self.assertEqual(pitch['candidate_ids'], [self.stored_candidates()[0]['id']])
 
         recovered = self.studio(mode='studio_recover', run_id=pitch['id'], inspected=True)
@@ -3284,6 +3309,68 @@ class VentureTests(unittest.TestCase):
         with patch('venture_panel.PANEL_PACK_LIMIT', 600):
             with self.assertRaises(PitchPackTooLarge):
                 self.ventures._pitch_pack(scout, ideas)
+
+    def test_a_pitch_carries_the_lessons_and_ventures_an_idea_cites(self):
+        # L and V ids reached the panel with no source behind them.
+        scout = dict(id='s' * 32, organization_id='org', evidence=dict(
+            items=[], lessons=[dict(id='L1', kind='venture', title='Freight Desk', text='Failed: ' + 'x' * 400)],
+            ventures=[dict(id='V1', name='Dock Ledger', state='running', thesis='Docks double-book trailers.')]))
+        ideas = [dict(name='Idea', run_id=scout['id'], evidence=['L1', 'V1'],
+                      dissent=dict(verdict='hold', summary='Held.', evidence=['L1']))]
+        sources = {source['id']: source for source in self.ventures._pitch_pack(scout, ideas)['sources']}
+        self.assertEqual(sorted(sources), ['L1', 'V1'])
+        self.assertEqual((sources['L1']['kind'], sources['L1']['title']), ('lesson', 'Freight Desk'))
+        self.assertTrue(sources['L1']['claim'].startswith('Failed: ') and len(sources['L1']['claim']) == 300)
+        self.assertEqual((sources['V1']['kind'], sources['V1']['claim']),
+                         ('venture', 'running: Docks double-book trailers.'))
+        # Two scout rounds: each excerpt keeps its idea's source_scope.
+        other = dict(scout, id='o' * 32)
+        ideas.append(dict(ideas[0], name='Other', run_id=other['id']))
+        with patch.object(self.ventures, '_studio_run_record', return_value=other):
+            pack = self.ventures._pitch_pack(scout, ideas)
+        self.assertEqual(sorted((source['id'], source['source_scope']) for source in pack['sources']),
+                         [('L1', 1), ('L1', 2), ('V1', 1), ('V1', 2)])
+
+    def test_an_idea_too_large_on_its_own_is_flagged_and_the_others_still_pitch(self):
+        # A first idea over the limit on its own used to fail the whole pitch
+        # and hold the idea that fit with it.
+        self.setup_studio_manual()
+        self.add_venture_group(self.create())
+        huge = candidate()
+        huge['product'] += ' Reconcile freight forwarder invoices.' * 30
+        small = candidate('Dock Ledger')
+        small['thesis'] = 'Warehouse docks double-book trailers because yard schedules live in spreadsheets.'
+        first = self.scout_with(huge, small)
+        big, little = self.stored_candidates()
+        size = lambda item: len(json.dumps(self.ventures._pitch_pack(first, [item]), ensure_ascii=False).encode())
+        self.assertGreater(size(big), size(little) + 400)
+        self.setup_panel(stakeholders=[dict(role='investor'), dict(role='customer')])
+        with patch('venture_panel.PANEL_PACK_LIMIT', size(little) + 200):
+            self.scout_with()
+        pitch, = self.pitch_runs()
+        self.assertEqual(pitch['state'], 'meeting', pitch['error'])
+        self.assertEqual(pitch['candidate_ids'], [little['id']])
+        flagged = self.ventures.get_candidate('org', big['id'])
+        self.assertIn('even on its own', flagged['pitch_blocked']['reason'])
+        self.assertEqual(flagged['product'], big['product'])  # Nothing is cut from the idea itself.
+        self.assertNotIn(big['id'], self.ventures._unpitched('org'))
+        # An edit clears the flag and puts the idea back in the queue.
+        edited = self.ventures.candidate_update('org', big['id'], dict(product='Reconcile carrier invoices.'),
+                                                'admin')
+        self.assertNotIn('pitch_blocked', edited)
+        self.assertIn(big['id'], self.ventures._unpitched('org'))
+        # When every idea is too large alone, the pitch keeps them, so
+        # recovering it (after an edit or an update) tries them again.
+        self.complete_pitch(pitch, [self.review('Dock Ledger', 'investor', 'hold')], spoke=['investor'])
+        with patch('venture_panel.PANEL_PACK_LIMIT', 64):
+            self.scout_with()
+        alone = self.pitch_runs()[-1]
+        self.assertEqual((alone['state'], alone['candidate_ids']), ('needs_attention', [big['id']]))
+        self.assertIn('Shorten it on the Ideas tab, then recover or dismiss this pitch', alone['error'])
+        self.assertIn('pitch_blocked', self.ventures.get_candidate('org', big['id']))
+        recovered = self.studio(mode='studio_recover', run_id=alone['id'], inspected=True)
+        self.assertEqual((recovered['state'], recovered['candidate_ids']), ('meeting', [big['id']]))
+        self.assertNotIn('pitch_blocked', self.ventures.get_candidate('org', big['id']))
 
     def test_an_oversize_batch_defers_the_backlog_idea_to_the_next_pitch(self):
         self.setup_studio_manual()

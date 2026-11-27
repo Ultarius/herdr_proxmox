@@ -57,6 +57,8 @@ PANEL_PITCH_IDEAS = 6  # Earlier open ideas join a round's new ideas up to this 
 PANEL_PACK_LIMIT = 32000
 # A source's claim is first cut to this when a pitch pack is over its limit.
 PANEL_SOURCE_CLAIM = 160
+# A cited lesson or venture travels as an excerpt of the scout's frozen pack.
+PANEL_INTERNAL_EXCERPT = 300
 PANEL_PROMPT_LIMIT = 8000
 PITCH_ANNOTATIONS = ('round', 'previous_feedback', 'stakeholder_screen', 'review_notes', 'revision_note')
 
@@ -487,6 +489,9 @@ class StakeholderPanel:
                 if identity in held:
                     continue
                 candidate = json.loads(data)
+                blocked = candidate.get('pitch_blocked')
+                if isinstance(blocked, dict) and blocked.get('version') == pitch_version(candidate):
+                    continue  # Too large to pitch until it is edited.
                 panel = candidate.get('panel') or {}
                 reviewed = candidate.get('stakeholder_reviews') or any(panel.get(verdict) for verdict in PANEL_VERDICTS)
                 # An idea edited since its review goes back to the panel.
@@ -525,18 +530,62 @@ class StakeholderPanel:
         if not ideas:
             raise ValueError('No idea from this pitch is still open; dismiss it.')
         scout = self._studio_run_record(organization, run['scout_run_id'])
-        while True:
-            try:
-                run['evidence'] = self._pitch_pack(scout, ideas, panel=run['panel'])
-                break
-            except PitchPackTooLarge:
-                if len(ideas) == 1:
-                    raise
-                # Keep the earliest ideas in this batch. Deferred ideas stay eligible for the next pitch.
-                ideas.pop()
+        try:
+            run['evidence'] = self._pitch_pack(scout, ideas, panel=run['panel'])
+        except PitchPackTooLarge:
+            # An idea too large even on its own is flagged on the idea and set
+            # aside until it is edited, so it does not hold back the others.
+            fits = []
+            for idea in ideas:
+                try:
+                    self._pitch_pack(scout, [idea], panel=run['panel'])
+                    fits.append(idea)
+                except PitchPackTooLarge:
+                    self._flag_pitch_size(idea, True)
+            oversized = [idea['name'] for idea in ideas if idea not in fits]
+            ideas = fits
+            if not ideas:
+                # This pitch keeps them, so recovering it after an edit (or a
+                # gateway update) tries them again.
+                raise PitchPackTooLarge(
+                    'Too large to pitch even on its own: ' + ', '.join(oversized)[:300]
+                    + '. Shorten it on the Ideas tab, then recover or dismiss this pitch.')
+            while True:
+                try:
+                    run['evidence'] = self._pitch_pack(scout, ideas, panel=run['panel'])
+                    break
+                except PitchPackTooLarge:
+                    if len(ideas) == 1:
+                        raise
+                    # Keep the earliest ideas in this batch. Deferred ideas stay eligible for the next pitch.
+                    ideas.pop()
+        for idea in ideas:
+            if idea.get('pitch_blocked'):
+                self._flag_pitch_size(idea, False)  # Fits now (edited, or recovered after an update).
         run['candidate_ids'] = [item['id'] for item in ideas]
         run['pitched_versions'] = {item['id']: pitch_version(item) for item in ideas}
         run['pre_screened_ideas'] = [idea['name'] for idea in run['evidence']['ideas'] if idea.get('pre_screened')]
+
+    def _flag_pitch_size(self, candidate, blocked):
+        """Mark an idea whose pitch pack alone exceeds the budget, or clear that mark.
+
+        ``_unpitched`` skips a marked idea until an edit changes what the
+        panel would judge. An operator editing it at this moment wins: the
+        mark is left for the next pitch to set or clear."""
+        try:
+            with self._holding_candidates([candidate['id']]):
+                current = self.get_candidate(candidate['organization_id'], candidate['id'])
+                if blocked:
+                    current['pitch_blocked'] = dict(
+                        at=_now().isoformat(), version=pitch_version(current),
+                        reason='Its pitch is over ' + str(PANEL_PACK_LIMIT) + ' bytes even on its own, with '
+                               'only the ids and links of its sources. Shorten the thesis, product or cited '
+                               'detail; the edit puts it back in the queue.')
+                elif not current.pop('pitch_blocked', None):
+                    return
+                self.save_candidate(current)
+        except Exception as error:  # Busy or removed: this pitch still decides without it.
+            logging.warning('Pitch size of idea %s not recorded: %s', candidate.get('id'), redact(str(error)))
 
     @staticmethod
     def _pitch_idea(candidate):
@@ -592,8 +641,21 @@ class StakeholderPanel:
                         pages.setdefault(page['id'], page)
             scoped = [dict(id=page['id'], title=page.get('title'), url=page.get('url'), claim=page.get('claim'))
                       for page in pages.values()]
+            frozen = origin.get('evidence') or {}
             scoped.extend(dict(id=item['id'], title=item.get('title'), link=item.get('link'))
-                          for item in (origin.get('evidence') or {}).get('items') or [] if item.get('id') in cited)
+                          for item in frozen.get('items') or [] if item.get('id') in cited)
+            # A scout may also cite a lesson (L) or one of the studio's
+            # ventures (V); the pitch carries a short excerpt of what the scout
+            # read, so the stakeholders can check that citation too.
+            scoped.extend(dict(id=item['id'], kind='lesson', title=str(item.get('title') or '')[:120],
+                               claim=str(item.get('text') or '')[:PANEL_INTERNAL_EXCERPT])
+                          for item in frozen.get('lessons') or []
+                          if isinstance(item, dict) and item.get('id') in cited)
+            scoped.extend(dict(id=item['id'], kind='venture', title=str(item.get('name') or '')[:120],
+                               claim=(str(item.get('state') or '') + ': '
+                                      + str(item.get('thesis') or ''))[:PANEL_INTERNAL_EXCERPT])
+                          for item in frozen.get('ventures') or []
+                          if isinstance(item, dict) and item.get('id') in cited)
             if len(rounds) > 1:
                 for _, idea in entries:
                     idea['source_scope'] = scope
@@ -623,7 +685,8 @@ class StakeholderPanel:
                 else:
                     source.pop(step, None)
         if size() > PANEL_PACK_LIMIT:
-            # The caller defers the last idea to the next pitch.
+            # The caller defers the last idea to the next pitch, or flags an
+            # idea that does not fit on its own.
             raise PitchPackTooLarge('The pitch exceeds its byte budget even without supporting detail.')
         return pack
 
