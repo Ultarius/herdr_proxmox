@@ -320,7 +320,23 @@ String _competitionText(Map competition) {
   };
   final error = '${competition['comparison_error'] ?? ''}';
   final comparison = error.isEmpty ? claim : 'Recheck this comparison. $error';
-  return notes.isEmpty ? comparison : '$comparison To check: $notes';
+  final usage = <String>[];
+  for (final seller in [
+    leader,
+    ...(competition['stack'] as List? ?? const []).whereType<Map>(),
+  ]) {
+    if (seller['price'] case final Map price
+        when price['period'] == 'per_unit') {
+      usage.add(
+        '${seller['name']} at ${price['units_per_month']} ${price['unit']} per month',
+      );
+    }
+  }
+  return [
+    comparison,
+    if (usage.isNotEmpty) 'Usage assumed: ${usage.join(', ')}.',
+    if (notes.isNotEmpty) 'To check: $notes',
+  ].join(' ');
 }
 
 String _moneyText(Object? value, Object? currency) {

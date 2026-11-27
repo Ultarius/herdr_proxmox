@@ -154,6 +154,30 @@ void main() {
                 'reason': 'BoomkwekerAI sells it.',
                 'blocked_by': 'incumbent',
                 'incumbent': {'name': 'BoomkwekerAI', 'price': 'EUR 149-699/month'},
+                'untried': 'Ruled out on an incumbent without trying a lower price, a bundle or a segment it does '
+                    'not serve.',
+              },
+              {
+                'segment': 'Yard capture kit',
+                'reason': 'PlantScout can add it.',
+                'blocked_by': 'incumbent',
+                'incumbent': {'name': 'PlantScout', 'price': 'EUR 2,500/year'},
+                'competition': {
+                  'strategy': 'price',
+                  'failed': 'It would match for accounts at risk.',
+                  'figures': {
+                    'ours_monthly': 29,
+                    'currency': 'EUR',
+                    'leader_monthly': 208.33,
+                    'discount_percent': 86.1,
+                    'matching_cost_monthly': 7173.2,
+                  },
+                  'notes': ['PlantScout\'s 40 paying customers are not stated in its cited evidence (W1).'],
+                  'usage': [
+                    {'seller': 'Our offer', 'units_per_month': 10, 'unit': 'jobs'},
+                  ],
+                  'sources': ['https://example.org/volume'],
+                },
               },
               {'segment': 'Spray register', 'reason': 'Excel is accepted.'},
             ],
@@ -184,7 +208,20 @@ void main() {
     expect(page(), contains('Cited source: https://example.org/rates'));
     expect(page(), contains('After the redesign: Check the volume discount.'));
     // What a competitor already sells comes first, with the seller and its price.
-    expect(page(), contains('Ruled out this round (3, 1 because a competitor sells it)'));
+    expect(
+      page(),
+      contains('Ruled out this round (4, 2 because a competitor sells it, 1 without a recorded case)'),
+    );
+    expect(
+      page(),
+      contains(
+        'Tried a lower price · 86.1% below the leader (29 against 208.33 EUR a month). Repricing all cited '
+        'accounts would cut revenue by 7173.2 EUR a month · Our offer at 10 jobs per month · why it failed: It would match for accounts at risk. · '
+        'to check: PlantScout\'s 40 paying customers are not stated in its cited evidence (W1).',
+      ),
+    );
+    expect(nodes('a').map((node) => node.getAttribute('href')), contains('https://example.org/volume'));
+    expect(page(), contains('Ruled out on an incumbent without trying a lower price, a bundle or a segment'));
     final ruledOut = nodes('p').map((node) => node.textContent ?? '').toList();
     final sold = ruledOut.indexOf(
       'Mailbox quote desk (Dutch tree traders) · a competitor sells it (BoomkwekerAI, EUR 149-699/month): '
@@ -196,7 +233,13 @@ void main() {
       greaterThan(sold),
     );
     expect(ruledOut, contains('Spray register · reason not classified: Excel is accepted.'));
-    expect(page(), contains('Later scouts weigh these segments for a lower price or as modules of one bundle.'));
+    expect(
+      page(),
+      contains(
+        'Later scouts weigh these segments for a lower price, as modules of one bundle or for buyers the seller '
+        'does not serve.',
+      ),
+    );
   });
 
   test('a fresh installation is offered the studio, not an organization', () async {

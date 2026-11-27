@@ -536,6 +536,7 @@ List<Component> _scoutLead(Map<String, dynamic> scout) {
       .toList();
   final sold = ruledOut.where((e) => e['blocked_by'] == 'incumbent').toList();
   final rest = ruledOut.where((e) => e['blocked_by'] != 'incumbent').toList();
+  final untried = sold.where((e) => '${e['untried'] ?? ''}'.isNotEmpty).length;
   return [
     if (outcome.isNotEmpty)
       paragraph(
@@ -576,23 +577,94 @@ List<Component> _scoutLead(Map<String, dynamic> scout) {
     if (ruledOut.isNotEmpty)
       disclosure(
         'Ruled out this round (${ruledOut.length}'
-        '${sold.isEmpty ? '' : ', ${sold.length} because a competitor sells it'})',
+        '${sold.isEmpty ? '' : ', ${sold.length} because a competitor sells it'}'
+        '${untried == 0 ? '' : ', $untried without a recorded case'})',
         [
           for (final entry in [...sold, ...rest])
-            paragraph(
-              '${entry['segment'] ?? ''}'
-              '${'${entry['market'] ?? ''}'.isEmpty ? '' : ' (${entry['market']})'}'
-              ' · ${_blockedLabels['${entry['blocked_by']}'] ?? 'reason not classified'}'
-              '${_seller(entry['incumbent'])}: ${entry['reason'] ?? ''}',
-            ),
+            el('article', [
+              paragraph(
+                '${entry['segment'] ?? ''}'
+                '${'${entry['market'] ?? ''}'.isEmpty ? '' : ' (${entry['market']})'}'
+                ' · ${_blockedLabels['${entry['blocked_by']}'] ?? 'reason not classified'}'
+                '${_seller(entry['incumbent'])}: ${entry['reason'] ?? ''}',
+              ),
+              if (entry['competition'] case final Map competition) ...[
+                paragraph(_triedCase(competition)),
+                for (final source
+                    in (competition['sources'] as List? ?? const [])
+                        .whereType<String>())
+                  if (source.startsWith('https://') ||
+                      source.startsWith('http://'))
+                    el(
+                      'a',
+                      [text(source)],
+                      attributes: {
+                        'href': source,
+                        'target': '_blank',
+                        'rel': 'noopener noreferrer',
+                      },
+                    ),
+              ],
+              if ('${entry['untried'] ?? ''}'.isNotEmpty)
+                paragraph('${entry['untried']}'),
+            ], classes: 'stack'),
           if (sold.isNotEmpty)
             paragraph(
               'A competitor with paying customers shows that buyers pay for the job. Later scouts weigh '
-              'these segments for a lower price or as modules of one bundle.',
+              'these segments for a lower price, as modules of one bundle or for buyers the seller does not '
+              'serve.',
             ),
         ],
       ),
   ];
+}
+
+const _strategyLabels = {
+  'price': 'a lower price',
+  'bundle': 'a bundle',
+  'segment': 'buyers the seller does not serve',
+};
+
+/// The case a ruled-out idea tried against its incumbent, with the
+/// gateway's figures and why the scout said it failed.
+String _triedCase(Map competition) {
+  final figures = competition['figures'] is Map
+      ? competition['figures'] as Map
+      : const {};
+  final currency = '${figures['currency'] ?? ''}';
+  final parts = [
+    'Tried ${_strategyLabels['${competition['strategy']}'] ?? 'an unnamed case'}',
+  ];
+  if ('${competition['unserved'] ?? ''}'.isNotEmpty)
+    parts.add('for ${competition['unserved']}');
+  if (figures['discount_percent'] != null) {
+    parts.add(
+      '${figures['discount_percent']}% below the leader (${figures['ours_monthly']} against '
+      '${figures['leader_monthly']} $currency a month). Repricing all cited accounts would cut revenue by '
+      '${figures['matching_cost_monthly']} $currency a month',
+    );
+  }
+  if (figures['saving_percent'] != null) {
+    parts.add(
+      'saves ${figures['saving_percent']}% on a stack of ${figures['stack_monthly']} $currency a month',
+    );
+  }
+  for (final usage
+      in (competition['usage'] as List? ?? const []).whereType<Map>()) {
+    parts.add(
+      '${usage['seller']} at ${usage['units_per_month']} ${usage['unit']} per month',
+    );
+  }
+  if ('${competition['refused'] ?? ''}'.isNotEmpty) {
+    parts.add('the gateway would refuse it: ${competition['refused']}');
+  }
+  if ('${competition['failed'] ?? ''}'.isNotEmpty)
+    parts.add('why it failed: ${competition['failed']}');
+  final notes = (competition['notes'] as List? ?? const [])
+      .map((note) => '$note')
+      .toList();
+  if (notes.isNotEmpty) parts.add('to check: ${notes.join(' ')}');
+  return parts.join(' · ');
 }
 
 const _blockedLabels = {

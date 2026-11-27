@@ -155,6 +155,8 @@ def cited_evidence_ids(candidate):
         for seller in [competition.get('leader'), *(sellers if isinstance(sellers, list) else [])]:
             if isinstance(seller, dict):
                 add(seller.get('evidence'))
+                if isinstance(seller.get('price'), dict):
+                    add(seller['price'].get('usage_evidence'))
     dimensions = candidate.get('confidence_dimensions')
     if isinstance(dimensions, dict):
         for item in dimensions.values():

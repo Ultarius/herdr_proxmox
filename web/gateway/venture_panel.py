@@ -725,7 +725,7 @@ class StakeholderPanel:
             prompt += (' In round 1, test each competition claim against the cited prices and what the buyer '
                        'actually uses. For a price challenger, ask whether the seller can match only for these '
                        'buyers. For a bundle, ask which paid tools it replaces and whether the first module '
-                       'sells on its own.')
+                       'sells on its own. Check that usage-based offers are priced at the same buyer workload.')
         if len(prompt) > PANEL_PROMPT_LIMIT:
             raise ValueError('The pitch prompt exceeds the discussion budget.')
         return prompt

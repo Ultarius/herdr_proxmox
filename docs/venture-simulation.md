@@ -751,6 +751,14 @@ needs review. The pitch includes the comparison and its cited sources so
 stakeholders can challenge the prices, the tools in the bundle and whether
 the first module can sell on its own.
 
+Competition prices can use `period: "per_unit"` for a fee per transaction,
+job or other unit. Include `unit`, `units_per_month` and
+`usage_evidence` with evidence IDs for the buyer's expected volume. The
+gateway multiplies the fee by the stated monthly volume, and the pitch and
+Ideas tab show the assumption. For example, USD 89 per job at eight jobs a
+month is USD 712 a month. Compare offers at the same workload. A volume
+absent from its cited sources gets a note for review.
+
 **Checking a draft during the meeting.** A meeting used to learn that an idea
 was refused (a past kill date, a missing citation, broken revenue lines) only
 after it ended, and the idea was lost for that round. The gateway now checks
@@ -767,8 +775,15 @@ drafts while the meeting runs:
   warnings and notes. A draft is untrusted: only a regular file of at most
   256 KB named like `draft-1.json` is read. A result the gateway cannot write
   uses no check, and the gateway continues processing the other drafts.
-- A run gets three checks. Later drafts get "no checks left" and are logged up
-  to eight entries.
+- A run gets three checks. A draft with no candidates and no ruled-out
+  competition case (below) gets a free receipt. The gateway retains all three
+  numbered checks and up to five free or over-limit receipts. Once the
+  checks are used, later drafts that would use one get "no checks left"
+  without running candidate or competition validation.
+- The result also covers each `ruled_out` entry blocked by an incumbent: the
+  case it tried, with the gateway's figures and any refusal, or the untried
+  flag. This is advisory and never fails the draft. It lets the Skeptic see
+  the numbers behind a rejection it confirms.
 - The gateway keeps the log (`draft_checks` on the run), with up to 80 numeric
   fields per checked idea. The submitted answer is validated again when the
   meeting ends.
@@ -778,6 +793,93 @@ drafts while the meeting runs:
   number nudged until it passes both show, so the Skeptic and the operator can
   tell which it was. The brief says to fix a failure by changing the offer,
   citing what a page states or dropping the idea.
+
+**Question 6 needs evidence for this segment.** A live round in the tree-trade
+focus rejected YardClaim, a EUR 29/month capture kit for two-user traders.
+Three reasons were given:
+- the market-leader advisor said the missing settlement layer was "one
+  developer quarter away" and could be bundled free or sold at EUR 500/year;
+- WinTree reaches "hundreds of nurseries and traders";
+- PlantScout sells QC and complaints.
+
+None of these was evidence for the segment. The leader's answers were a
+role-played forecast. The leader also said the layer "does not exist today".
+The reach count covered the whole sector. And the customer advisor said these
+traders spend under EUR 5,000 a year on all their software and run on Outlook,
+Excel and WhatsApp. That is less than PlantScout's EUR 4,000-5,500 for QC and
+complaints.
+
+The scout never recorded the price case it weighed (86% below the complaints
+module) or the case for the buyers PlantScout does not serve. Question 6 now
+says:
+- reach is shown for the idea's segment. Current workarounds and software
+  budgets help identify what to research. Look for a source showing whether
+  the incumbent can sell to this segment, including channel access, buyer
+  eligibility and what customers actually pay;
+- **what a stakeholder says is judgment, not evidence.** A leader advisor's
+  "we could build it in a quarter", "we would give it away" or "we would open
+  a cheaper tier" makes the first half uncertain, not true, unless a cited
+  source backs it: a module it already sells, a published roadmap, or its
+  release history. A leader that has sold the adjacent module for years
+  without this part is evidence the other way. An idea is rejected on question
+  6 only when cited evidence shows both halves for this segment; otherwise it
+  is held with the test that would settle it;
+- the studio can compete on price, as a bundle or by targeting **a segment
+  the leader does not serve**. The segment strategy needs cited
+  evidence that these buyers do not buy from the leader: its price is above
+  what they spend on the job, its product needs what they lack (an ERP, an
+  implementation, a minimum number of users), or its customers are a
+  different kind of firm. It is recorded with `competition` strategy
+  `segment`.
+
+The market-leader advisor is also asked which of these buyers it does not
+serve today and why it has not built this for them. The stakeholder guide says
+its answers about what it would do are forecasts to record, and points to the
+evidence that would show them.
+
+**A ruled-out idea records the case it tried.** A `ruled_out` entry with
+`blocked_by: "incumbent"` may carry `competition`, in the candidates' format,
+plus two fields:
+- `failed`: why the case did not hold, required, up to 300 characters;
+- `ours` for a price or bundle case gives the price the scout weighed in the
+  currency of the cited prices. It uses the same period and, for a per-unit
+  price, the same volume and citation fields as a competitor's price.
+
+The gateway parses and computes the case like a candidate's
+(`ruled_out_competition`). The entry keeps the strategy, the sellers, the
+figures, any usage assumptions, source URLs, up to three notes and `failed`. A case a
+candidate would be refused for keeps its strategy, its reason and the refusal
+as `refused`, since the entry is advisory. An incumbent entry without a case
+gets `untried`: "Ruled out on an incumbent without trying a lower price, a
+bundle or a segment it does not serve."
+
+The next scout's pack carries a summary of the case and its sources or the
+untried flag. On the Studio tab, **Ruled out this round** shows how many
+entries lack a recorded case. It shows the discount and projected revenue
+impact if the leader reprices all cited accounts, the bundle's saving, any
+usage assumptions, and the reasons and sources behind the scout's decision.
+
+**Overlooked segments carry forward.** The same round's four advisors named
+four segments the studio might be overlooking:
+- grower-consolidators in Opheusden, Zundert, Boskoop and Pinneberg who buy
+  70-80% of their stock from 15+ micro-growers;
+- the Bulgarian exporter side;
+- the buyer side;
+- landscape contractors buying from several traders.
+
+The round screened none of them, and the next round would have explored from
+scratch. The pack now carries `overlooked`:
+- up to six `{segment, stakeholder, date}` entries from the `overlooked`
+  answers of the three most recent settled scouts with suggestions relevant
+  to the current focus;
+- deduplicated case-insensitively, newest first;
+- older suggestions are trimmed under budget pressure. The newest is kept
+  ahead of older rejected segments, lessons and pitch feedback.
+
+When the pack has `overlooked`, the brief and the answer rules ("SCREEN AN
+OVERLOOKED SEGMENT") tell the scout to weigh an eligible suggestion that fits
+the run and that `ruled_out` does not already cover for the same market. The scout returns it as a
+candidate, a held idea or a `ruled_out` entry.
 
 Vendor pages are read for what they say, not inferred from a feature name, and
 their claims are reported as the vendor's own.
@@ -857,10 +959,12 @@ answer, where `market` names the buyer and geography the idea was judged for.
 `no_problem` (the buyer already achieves the outcome), `no_payer`, `delivery`,
 `size` or `other`; another value is dropped. With `incumbent`, `incumbent`
 names the seller and its price (`{"name","price"}`, at most 120 and 80
-characters; a bare name is accepted). The next scout's pack keeps both, so it
-can weigh those segments for a lower price or as bundle modules instead of
-skipping them, and the Studio tab lists them first under **Ruled out this
-round**. They are advisory:
+characters; a bare name is accepted) and `competition` the case it tried, or
+the entry is marked `untried` (see "A ruled-out idea records the case it
+tried"). The next scout's pack keeps them, so it can weigh those segments for
+a lower price, as bundle modules or for buyers the seller does not serve
+instead of skipping them. The Studio tab lists them first under **Ruled out
+this round**. They are advisory:
 - an unusable entry is dropped;
 - a segment repeated for the same market is kept once;
 - the reason is bounded to 300 characters;
